@@ -1291,6 +1291,14 @@ tests/test_qwen36_dense_batch$(EXE): tests/test_qwen36_dense_batch.c gsgemv.h qg
 tests/test_qwen36_json_escape$(EXE): tests/test_qwen36_json_escape.c gsgemv.h qgemv.h sse41_kernels.h qwen36.c qwen38_vision.h expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
+# Dense-bridge gate: qwen36's loader against an MLX affine
+# model.safetensors (the dense half of a Swiftlet qpack container) --
+# `language_model.` name resolution, U32 triple indexing, checked Q4/Q8
+# expansion, refusals.  With argv it doubles as the round-trip harness for
+# tests/test_make_qwen36_qpack_snap.py.
+tests/test_qwen36_dense_affine$(EXE): tests/test_qwen36_dense_affine.c qwen36.c affine_quant.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
 # Both tokenizer.json merge spellings ("a b" strings and ["a","b"] pairs)
 # must index the same merge table; the pair form is what Qwen3.6 ships.
 tests/test_qwen36_tok_merges$(EXE): tests/test_qwen36_tok_merges.c gsgemv.h qgemv.h sse41_kernels.h qwen36.c qwen38_vision.h expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
