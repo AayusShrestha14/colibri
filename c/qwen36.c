@@ -682,6 +682,15 @@ typedef struct {
     int n_group, topk_group;
     float theta, eps, partial_rotary_factor;
     int norm_topk, has_qk_norm, has_bias, attn_output_gate;
+    /* RMSNorm weight dialect for the tensors rmsnorm_row touches (input/post
+     * layernorms, q/k norms, final norm).  1 = HF Qwen3.6 zero-centered
+     * storage, apply (1 + w) -- the convention every converted snapshot uses
+     * and the engine has always assumed.  0 = full-gamma storage (MLX-derived
+     * containers: mlx-lm materialises the +1 into the weights at conversion),
+     * unshifted back to zero-centered at LOAD so the forward pass stays one
+     * convention.  The DeltaNet gated norm is full-gamma in BOTH dialects and
+     * is untouched by this flag. */
+    int zero_centered_norms;
     uint8_t *is_attn;   /* [n_layers] 1 if Gated Attention layer, 0 if DeltaNet */
     /* Gated DeltaNet (linear_attention) dims, read from qwen36_meta.json. */
     int dn_vheads, dn_kheads, dn_kdim, dn_vdim, dn_convk, dn_conv_dim;
@@ -1397,7 +1406,7 @@ static void load_cfg(Cfg *c, const char *snap) {
     c->partial_rotary_factor = 0.25f;
     c->n_experts = 256; c->topk = 8; c->inter = 512; c->shared_inter = 512;
     c->n_group = 1; c->topk_group = 1; c->norm_topk = 1; c->has_qk_norm = 1; c->has_bias = 0;
-    c->attn_output_gate = 1; c->n_active = 0;
+    c->attn_output_gate = 1; c->n_active = 0; c->zero_centered_norms = 1;
     c->vis_depth = 0; c->image_token = -1;
     c->mrope_section[0] = 11; c->mrope_section[1] = 11; c->mrope_section[2] = 10;
     if (c->n_layers <= 0 || c->n_layers > 512) { fprintf(stderr, "load_cfg: n_layers=%d out of range 1..512\n", c->n_layers); exit(1); }
@@ -1540,6 +1549,7 @@ static void load_meta(Cfg *c, const char *snap) {
         if((v=json_get(r,"rms_eps"))&&v->t==J_NUM) c->eps=(float)v->num;
         if((v=json_get(r,"attn_output_gate"))&&v->t==J_BOOL) c->attn_output_gate=v->boolean;
         if((v=json_get(r,"norm_topk_prob"))&&v->t==J_BOOL) c->norm_topk=v->boolean;
+        if((v=json_get(r,"zero_centered_norms"))&&v->t==J_BOOL) c->zero_centered_norms=v->boolean;
         if((v=json_get(r,"has_bias"))&&v->t==J_BOOL) c->has_bias=v->boolean;
         if((v=json_get(r,"has_qk_norm"))&&v->t==J_BOOL) c->has_qk_norm=v->boolean;
         if((v=json_get(r,"image_token_id"))&&v->t==J_NUM) c->image_token=(int)v->num;
@@ -1846,6 +1856,23 @@ static int q36_vision_attach(Model *m, const float *patches, int grid_h, int gri
     return tokens;
 }
 
+/* Loader for the RMSNorm weights rmsnorm_row applies as (1 + w).  HF Qwen3.6
+ * stores them zero-centered and the forward pass is written for that; an
+ * MLX-derived container stores FULL gamma (mlx-lm materialises the +1 at
+ * conversion -- measured on the production qpack container: input_layernorm
+ * mean 1.03, q_norm mean 1.33, where the zero-centered forms centre on 0).
+ * Feeding full gamma through (1 + w) doubles every normalised activation and
+ * the model degenerates to noise, so the shift is undone HERE, at load, and
+ * the forward pass keeps exactly one convention.  The DeltaNet gated norm is
+ * full gamma in both dialects (its forward multiplies plain w) and must NOT
+ * come through this loader. */
+static float *load_norm_n(Model *m, const char *name, int64_t want) {
+    float *w = load_t_n(m, name, want);
+    if (!m->c.zero_centered_norms)
+        for (int64_t i = 0; i < want; i++) w[i] -= 1.0f;
+    return w;
+}
+
 static void model_init_range(Model *m, const char *snap, int cap, int bits,
                              int layer_begin, int layer_end,
                              int load_boundaries, int allocate_state) {
@@ -1882,7 +1909,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         m->embed = load_t_n(m, "model.embed_tokens.weight", (int64_t)c->vocab * c->hidden);
         load_tq(m, "lm_head.weight", c->hidden, c->vocab, quantize_dense, "lmhead", &m->lm_head);
         if (m->lm_head.q || m->lm_head.q4) { qcount++; qfreed += (double)c->hidden * c->vocab * sizeof(float); }
-        m->final_norm = load_t_n(m, "model.norm.weight", c->hidden);
+        m->final_norm = load_norm_n(m, "model.norm.weight", c->hidden);
         q36_load_vision(m);
     }
     m->L = calloc((size_t)c->n_layers, sizeof(Layer));
@@ -1897,8 +1924,9 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     for (int i = layer_begin; i < layer_end; i++) {
         int ai = m->active_of[i];        /* == i for Phase 2 */
         Layer *l = &m->L[i];
-        /* input/post layernorms exist for every layer */
-        #define LD(field, suffix, want) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,ai); l->field = load_t_n(m,nm,(want))
+        /* input/post layernorms exist for every layer; they go through
+         * load_norm_n (rmsnorm_row weights), the router does not. */
+        #define LD(field, suffix, want) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,ai); l->field = load_norm_n(m,nm,(want))
         LD(in_ln,  "input_layernorm.weight", c->hidden);
         LD(post_ln,"post_attention_layernorm.weight", c->hidden);
         #undef LD
@@ -1910,9 +1938,9 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         /* q/k norms are per-head [head_dim]; only on attention layers, load if present */
         if (c->has_qk_norm) {
             snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.q_norm.weight", ai);
-            l->qn = dense_has(m, nm) ? load_t_n(m, nm, c->head_dim) : NULL;
+            l->qn = dense_has(m, nm) ? load_norm_n(m, nm, c->head_dim) : NULL;
             snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.k_norm.weight", ai);
-            l->kn = dense_has(m, nm) ? load_t_n(m, nm, c->head_dim) : NULL;
+            l->kn = dense_has(m, nm) ? load_norm_n(m, nm, c->head_dim) : NULL;
         } else { l->qn = NULL; l->kn = NULL; }
         /* router correction bias (optional) */
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.e_score_correction_bias", ai);
@@ -4991,7 +5019,7 @@ static int qwen36_edge_engine_open(
      * either (only main()'s static Model did), so lm_head stays f32-only here,
      * exactly as before. */
     load_tq(&engine->model, "lm_head.weight", config->hidden, config->vocab, 0, "lmhead", &engine->model.lm_head);
-    engine->model.final_norm = load_t_n(
+    engine->model.final_norm = load_norm_n(
         &engine->model, "model.norm.weight", config->hidden);
     engine->model.quant_bits = container_layer_is_int4(&engine->model, 0) ? 4 : 8;
     char tokenizer_path[4096];
