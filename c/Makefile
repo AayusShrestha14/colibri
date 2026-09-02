@@ -1193,10 +1193,18 @@ ifneq ($(EXE),)
 .PHONY: qwen36
 qwen36: qwen36$(EXE)
 endif
+# Apple METAL=1 engine builds also compile the qpack MLX-affine routed-
+# expert path (activated at runtime by QWEN36_QPACK=<container dir>); other
+# builds keep the inline stubs in qwen36_qpack.h and change nothing.
+QWEN36_QPACK_SRC =
+ifeq ($(METAL),1)
+QWEN36_QPACK_SRC = qwen36_qpack.c qpack.c
+QWEN36_CFLAGS  += -DQWEN36_QPACK
+endif
 # Rebuild when CUDA_DLL changes; otherwise an existing CPU-only executable can
 # be reported as up to date despite selecting the Windows CUDA DLL tier.
-qwen36$(EXE): qwen36.c affine_quant.h qwen38_vision.h sse41_kernels.h decode_batch.h serve_poll.h cli_args.h qwen36_tier.h expert_ffn.h idot.h st.h json.h compat.h omp_tune.h kv_prefix.h pin_pool.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h gsgemv.h qgemv.h $(QWEN36_TIER_SRC) $(CUDA_OBJ) .build-config
-	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
+qwen36$(EXE): qwen36.c affine_quant.h qwen36_qpack.h qwen38_vision.h sse41_kernels.h decode_batch.h serve_poll.h cli_args.h qwen36_tier.h expert_ffn.h idot.h st.h json.h compat.h omp_tune.h kv_prefix.h pin_pool.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h gsgemv.h qgemv.h $(QWEN36_TIER_SRC) $(QWEN36_QPACK_SRC) $(CUDA_OBJ) $(METAL_OBJ) .build-config
+	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_SRC) $(QWEN36_QPACK_SRC) $(CUDA_OBJ) $(METAL_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
 
 # Qwen-Image-2.1 text-to-image (docs/qwen-image.md). It reads the diffusers
 # checkpoint as it is: no conversion step. qi_gemm.h is its one matrix kernel.
@@ -1287,6 +1295,13 @@ tests/test_qwen36_cache_route$(EXE): tests/test_qwen36_cache_route.c gsgemv.h qg
 
 tests/test_qwen36_dense_batch$(EXE): tests/test_qwen36_dense_batch.c gsgemv.h qgemv.h sse41_kernels.h qwen36.c qwen38_vision.h expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+# CPU gate: the qpack MLX-affine routed-expert glue (qwen36_qpack.c)
+# against the portable affine reference, on a synthesized container -- no
+# GPU, every platform. The Apple parity twin (Metal vs CPU reference on a
+# real Swiftlet-generated fixture) is the qwen36-metal-test target.
+tests/test_qwen36_qpack$(EXE): tests/test_qwen36_qpack.c qwen36.c gsgemv.h qgemv.h sse41_kernels.h qwen38_vision.h expert_ffn.h qwen36_qpack.c qwen36_qpack.h qpack.c qpack.h affine_quant.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(METAL_OBJ)
+	$(CC) $(QWEN36_CFLAGS) -DQWEN36_QPACK $< qwen36_qpack.c qpack.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(METAL_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 tests/test_qwen36_json_escape$(EXE): tests/test_qwen36_json_escape.c gsgemv.h qgemv.h sse41_kernels.h qwen36.c qwen38_vision.h expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
