@@ -1212,7 +1212,7 @@ QWEN36_CFLAGS  += -DQWEN36_QPACK
 endif
 # Rebuild when CUDA_DLL changes; otherwise an existing CPU-only executable can
 # be reported as up to date despite selecting the Windows CUDA DLL tier.
-qwen36$(EXE): qwen36.c affine_quant.h qwen36_qpack.h qwen38_vision.h sse41_kernels.h decode_batch.h serve_poll.h cli_args.h qwen36_tier.h expert_ffn.h idot.h st.h json.h compat.h omp_tune.h kv_prefix.h pin_pool.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h gsgemv.h qgemv.h $(QWEN36_TIER_SRC) $(QWEN36_QPACK_SRC) $(CUDA_OBJ) $(METAL_OBJ) .build-config
+qwen36$(EXE): qwen36.c affine_quant.h backend_metal.h qwen36_qpack.h qwen38_vision.h sse41_kernels.h decode_batch.h serve_poll.h cli_args.h qwen36_tier.h expert_ffn.h idot.h st.h json.h compat.h omp_tune.h kv_prefix.h pin_pool.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h gsgemv.h qgemv.h $(QWEN36_TIER_SRC) $(QWEN36_QPACK_SRC) $(CUDA_OBJ) $(METAL_OBJ) .build-config
 	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_SRC) $(QWEN36_QPACK_SRC) $(CUDA_OBJ) $(METAL_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
 
 # Qwen-Image-2.1 text-to-image (docs/qwen-image.md). It reads the diffusers
