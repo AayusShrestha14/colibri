@@ -4466,8 +4466,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[qwen36] mixed layout on disk but qwen36_meta.json has no expert_down_bits -- down scales assumed per row\n");
     /* Offer the dense trunk to the placer before the tier decides its budget:
      * sizes only, from the same dense-i8 entries the uploads below will use.
-     * No entry (dense-i8 off) means nothing to offer, and the CPU path stands. */
-    {
+     * No entry (dense-i8 off) means nothing to offer, and the CPU path stands.
+     * A qpack container owns routed execution outright, so it must not seed
+     * CUDA placement state for a tier that is deliberately skipped below. */
+    if (!qq_active()) {
         int O_qkv = m.c.dn_conv_dim, O_z = m.c.dn_vheads * m.c.dn_vdim;
         if (m.lm_head.q)
             qt_trunk_offer("lmhead", 0, (size_t)m.lm_head.I * m.lm_head.O + (size_t)m.lm_head.O * sizeof(float));
