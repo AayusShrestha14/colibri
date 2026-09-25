@@ -2721,9 +2721,15 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
  *
  * Con `keep_all` si tengono i logit di ogni posizione, che serve solo al
  * confronto con l'oracolo; altrimenti si tiene l'ultima riga, che e' l'unica
- * che decide il token successivo. */
+ * che decide il token successivo.
+ *
+ * `halt`, se c'e', si chiede prima di ogni pezzo: un client che se n'e' andato
+ * a meta' di un prompt lungo non deve tenere il motore occupato fino in fondo.
+ * Se dice di fermarsi si torna NULL a un confine di pezzo, dove ogni layer e'
+ * avanzato e `filled` dice esattamente quanti token la sessione ha macinato. */
 static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
-                              const float *vision, int n_vision, int keep_all) {
+                              const float *vision, int n_vision, int keep_all,
+                              int (*halt)(void *), void *halt_arg) {
     const Cfg *c = &m->c;
     const char *setting = getenv("GLM53_PREFILL_CHUNK");
     int chunk = setting ? atoi(setting) : 128;
@@ -2736,6 +2742,11 @@ static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
     int used_vision = 0;
 
     for (int at = 0; at < n; at += chunk) {
+        if (halt && halt(halt_arg)) {
+            free(all);
+            free(last);
+            return NULL;
+        }
         const int here = at + chunk <= n ? chunk : n - at;
         /* Gli embedding dell'immagine vanno divisi come i token: a ogni pezzo
          * quelli dei segnaposto che contiene, altrimenti il conto non torna e
@@ -3075,7 +3086,7 @@ static void slot_remember(KVSlot *slot, const int *tokens, int n) {
         if (!slot->tokens) { fprintf(stderr, "OOM allocating slot history\n"); exit(1); }
         slot->cap = n;
     }
-    memcpy(slot->tokens, tokens, (size_t)n * sizeof(int));
+    if (n > 0) memcpy(slot->tokens, tokens, (size_t)n * sizeof(int));
     slot->n = n;
 }
 
@@ -3316,6 +3327,24 @@ static int serve_cancel_pending(unsigned long long id, int *input_eof) {
     return stopped ? SERVE_CTL_STOP : SERVE_CTL_NONE;
 }
 
+/* La stessa guardata, fra un pezzo di prefill e l'altro.
+ *
+ * Senza, un client che se ne va a meta' di un prompt lungo lascia il motore a
+ * macinarlo fino in fondo per nessuno: misurato su una macchina di prova, un
+ * prompt di 281 token disconnesso a 20 s ha tenuto il motore fino a 211.7 s.
+ * Si ferma solo un CANCEL. Uno STOP si ricorda e decide al primo passo di
+ * decodifica, come avrebbe fatto arrivando li'; un CANCEL dopo vince lo
+ * stesso. EOF non ferma niente, e da li' non si legge piu'. */
+typedef struct { unsigned long long id; int *ctl, *input_eof; } PrefillWatch;
+
+static int prefill_should_halt(void *arg) {
+    PrefillWatch *w = (PrefillWatch *)arg;
+    if (*w->input_eof) return 0;
+    const int seen = serve_cancel_pending(w->id, w->input_eof);
+    if (seen != SERVE_CTL_NONE && *w->ctl != SERVE_CTL_CANCEL) *w->ctl = seen;
+    return *w->ctl == SERVE_CTL_CANCEL;
+}
+
 /* Genera per una richiesta e chiude col suo DONE.
  *
  * Ritorna -1 se stdin ha raggiunto EOF durante il turno, 0 altrimenti: il turno
@@ -3430,16 +3459,25 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         g_echo_pin_logit = (pinned > 0 && shared == pinned && ps >= 0)
                            ? slot->pins.slot[ps].logit : NULL;
     }
+    int rows = 1, ctl = SERVE_CTL_NONE, input_eof = 0;
+    PrefillWatch watch = { q->id, &ctl, &input_eof };
     float *logits = forward_prefill(m, slot->session, sequence + shared,
-                                    total - shared, vision, n_vision, 0);
+                                    total - shared, vision, n_vision, 0,
+                                    prefill_should_halt, &watch);
     g_echo_k = 0; g_echo_id = 0;   /* la lettura riguarda il prefill, non la decodifica */
-    if (q->pin && logits &&
+    /* Interrotto a meta' prefill: la sessione ha macinato solo `filled` token,
+     * e da qui in poi `total` dice quello, cosi' la storia che slot_remember
+     * scrive sotto e la riga CANCEL descrivono la cache vera. Un nuovo tentativo
+     * dello stesso prompt ne e' allora un'estensione stretta e riusa il pezzo
+     * gia' fatto. Il ciclo sotto esce al primo giro, senza toccare `logits`. */
+    if (ctl == SERVE_CTL_CANCEL)
+        total = slot->session->filled;      /* e niente fotografia di un prompt a meta' */
+    else if (q->pin && logits &&
         !slot_pin_save(m, slot, sequence, total, logits) && getenv("GLM53_VERBOSE"))
         fprintf(stderr, "[PIN] fotografia non riuscita, si riparte da capo ogni volta\n");
     else if (q->pin)
         fprintf(stderr, "[PIN] stato fotografato a %d token\n", total);
     GSession *session = slot->session;
-    int rows = 1, ctl = SERVE_CTL_NONE, input_eof = 0;
     for (int step = 0; step < budget; step++) {
         /* #1332: una guardata a stdin per token. Il costo e' una select con
          * timeout zero; il guadagno e' che il gateway smette di aspettare un
@@ -3454,7 +3492,14 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
          * pagherebbe una select e una fgets a vuoto. Il turno finisce qui sotto
          * e il DONE parte lo stesso; e' serve_one a dire a serve_loop, col
          * valore di ritorno, che dopo non c'e' piu' nessuno. */
-        if (!input_eof) ctl = serve_cancel_pending(q->id, &input_eof);
+        /* Un CANCEL visto durante il prefill decide qui senza guardare di
+         * nuovo. Uno STOP invece si guarda lo stesso: un CANCEL arrivato dopo
+         * l'ultima guardata del prefill deve vincere, come vinceva quando
+         * arrivavano insieme a questo punto. */
+        if (ctl != SERVE_CTL_CANCEL && !input_eof) {
+            const int seen = serve_cancel_pending(q->id, &input_eof);
+            if (seen != SERVE_CTL_NONE) ctl = seen;
+        }
         if (ctl != SERVE_CTL_NONE) break;
         if (total >= room) { limited = 1; break; }
         const float *row = logits + (size_t)(rows - 1) * m->c.vocab;
@@ -3517,13 +3562,18 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
      * un client che ha cambiato idea. */
     if (ctl == SERVE_CTL_CANCEL) {
         /* Fin dove e' arrivato il motore: il client ne ha ricevuti al massimo
-         * `emitted`, e quanti ne mancano si legge solo dal suo lato. `filled`
-         * sta accanto perche' un Continue riusa solo se ha piu' token di
-         * quelli in cache: oggi filled == prompt + emitted, quindi anche un
-         * client che ha ricevuto tutto rifa' il prefill da capo. */
+         * `emitted`, e quanti ne mancano si legge solo dal suo lato. Durante il
+         * prefill `filled` conta solo il prefisso completato; durante la decodifica
+         * filled == prompt + emitted. Un nuovo tentativo riusa la cache solo se
+         * il prompt ne contiene tutto il prefisso e almeno un token in piu'. */
         if (getenv("GLM53_VERBOSE"))
             fprintf(stderr, "CANCEL %llu %d %d %d\n", q->id, prompt_tokens,
                     emitted, session->filled);
+        /* Un turno con un'immagine interrotto a meta' prefill lascerebbe nella
+         * storia solo gli id dei segnaposto, e gli id non dicono quale
+         * immagine: una richiesta dopo con gli stessi id e senza IMAGE
+         * riuserebbe righe fatte da embedding che non ha mandato. Si butta. */
+        if (n_vision > 0) slot_reset(m, slot);
         serve_line("ERROR %llu CANCELLED\n", q->id);
         free(sequence);
         return input_eof ? -1 : 0;
@@ -3808,7 +3858,8 @@ int main(int argc, char **argv) {
      * volta e ogni token dopo costa un token, non tutto il prefisso. */
     GSession *session = session_open(&model, count + (greedy > 0 ? greedy : 0) + 1);
     const double prefill_start = now_s();
-    float *logits = forward_prefill(&model, session, tokens, count, vision, n_vision, 1);
+    float *logits = forward_prefill(&model, session, tokens, count, vision, n_vision, 1,
+                                    NULL, NULL);
     if (getenv("GLM53_VERBOSE")) {
         fprintf(stderr, "load %.1fs, prefill %d tokens in %.1fs\n",
                 load_seconds, count, now_s() - prefill_start);
