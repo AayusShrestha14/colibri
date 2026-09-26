@@ -5320,6 +5320,11 @@ class APIHandler(BaseHTTPRequestHandler):
         if not isinstance(stream, bool):
             raise APIError(400, "`stream` must be a boolean.", "stream")
         message_id = "msg_" + uuid.uuid4().hex[:24]
+        # GLM-5.3 opens <think> in the prompt even with thinking off (#1278), so its reply
+        # starts with reasoning either way. Give that reasoning its own thinking block, as
+        # the OpenAI path gives it reasoning_content, instead of gluing it to the answer.
+        reasoning_block = enable_thinking or starts_in_reasoning(enable_thinking,
+                                                                 add_generation_prompt)
 
         def blocks_and_stop(text, stats, tool_reply=None):
             """Split a finished reply into Anthropic content blocks + stop_reason."""
@@ -5327,10 +5332,10 @@ class APIHandler(BaseHTTPRequestHandler):
             reasoning = ""
             if ARCH == "inkling":
                 text, reasoning = split_inkling(text)
-            elif enable_thinking:
+            elif reasoning_block:
                 reasoning, text = split_thinking_reply(text, enable_thinking,
                                                        add_generation_prompt)
-            if enable_thinking:
+            if reasoning_block:
                 content.append({"type": "thinking", "thinking": reasoning,
                                 "signature": ANTHROPIC_LOCAL_SIGNATURE})
             calls = []
@@ -5420,10 +5425,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 "id": message_id, "type": "message", "role": "assistant",
                 "model": self.server.model_id, "content": [], "stop_reason": None,
                 "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}}})
-            text_index = 1 if enable_thinking else 0
-            stream_state = {"thinking_closed": not enable_thinking,
-                            "text_started": not enable_thinking}
-            if enable_thinking:
+            text_index = 1 if reasoning_block else 0
+            stream_state = {"thinking_closed": not reasoning_block,
+                            "text_started": not reasoning_block}
+            if reasoning_block:
                 send_event("content_block_start", {"type": "content_block_start", "index": 0,
                     "content_block": {"type": "thinking", "thinking": "", "signature": ""}})
             else:

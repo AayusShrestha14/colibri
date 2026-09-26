@@ -345,6 +345,36 @@ class MessagesHTTPTest(unittest.TestCase):
             {"type": "text", "text": "answer"},
         ])
 
+    def test_glm53_reasoning_without_thinking_gets_its_own_block(self):
+        """GLM-5.3 opens <think> even with thinking off (#1278): the reasoning it writes
+        must not be glued to the answer."""
+        self.engine.script = ("Let me think", "</think>", "Paris.")
+        with patch("openai_server.ARCH", "glm53"):
+            with self.post(self.base_body()) as response:
+                payload = json.load(response)
+            self.assertEqual(payload["content"], [
+                {"type": "thinking", "thinking": "Let me think", "signature": "colibri-local"},
+                {"type": "text", "text": "Paris."},
+            ])
+
+    def test_streamed_glm53_reasoning_without_thinking_gets_its_own_block(self):
+        self.engine.script = ("Let me think", "</think>", "Paris.")
+        with patch("openai_server.ARCH", "glm53"):
+            with self.post(self.base_body(stream=True)) as response:
+                raw = response.read().decode()
+        payloads = [json.loads(line[len("data: "):]) for line in raw.splitlines()
+                    if line.startswith("data: ")]
+        starts = [p for p in payloads if p["type"] == "content_block_start"]
+        self.assertEqual([(p["index"], p["content_block"]["type"]) for p in starts],
+                         [(0, "thinking"), (1, "text")])
+        deltas = [p for p in payloads if p["type"] == "content_block_delta"]
+        self.assertEqual({(p["index"], p["delta"]["type"]) for p in deltas},
+                         {(0, "thinking_delta"), (0, "signature_delta"), (1, "text_delta")})
+        self.assertEqual("".join(p["delta"].get("thinking", "") for p in deltas),
+                         "Let me think")
+        self.assertEqual("".join(p["delta"].get("text", "") for p in deltas), "Paris.")
+        self.assertNotIn("</think>", raw)
+
     def test_inkling_thinking_uses_inkling_content_markers(self):
         self.engine.script = ("<|content_thinking|>reason", "ing<|content_text|>answer",)
         with patch("openai_server.ARCH", "inkling"):
