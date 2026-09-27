@@ -2262,7 +2262,7 @@ def generate_image(backend, prompt, settings, protocol, out=None, stream=None):
                                   progress.preview, progress.interrupted)
     except ImageCancelled:
         progress.stop()
-        print(f"  {C.yel}⏹ cancelled{C.r}\n", file=stream)
+        print(f"  {C.yel}■ cancelled{C.r}\n", file=stream)
         return None
     except ImageEngineError as error:
         progress.stop()
@@ -2449,7 +2449,7 @@ def cmd_chat(a):
                     banner(f"images · {mid} · attached")
                     image_repl(a, RemoteImageBackend(base, mid, getattr(a,"api_key",None),
                                                      entry.get("image")), mid)
-                    print(f"  {C.dim}goodbye — the engine keeps running for the next session{C.r}")
+                    print(f"  {C.dim}goodbye: the engine keeps running for the next session{C.r}")
                     return
                 banner(f"chat · {mid} · attached")
                 chat_attached(a, base, mid); return
@@ -2473,7 +2473,7 @@ def cmd_chat(a):
             print(f"\n  {C.dim}interrupted{C.r}")
         finally:
             backend.close()
-        print(f"  {C.teal}goodbye{C.r} {C.dim}— the hummingbird returns to its nest{C.r}\n")
+        print(f"  {C.teal}goodbye{C.r} {C.dim}the hummingbird returns to its nest{C.r}\n")
         return
     if arch!="glm":
         engine=engine_for(a.model)
