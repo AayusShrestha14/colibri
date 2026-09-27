@@ -276,23 +276,29 @@ class CommandsTest(unittest.TestCase):
             probe.bind(("127.0.0.1", 0))
             port = probe.getsockname()[1]
         env = dict(self.env)
+        # The log goes to a file, not to a pipe nobody reads: a full pipe blocks
+        # the gateway mid-write, and macOS pipes hold a quarter of Linux's.
+        log = open(Path(self.tmp.name) / "serve.log", "w+b")
+        self.addCleanup(log.close)
         process = subprocess.Popen(
             [sys.executable, str(C_DIR / "openai_server.py"), "--model", self.model,
              "--engine", str(STUB), "--port", str(port)],
-            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=str(C_DIR))
+            env=env, stdout=log, stderr=subprocess.STDOUT, cwd=str(C_DIR))
         try:
             import time
             from urllib.request import Request, urlopen
-            deadline = time.time() + 30
+            deadline = time.time() + 120           # a loaded CI runner, not a slow engine
             while True:
                 try:
-                    with urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=2) as r:
+                    with urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=5) as r:
                         entry = json.loads(r.read())["data"][0]
                     break
                 except OSError:
                     if time.time() > deadline or process.poll() is not None:
+                        log.seek(0)
+                        print(log.read()[-3000:].decode("utf-8", "replace"), file=sys.stderr)
                         raise
-                    time.sleep(0.1)
+                    time.sleep(0.2)
             self.assertEqual(entry["id"], "qwen-image-2.1-colibri")
             self.assertEqual(entry["capabilities"], ["image_generation"])
             body = json.dumps({"model": entry["id"], "prompt": "x", "size": "256x256",
@@ -304,10 +310,10 @@ class CommandsTest(unittest.TestCase):
         finally:
             process.terminate()
             try:
-                process.communicate(timeout=20)
+                process.wait(timeout=20)
             except subprocess.TimeoutExpired:
                 process.kill()
-                process.communicate()
+                process.wait()
 
 
 if __name__ == "__main__":
