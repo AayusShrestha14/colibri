@@ -22,6 +22,14 @@
  * are handed back to the OS when nothing reads them later (qiv_release): at
  * 1024x1024 the last up blocks hold 288-channel maps of 1.2 GB each, and without
  * that the decode would not fit next to the rest of the pipeline.
+ *
+ * Cost: about 4.2 TFLOP at 512x512, growing with the pixel count; measured on
+ * ds (Zen 4, 8 threads) 81% of the time is qi_gemm at 700-800 GFLOP/s, the rest
+ * is the RMS norm + SiLU prologue, the im2col copy and the epilogues. Peak
+ * memory is the weights (1.0 GB f32) plus about 1.8 GB per megapixel.
+ *
+ * Interface: qiv_load(dir) / qiv_decode(v, z, h, w, rgba, out_f) / qiv_free(v);
+ * qiv_set_progress for a callback after each stage (8 for the real model).
  */
 #ifndef COLIBRI_QWENIMAGE_VAE_H
 #define COLIBRI_QWENIMAGE_VAE_H
