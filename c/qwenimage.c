@@ -93,7 +93,12 @@ static int jbool(jval *o, const char *k, int def){
 static int g_bits = 8;   /* COLI_IMG_BITS: storage of the big matrices */
 static int g_act8 = 0;   /* COLI_IMG_ACT8=1: int8 activations on the int8 matrices (VNNI) */
 
-typedef struct { QiMat m; void *own; float *own_sc; } Lin;
+/* act8: this matrix may take int8 activations (COLI_IMG_ACT8). Only the DiT's
+ * block matrices do. Measured on the real model: the text encoder's hidden
+ * states carry a few huge channels, and one int8 scale per token wipes out the
+ * rest (last layer 124% off, against 7% with int8 weights alone), while the
+ * DiT blocks keep the picture (30.1 dB against 35.6 for int8 weights alone). */
+typedef struct { QiMat m; void *own; float *own_sc; int act8; } Lin;
 
 static st_tensor *need_tensor(shards *S, const char *name, int64_t n0, int64_t n1){
     st_tensor *t = st_find(S, name);
@@ -148,7 +153,7 @@ static float *vec_load(shards *S, const char *name, int n){
 static int g_prof; static double g_t_lin, g_t_att;
 static inline void linear(float *y, const float *x, int M, const Lin *l){
     double t0 = g_prof ? now_s() : 0;
-    if (g_act8 && l->m.fmt == QI_I8) qi_gemm_act8(y, l->m.N, x, l->m.K, M, &l->m, NULL);
+    if (g_act8 && l->act8 && l->m.fmt == QI_I8) qi_gemm_act8(y, l->m.N, x, l->m.K, M, &l->m, NULL);
     else qi_gemm(y, x, M, &l->m, NULL);
     if (g_prof) g_t_lin += now_s() - t0;
 }
@@ -481,6 +486,7 @@ static void dit_load(Dit *d, const char *model){
         lin_load(&S, BN("img_mlp.gate_layer.weight"), d->mlp, D, g_bits, &B->gate);
         lin_load(&S, BN("img_mlp.proj.weight"), d->mlp, D, g_bits, &B->proj);
         lin_load(&S, BN("img_mlp.out.weight"), D, d->mlp, g_bits, &B->out);
+        B->q.act8 = B->k.act8 = B->v.act8 = B->o.act8 = B->gate.act8 = B->proj.act8 = B->out.act8 = 1;
         B->nq = vec_load(&S, BN("attn.norm_q.weight"), d->hd);
         B->nk = vec_load(&S, BN("attn.norm_k.weight"), d->hd);
 #undef BN
@@ -1195,7 +1201,7 @@ static void usage(void){
         "       qwenimage --model DIR --serve\n"
         "       qwenimage --model DIR --ref REFDIR\n"
         "env:   COLI_IMG_BITS=8|16|32 weight storage (default 8: int8 rows)\n"
-        "       COLI_IMG_ACT8=1  int8 activations on the int8 matrices (VNNI, about 2x; quality measured separately)\n"
+        "       COLI_IMG_ACT8=1  int8 activations in the DiT blocks (VNNI, about 2x on the step; 30.1 dB vs 35.6)\n"
         "       COLI_IMG_TE=resident|stage  keep the text encoder loaded between prompts (serve default: resident)\n");
 }
 
