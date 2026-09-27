@@ -21,11 +21,15 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 | `build` | Build/prepare the engine. |
 | `info` | Print model / build info. |
 | `plan` | Show the computed RAM/VRAM placement plan (`--json` for machine-readable). |
+| `mirror` | Plan, stage, or verify a usage-ranked partial model mirror (see [multidisk.md](multidisk.md)). |
 | `doctor` | Environment/health check (`--json` report, `--deep` strict preflight). |
 | `tune` | Measure and save the fastest quality-preserving execution profile for this machine/model. |
 | `run "<prompt>"` | One-shot generation for the given prompt (positional, may be multi-word). |
 | `chat` | Interactive REPL chat. |
 | `serve` | Start the OpenAI-compatible HTTP server. |
+| `web` | `serve`, then open the dashboard in the browser. |
+| `stop` | Shut down a running `coli serve` and its engine. |
+| `cluster coordinator` / `cluster worker` | Run the local-cluster control plane, or an expert worker that serves experts to it. |
 | `bench [tasks]` | Run benchmark tasks (`--limit`, `--data`). |
 | `convert` | Convert an FP8 repo to a colibrì int4 snapshot. |
 
@@ -47,6 +51,11 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 | `--vram` | `0` (auto) | CUDA plan | Total VRAM budget in GB. |
 | `--auto-tier` | off | resource plan | Automatically apply the RAM/VRAM placement plan. |
 | `--no-tune-profile` | off | profile loader | Ignore a saved measured profile. |
+| `--think` / `--no-think` | the model's default | `enable_thinking` in the chat request | Whether the model reasons before answering. Off, the prompt closes the reasoning block and the answer starts at the first word. |
+| `--effort` | the model's default | `reasoning_effort` in the chat request | `minimal`, `low`, `medium`, `high` or `xhigh`: how long the model reasons, on the families that take it. |
+| `--xdna` | off | `COLI_XDNA=1` | Experimental: run qualified GLM operations on the AMD XDNA2 NPU (reduced-precision BF16 path; output may differ). |
+| `--cluster-workers` | `$CLUSTER_WORKERS` | `CLUSTER_WORKERS` | Comma-separated expert workers, `host:port,...`. |
+| `--cluster-coordinator` | `$CLUSTER_COORDINATOR` | worker discovery | Control-plane URL used to discover expert workers. |
 
 ### Subcommand-specific flags
 
