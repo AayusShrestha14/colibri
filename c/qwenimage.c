@@ -1234,6 +1234,9 @@ static void usage(void){
 }
 
 int main(int argc, char **argv){
+    /* Windows: the IMAGE and PREVIEW frames carry raw bytes; a text-mode stdout
+     * would turn every 0x0A inside them into 0x0D 0x0A (#748) */
+    coli_serve_binary_mode();
     const char *model = NULL, *prompt = NULL, *out = NULL, *ref = NULL;
     int width = 768, height = 512, steps = 8, serve = 0;
     uint64_t seed = 42; int seed_set = 0;

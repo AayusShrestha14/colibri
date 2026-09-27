@@ -128,7 +128,9 @@ static void qi_gemm_ld(float *Y, int ldy, const float *X, int ldx, int M, const 
      * does not depend on the thread count. */
     #pragma omp parallel
     {
-        float *panel = (float *)aligned_alloc(64, (size_t)QI_KC * QI_NR * sizeof(float));
+        /* plain malloc: the kernel loads unaligned, and aligned_alloc is missing from
+         * the Windows CRT */
+        float *panel = (float *)malloc((size_t)QI_KC * QI_NR * sizeof(float));
         if (!panel) { fprintf(stderr, "OOM qi_gemm panel\n"); exit(1); }
         #pragma omp for schedule(dynamic, 1) collapse(2)
         for (int mb = 0; mb < mblocks; mb++)
@@ -253,7 +255,7 @@ static void qi_gemm_act8(float *Y, int ldy, const float *X, int ldx, int M, cons
     const int nblocks = (N + QI_NR - 1) / QI_NR, mblocks = (M + QI_MC - 1) / QI_MC;
     #pragma omp parallel
     {
-        int8_t *panel = (int8_t *)aligned_alloc(64, (size_t)Kp * QI_NR);
+        int8_t *panel = (int8_t *)malloc((size_t)Kp * QI_NR);
         int32_t wsum[QI_NR];
         if (!panel) { fprintf(stderr, "OOM qi_gemm_act8 panel\n"); exit(1); }
         #pragma omp for schedule(dynamic, 1) collapse(2)
