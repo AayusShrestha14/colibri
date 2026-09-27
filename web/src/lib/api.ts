@@ -377,6 +377,9 @@ export interface GenerateImageOptions {
   onProgress?: (progress: ImageProgress) => void
   /* A preview as a data URI, small and noisy: the latent of the step so far. */
   onPartial?: (url: string, index: number) => void
+  /* Streaming was not available and the picture is being made by one plain
+     request: nothing more will arrive until it is done. */
+  onPlainRequest?: () => void
 }
 
 /* The stream did not work as a stream (no body, or a close before the first
@@ -493,6 +496,7 @@ export async function generateImage(options: GenerateImageOptions): Promise<Gene
     answer = await streamImage(options)
   } catch (cause) {
     if (!(cause instanceof StreamUnavailable) || options.signal.aborted) throw cause
+    options.onPlainRequest?.()
     answer = await requestImage(options)
   }
   const picture = answer.data?.[0]
