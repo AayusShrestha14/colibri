@@ -5064,7 +5064,7 @@ class APIHandler(BaseHTTPRequestHandler):
             event("error", {"error": {"message": "cancelled", "type": "cancelled",
                                       "param": None, "code": "cancelled"}})
             write(b"data: [DONE]\n\n")
-            return
+            raise ClientCancelled() from None       # counted as cancelled, not completed
         except image_engine.ImageEngineError as error:
             if not state["started"]:
                 raise APIError(500, f"The image engine failed: {error}", None, "engine_error",

@@ -32,7 +32,7 @@ import zlib
 from pathlib import Path
 
 INDEX_FILE = "model_index.json"
-TOKENIZER_FILE = os.path.join("processor", "tokenizer.json")
+TOKENIZER_FILE = "processor/tokenizer.json"   # forward slash: fine on Windows too
 COMPONENTS = ("text_encoder", "transformer", "vae", "processor", "scheduler")
 
 # What an engine that says less than the contract is assumed to mean. The
@@ -121,11 +121,16 @@ class ImageEngine:
         # running for a port, the same marks the text engines carry.
         child_env["SNAP"] = str(model)
         child_env["SERVE"] = "1"
-        spawn_flags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
+        # Its own process group (a new session on POSIX): Ctrl-C in the terminal
+        # reaches coli, which turns it into CANCEL, instead of killing the engine
+        # in the middle of a picture. Losing coli still ends the engine: its
+        # stdin closes, and EOF is the protocol's clean exit.
+        spawn = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+                 if sys.platform == "win32" else {"start_new_session": True})
         try:
             self.process = subprocess.Popen(
                 engine_command(executable, model), env=child_env, stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE, stderr=stderr, bufsize=0, creationflags=spawn_flags)
+                stdout=subprocess.PIPE, stderr=stderr, bufsize=0, **spawn)
         except OSError as error:
             raise ImageEngineError(f"cannot start the image engine {executable}: {error}") from error
         if on_stderr is not None:
@@ -141,7 +146,22 @@ class ImageEngine:
         self.events = queue.Queue()
         self.dead = None                      # why the engine is gone, once it is
         self._seq = 0
-        self.info = self._await_ready(load_timeout)
+        try:
+            self.info = self._await_ready(load_timeout)
+        except BaseException:
+            # A failed start must not leave a process or three pipes behind.
+            self._kill_quietly()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
+                try:
+                    if stream is not None:
+                        stream.close()
+                except (OSError, ValueError):
+                    pass
+            raise
         self.dispatcher = threading.Thread(target=self._dispatch, name="qwenimage-stdout",
                                            daemon=True)
         self.dispatcher.start()
@@ -354,6 +374,13 @@ class ImageEngine:
         dispatcher = getattr(self, "dispatcher", None)
         if dispatcher is not None and dispatcher is not threading.current_thread():
             dispatcher.join(timeout=5)
+        if self.process.poll() is not None:
+            for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
+                try:
+                    if stream is not None:
+                        stream.close()
+                except (OSError, ValueError):
+                    pass
 
 
 def _parse_line(raw):
