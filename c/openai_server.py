@@ -1402,7 +1402,7 @@ def render_chat_olmoe(messages, enable_thinking=False, reasoning_effort=None, to
 
 
 def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, tools=None,
-                     tool_choice=None, add_generation_prompt=True):
+                     tool_choice=None, add_generation_prompt=True, preserve_thinking=False):
     """Text-only subset of Qwen3.6's chat_template: <|im_start|>role\\n ...
     <|im_end|>\\n frames, then the generation prompt. The official template
     opens a mandatory <think> block after `<|im_start|>assistant\\n` — the
@@ -1415,11 +1415,32 @@ def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, too
     assistant turn AFTER the last user query with its <think></think> block (an earlier one,
     from history, has it stripped) -- so the open-turn shape is that think-form minus the
     <|im_end|> terminator and with no cue, not the bare history form the loop emits otherwise.
-    ChatML's per-turn terminator is why the marker has to be dropped explicitly, as on qwen38."""
+    ChatML's per-turn terminator is why the marker has to be dropped explicitly, as on qwen38.
+
+    preserve_thinking is the template's own kwarg of the same name (#1759): every past assistant
+    turn keeps its <think> block, `reasoning_content` inside it, empty when there is none. Qwen
+    trained Qwen3.6 on that form. Without it the template strips the block from every turn before
+    the last user query, so a turn generated after the pre-closed think header comes back without
+    the header it was fed, the resent history diverges from the engine's state at the first
+    assistant turn, and prefix reuse -- all or nothing on a recurrent state -- never engages."""
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
     if tool_choice == "none":
         tools = None
+    # The template's last_query_index: the last user turn that is a real query and not a
+    # tool result riding in as one. An assistant turn after it keeps its <think> block
+    # with or without preserve_thinking. With no query at all the template raises; here
+    # the index stays where the template starts it, at the last message.
+    last_query = len(messages) - 1
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        raw = message.get("content")
+        query = (content_text(raw, f"messages.{index}.content") if raw is not None else "").strip()
+        if not (query.startswith("<tool_response>") and query.endswith("</tool_response>")):
+            last_query = index
+            break
     if (tools or tool_choice not in (None, "none")) and not _TOOL_FALLBACK:
         raise APIError(400, "Tool use is not wired up for the qwen36 engine yet. "
                        "Set COLI_TOOL_FALLBACK=1 to opt into prompt-injected "
@@ -1456,6 +1477,18 @@ def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, too
             parts.append("<|im_start|>user\n"
                          + _fallback_tool_result(message, index) + "<|im_end|>\n")
             continue
+        if role == "assistant":
+            # The template's reading of a past turn: `reasoning_content` when it is a
+            # string, otherwise whatever the content carries before a </think> (a client
+            # echoing the raw reply), which then leaves the content.
+            reasoning = message.get("reasoning_content")
+            if not isinstance(reasoning, str):
+                reasoning = ""
+                if "</think>" in text:
+                    reasoning = text.split("</think>")[0].rstrip("\n").split("<think>")[-1].lstrip("\n")
+                    text = text.split("</think>")[-1].lstrip("\n")
+            if preserve_thinking or index > last_query:
+                text = f"<think>\n{reasoning.strip()}\n</think>\n\n{text}"
         if role == "assistant" and _TOOL_FALLBACK:
             text += _fallback_tool_calls(message.get("tool_calls"), index)
         parts.append(f"<|im_start|>{role}\n{text}<|im_end|>\n")
@@ -2569,7 +2602,8 @@ def resolve_generation_prompt(messages, body):
 
 
 def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None, tools=None,
-                         tool_choice=None, audio_out=None, add_generation_prompt=True):
+                         tool_choice=None, audio_out=None, add_generation_prompt=True,
+                         preserve_thinking=False):
     """Render a chat request with the active engine's native prompt contract.
 
     `add_generation_prompt=False` (a continued assistant turn) is implemented for the families
@@ -2592,7 +2626,7 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
                                   tool_choice, add_generation_prompt)
     if ARCH == "qwen36":
         return render_chat_qwen(messages, enable_thinking, reasoning_effort, tools,
-                                tool_choice, add_generation_prompt)
+                                tool_choice, add_generation_prompt, preserve_thinking)
     if ARCH == "glm":
         return render_chat(messages, enable_thinking, reasoning_effort, tools,
                            tool_choice, add_generation_prompt)
@@ -4490,7 +4524,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 if not isinstance(text, str) or not text.strip():
                     raise APIError(400, f"`questions[{i}].question` must be a non-empty string.",
                                    "questions")
-                per = entry.get("normalize", body.get("normalize", "mean"))
+                per = entry.get("normalize", body.get("normalize", "sum"))
                 if per not in ("mean", "sum"):
                     raise APIError(400, "`normalize` must be \"mean\" or \"sum\".", "normalize")
                 questions.append((text, self._brio_options(entry.get("options"),
@@ -4537,7 +4571,13 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "Provide `state`, `messages` or `question`.", "state")
         if not state and form != "options":
             raise APIError(400, f"`{form}` needs a `state` (or `messages`) to decide on.", "state")
-        normalize = body.get("normalize", "mean")
+        # "sum" (the joint log-probability of the option as a continuation)
+        # is the default: "mean" compares per-token averages, which silently
+        # favors multi-token options whenever the menu mixes token counts —
+        # e.g. DENY (2 tokens) beating ALLOW (1) on every safe change in a
+        # 30-case benchmark. "mean" stays available for menus whose options
+        # tokenize to the same length, and warns when they do not.
+        normalize = body.get("normalize", "sum")
         if normalize not in ("mean", "sum"):
             raise APIError(400, "`normalize` must be \"mean\" or \"sum\".", "normalize")
         # Lo slot si sceglie dallo STATO, non dalla domanda: mille domande
@@ -4606,6 +4646,15 @@ class APIHandler(BaseHTTPRequestHandler):
                     raise APIError(502, "The engine returned no log probabilities for the "
                                         "options.", None, "engine_error", "server_error")
                 key = "mean_logprob" if norm == "mean" else "logprob"
+                if norm == "mean":
+                    token_counts = {entry["tokens"] for entry in scored if entry["tokens"]}
+                    if len(token_counts) > 1:
+                        counts = ", ".join(f"{entry['option']}={entry['tokens']}"
+                                           for entry in scored)
+                        print(f"[brio] WARNING: normalize=mean with unequal option "
+                              f"token counts ({counts}) — per-token averages favor "
+                              f"multi-token options; consider normalize=sum",
+                              file=sys.stderr)
                 top = max(entry[key] for entry in scored)
                 weights = [math.exp(entry[key] - top) for entry in scored]
                 total_weight = sum(weights) or 1.0
@@ -5194,6 +5243,15 @@ class APIHandler(BaseHTTPRequestHandler):
             # while non-streaming happened to survive. Make the template's "unused"
             # true end-to-end instead of trusting every path to opt out.
             enable_thinking = False
+        # Qwen3.6's preserve_thinking (#1759), under the name Qwen's own API gives it. Off
+        # by default with thinking on: a standard client does not send the reasoning back,
+        # and the block would come back empty where the model did think. On by default with
+        # thinking off: there the block the history gets is the empty one the turn was
+        # actually generated after, so the resent history is the engine's state byte for
+        # byte and prefix reuse can engage. Only the qwen36 renderer reads it.
+        preserve_thinking = body.get("preserve_thinking", not enable_thinking)
+        if not isinstance(preserve_thinking, bool):
+            raise APIError(400, "`preserve_thinking` must be a boolean.", "preserve_thinking")
         tools = body.get("tools") or body.get("functions") or None
         tool_choice = body.get("tool_choice")
         audio_clips = [] if ARCH == "inkling" else None
@@ -5230,7 +5288,8 @@ class APIHandler(BaseHTTPRequestHandler):
         add_generation_prompt = resolve_generation_prompt(messages, body)
         prompt = render_chat_for_arch(messages, enable_thinking, reasoning_effort,
                                       tools, tool_choice, audio_out=audio_clips,
-                                      add_generation_prompt=add_generation_prompt)
+                                      add_generation_prompt=add_generation_prompt,
+                                      preserve_thinking=preserve_thinking)
         self.generation(body, prompt, request_id, True, tools, tool_choice,
                         enable_thinking=enable_thinking,
                         add_generation_prompt=add_generation_prompt,
@@ -5276,7 +5335,8 @@ class APIHandler(BaseHTTPRequestHandler):
         prompt = render_chat_for_arch(messages, enable_thinking,
                                       default_effort if enable_thinking else None,
                                       tools, tool_choice,
-                                      add_generation_prompt=add_generation_prompt)
+                                      add_generation_prompt=add_generation_prompt,
+                                      preserve_thinking=not enable_thinking)
         self.anthropic_generation(translated, prompt, request_id, tools, enable_thinking,
                                   add_generation_prompt)
 
