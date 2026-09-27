@@ -1458,6 +1458,15 @@ qwen38-vision-check: tests/test_qwen38_vision$(EXE)
 	$(PYTHON) tools/make_qwen38_vision_tiny.py --out ./qwen38_vision_tiny
 	./tests/test_qwen38_vision$(EXE) ./qwen38_vision_tiny
 
+# Qwen-Image-2.1 VAE decoder against diffusers. The fixture needs torch and
+# diffusers (tools/make_qwenimage_vae_tiny.py OUTDIR, about 6 MB); the test itself
+# is plain C: make test_qwenimage_vae && tests/test_qwenimage_vae OUTDIR
+tests/test_qwenimage_vae$(EXE): tests/test_qwenimage_vae.c qwenimage_vae.h qi_gemm.h st.h json.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+.PHONY: test_qwenimage_vae
+test_qwenimage_vae: tests/test_qwenimage_vae$(EXE)
+
 # Il percorso completo: frame IMAGE, torre, sostituzione degli embedding,
 # generazione. Prova che due immagini diverse danno risposte diverse, che e'
 # l'unica domanda a cui una fixture con pesi casuali sa rispondere onestamente.
