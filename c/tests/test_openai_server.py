@@ -27,9 +27,11 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            parse_arch_tool_calls, parse_k3_tool_calls, parse_qwen38_tool_calls,
                            read_engine_turn, render_chat, render_chat_for_arch,
                            render_chat_glm53, render_chat_inkling, render_chat_kimi,
-                           render_chat_olmoe,
-                           render_chat_qwen38, render_chat_v4, render_chat_dsv41, serve,
+                           render_chat_olmoe, render_chat_qwen,
+                           render_chat_qwen38, render_chat_v4, render_chat_dsv41,
+                           _dsv4_tool_calls, serve,
                            resolve_generation_prompt, split_thinking_reply,
+                           detect_chat_flavor, qwen36_has_vision,
                            split_thinking_reply_spans, starts_in_reasoning,
                            parse_tool_calls_spans, parse_arch_tool_calls_spans,
                            THINK_OPEN, THINK_CLOSE,
@@ -461,6 +463,105 @@ class TemplateTest(unittest.TestCase):
             "M user 8\nContinue"
             "G 1\n",
         )
+
+    def test_qwen36_history_is_what_the_engine_was_fed(self):
+        """#1759: prefix reuse on qwen36 is all or nothing, because nothing rewinds the
+        DeltaNet state, so it engages only if the next turn's prompt begins with exactly
+        the text the engine read: the previous prompt plus what it generated. The
+        template's preserve_thinking gives a past turn the <think> block it was generated
+        after; its default strips the block, and the history diverges at the first
+        assistant turn of every conversation."""
+        first = [{"role": "user", "content": "Capital of France?"}]
+        follow = {"role": "user", "content": "And of Italy?"}
+
+        # Thinking off: the generation followed the pre-closed header.
+        fed = render_chat_qwen(first, enable_thinking=False) + "Paris."
+        history = first + [{"role": "assistant", "content": "Paris."}, follow]
+        self.assertTrue(render_chat_qwen(history, enable_thinking=False,
+                                         preserve_thinking=True).startswith(fed))
+        self.assertFalse(render_chat_qwen(history, enable_thinking=False).startswith(fed))
+
+        # Thinking on: the history matches only if the client sends the reasoning back,
+        # as reasoning_content or inside the content, the way the model wrote it.
+        fed = (render_chat_qwen(first, enable_thinking=True)
+               + "Easy one.\n</think>\n\nParis.")
+        for past in ({"role": "assistant", "content": "Paris.",
+                      "reasoning_content": "Easy one."},
+                     {"role": "assistant",
+                      "content": "<think>\nEasy one.\n</think>\n\nParis."}):
+            with self.subTest(past=past):
+                prompt = render_chat_qwen(first + [past, follow], enable_thinking=True,
+                                          preserve_thinking=True)
+                self.assertTrue(prompt.startswith(fed))
+                # Without preserve_thinking the block leaves the history either way.
+                self.assertIn("<|im_start|>assistant\nParis.<|im_end|>",
+                              render_chat_qwen(first + [past, follow], enable_thinking=True))
+
+    def test_qwen36_images_follow_the_container(self):
+        """#1757: a qwen36 container converted with its vision tower says so in
+        qwen36_meta.json, and only then does the gateway turn image parts into
+        patches for the engine; an older or text-only container keeps refusing them."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            self.assertFalse(qwen36_has_vision(d))
+            meta = Path(d) / "qwen36_meta.json"
+            meta.write_text(json.dumps({"num_experts": 0}), encoding="utf-8")
+            self.assertFalse(qwen36_has_vision(d))
+            meta.write_text(json.dumps({"vision": {"depth": 27}}), encoding="utf-8")
+            self.assertTrue(qwen36_has_vision(d))
+            meta.write_text("not json", encoding="utf-8")
+            self.assertFalse(qwen36_has_vision(d))
+        self.assertFalse(qwen36_has_vision(None))
+
+    def test_qwen38_images_arrive_as_data_uri_bytes(self):
+        """A data: URI reaches the preprocessor as bytes. Image.open read them as a
+        file name and every image request died with "embedded null byte" (500):
+        the preprocessor's own test hands it a PIL image, so only the gateway path
+        broke. Found running Qwen3.8-27B with its tower (#1757)."""
+        try:
+            import base64, io, tempfile
+            import numpy
+            from PIL import Image
+        except ImportError as missing:
+            self.skipTest(f"needs Pillow and numpy ({missing})")
+        from openai_server import expand_qwen38_images
+        buffer = io.BytesIO()
+        Image.fromarray((numpy.arange(64 * 96 * 3) % 251).astype("uint8").reshape(64, 96, 3)).save(buffer, "PNG")
+        uri = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "preprocessor_config.json").write_text(json.dumps(
+                {"patch_size": 16, "merge_size": 2, "temporal_patch_size": 2}), encoding="utf-8")
+            messages, images = expand_qwen38_images(
+                [{"role": "user", "content": [{"type": "text", "text": "what is this?"},
+                                              {"type": "image_url", "image_url": {"url": uri}}]}], d)
+        self.assertEqual(len(images), 1)
+        patches, grid_h, grid_w = images[0]
+        self.assertEqual(patches.shape[0], grid_h * grid_w)
+        self.assertIn("what is this?", messages[0]["content"])
+
+    def test_qwen38_template_on_the_qwen36_engine(self):
+        """#1757: Qwen3.8-27B is a dense model of Qwen3.5's architecture, so the qwen36
+        engine runs it, but it ships Qwen3.8's chat_template.jinja. The gateway renders
+        the template the checkpoint carries, not its engine family's."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            template = Path(d) / "chat_template.jinja"
+            template.write_text("{%- set resolved_reasoning_effort = "
+                                "reasoning_effort|default('xhigh') %}", encoding="utf-8")
+            self.assertEqual(detect_chat_flavor("qwen36", d), "qwen38")
+            self.assertIsNone(detect_chat_flavor("glm53", d))
+            template.write_text("{%- if enable_thinking is defined %}", encoding="utf-8")
+            self.assertIsNone(detect_chat_flavor("qwen36", d))
+            template.unlink()
+            self.assertIsNone(detect_chat_flavor("qwen36", d))
+        history = [{"role": "user", "content": "Capital of France?"}]
+        with patch("openai_server.ARCH", "qwen36"), patch("openai_server.CHAT_FLAVOR", "qwen38"):
+            for thinking in (True, False):
+                self.assertEqual(render_chat_for_arch(history, thinking, "xhigh"),
+                                 render_chat_qwen38(history, thinking, "xhigh"))
+        with patch("openai_server.ARCH", "qwen36"):
+            self.assertNotEqual(render_chat_for_arch(history, True, "xhigh"),
+                                render_chat_qwen38(history, True, "xhigh"))
 
     def test_kimi_renders_tool_declaration_and_choice(self):
         tools = [{"type": "function", "function": {
@@ -2339,6 +2440,17 @@ class HTTPTest(unittest.TestCase):
         self.assertIn("queued", scheduler)
         self.assertEqual(health["kv_slots"], 2)
 
+    def test_health_reports_the_continuation_switch(self):
+        """The web UI shows Continue only when this is true: with the switch off a
+        trailing assistant turn is answered fresh, which a Continue button would
+        present as a resumption. Unauthed probes keep the bare liveness shape."""
+        for value, expected in (("1", True), ("0", False)):
+            with patch.dict(os.environ, {"COLI_CONTINUE_ASSISTANT": value}), \
+                 self.request("/health") as response:
+                self.assertIs(json.load(response)["continue_assistant"], expected)
+        with urlopen(self.base + "/health", timeout=2) as response:
+            self.assertNotIn("continue_assistant", json.load(response))
+
     def test_profile_requires_auth(self):
         """/profile is served before require_auth(), so it needs its own gate.
 
@@ -2590,6 +2702,44 @@ class HTTPTest(unittest.TestCase):
                 "tool_choice": {"type": "function", "function": "search"}})
         self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 400)
+
+    def test_qwen36_preserve_thinking_defaults_to_the_fed_history(self):
+        """#1759: with thinking off the past turn keeps the empty block it was generated
+        after, so a standard client's resent history matches the engine's state. With
+        thinking on the template default stays: a standard client does not send the
+        reasoning back, and an empty block would claim the model did not think. The
+        request key overrides either way."""
+        history = [{"role": "user", "content": "Capital of France?"},
+                   {"role": "assistant", "content": "Paris."},
+                   {"role": "user", "content": "And of Italy?"}]
+        kept = "<|im_start|>assistant\n<think>\n\n</think>\n\nParis.<|im_end|>"
+        bare = "<|im_start|>assistant\nParis.<|im_end|>"
+        cases = (({}, kept), ({"enable_thinking": True}, bare),
+                 ({"preserve_thinking": False}, bare),
+                 ({"enable_thinking": True, "preserve_thinking": True},
+                  "<|im_start|>assistant\n<think>\n\n</think>\n\nParis.<|im_end|>"))
+        with patch("openai_server.ARCH", "qwen36"):
+            for extra, expected in cases:
+                with self.subTest(extra=extra):
+                    with self.request("/v1/chat/completions", {
+                            "model": "test-model", "messages": history, **extra}) as response:
+                        self.assertEqual(response.status, 200)
+                    self.assertIn(expected, self.engine.calls[-1][0])
+            with self.assertRaises(HTTPError) as caught:
+                self.request("/v1/chat/completions", {
+                    "model": "test-model", "messages": history, "preserve_thinking": "yes"})
+            self.addCleanup(caught.exception.close)
+            self.assertEqual(caught.exception.code, 400)
+
+    def test_qwen38_template_defaults_to_xhigh_thinking_on_the_qwen36_engine(self):
+        """What the flavor changes over the wire: with no thinking field, a Qwen3.8
+        template reasons at xhigh by default, as the qwen38 family does."""
+        history = [{"role": "user", "content": "Capital of France?"}]
+        with patch("openai_server.ARCH", "qwen36"), patch("openai_server.CHAT_FLAVOR", "qwen38"):
+            with self.request("/v1/chat/completions", {
+                    "model": "test-model", "messages": history}) as response:
+                self.assertEqual(response.status, 200)
+        self.assertEqual(self.engine.calls[-1][0], render_chat_qwen38(history, True, "xhigh"))
 
     def test_a_well_formed_forced_tool_choice_still_runs(self):
         """The read above must not change the shape clients actually send."""

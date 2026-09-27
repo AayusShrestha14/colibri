@@ -75,6 +75,18 @@ sequences. The extension
 `enable_thinking: true` enables GLM-5.2's reasoning block; the standard
 `reasoning_effort` field also enables it unless set to `none`.
 
+On Qwen3.6 the extension `preserve_thinking` is the official template's kwarg of
+the same name: past assistant turns keep their `<think>` block, with the
+`reasoning_content` the client sends back, empty when it sends none. It
+defaults to `true` when thinking is off and to `false` when it is on. With
+thinking off, the empty block is the one each past turn was generated after,
+so a client that resends only `content` sends the history the engine already
+holds and the KV prefix is reused instead of prefilled again (#1759). With
+thinking on a standard client drops the reasoning, the history cannot match
+either way, and the template's default applies; a client that sends
+`reasoning_content` back can set `preserve_thinking: true` to get the reuse
+too. Both values render byte for byte like the official `chat_template.jinja`.
+
 The server serves one generation at a time: the model stays in one persistent
 process, so concurrent HTTP requests queue instead of loading duplicate model
 copies. Tool calling depends on the active engine; see the support matrix below.

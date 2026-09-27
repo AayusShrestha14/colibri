@@ -59,6 +59,10 @@ class DisplayVariant:
     geometry: tuple
     display_name: str
     display_scale: str
+    # The API model id for this checkpoint, when it must not borrow the family's:
+    # set only where no id was ever announced for it, so existing clients of the
+    # 35B and 2.4T keep the id they were configured with.
+    model_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +71,9 @@ class PlannerGeometry:
     fixed_state_bytes: int
     workspace_bytes: int
     configured_experts: int
+    # A dense checkpoint (no expert count in its config): zero experts is its shape,
+    # not a broken MoE config, and the planner keeps every weight resident (#1757).
+    dense: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,6 +247,10 @@ def _qwen36_geometry(config, context, _model_dir):
     conv_dim = key_heads * key_dim * 2 + value_heads * value_dim
     fixed = (layers - full) * (value_heads * key_dim * value_dim +
                                conv_dim * (conv_k - 1)) * 4
+    # A dense checkpoint of the family (Qwen3.8-27B, #1757) has no num_experts: nothing
+    # to cache, every weight resident.
+    if "num_experts" not in config:
+        return PlannerGeometry(kv, fixed, 0, 0, dense=True)
     return PlannerGeometry(kv, fixed, 0, _required_int(config, "num_experts", "qwen36"))
 
 
@@ -1288,7 +1299,10 @@ FAMILIES = (
     ),
     FamilyDescriptor(
         id="qwen36",
-        model_types=("qwen3_5_moe", "qwen3_5_moe_text"),
+        # qwen3_5 / qwen3_5_text: the dense checkpoints of the same architecture
+        # (Qwen3.8-27B, #1757). The engine loads their MLP as an ungated shared
+        # expert and routes nothing.
+        model_types=("qwen3_5_moe", "qwen3_5_moe_text", "qwen3_5", "qwen3_5_text"),
         display_name="Qwen3.6-35B-A3B",
         display_scale="35B",
         # Both checkpoints declare qwen3_5_moe_text. Keyed on the three
@@ -1301,6 +1315,9 @@ FAMILIES = (
             DisplayVariant((("num_hidden_layers", 92), ("num_experts", 512),
                             ("hidden_size", 8192)),
                            "Qwen3.8-2.4T-A95B", "2.4T"),
+            DisplayVariant((("num_hidden_layers", 64), ("hidden_size", 5120),
+                            ("intermediate_size", 17408)),
+                           "Qwen3.8-27B", "27B", model_id="qwen3.8-27b-colibri"),
         ),
         engine_artifact="qwen36",
         engine_aliases=(),
@@ -1562,6 +1579,17 @@ def resolve_model(model_dir):
                           config, family_config, str(model))
 
 
+def default_model_id(resolved):
+    """The API model id for what was actually loaded: its display variant's, if it has
+    one of its own, else the family's."""
+    family = resolved.descriptor
+    config = resolved.family_config
+    for variant in family.display_variants:
+        if variant.model_id and all(config.get(key) == value for key, value in variant.geometry):
+            return variant.model_id
+    return family.default_model_id
+
+
 def display_for(resolved):
     """(display_name, display_scale) for what was actually loaded.
 
@@ -1598,7 +1626,7 @@ def planner_geometry(resolved, context):
             for value in (geometry.context_state_bytes, geometry.fixed_state_bytes,
                           geometry.workspace_bytes, geometry.configured_experts)):
         raise RegistryError(f"invalid planner geometry for {resolved.descriptor.id}")
-    if geometry.configured_experts < 1:
+    if geometry.configured_experts < 1 and not geometry.dense:
         raise ValueError(f"{resolved.descriptor.id}: configured expert count is zero")
     return geometry
 

@@ -854,6 +854,9 @@ def env_for(a):
         e.setdefault("PIPE", "1")
         e.setdefault("PILOT_REAL", "1")
     e["COLI_POLICY"]=a.policy
+    # Explicit request only. Absent flag => variable absent => engine default,
+    # which is the current path. Never set from discovery or from a plan.
+    if getattr(a, "xdna", False): e["COLI_XDNA"]="1"
     if getattr(a, "cluster_workers", None): e["CLUSTER_WORKERS"] = a.cluster_workers
     if getattr(a, "cluster_coordinator", None): e["CLUSTER_COORDINATOR"] = a.cluster_coordinator
     if a.ram:  e["RAM_GB"]=str(a.ram)
@@ -1196,7 +1199,9 @@ def cmd_info(a):
         experts=arch_c.get("n_routed_experts",arch_c.get("num_experts"))
         row("model", a.model)
         row("arch", f"hidden {arch_c.get('hidden_size')} · {arch_c.get('num_hidden_layers')} layer · "
-                    f"{experts} expert/layer · top-{arch_c.get('num_experts_per_tok')}")
+                    + (f"{experts} expert/layer · top-{arch_c.get('num_experts_per_tok')}"
+                       if experts is not None else
+                       f"dense (MLP {arch_c.get('intermediate_size')}, no experts)"))
         sts=[x for x in os.listdir(a.model) if x.endswith('.safetensors')]
         sz=sum(os.path.getsize(os.path.join(a.model,x)) for x in sts)
         row("shards", f"{len(sts)} files · {sz/1e9:.0f} GB on disk")
@@ -1867,14 +1872,15 @@ def cmd_chat(a):
         if getattr(a,"attach",None):
             sys.exit(f"--attach: no coli serve answering at {base} (start one with: coli serve --model <dir>)")
     need_model(a.model)
-    family=resolve_model(a.model).descriptor
+    resolved=resolve_model(a.model); family=resolved.descriptor
     arch=family.id
     if not family.has_gateway_adapter:
         sys.exit(f"{family.display_name}: gateway adapter is not wired")
     if arch!="glm":
         engine=engine_for(a.model)
         need_model(a.model,engine)
-        model_id=family.default_model_id
+        from family_registry import default_model_id
+        model_id=default_model_id(resolved)
         banner(f"chat · {model_id} · local server", model=a.model)
         import openai_server
         # --cap rides along so an explicit `coli chat --cap N` reaches the
@@ -2270,8 +2276,20 @@ def cmd_stop(a):
         print(f"  nothing running — no serve on port {a.port}, no SERVE engines"); return
     for pid,desc in targets.items(): print(f"  {'would stop' if a.dry_run else 'stopping'} {pid}: {desc}")
     if a.dry_run: return
-    for pid in targets:
+    # Graceful first: only the launcher's Engine.close drains the engine
+    # (stdin EOF -> atexit -> HEAT_FILE save). SIGTERM the launchers and
+    # give them the drain window to exit on their own; engine pids left
+    # behind (orphaned, no launcher) get the old treatment after.
+    launchers = [pid for pid, d in targets.items() if d.startswith("coli serve")]
+    strays   = [pid for pid, d in targets.items() if not d.startswith("coli serve")]
+    deadline = time.time() + 30.0
+    for pid in launchers:
         try: os.kill(pid, signal.SIGTERM)
+        except OSError: pass
+    while time.time() < deadline and any(_pid_alive(p) for p in launchers):
+        time.sleep(0.25)
+    for pid in strays:
+        try: os.kill(pid, signal.SIGTERM)   # normally already gone with the launcher
         except OSError: pass
     time.sleep(2.0)
     for pid in targets:
@@ -2555,6 +2573,15 @@ def main():
                         default=os.environ.get("COLI_POLICY","quality"),
                         help="resource policy (explicit --topk/--topp overrides warn and proceed)")
     common.add_argument("--repin", type=int, default=0, help="adapt RAM/VRAM experts every N tokens")
+    # Explicit, default-off opt-in to the qualified native XDNA2 (Ryzen AI NPU)
+    # lane. Deliberately NOT a --policy value: --policy chooses how the planner may
+    # spend memory, this chooses a compute device, and a user wanting quality
+    # planning ON the NPU must be able to say both. Deliberately not inferred from
+    # hardware either -- the reduced-precision consequence means the user has to ask.
+    common.add_argument("--xdna", action="store_true",
+                        help="experimental: run qualified GLM operations on the AMD XDNA2 NPU "
+                             "(reduced-precision BF16 path; output may differ; unsupported "
+                             "operations use the normal path)")
     # Absent (None) = not explicitly set: the glm engine gets the 0 sentinel and picks
     # (8 historically; 1 on Metal+darwin+fast SSD, #379 -- an honest F_NOCACHE probe
     # measures "fast", cached in <model>/.coli_ssd), while non-glm arches get the
