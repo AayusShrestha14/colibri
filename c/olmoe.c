@@ -1738,23 +1738,24 @@ static void serve_hwinfo(Model *m) {
     /* #1601: neither /proc/cpuinfo nor /proc/meminfo exists on macOS (or
      * Windows), so both reads above fail silently and this line went out as
      * "0.0 0.0 ... unknown" -- the /health hwinfo the dashboard renders. Fill
-     * only what /proc could not supply, so the Linux path stays byte-identical
-     * (same shape as deepseek_v4.c's #macos-port HWINFO fix).
-     * Dev's 7ed6084 already added a simple fallback (ra=compat_mem_available_gb),
-     * but this version also fills cpu brand on Darwin and total RAM via
-     * compat_mem_total_gb(), which is the full fix for /health. */
+     * only what /proc could not supply, so the Linux path stays byte-identical.
+     * Use the shared one-pass probe on the other platforms too: besides keeping
+     * total and available RAM from different definitions, this avoids calling
+     * platform-specific helpers that are not available in every build. */
 #if defined(__APPLE__)
     if (!cpu[0]) {
         size_t len = sizeof(cpu);
         if (sysctlbyname("machdep.cpu.brand_string", cpu, &len, NULL, 0) != 0)
             cpu[0] = 0;
     }
-    if (rt <= 0.0) rt = compat_mem_total_gb();
-    if (ra <= 0.0) ra = compat_mem_available_gb();
-#elif defined(_WIN32)
-    if (rt <= 0.0 || ra <= 0.0) { double t = 0, a = 0; compat_meminfo(&t, &a);
+#endif
+#if defined(__APPLE__) || defined(_WIN32)
+    if (rt <= 0.0 || ra <= 0.0) {
+        double t = 0, a = 0;
+        compat_meminfo_gb(&t, &a);
         if (rt <= 0.0) rt = t;
-        if (ra <= 0.0) ra = a; }
+        if (ra <= 0.0) ra = a;
+    }
 #else
     if (ra <= 0.0) ra = compat_mem_available_gb();
     if (rt <= 0.0) {
