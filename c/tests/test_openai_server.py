@@ -16,6 +16,7 @@ from urllib.request import Request, urlopen
 from pathlib import Path
 
 import openai_server
+from family_registry import family_by_id, family_ids
 from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            CONTINUATION_FAMILIES, _marker_cuts,
                            DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
@@ -1177,6 +1178,57 @@ class StageSpanReportingTest(unittest.TestCase):
         self.assertEqual(parse_tool_calls(raw), parse_tool_calls_spans(raw)[:2])
         self.assertEqual(parse_arch_tool_calls(raw, None),
                          parse_arch_tool_calls_spans(raw, None)[:2])
+
+    def test_a_qwen38_template_on_the_qwen36_engine_parses_as_qwen38_without_maps(self):
+        # The parser follows the template the checkpoint ships (#1757), not the engine
+        # family: a qwen36 engine running Qwen3.8's template emits Qwen3.8's XML calls.
+        # That parser reports no maps, which is safe only because the logprobs channel
+        # is refused on that engine (ChatFlavorLogprobsGateTest).
+        tool = {"type": "function", "function": {
+            "name": "weather", "description": "w",
+            "parameters": {"type": "object",
+                           "properties": {"city": {"type": "string"},
+                                          "days": {"type": "integer"}}}}}
+        raw = ("Sure.\n\n<tool_call>\n<function=weather>\n<parameter=city>\nRome\n"
+               "</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>")
+        with patch("openai_server.ARCH", "qwen36"), patch("openai_server.CHAT_FLAVOR", "qwen38"):
+            spans = parse_arch_tool_calls_spans(raw, [tool])
+            public = parse_arch_tool_calls(raw, [tool])
+        self.assertEqual(len(spans), 4)
+        content, calls, box_map, content_map = spans
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "weather")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]),
+                         {"city": "Rome", "days": 3})
+        self.assertEqual(content, "Sure.")
+        self.assertIsNone(box_map)
+        self.assertIsNone(content_map)
+        self.assertEqual(len(public), 2)
+        self.assertEqual(public[0], "Sure.")
+        self.assertEqual(len(public[1]), 1)
+        self.assertEqual(public[1][0]["function"]["name"], "weather")
+
+    def test_the_qwen38_engine_parses_its_own_calls_with_no_flavor_set(self):
+        # The native arm of the same dispatch: chat_flavor() falls back to ARCH, so a
+        # qwen38 engine with no flavor recorded still reaches the qwen38 parser.
+        tool = {"type": "function", "function": {
+            "name": "weather", "description": "w",
+            "parameters": {"type": "object",
+                           "properties": {"city": {"type": "string"}}}}}
+        raw = ("Sure.\n\n<tool_call>\n<function=weather>\n<parameter=city>\nRome\n"
+               "</parameter>\n</function>\n</tool_call>")
+        with patch("openai_server.ARCH", "qwen38"), patch("openai_server.CHAT_FLAVOR", None):
+            spans = parse_arch_tool_calls_spans(raw, [tool])
+            public = parse_arch_tool_calls(raw, [tool])
+        self.assertEqual(len(spans), 4)
+        self.assertEqual(len(spans[1]), 1)
+        self.assertEqual(spans[1][0]["function"]["name"], "weather")
+        self.assertEqual(json.loads(spans[1][0]["function"]["arguments"]), {"city": "Rome"})
+        self.assertIsNone(spans[2])
+        self.assertIsNone(spans[3])
+        self.assertEqual(len(public), 2)
+        self.assertEqual(len(public[1]), 1)
+        self.assertEqual(public[1][0]["function"]["name"], "weather")
 
 
 class ProtocolTest(unittest.TestCase):
@@ -6009,6 +6061,81 @@ class CapabilitySplitIndependenceTest(unittest.TestCase):
         self.assertTrue(engine.supports_tok_ids)
         engine.supports_logprobs_echo = False
         self.assertTrue(engine.supports_tok_ids)
+
+
+class ChatFlavorLogprobsGateTest(unittest.TestCase):
+    """The logprobs/echo gate is keyed on the engine family (`supports_logprobs_echo`). A chat
+    flavor (#1757) selects the chat template, the tool-call parser and the default thinking
+    effort; it does not change what the engine can do. Under the qwen38 flavor a qwen36
+    engine parses tool calls with the qwen38 parser, which reports no span maps, so that
+    engine must never be asked for the numeric channel. Today detect_chat_flavor flavors
+    only qwen36, and only for a checkpoint that ships Qwen3.8's template. The invariant test
+    below feeds that template to every registry family and requires that no family it
+    flavors has the channel."""
+
+    def _engine(self, arch, flavor):
+        # Every SUBMIT gets its terminal frame, so a request that wrongly passes the gate
+        # completes at once and fails on an assertion, not on the client's timeout.
+        def respond(process, written):
+            if written.startswith(b"SUBMIT "):
+                request_id = written.split()[1]
+                process.stdout.feed(b"DONE " + request_id + b" STAT 1 1 0 1 1 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.ARCH", arch), patch("openai_server.CHAT_FLAVOR", flavor), \
+                patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("engine", "model")
+        self.addCleanup(engine.close)
+        return engine
+
+    def test_no_family_with_the_numeric_channel_is_ever_given_a_chat_flavor(self):
+        # Both sides come from the sources the server reads: the registry's families, the
+        # capability each one's Engine sets, and detect_chat_flavor over a checkpoint that
+        # ships Qwen3.8's template -- the one input that flavors anything today.
+        families = family_ids()
+        self.assertGreater(len(families), 0)
+        with tempfile.TemporaryDirectory() as model_dir:
+            (Path(model_dir) / "chat_template.jinja").write_text(
+                "{%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}",
+                encoding="utf-8")
+            flavored = {family_id for family_id in families
+                        if detect_chat_flavor(family_id, model_dir) is not None}
+        channel = set()
+        for family_id in families:
+            process = FakeProcess(lambda _process, _frame: None)
+            with patch("openai_server.subprocess.Popen", return_value=process):
+                engine = Engine("engine", "model", cap=1, family=family_by_id(family_id))
+            self.addCleanup(engine.close)
+            if engine.supports_logprobs_echo:
+                channel.add(family_id)
+        self.assertIn("qwen36", flavored)
+        self.assertIn("glm", channel)
+        self.assertEqual(flavored & channel, set())
+
+    def test_logprobs_is_refused_on_a_qwen36_engine_with_the_qwen38_template(self):
+        engine = self._engine("qwen36", "qwen38")
+        self.assertFalse(engine.supports_logprobs_echo)
+        base = _spawn_test_server(self, engine)
+        with patch("openai_server.ARCH", "qwen36"), patch("openai_server.CHAT_FLAVOR", "qwen38"):
+            status, error = _error_body(self, lambda: _post_chat(base, {
+                "model": "test-model", "logprobs": True,
+                "messages": [{"role": "user", "content": "hi"}]}))
+        self.assertEqual(status, 400)
+        self.assertEqual(error["param"], "logprobs")
+        self.assertEqual(error["code"], "unsupported_parameter")
+        self.assertEqual(
+            error["message"],
+            "Log probabilities are not requested from this engine by these endpoints.")
+        # Refused before anything reached the engine, not after a turn it then discarded.
+        self.assertEqual([w for w in engine.process.writes if w.startswith(b"SUBMIT ")], [])
+
+    def test_the_same_request_passes_the_gate_on_a_glm_engine(self):
+        engine = self._engine("glm", None)
+        self.assertTrue(engine.supports_logprobs_echo)
+        body = {"model": "test-model", "logprobs": True,
+                "messages": [{"role": "user", "content": "hi"}]}
+        self.assertEqual(logprobs_options(body, True, engine.supports_logprobs_echo),
+                         (1, False, 0))
 
 
 class SubmitHeaderExtensionTest(unittest.TestCase):
