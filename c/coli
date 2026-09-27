@@ -613,7 +613,12 @@ def env_for_engine(a, arch, plan=None):
             sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} the engine binary is CPU-only")
         env["COLI_CUDA"] = "1"
         env["CUDA_EXPERT_GB"] = str(vram)
-    if getattr(a, "auto_tier", False):
+    if getattr(a, "auto_tier", False) and family.modality == "image":
+        # The tier plan places experts and KV state; an image model has
+        # neither, and build_plan would stop on "no safetensors shards".
+        print(f"  {C.dim}[PLAN] --auto-tier has nothing to place for "
+              f"{family.display_name}; coli plan shows its RAM{C.r}", file=sys.stderr)
+    elif getattr(a, "auto_tier", False):
         # GLM has historically applied both the resource plan and its measured
         # profile inside env_for().  The sibling launcher returned above that
         # code path, so #1196 could measure and save a perfectly valid Kimi,

@@ -119,7 +119,7 @@ def detect(env=None, stream=None, query=True, da1=None):
     if env.get("TMUX") or term.startswith(("screen", "tmux")):
         # tmux forwards graphics only with allow-passthrough (and sixel only
         # when built for it): half blocks are the one thing that always shows.
-        return "blocks", "inside tmux/screen (set COLI_IMAGE_PROTOCOL to force graphics)"
+        return "blocks", "inside tmux or screen; COLI_IMAGE_PROTOCOL forces graphics"
     if env.get("KITTY_WINDOW_ID") or term == "xterm-kitty":
         return "kitty", "kitty"
     if program == "ghostty" or term == "xterm-ghostty" or env.get("GHOSTTY_RESOURCES_DIR"):
@@ -140,8 +140,8 @@ def detect(env=None, stream=None, query=True, da1=None):
         # and the same setting turns on its iTerm2 decoder.
         if sixel():
             return "iterm", "VS Code terminal with images enabled"
-        return "blocks", ("VS Code terminal (enable terminal.integrated.enableImages "
-                          "for full-resolution images)")
+        return "blocks", ("VS Code terminal; terminal.integrated.enableImages gives "
+                          "full-resolution images")
     candidate = (env.get("WT_SESSION") or term.startswith(("foot", "mlterm", "xterm", "contour",
                                                            "mintty"))
                  or program in ("mintty", "contour") or env.get("KONSOLE_VERSION"))
@@ -149,7 +149,7 @@ def detect(env=None, stream=None, query=True, da1=None):
         return "sixel", ("Windows Terminal (sixel)" if env.get("WT_SESSION")
                          else f"{term or program} reports sixel")
     if env.get("WT_SESSION"):
-        return "blocks", "Windows Terminal without sixel (1.22+ has it)"
+        return "blocks", "Windows Terminal did not report sixel; 1.22 or newer has it"
     return "blocks", "no graphics protocol detected"
 
 
