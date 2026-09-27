@@ -986,6 +986,52 @@ static void mv(float *out, const Mat *w, const float *x) {
     }
 }
 
+/* mv for S rows at once: out[S, rows] = x[S, columns] W^T. The kernels compute
+ * each (row, output) pair exactly as the one-row call does, so every token
+ * gets the same bits as S separate mv calls. What changes is the traffic: W is
+ * read once for the whole batch instead of once per token, which is the whole
+ * cost of a prefill, since at one token the dense matrices are bandwidth-bound.
+ * Matrices that live on a GPU keep the per-row path they already have. */
+static void mm(float *out, const Mat *w, const float *x, int S) {
+    int gpu = 0;
+#ifdef COLI_METAL
+    gpu |= g_metal_ready && w->resident && (w->fmt == 1 || w->fmt == 4);
+#endif
+#ifdef COLI_VULKAN
+    gpu |= g_vk_ready && w->resident && (w->fmt == 1 || w->fmt == 4);
+#endif
+    if (S == 1 || gpu) {
+        for (int t = 0; t < S; t++)
+            mv(out + (size_t)t * w->rows, w, x + (size_t)t * w->columns);
+        return;
+    }
+    switch (w->fmt) {
+    case 4: matmul_i4_grouped(out, x, w->q4, w->s, S, w->columns, w->rows, w->gs); break;
+    case 1: matmul_q(out, x, w->q8, w->s, S, w->columns, w->rows); break;
+    default: matmul(out, x, w->f, S, w->columns, w->rows); break;
+    }
+}
+
+/* mv_rows for S rows: out[S, rows] from x[S, columns] and W's rows
+ * [row0, row0 + rows). */
+static void mm_rows(float *out, const Mat *w, const float *x, int S, int row0, int rows) {
+    switch (w->fmt) {
+    case 4: {
+        const int packed = (w->columns + 1) / 2, groups = w->columns / w->gs;
+        matmul_i4_grouped(out, x, w->q4 + (size_t)row0 * packed,
+                          w->s + (size_t)row0 * groups, S, w->columns, rows, w->gs);
+        break;
+    }
+    case 1:
+        matmul_q(out, x, w->q8 + (size_t)row0 * w->columns, w->s + row0,
+                 S, w->columns, rows);
+        break;
+    default:
+        matmul(out, x, w->f + (size_t)row0 * w->columns, S, w->columns, rows);
+        break;
+    }
+}
+
 static void rms(float *out, const float *x, const float *w, int n, float eps) {
     float square = 0.0f;
     for (int i = 0; i < n; i++) square += x[i] * x[i];
@@ -1029,50 +1075,74 @@ static void mlp3(float *out, const float *x, const Mat *g, const Mat *u, const M
     mv(out, d, sg);
 }
 
+/* mlp3 for S rows: sg and su hold S * g->rows floats each. */
+static void mlp3_rows(float *out, const float *x, int S, const Mat *g, const Mat *u,
+                      const Mat *d, float limit, float *sg, float *su) {
+    mm(sg, g, x, S); mm(su, u, x, S);
+    for (int t = 0; t < S; t++)
+        swiglu_clamped(sg + (size_t)t * g->rows, su + (size_t)t * g->rows, g->rows, limit);
+    mm(out, d, sg, S);
+}
+
 /* ---------- KDA: proiezioni, gate, ricorrenza ---------- */
 static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
                       float *out, float *state, float *window, float *scratch) {
     const int P = c->kda_proj, H = c->kda_heads, D = c->kda_hd;
+    const size_t T = (size_t)tokens;
+    /* Every projection reads only its own token's row, so they all run
+     * batched over the block; only the recurrence walks token by token. */
+    float *q = malloc(T * P * sizeof(float));
+    float *k = malloc(T * P * sizeof(float));
+    float *v = malloc(T * P * sizeof(float));
+    float *low = malloc(T * D * sizeof(float));
+    float *decay = malloc(T * P * sizeof(float));
+    float *beta = malloc(T * H * sizeof(float));
+    float *gate = malloc(T * P * sizeof(float));
+    float *normed = malloc(T * P * sizeof(float));
     float *qkv = malloc((size_t)3 * P * sizeof(float));
-    float *gate = malloc((size_t)P * sizeof(float));
-    float *decay = malloc((size_t)P * sizeof(float));
-    float *beta = malloc((size_t)H * sizeof(float));
-    float *low = malloc((size_t)D * sizeof(float));
     float *core = malloc((size_t)P * sizeof(float));
-    for (int t = 0; t < tokens; t++) {
-        const float *row = x + (size_t)t * c->hidden;
-        mv(qkv, &l->kq, row);
-        mv(qkv + P, &l->kk, row);
-        mv(qkv + 2 * P, &l->kv, row);
-        /* decadimento: gate_lower_bound * sigmoid(exp(A_log[h]) * (W_fb W_fa x + dt_bias)) */
-        mv(low, &l->kfa, row);
-        mv(decay, &l->kfb, low);
+    if (!q || !k || !v || !low || !decay || !beta || !gate || !normed || !qkv || !core) {
+        fprintf(stderr, "OOM in KDA\n"); exit(1);
+    }
+    mm(q, &l->kq, x, tokens);
+    mm(k, &l->kk, x, tokens);
+    mm(v, &l->kv, x, tokens);
+    /* decadimento: gate_lower_bound * sigmoid(exp(A_log[h]) * (W_fb W_fa x + dt_bias)) */
+    mm(low, &l->kfa, x, tokens);
+    mm(decay, &l->kfb, low, tokens);
+    mm(beta, &l->kb, x, tokens);
+    /* il gate low-rank dell'uscita: stessa forma, altri pesi */
+    mm(low, &l->kga, x, tokens);
+    mm(gate, &l->kgb, low, tokens);
+    for (size_t t = 0; t < T; t++) {
+        float *dk = decay + t * P, *bt = beta + t * H;
         for (int h = 0; h < H; h++)
             for (int d = 0; d < D; d++) {
                 int i = h * D + d;
-                decay[i] = c->gate_lb * sigmoidf_(expf(l->alog[h]) * (decay[i] + l->dt[i]));
+                dk[i] = c->gate_lb * sigmoidf_(expf(l->alog[h]) * (dk[i] + l->dt[i]));
             }
-        mv(beta, &l->kb, row);
-        for (int h = 0; h < H; h++) beta[h] = sigmoidf_(beta[h]);
-        coli_kda_step(core, state, window, qkv, l->conv, decay, beta,
+        for (int h = 0; h < H; h++) bt[h] = sigmoidf_(bt[h]);
+        memcpy(qkv, q + t * P, (size_t)P * sizeof(float));
+        memcpy(qkv + P, k + t * P, (size_t)P * sizeof(float));
+        memcpy(qkv + 2 * P, v + t * P, (size_t)P * sizeof(float));
+        coli_kda_step(core, state, window, qkv, l->conv, dk, bt,
                       H, D, D, c->conv_k, 1e-6f, scratch);
         /* uscita: RMSNorm per testa, pesata da o_norm, moltiplicata dal gate
-         * low-rank, poi la proiezione di uscita. */
-        mv(low, &l->kga, row);
-        mv(gate, &l->kgb, low);
-        float *normed = qkv;                         /* riuso: 3P >= P */
+         * low-rank, poi la proiezione di uscita (dopo il ciclo, in blocco). */
+        const float *gt = gate + t * P;
         for (int h = 0; h < H; h++) {
             const float *src = core + (size_t)h * D;
-            float *dst = normed + (size_t)h * D;
+            float *dst = normed + t * P + (size_t)h * D;
             float square = 0.0f;
             for (int d = 0; d < D; d++) square += src[d] * src[d];
             float inverse = 1.0f / sqrtf(square / D + c->eps);
             for (int d = 0; d < D; d++)
-                dst[d] = src[d] * inverse * l->onorm[d] * sigmoidf_(gate[(size_t)h * D + d]);
+                dst[d] = src[d] * inverse * l->onorm[d] * sigmoidf_(gt[(size_t)h * D + d]);
         }
-        mv(out + (size_t)t * c->hidden, &l->ko, normed);
     }
-    free(core); free(low); free(beta); free(decay); free(gate); free(qkv);
+    mm(out, &l->ko, normed, tokens);
+    free(core); free(qkv); free(normed); free(gate); free(beta); free(decay);
+    free(low); free(v); free(k); free(q);
 }
 
 /* ---------- MLA + indexer con k-pool ---------- */
@@ -1093,31 +1163,48 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
     unsigned char *valid = malloc((size_t)seen);
     memset(valid, 1, (size_t)seen);
 
+    /* Le proiezioni leggono solo la riga del proprio token: tutte in blocco. */
+    mm(qa, &l->qa, x, tokens);
     for (int t = 0; t < tokens; t++) {
-        const int at = base + t;          /* posizione assoluta nella cache */
-        const float *row = x + (size_t)t * c->hidden;
         float *qn = qa + (size_t)t * c->q_lora;
-        mv(qn, &l->qa, row);
         rms(qn, qn, l->qa_ln, c->q_lora, c->eps);
-        mv(queries + (size_t)t * H * QK, &l->qb, qn);
-        float *here = latent + (size_t)at * L;
-        mv(here, &l->kva, row);
-        rms(here, here, l->kva_ln, L, c->eps);
-        /* la query entra nello spazio del latente una volta per testa, invece
-         * che il latente nello spazio della query una volta per posizione */
-        for (int h = 0; h < H; h++)
-            mv_rows(absorbed + ((size_t)t * H + h) * L, &l->kvb_kt,
-                    queries + ((size_t)t * H + h) * QK, h * L, L);
-        /* indexer: le query vengono dal q_a normalizzato, le chiavi dall'hidden
-         * con LayerNorm (con bias), e i pesi per testa sono scalati da IH^-0.5 */
-        mv(iq + (size_t)t * IH * ID, &l->iwq, qn);
-        float *kraw = ik + (size_t)at * ID;
-        mv(kraw, &l->iwk, row);
-        layer_norm(kraw, kraw, l->ik_nw, l->ik_nb, ID, 1e-5f);
-        mv(gates + (size_t)at * ID, &l->ikpg, row);
-        mv(head_w + (size_t)t * IH, &l->iwp, row);
-        for (int h = 0; h < IH; h++) head_w[(size_t)t * IH + h] /= sqrtf((float)IH);
     }
+    mm(queries, &l->qb, qa, tokens);
+    mm(latent + (size_t)base * L, &l->kva, x, tokens);
+    for (int t = 0; t < tokens; t++) {
+        float *here = latent + (size_t)(base + t) * L;
+        rms(here, here, l->kva_ln, L, c->eps);
+    }
+    /* la query entra nello spazio del latente una volta per testa, invece
+     * che il latente nello spazio della query una volta per posizione; in
+     * blocco, una testa alla volta, raccogliendo la sua fetta di ogni token */
+    {
+        float *qh = malloc((size_t)tokens * QK * sizeof(float));
+        float *ah = malloc((size_t)tokens * L * sizeof(float));
+        if (!qh || !ah) { fprintf(stderr, "OOM in MLA\n"); exit(1); }
+        for (int h = 0; h < H; h++) {
+            for (int t = 0; t < tokens; t++)
+                memcpy(qh + (size_t)t * QK, queries + ((size_t)t * H + h) * QK,
+                       (size_t)QK * sizeof(float));
+            mm_rows(ah, &l->kvb_kt, qh, tokens, h * L, L);
+            for (int t = 0; t < tokens; t++)
+                memcpy(absorbed + ((size_t)t * H + h) * L, ah + (size_t)t * L,
+                       (size_t)L * sizeof(float));
+        }
+        free(ah); free(qh);
+    }
+    /* indexer: le query vengono dal q_a normalizzato, le chiavi dall'hidden
+     * con LayerNorm (con bias), e i pesi per testa sono scalati da IH^-0.5 */
+    mm(iq, &l->iwq, qa, tokens);
+    mm(ik + (size_t)base * ID, &l->iwk, x, tokens);
+    for (int t = 0; t < tokens; t++) {
+        float *kraw = ik + (size_t)(base + t) * ID;
+        layer_norm(kraw, kraw, l->ik_nw, l->ik_nb, ID, 1e-5f);
+    }
+    mm(gates + (size_t)base * ID, &l->ikpg, x, tokens);
+    mm(head_w, &l->iwp, x, tokens);
+    for (int t = 0; t < tokens; t++)
+        for (int h = 0; h < IH; h++) head_w[(size_t)t * IH + h] /= sqrtf((float)IH);
 
     const int width = coli_sparse_index_width(c->index_topk, c->index_kpool, c->index_kpool_tail);
     int *selected = malloc((size_t)tokens * width * sizeof(int));
@@ -1137,14 +1224,18 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
     }
     /* Attenzione nello spazio del latente. La scala resta 1/sqrt(qk_nope):
      * il prodotto e' lo stesso numero di prima, calcolato in un altro ordine. */
-    float *context = malloc((size_t)H * V * sizeof(float));
-    float *pooled = malloc((size_t)L * sizeof(float));
+    /* La media pesata dei latenti e' per token e per testa; le due
+     * proiezioni che la seguono (kvb_v per testa, poi o) vanno in blocco. */
+    float *pooled = malloc((size_t)tokens * H * L * sizeof(float));
+    unsigned char *attended = malloc((size_t)tokens * H);
     float *score = malloc((size_t)width * sizeof(float));
+    if (!pooled || !attended || !score) { fprintf(stderr, "OOM in MLA\n"); exit(1); }
     const float scale = 1.0f / sqrtf((float)QK);
     for (int t = 0; t < tokens; t++) {
         const int *chosen = selected + (size_t)t * width;
         for (int h = 0; h < H; h++) {
             const float *q = absorbed + ((size_t)t * H + h) * L;
+            float *pool = pooled + ((size_t)t * H + h) * L;
             float top = -INFINITY;
             int used = 0;
             for (int i = 0; i < width; i++) {
@@ -1157,25 +1248,39 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
                 if (score[used] > top) top = score[used];
                 used++;
             }
-            float *result = context + (size_t)h * V;
-            memset(result, 0, (size_t)V * sizeof(float));
+            memset(pool, 0, (size_t)L * sizeof(float));
+            attended[(size_t)t * H + h] = used > 0;
             if (!used) continue;
             double total = 0.0;
             for (int i = 0; i < used; i++) { score[i] = expf(score[i] - top); total += score[i]; }
-            memset(pooled, 0, (size_t)L * sizeof(float));
             int seen_slot = 0;
             for (int i = 0; i < width; i++) {
                 const int at = chosen[i];
                 if (at < 0 || at >= seen) continue;
                 const float weight = (float)(score[seen_slot++] / total);
                 const float *c_j = latent + (size_t)at * L;
-                for (int d = 0; d < L; d++) pooled[d] += weight * c_j[d];
+                for (int d = 0; d < L; d++) pool[d] += weight * c_j[d];
             }
-            mv_rows(result, &l->kvb_v, pooled, h * V, V);
         }
-        mv(out + (size_t)t * c->hidden, &l->o, context);
     }
-    free(score); free(pooled);
+    float *context = malloc((size_t)tokens * H * V * sizeof(float));
+    float *ph = malloc((size_t)tokens * L * sizeof(float));
+    float *vh = malloc((size_t)tokens * V * sizeof(float));
+    if (!context || !ph || !vh) { fprintf(stderr, "OOM in MLA\n"); exit(1); }
+    for (int h = 0; h < H; h++) {
+        for (int t = 0; t < tokens; t++)
+            memcpy(ph + (size_t)t * L, pooled + ((size_t)t * H + h) * L, (size_t)L * sizeof(float));
+        mm_rows(vh, &l->kvb_v, ph, tokens, h * V, V);
+        for (int t = 0; t < tokens; t++) {
+            float *result = context + (size_t)t * H * V + (size_t)h * V;
+            if (attended[(size_t)t * H + h])
+                memcpy(result, vh + (size_t)t * V, (size_t)V * sizeof(float));
+            else
+                memset(result, 0, (size_t)V * sizeof(float));   /* nessuna posizione: zero, come prima */
+        }
+    }
+    mm(out, &l->o, context, tokens);
+    free(vh); free(ph); free(score); free(attended); free(pooled);
 
     free(context); free(selected); free(valid); free(head_w);
     free(iq); free(absorbed); free(queries); free(qa);
@@ -1766,11 +1871,10 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     const int wide = c->dense_inter > c->moe_inter ? c->dense_inter : c->moe_inter;
 
     if (index < c->first_dense) {                 /* layer denso: nessun router */
-        float *sg = malloc((size_t)wide * sizeof(float));
-        float *su = malloc((size_t)wide * sizeof(float));
-        for (int t = 0; t < tokens; t++)
-            mlp3(out + (size_t)t * c->hidden, x + (size_t)t * c->hidden,
-                 &l->dg, &l->du, &l->dd, c->swiglu_limit, sg, su);
+        float *sg = malloc((size_t)tokens * wide * sizeof(float));
+        float *su = malloc((size_t)tokens * wide * sizeof(float));
+        if (!sg || !su) { fprintf(stderr, "OOM in dense FFN\n"); exit(1); }
+        mlp3_rows(out, x, tokens, &l->dg, &l->du, &l->dd, c->swiglu_limit, sg, su);
         free(su); free(sg);
         return;
     }
@@ -1827,15 +1931,18 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
      * che non da' errore, da' numeri sbagliati. Quindi si lavora a blocchi
      * grandi al piu' quanto la cache: si legge il blocco in parallelo, si
      * applica a tutti i token, si passa al prossimo. */
-    float *sg = malloc((size_t)wide * sizeof(float));
-    float *su = malloc((size_t)wide * sizeof(float));
-    float *tmp = malloc((size_t)c->hidden * sizeof(float));
-    if (!sg || !su || !tmp) { fprintf(stderr, "OOM in MoE\n"); exit(1); }
+    /* sg/su/tmp/xg hold a whole block's rows: the shared expert runs on every
+     * token, and a routed expert on every token that chose it, batched. */
+    float *sg = malloc((size_t)tokens * wide * sizeof(float));
+    float *su = malloc((size_t)tokens * wide * sizeof(float));
+    float *tmp = malloc((size_t)tokens * c->hidden * sizeof(float));
+    float *xg = malloc((size_t)tokens * c->hidden * sizeof(float));
+    int *row_t = malloc((size_t)tokens * sizeof(int));
+    float *row_w = malloc((size_t)tokens * sizeof(float));
+    if (!sg || !su || !tmp || !xg || !row_t || !row_w) { fprintf(stderr, "OOM in MoE\n"); exit(1); }
 
     /* l'esperto condiviso e' sempre attivo e non passa dalla cache */
-    for (int t = 0; t < tokens; t++)
-        mlp3(out + (size_t)t * c->hidden, x + (size_t)t * c->hidden,
-             &l->rg, &l->ru, &l->rd, c->swiglu_limit, sg, su);
+    mlp3_rows(out, x, tokens, &l->rg, &l->ru, &l->rd, c->swiglu_limit, sg, su);
 
     if (!m->streaming) {
         for (int t = 0; t < tokens; t++)
@@ -1847,7 +1954,7 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
                 float *dst = out + (size_t)t * c->hidden;
                 for (int d = 0; d < c->hidden; d++) dst[d] += scale * tmp[d];
             }
-        free(tmp); free(su); free(sg); free(weight); free(chosen);
+        free(row_w); free(row_t); free(xg); free(tmp); free(su); free(sg); free(weight); free(chosen);
         return;
     }
 
@@ -1959,13 +2066,15 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
         }
 #endif
         if (!metal_done) {
-            /* CPU fallback: one expert at a time, then every token that chose it. */
+            /* CPU fallback: one expert at a time, all the tokens that chose it
+             * in one batch, then added back in token order. */
             for (int i = 0; i < here; i++) {
                 const int eid = union_ids[base + i];
                 Slot *slot = &cache->s[slot_of[i]];
                 slot->used = ++m->clock;
                 Mat gate, up, down;
                 expert_mats(m, slot, &gate, &up, &down);
+                int R = 0;
                 for (int t = 0; t < tokens; t++) {
                     float scale = 0.0f;
                     for (int k = 0; k < topk; k++)
@@ -1974,16 +2083,23 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
                             break;
                         }
                     if (scale == 0.0f) continue;
-                    mlp3(tmp, x + (size_t)t * c->hidden, &gate, &up, &down,
-                         c->swiglu_limit, sg, su);
-                    float *dst = out + (size_t)t * c->hidden;
-                    for (int d = 0; d < c->hidden; d++) dst[d] += scale * tmp[d];
+                    memcpy(xg + (size_t)R * c->hidden, x + (size_t)t * c->hidden,
+                           (size_t)c->hidden * sizeof(float));
+                    row_t[R] = t; row_w[R] = scale; R++;
+                }
+                if (!R) continue;
+                mlp3_rows(tmp, xg, R, &gate, &up, &down, c->swiglu_limit, sg, su);
+                for (int r = 0; r < R; r++) {
+                    const float *src = tmp + (size_t)r * c->hidden;
+                    float *dst = out + (size_t)row_t[r] * c->hidden;
+                    const float scale = row_w[r];
+                    for (int d = 0; d < c->hidden; d++) dst[d] += scale * src[d];
                 }
             }
         }
     }
     free(to_read); free(slot_of); free(union_ids);
-    free(tmp); free(su); free(sg); free(weight); free(chosen);
+    free(row_w); free(row_t); free(xg); free(tmp); free(su); free(sg); free(weight); free(chosen);
 }
 
 /* ---------- caricamento ---------- */
@@ -2506,8 +2622,12 @@ static void glm_echo(unsigned long long id, int pos, int token,
     putchar('\n'); fflush(stdout);
 }
 
-static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
-                           const float *vision, int n_vision) {
+/* `need`: how many of the last rows get logits. The head is the largest
+ * matrix outside the experts (vocab x hidden), and a prefill that keeps only
+ * its last row used to compute it for every token anyway. Rows before
+ * n - need are left unset. */
+static float *forward_span_rows(GModel *m, GSession *s, const int *tokens, int n,
+                                const float *vision, int n_vision, int need) {
     const Cfg *c = &m->c;
     const int H = c->hc_mult;
     const int start = s->filled;   /* NON 'base': nel ciclo dei layer e' gia' preso */
@@ -2571,8 +2691,8 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
 
     float *logits = malloc((size_t)n * c->vocab * sizeof(float));
     double t_head0 = now_s();
-    for (int t = 0; t < n; t++)
-        mv(logits + (size_t)t * c->vocab, &m->head, normed + (size_t)t * D);
+    if (need < 1 || need > n) need = n;
+    mm(logits + (size_t)(n - need) * c->vocab, &m->head, normed + (size_t)(n - need) * D, need);
     m->t_head += now_s() - t_head0;
     m->forwards++;
 
@@ -2580,6 +2700,11 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
     free(next); free(streams);
     s->filled = start + n;
     return logits;
+}
+
+static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
+                           const float *vision, int n_vision) {
+    return forward_span_rows(m, s, tokens, n, vision, n_vision, n);
 }
 
 /* Prefill a pezzi.
@@ -2619,9 +2744,11 @@ static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
         if (vision && c->image_token >= 0)
             for (int i = 0; i < here; i++)
                 if (tokens[at + i] == c->image_token) mine++;
-        float *part = forward_span(m, s, tokens + at, here,
-                                   vision ? vision + (size_t)used_vision * c->hidden : NULL,
-                                   mine);
+        /* senza keep_all e senza echo serve solo l'ultima riga del pezzo */
+        const int need = keep_all || (g_echo_k > 0 && g_echo_id) ? here : 1;
+        float *part = forward_span_rows(m, s, tokens + at, here,
+                                        vision ? vision + (size_t)used_vision * c->hidden : NULL,
+                                        mine, need);
         used_vision += mine;
         if (keep_all) {
             memcpy(all + (size_t)at * c->vocab, part,
@@ -3652,9 +3779,12 @@ int main(int argc, char **argv) {
     GSession *session = session_open(&model, count + (greedy > 0 ? greedy : 0) + 1);
     const double prefill_start = now_s();
     float *logits = forward_prefill(&model, session, tokens, count, vision, n_vision, 1);
-    if (getenv("GLM53_VERBOSE"))
+    if (getenv("GLM53_VERBOSE")) {
         fprintf(stderr, "load %.1fs, prefill %d tokens in %.1fs\n",
                 load_seconds, count, now_s() - prefill_start);
+        fprintf(stderr, "prefill profile: attention %.1fs, ffn %.1fs (disk %.1fs), "
+                        "head %.1fs\n", model.t_attn, model.t_ffn, model.t_disk, model.t_head);
+    }
     printf("teacher_forcing");
     for (int t = 0; t < count; t++)
         printf(" %d", argmax(logits + (size_t)t * model.c.vocab, model.c.vocab));
