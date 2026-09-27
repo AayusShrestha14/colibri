@@ -1250,7 +1250,9 @@ def cmd_info(a):
         experts=arch_c.get("n_routed_experts",arch_c.get("num_experts"))
         row("model", a.model)
         row("arch", f"hidden {arch_c.get('hidden_size')} · {arch_c.get('num_hidden_layers')} layer · "
-                    f"{experts} expert/layer · top-{arch_c.get('num_experts_per_tok')}")
+                    + (f"{experts} expert/layer · top-{arch_c.get('num_experts_per_tok')}"
+                       if experts is not None else
+                       f"dense (MLP {arch_c.get('intermediate_size')}, no experts)"))
         sts=[x for x in os.listdir(a.model) if x.endswith('.safetensors')]
         sz=sum(os.path.getsize(os.path.join(a.model,x)) for x in sts)
         row("shards", f"{len(sts)} files · {sz/1e9:.0f} GB on disk")
@@ -2458,7 +2460,7 @@ def cmd_chat(a):
         elif getattr(a,"attach",None):
             sys.exit(f"--attach: no coli serve answering at {base} (start one with: coli serve --model <dir>)")
     need_model(a.model)
-    family=resolve_model(a.model).descriptor
+    resolved=resolve_model(a.model); family=resolved.descriptor
     arch=family.id
     if not family.has_gateway_adapter:
         sys.exit(f"{family.display_name}: gateway adapter is not wired")
@@ -2478,7 +2480,8 @@ def cmd_chat(a):
     if arch!="glm":
         engine=engine_for(a.model)
         need_model(a.model,engine)
-        model_id=family.default_model_id
+        from family_registry import default_model_id
+        model_id=default_model_id(resolved)
         banner(f"chat · {model_id} · local server", model=a.model)
         import openai_server
         # --cap rides along so an explicit `coli chat --cap N` reaches the

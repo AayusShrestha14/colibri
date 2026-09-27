@@ -25,6 +25,7 @@ import v41_dsml                     # ...and V4.1's, whose tag names differ by a
 import image_engine                 # the qwenimage serve protocol, PNG and request rules
 from family_registry import (FamilyConfigError, UnknownFamilyError, family_by_id,
                              family_ids, resolve_model)
+from family_registry import default_model_id as registry_default_model_id
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -715,7 +716,7 @@ def parse_arch_tool_calls(reply, tools, tool_reply=None):
             _sideband_text, calls = parse_k3_tool_calls(tool_reply, tools)
             return reply.strip(), calls
         return parse_k3_tool_calls(reply, tools)  # compatibility with pre-#1147 engines
-    if ARCH == "qwen38":
+    if chat_flavor() == "qwen38":
         return parse_qwen38_tool_calls(reply, tools)
     return parse_tool_calls(reply, tools)
 
@@ -750,6 +751,32 @@ def _tool_hold():
 
 ARCH = "glm"   # set in main(): a family id from family_registry (glm | inkling |
                # kimi | olmoe | qwen36 | qwen38 | deepseek_v4)
+# The chat template the model was trained on, when it is not its engine family's (#1757):
+# Qwen3.8-27B is a dense Qwen3.5-architecture model, so the qwen36 engine runs it, but it
+# ships Qwen3.8's chat_template.jinja (the same file, sha256 c3cf9e34, that the qwen38
+# renderer is pinned to): xhigh reasoning by default, the XML tool-call form, history
+# that keeps its thinking. None means "the family's own", which is what every other
+# checkpoint is. Only rendering follows it; what the engine can do (images) stays ARCH's.
+CHAT_FLAVOR = None
+
+
+def chat_flavor():
+    return CHAT_FLAVOR or ARCH
+
+
+def detect_chat_flavor(family_id, model_dir):
+    """The template a checkpoint ships, when it differs from its family's (see CHAT_FLAVOR)."""
+    if family_id != "qwen36" or not model_dir:
+        return None
+    for name in ("chat_template.jinja", "tokenizer_config.json"):
+        try:
+            text = (Path(model_dir) / name).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        # the line that makes a template Qwen3.8's: reasoning is on by default, at xhigh
+        if "reasoning_effort|default('xhigh')" in text:
+            return "qwen38"
+    return None
 
 INK_THINK, INK_TEXT = "<|content_thinking|>", "<|content_text|>"
 
@@ -2037,6 +2064,19 @@ def expand_qwen38_images(messages, model_dir, max_tokens=None):
     return rewritten, images
 
 
+def qwen36_has_vision(model_dir):
+    """Whether a qwen36 container carries its vision tower (#1757). The converter
+    writes the tower's shape into qwen36_meta.json only when it copied the weights;
+    older containers, and text-only checkpoints, have none."""
+    if not model_dir:
+        return False
+    try:
+        meta = json.loads((Path(model_dir) / "qwen36_meta.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(meta, dict) and isinstance(meta.get("vision"), dict)
+
+
 def expand_glm53_images(messages, model_dir):
     """Sostituisce le parti immagine coi loro segnaposto e ne estrae le patch.
 
@@ -2622,7 +2662,7 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
     if ARCH == "glm53":
         return render_chat_glm53(messages, enable_thinking, reasoning_effort, tools,
                                  tool_choice, add_generation_prompt)
-    if ARCH == "qwen38":
+    if chat_flavor() == "qwen38":
         return render_chat_qwen38(messages, enable_thinking, reasoning_effort, tools,
                                   tool_choice, add_generation_prompt)
     if ARCH == "qwen36":
@@ -5435,7 +5475,7 @@ class APIHandler(BaseHTTPRequestHandler):
         if reasoning_effort is None and "enable_thinking" not in body:
             # Qwen3.8's official template defaults to enabled xhigh thinking;
             # preserve the older opt-in default for the other families.
-            if ARCH == "qwen38":
+            if chat_flavor() == "qwen38":
                 reasoning_effort = "xhigh"
             elif os.environ.get("COLI_THINK", "0") == "1":
                 reasoning_effort = "high"
@@ -5484,8 +5524,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 raise APIError(400, "one image per request for now; the engine "
                                     "holds a single pending image.", "messages")
             image = images[0] if images else None
-        elif ARCH == "qwen38":
-            ceiling = os.environ.get("Q38_MAX_IMAGE_TOKENS")
+        elif ARCH == "qwen38" or (ARCH == "qwen36" and qwen36_has_vision(
+                getattr(self.server.engine, "model_dir", None))):
+            # Qwen3.5/3.6/3.8 share the tower and the preprocessor, so qwen36
+            # checkpoints converted with their tower take the same path (#1757).
+            ceiling = os.environ.get("Q38_MAX_IMAGE_TOKENS" if ARCH == "qwen38"
+                                     else "Q36_MAX_IMAGE_TOKENS")
             messages, images = expand_qwen38_images(
                 messages, getattr(self.server.engine, "model_dir", None),
                 int(ceiling) if ceiling else None)
@@ -5520,7 +5564,7 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "`thinking` must be an object.", "thinking")
         enable_thinking = bool(thinking and thinking.get("type") == "enabled")
         if not enable_thinking and thinking is None:
-            if ARCH == "qwen38":
+            if chat_flavor() == "qwen38":
                 enable_thinking = True
             elif os.environ.get("COLI_THINK", "0") == "1":
                 enable_thinking = True
@@ -5538,7 +5582,7 @@ class APIHandler(BaseHTTPRequestHandler):
             translated["tool_choice"] = tool_choice
         if tool_choice == "none":
             tools = None
-        default_effort = "xhigh" if ARCH == "qwen38" and thinking is None else "high"
+        default_effort = "xhigh" if chat_flavor() == "qwen38" and thinking is None else "high"
         add_generation_prompt = resolve_generation_prompt(messages, body)
         prompt = render_chat_for_arch(messages, enable_thinking,
                                       default_effort if enable_thinking else None,
@@ -5843,10 +5887,19 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     try:
         family = pending_family or resolve_model(model).descriptor
-        global ARCH
+        global ARCH, CHAT_FLAVOR
         ARCH = family.id
+        CHAT_FLAVOR = detect_chat_flavor(family.id, model)
+        if CHAT_FLAVOR:
+            print(f"[gateway] {family.id} engine, {CHAT_FLAVOR} chat template "
+                  "(from the checkpoint's chat_template.jinja)", file=sys.stderr)
         engine = pending_engine or default_engine(family)
-        model_id = pending_model_id or family.default_model_id
+        if not pending_model_id:
+            try:
+                pending_model_id = registry_default_model_id(resolve_model(model))
+            except Exception:
+                pending_model_id = family.default_model_id
+        model_id = pending_model_id
         server.model_id = model_id
         if kv_slots > family.limits.max_kv_slots:
             raise ValueError(f"{family.id} engine supports at most "
@@ -5927,7 +5980,7 @@ def main():
     if args.engine is None:
         args.engine = str(default_engine(family))
     if args.model_id is None:
-        args.model_id = family.default_model_id
+        args.model_id = registry_default_model_id(resolved)
     serve(args.model, args.host, args.port, args.model_id, args.api_key,
           args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,
           max_queue=args.max_queue,queue_timeout=args.queue_timeout,kv_slots=args.kv_slots,
