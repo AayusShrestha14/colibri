@@ -247,6 +247,32 @@ class TemplateTest(unittest.TestCase):
             self.assertFalse(qwen36_has_vision(d))
         self.assertFalse(qwen36_has_vision(None))
 
+    def test_qwen38_images_arrive_as_data_uri_bytes(self):
+        """A data: URI reaches the preprocessor as bytes. Image.open read them as a
+        file name and every image request died with "embedded null byte" (500):
+        the preprocessor's own test hands it a PIL image, so only the gateway path
+        broke. Found running Qwen3.8-27B with its tower (#1757)."""
+        try:
+            import base64, io, tempfile
+            import numpy
+            from PIL import Image
+        except ImportError as missing:
+            self.skipTest(f"needs Pillow and numpy ({missing})")
+        from openai_server import expand_qwen38_images
+        buffer = io.BytesIO()
+        Image.fromarray((numpy.arange(64 * 96 * 3) % 251).astype("uint8").reshape(64, 96, 3)).save(buffer, "PNG")
+        uri = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "preprocessor_config.json").write_text(json.dumps(
+                {"patch_size": 16, "merge_size": 2, "temporal_patch_size": 2}), encoding="utf-8")
+            messages, images = expand_qwen38_images(
+                [{"role": "user", "content": [{"type": "text", "text": "what is this?"},
+                                              {"type": "image_url", "image_url": {"url": uri}}]}], d)
+        self.assertEqual(len(images), 1)
+        patches, grid_h, grid_w = images[0]
+        self.assertEqual(patches.shape[0], grid_h * grid_w)
+        self.assertIn("what is this?", messages[0]["content"])
+
     def test_qwen38_template_on_the_qwen36_engine(self):
         """#1757: Qwen3.8-27B is a dense model of Qwen3.5's architecture, so the qwen36
         engine runs it, but it ships Qwen3.8's chat_template.jinja. The gateway renders
