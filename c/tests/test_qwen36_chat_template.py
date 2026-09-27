@@ -6,8 +6,8 @@ quella scelta si paga in un modo solo: la copia scritta a mano puo' scostarsi
 dall'originale senza che nessuno se ne accorga, perche' il modello risponde
 comunque. Qui il template vero viene reso con jinja2 e confrontato byte per byte
 con quello che produce il gateway, senza strumenti (che il motore qwen36 non
-espone) e sui due rami del blocco di ragionamento, piu' il turno aperto della
-prosecuzione.
+espone) e sui due rami del blocco di ragionamento, per ciascuno con e senza
+preserve_thinking (#1759), piu' il turno aperto della prosecuzione.
 
 Se manca il template o jinja2, il test si dichiara SALTATO invece di passare: un
 test che non ha trovato il suo riferimento non ha verificato niente, e dirlo
@@ -41,12 +41,34 @@ CASES = {
                      {"role": "assistant", "content": "2"},
                      {"role": "user", "content": "e 2+2?"}],
     },
+    # Il ragionamento rimandato dal client: il template lo scrive solo con
+    # preserve_thinking, altrimenti lo toglie.
+    "ragionamento in cronologia": {
+        "messages": [{"role": "user", "content": "1+1?"},
+                     {"role": "assistant", "content": "2", "reasoning_content": "uno piu' uno"},
+                     {"role": "user", "content": "e 2+2?"}],
+    },
+    # Un client che rimanda la risposta grezza: il template separa il blocco dal
+    # contenuto a </think>.
+    "risposta grezza in cronologia": {
+        "messages": [{"role": "user", "content": "1+1?"},
+                     {"role": "assistant", "content": "<think>\nuno piu' uno\n</think>\n\n2"},
+                     {"role": "user", "content": "e 2+2?"}],
+    },
+    # Un turno assistant DOPO l'ultima domanda tiene il blocco anche senza
+    # preserve_thinking (last_query_index del template).
+    "assistant dopo l'ultima domanda": {
+        "messages": [{"role": "user", "content": "1+1?"},
+                     {"role": "assistant", "content": "2"}],
+    },
 }
 
 THINKING = (True, False)
+PRESERVE = (False, True)
 
 
-def reference(template_text, *, messages, enable_thinking=True, add_generation_prompt=True):
+def reference(template_text, *, messages, enable_thinking=True, add_generation_prompt=True,
+              preserve_thinking=False):
     import jinja2
 
     def raise_exception(message):
@@ -59,7 +81,7 @@ def reference(template_text, *, messages, enable_thinking=True, add_generation_p
     environment.globals["raise_exception"] = raise_exception
     rendered = environment.from_string(template_text)
     return rendered.render(messages=messages, add_generation_prompt=add_generation_prompt,
-                           enable_thinking=enable_thinking)
+                           enable_thinking=enable_thinking, preserve_thinking=preserve_thinking)
 
 
 def show(label, ours, theirs):
@@ -98,17 +120,21 @@ def main() -> int:
 
     failures = 0
     for enable_thinking in THINKING:
-        for label, case in CASES.items():
-            name = f"{label} [thinking={enable_thinking}]"
-            theirs = reference(template_text, messages=case["messages"],
-                               enable_thinking=enable_thinking)
-            ours = openai_server.render_chat_qwen(case["messages"],
-                                                  enable_thinking=enable_thinking)
-            if ours == theirs:
-                print(f"ok   {name}")
-            else:
-                show(name, ours, theirs)
-                failures += 1
+        for preserve_thinking in PRESERVE:
+            for label, case in CASES.items():
+                name = (f"{label} [thinking={enable_thinking} "
+                        f"preserve_thinking={preserve_thinking}]")
+                theirs = reference(template_text, messages=case["messages"],
+                                   enable_thinking=enable_thinking,
+                                   preserve_thinking=preserve_thinking)
+                ours = openai_server.render_chat_qwen(case["messages"],
+                                                      enable_thinking=enable_thinking,
+                                                      preserve_thinking=preserve_thinking)
+                if ours == theirs:
+                    print(f"ok   {name}")
+                else:
+                    show(name, ours, theirs)
+                    failures += 1
 
     # Prosecuzione: l'ultimo turno assistant e' da CONTINUARE. Come qwen38, ChatML chiude
     # ogni turno con <|im_end|> e il template non ha un ramo di continuazione, quindi la
