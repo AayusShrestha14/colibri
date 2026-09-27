@@ -1291,7 +1291,7 @@ int qt_replan(int layer,const uint32_t *counts,int max_swaps){
         int nc=0, nv=0;
         for(size_t i=lo;i<hi;i++){
             QSlot *s=&G.slot[i]; int e=(int)(i%G.ne);
-            if(home(e)!=di || s->queued) continue;
+            if(home2((int)(i/G.ne),e)!=di || s->queued) continue;
             if(s->resident) vict[nv++]=(int)i;
             else if(s->g4 && counts[i-lo]>0) cand[nc++]=(int)i;
         }
