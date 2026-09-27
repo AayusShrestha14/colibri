@@ -250,6 +250,47 @@ class ResourcePlanTest(unittest.TestCase):
         ])
         return model
 
+    def _qwen_dense_model(self, num_experts=None):
+        """Qwen3.8-27B's shape at toy size (#1757): the qwen3_5 architecture with one
+        dense MLP per layer and no expert count in the config."""
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        model = Path(other.name)
+        text = {
+            "model_type": "qwen3_5_text", "num_hidden_layers": 4, "hidden_size": 32,
+            "intermediate_size": 64, "num_key_value_heads": 1, "head_dim": 8,
+            "linear_num_key_heads": 2, "linear_key_head_dim": 8,
+            "linear_num_value_heads": 4, "linear_value_head_dim": 8,
+            "linear_conv_kernel_dim": 4,
+            "layer_types": ["linear_attention"] * 3 + ["full_attention"],
+        }
+        if num_experts is not None:
+            text["num_experts"] = num_experts
+        (model / "config.json").write_text(json.dumps(
+            {"model_type": "qwen3_5", "text_config": text}))
+        write_shard(model / "model.safetensors", [
+            ("model.language_model.embed_tokens.weight", 100),
+            ("model.language_model.layers.0.mlp.gate_proj.weight", 80),
+            ("model.language_model.layers.0.mlp.up_proj.weight", 80),
+            ("model.language_model.layers.0.mlp.down_proj.weight", 80),
+        ])
+        return model
+
+    def test_dense_qwen_model_keeps_every_weight_resident(self):
+        plan = build_plan(self._qwen_dense_model(), context=32, available_memory=32 * GB,
+                          available_disk=100 * GB, gpus=[])
+        self.assertEqual(plan["model"]["family_id"], "qwen36")
+        self.assertEqual(plan["model"]["configured_experts"], 0)
+        self.assertEqual(plan["tiers"]["ram"]["cache_slots_per_layer"], 1)
+        self.assertIn("dense model", plan["expected_bottleneck"])
+        self.assertFalse([w for w in plan["warnings"] if "expert slot" in w])
+        self.assertEqual([d["target"] for d in plan["decisions"]], ["RAM"])
+
+    def test_zero_experts_declared_is_still_a_broken_config(self):
+        with self.assertRaisesRegex(ValueError, "num_experts|expert count is zero"):
+            build_plan(self._qwen_dense_model(num_experts=0), context=32,
+                       available_memory=32 * GB, available_disk=100 * GB, gpus=[])
+
     def _glm53_model(self):
         other = tempfile.TemporaryDirectory()
         self.addCleanup(other.cleanup)

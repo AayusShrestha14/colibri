@@ -506,6 +506,44 @@ jobs:
               ./qwen36 "$cap" 8 qwen38_2p4t_tiny/ref_full.json
             echo "::endgroup::"
           done
+      - name: "Qwen3.8-27B geometry: a dense checkpoint of the same architecture (#1757)"
+        run: |
+          cd c
+          # Qwen/Qwen3.8-27B is Qwen3_5ForConditionalGeneration: the hybrid
+          # DeltaNet + gated attention of this engine with one SwiGLU MLP per
+          # layer and no router. The converter has to write num_experts 0 and
+          # the MLP width, and the engine has to run that MLP as an ungated
+          # shared expert, token for token against Qwen3_5ForCausalLM.
+          python3 tools/make_qwen36_tiny.py --geometry qwen38-27b-dense \
+                  --out qwen38_27b_tiny --ref-mode full \
+                  --emit-ref qwen38_27b_tiny/ref_full.json
+          python3 tools/convert_qwen36.py --model qwen38_27b_tiny \
+                  --out qwen38_27b_tiny_c --ebits 8
+          python3 -c "import json; m = json.load(open('qwen38_27b_tiny_c/qwen36_meta.json')); \
+                      assert (m['num_experts'], m['topk'], m['shared_inter']) == (0, 0, 128), m"
+          for cap in 1 8; do
+            echo "::group::27B dense geometry cap=$cap"
+            COLI_DENSE_I8=0 SNAP=qwen38_27b_tiny_c \
+              ./qwen36 "$cap" 8 qwen38_27b_tiny/ref_full.json
+            echo "::endgroup::"
+          done
+          # The same model with its vision tower (Qwen3_5ForConditionalGeneration):
+          # a prompt with one 4x8-patch image, token-exact against transformers.
+          # Every position after the image depends on the 3D M-RoPE positions
+          # (1D positions give 6/16 here), and the serve test holds the IMAGE
+          # frame path to the same tokens.
+          python3 tools/make_qwen36_vl_tiny.py --out qwen38_27b_vl_tiny
+          python3 tools/convert_qwen36.py --model qwen38_27b_vl_tiny \
+                  --out qwen38_27b_vl_tiny_c --ebits 8 | tee convert_vl.log
+          grep -q "\[vision\] model-vision.safetensors" convert_vl.log
+          for cap in 1 8; do
+            echo "::group::27B vision cap=$cap"
+            COLI_DENSE_I8=0 SNAP=qwen38_27b_vl_tiny_c \
+              ./qwen36 "$cap" 8 qwen38_27b_vl_tiny/ref.json
+            echo "::endgroup::"
+          done
+          QWEN36_VL_TINY=qwen38_27b_vl_tiny_c QWEN36_VL_REF=qwen38_27b_vl_tiny/ref.json \
+            python3 -m unittest -v tests.test_qwen36_vision_serve
       - name: Same run under ASan + UBSan
         run: |
           cd c
