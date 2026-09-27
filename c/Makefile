@@ -1194,7 +1194,7 @@ ifneq ($(EXE),)
 .PHONY: qwenimage
 qwenimage: qwenimage$(EXE)
 endif
-qwenimage$(EXE): qwenimage.c qi_gemm.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h tok_unicode_deepseek.h qwen38_nfc.h qwen38_nfc_tables.h serve_poll.h compat.h .build-config
+qwenimage$(EXE): qwenimage.c qi_gemm.h qwenimage_vae.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h tok_unicode_deepseek.h qwen38_nfc.h qwen38_nfc_tables.h serve_poll.h compat.h .build-config
 	$(CC) $(CFLAGS) qwenimage.c -o qwenimage$(EXE) $(LDFLAGS)
 
 test_qi_gemm$(EXE): tests/test_qi_gemm.c qi_gemm.h

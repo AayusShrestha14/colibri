@@ -1046,6 +1046,17 @@ static float *ref_tensor(shards *S, const char *name, int64_t *n){
     return v;
 }
 
+static float *ref_named(shards *S, const char *fmt, int i){
+    char name[64]; snprintf(name, sizeof name, fmt, i);
+    return ref_tensor(S, name, NULL);
+}
+
+/* Every stage against a reference dump (tools/make_qwenimage_tiny.py for the tiny
+ * pipeline, tools/qwenimage_ref.py for the real one). Each stage starts from the
+ * REFERENCE input of that stage, so an error is reported where it is made and not
+ * carried into the next one; the chained run from our own outputs comes last.
+ * With COLI_IMG_BITS=16 the weights are the checkpoint's bf16 values exactly, so
+ * what remains is summation order. */
 static int run_oracle(Engine *e, const char *refdir){
     char *arena = NULL;
     jval *meta = read_json(refdir, "ref.json", &arena);
@@ -1053,64 +1064,83 @@ static int run_oracle(Engine *e, const char *refdir){
     const char *prompt = pv && pv->t == J_STR ? pv->str : NULL;
     int width = (int)jnum(meta, "width", 0), height = (int)jnum(meta, "height", 0);
     int steps = (int)jnum(meta, "steps", 0), drop_ref = (int)jnum(meta, "drop_idx", -1);
-    if (!prompt || !width || !height || !steps) { fprintf(stderr, "[oracle] ref.json needs prompt/width/height/steps\n"); return 2; }
+    jval *idv = json_get(meta, "input_ids");
+    if (!prompt || !width || !height || !steps || !idv || idv->t != J_ARR) {
+        fprintf(stderr, "[oracle] ref.json needs prompt, width, height, steps, input_ids\n"); return 2;
+    }
     shards R; memset(&R, 0, sizeof R); st_init(&R, refdir);
     int fails = 0;
+    const double TIGHT = 2e-4, LOOSE = 2e-3;
     /* 1. tokens */
     int n, drop;
     int *ids = te_encode_prompt(&e->te, prompt, &n, &drop);
-    int64_t nref = 0; float *rid = ref_tensor(&R, "input_ids", &nref);
-    int tok_ok = rid && nref == n && drop == drop_ref;
-    for (int i = 0; tok_ok && i < n; i++) tok_ok = (int)rid[i] == ids[i];
-    fprintf(stderr, "[oracle] tokens: %d (ref %lld), drop_idx %d (ref %d): %s\n", n, (long long)nref, drop, drop_ref,
+    int nref = idv->len, tok_ok = nref == n && drop == drop_ref;
+    for (int i = 0; tok_ok && i < n; i++) tok_ok = (int)idv->kids[i]->num == ids[i];
+    fprintf(stderr, "[oracle] tokens: %d (ref %d), drop_idx %d (ref %d): %s\n", n, nref, drop, drop_ref,
             tok_ok ? "IDENTICAL" : "DIFFERENT");
     fails += !tok_ok;
-    /* 2. text encoder -> prompt_embeds (from the reference ids, so a tokenizer
-     * difference does not hide everything after it) */
+    int *use = xmalloc(sizeof(int) * nref);
+    for (int i = 0; i < nref; i++) use[i] = (int)idv->kids[i]->num;
+    /* 2. text encoder, on the reference ids */
     te_load(&e->te, e->model);
-    int *use = ids; int nuse = n;
-    if (!tok_ok && rid) { use = xmalloc(sizeof(int) * nref); for (int64_t i = 0; i < nref; i++) use[i] = (int)rid[i]; nuse = (int)nref; drop = drop_ref; }
-    float *h = te_forward(&e->te, use, nuse);
-    int L = nuse - drop;
+    float *h = te_forward(&e->te, use, nref);
+    te_unload(&e->te);
+    float *last = ref_named(&R, "te_hidden_%02d", e->te.layers);
+    if (last) fails += cmp("text encoder last layer", h, last, (size_t)nref * e->te.hidden) > TIGHT;
+    free(last);
+    int L = nref - drop_ref;
     float *emb_ref = ref_tensor(&R, "prompt_embeds", NULL);
-    if (emb_ref) fails += cmp("prompt_embeds", h + (int64_t)drop * e->te.hidden, emb_ref, (size_t)L * e->te.hidden) > 1e-3;
-    /* 3. DiT: prefix from the REFERENCE embeddings, then every step from the
-     * reference latents of that step, so errors do not compound across stages */
+    if (emb_ref) fails += cmp("prompt_embeds", h + (int64_t)drop_ref * e->te.hidden, emb_ref, (size_t)L * e->te.hidden) > TIGHT;
+    /* 3. DiT: the prefix from the REFERENCE embeddings */
     dit_load(&e->dit, e->model);
-    float *emb = emb_ref ? emb_ref : h + (int64_t)drop * e->te.hidden;
-    float *txt = fmalloc((size_t)L * e->dit.dim);
+    const float *emb = emb_ref ? emb_ref : h + (int64_t)drop_ref * e->te.hidden;
+    int D = e->dit.dim;
+    float *txt = fmalloc((size_t)L * D);
     Prefix P; memset(&P, 0, sizeof P);
     dit_prefix(&e->dit, emb, L, &P, txt);
-    float *txt_ref = ref_tensor(&R, "txt_in_out", NULL);
-    if (txt_ref) fails += cmp("txt_in output", txt, txt_ref, (size_t)L * e->dit.dim) > 1e-3;
+    float *txt_ref = ref_tensor(&R, "step0_txt_in", NULL);
+    if (txt_ref) fails += cmp("txt_in", txt, txt_ref, (size_t)L * D) > TIGHT;
     int gh = height / 16, gw = width / 16, N = gh * gw, C = e->dit.in_ch;
     float *sig = fmalloc(steps + 1), *ts = fmalloc(steps);
     double mu;
     sched_sigmas(&e->sch, steps, N, sig, ts, &mu);
     float *sig_ref = ref_tensor(&R, "sigmas", NULL);
     if (sig_ref) fails += cmp("sigmas", sig, sig_ref, steps + 1) > 1e-6;
+    float *temb_ref = ref_tensor(&R, "step0_temb", NULL), *mod_ref = ref_tensor(&R, "step0_modulation", NULL);
+    if (temb_ref && mod_ref) {
+        float *temb = fmalloc(D), *mod = fmalloc(4 * (size_t)D), *outs = fmalloc(D);
+        dit_temb(&e->dit, ts[0], temb);
+        fails += cmp("temb (t of step 0)", temb, temb_ref, D) > TIGHT;
+        dit_temb(&e->dit, 0.f, temb);
+        fails += cmp("temb (t = 0, prompt)", temb, temb_ref + D, D) > TIGHT;
+        dit_modulation(&e->dit, ts[0], mod, outs);
+        fails += cmp("modulation (step 0)", mod, mod_ref, 4 * (size_t)D) > TIGHT;
+        free(temb); free(mod); free(outs);
+    }
     DitStep s; dit_step_init(&s, &e->dit, &P, gh, gw);
-    float *np = fmalloc((size_t)N * C), *lat = ref_tensor(&R, "latents_init", NULL);
-    float *mine = fmalloc((size_t)N * C);
-    if (!lat) { fprintf(stderr, "[oracle] ref has no latents_init\n"); return 2; }
-    memcpy(mine, lat, (size_t)N * C * 4);
-    char name[64];
+    float *np = fmalloc((size_t)N * C), *lat0 = ref_tensor(&R, "latents_init", NULL), *mine = fmalloc((size_t)N * C);
+    if (!lat0) { fprintf(stderr, "[oracle] ref has no latents_init\n"); return 2; }
+    memcpy(mine, lat0, (size_t)N * C * 4);
+    double worst = 0;
     for (int i = 0; i < steps; i++) {
-        snprintf(name, sizeof name, "latents_%d", i);
-        float *in = i == 0 ? lat : ref_tensor(&R, name, NULL);
-        if (!in) in = mine;
+        float *in = i == 0 ? lat0 : ref_named(&R, "latents_%03d", i - 1);
+        if (!in) { fprintf(stderr, "[oracle] ref has no latents_%03d\n", i - 1); return 2; }
         dit_forward(&e->dit, &P, &s, in, ts[i], np);
-        snprintf(name, sizeof name, "noise_pred_%d", i);
-        float *want = ref_tensor(&R, name, NULL);
-        if (want) { char w[64]; snprintf(w, sizeof w, "noise_pred step %d", i); fails += cmp(w, np, want, (size_t)N * C) > 1e-2; free(want); }
+        float *want = ref_named(&R, "noise_pred_%03d", i);
+        if (want) {
+            char w[64]; snprintf(w, sizeof w, "noise_pred step %d", i);
+            double r = cmp(w, np, want, (size_t)N * C); if (r > worst) worst = r;
+            fails += r > LOOSE; free(want);
+        }
+        if (in != lat0) free(in);
         /* the chained trajectory, from our own predictions only */
-        if (in != mine) dit_forward(&e->dit, &P, &s, mine, ts[i], np);
+        dit_forward(&e->dit, &P, &s, mine, ts[i], np);
         float dt = sig[i + 1] - sig[i];
         for (int64_t k = 0; k < (int64_t)N * C; k++) mine[k] += dt * np[k];
-        if (in != lat && in != mine) free(in);
     }
     float *fin = ref_tensor(&R, "latents_final", NULL);
-    if (fin) fails += cmp("final latents (chained)", mine, fin, (size_t)N * C) > 2e-2;
+    if (fin) fails += cmp("final latents, chained", mine, fin, (size_t)N * C) > 2e-2;
+    dit_step_free(&s);
 #ifdef QI_HAVE_VAE
     {
         char dir[2100]; snprintf(dir, sizeof dir, "%s/vae", e->model);
@@ -1119,14 +1149,28 @@ static int run_oracle(Engine *e, const char *refdir){
             uint8_t *rgba = xmalloc((size_t)width * height * 4);
             float *of = fmalloc((size_t)4 * width * height);
             qiv_decode(vae, fin, gh, gw, rgba, of);
-            float *img_ref = ref_tensor(&R, "image_float", NULL);
-            if (img_ref) fails += cmp("VAE output (ref latents)", of, img_ref, (size_t)4 * width * height) > 1e-3;
+            float *img_ref = ref_tensor(&R, "vae_out", NULL);
+            if (img_ref) fails += cmp("VAE output (ref latents)", of, img_ref, (size_t)4 * width * height) > LOOSE;
+            st_tensor *rt = st_find(&R, "rgba");
+            if (rt && rt->nbytes == (int64_t)width * height * 4) {
+                uint8_t *want = xmalloc((size_t)rt->nbytes);
+                st_pread_full(rt->fd, want, rt->nbytes, rt->off, "rgba");
+                int64_t diff = 0, big = 0;
+                for (int64_t k = 0; k < rt->nbytes; k++) { int d = abs((int)rgba[k] - (int)want[k]); diff += d > 0; big += d > 1; }
+                fprintf(stderr, "[oracle] RGBA from ref latents: %lld of %lld bytes differ, %lld by more than 1\n",
+                        (long long)diff, (long long)rt->nbytes, (long long)big);
+                fails += big > rt->nbytes / 1000;
+                free(want);
+            }
+            char out[2200]; snprintf(out, sizeof out, "%s/oracle_c.png", refdir);
+            qiv_decode(vae, mine, gh, gw, rgba, NULL);
+            if (!write_png(out, rgba, width, height)) fprintf(stderr, "[oracle] our own chained image: %s\n", out);
             free(img_ref); free(rgba); free(of);
             qiv_free(vae);
         }
     }
 #endif
-    fprintf(stderr, "[oracle] %s\n", fails ? "MISMATCH" : "all stages within tolerance");
+    fprintf(stderr, "[oracle] worst noise_pred rel %.3e -> %s\n", worst, fails ? "MISMATCH" : "all stages within tolerance");
     return fails ? 1 : 0;
 }
 
