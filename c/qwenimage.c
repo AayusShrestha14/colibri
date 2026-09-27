@@ -19,6 +19,7 @@
  *
  * Usage:
  *   qwenimage --model DIR --prompt "..." [--width W] [--height H] [--steps N]
+ *             (sides: multiples of 32, as the pipeline snaps them; default 768x512)
  *             [--seed S] --out image.png
  *   qwenimage --model DIR --serve        line protocol, see serve_loop()
  *   qwenimage --model DIR --ref REFDIR   compare every stage with a reference
@@ -143,9 +144,13 @@ static float *vec_load(shards *S, const char *name, int n){
     st_read_f32_cap(S, name, v, n, 1);
     return v;
 }
+/* QWENIMAGE_PROF=1: where a step's time goes (linears, attention, the rest) */
+static int g_prof; static double g_t_lin, g_t_att;
 static inline void linear(float *y, const float *x, int M, const Lin *l){
+    double t0 = g_prof ? now_s() : 0;
     if (g_act8 && l->m.fmt == QI_I8) qi_gemm_act8(y, l->m.N, x, l->m.K, M, &l->m, NULL);
     else qi_gemm(y, x, M, &l->m, NULL);
+    if (g_prof) g_t_lin += now_s() - t0;
 }
 
 /* ---- small kernels -------------------------------------------------------- */
@@ -183,6 +188,7 @@ static inline float gelu_tanh(float x){
 static void attention(float *out, int ldo, const float *Q, int ldq, int Tq,
                       const float *K, const float *V, int ldk, int Tk,
                       int heads, int kvheads, int hd, int causal){
+    double tprof = g_prof ? now_s() : 0;
     float *S = fmalloc((size_t)Tq * Tk);
     float *vt = fmalloc((size_t)hd * Tk);
     const float scale = 1.f / sqrtf((float)hd);
@@ -214,6 +220,7 @@ static void attention(float *out, int ldo, const float *Q, int ldq, int Tq,
         qi_gemm_ld(out + (int64_t)h * hd, ldo, S, Tk, Tq, &Vm, NULL);
     }
     free(S); free(vt);
+    if (g_prof) g_t_att += now_s() - tprof;
 }
 
 /* ---- text encoder (Qwen3-VL language model, prefill only) ------------------ */
@@ -869,10 +876,14 @@ static int engine_generate(Engine *e, const char *prompt, int width, int height,
         emit_progress(pg, "denoise", i, steps, t0);
         if (pg && pg->cancelled && pg->cancelled(pg->id)) { snprintf(msg, msgn, "cancelled"); rc = -1; break; }
         double ts0 = now_s();
+        g_t_lin = g_t_att = 0;
         dit_forward(&e->dit, &e->prefix, &s, lat, ts[i], np);
         float dt = sig[i + 1] - sig[i];
         for (int64_t k = 0; k < (int64_t)N * C; k++) lat[k] += dt * np[k];
-        fprintf(stderr, "[qwenimage] step %d/%d  t=%.1f  %.2f s\n", i + 1, steps, ts[i], now_s() - ts0);
+        double tstep = now_s() - ts0;
+        fprintf(stderr, "[qwenimage] step %d/%d  t=%.1f  %.2f s", i + 1, steps, ts[i], tstep);
+        if (g_prof) fprintf(stderr, "  (linears %.2f, attention %.2f, rest %.2f)", g_t_lin, g_t_att, tstep - g_t_lin - g_t_att);
+        fputc('\n', stderr);
     }
     dit_step_free(&s);
     double t2 = now_s();
@@ -1123,7 +1134,7 @@ static int run_oracle(Engine *e, const char *refdir){
 
 static void usage(void){
     fprintf(stderr,
-        "usage: qwenimage --model DIR --prompt TEXT [--width 768] [--height 432] [--steps 8] [--seed N] --out FILE.png\n"
+        "usage: qwenimage --model DIR --prompt TEXT [--width 768] [--height 512] [--steps 8] [--seed N] --out FILE.png\n"
         "       qwenimage --model DIR --serve\n"
         "       qwenimage --model DIR --ref REFDIR\n"
         "env:   COLI_IMG_BITS=8|16|32 weight storage (default 8: int8 rows)\n"
@@ -1133,7 +1144,7 @@ static void usage(void){
 
 int main(int argc, char **argv){
     const char *model = NULL, *prompt = NULL, *out = NULL, *ref = NULL;
-    int width = 768, height = 432, steps = 8, serve = 0;
+    int width = 768, height = 512, steps = 8, serve = 0;
     uint64_t seed = 42; int seed_set = 0;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
@@ -1159,6 +1170,7 @@ int main(int argc, char **argv){
     if (b && *b) { g_bits = atoi(b); if (g_bits != 8 && g_bits != 16 && g_bits != 32) { usage(); return 2; } }
     const char *a8 = getenv("COLI_IMG_ACT8");
     g_act8 = a8 && *a8 == '1';
+    g_prof = getenv("QWENIMAGE_PROF") != NULL;
 #ifndef QI_HAVE_VNNI
     if (g_act8) { fprintf(stderr, "[qwenimage] COLI_IMG_ACT8 needs VNNI; this build has none, staying on f32 activations\n"); g_act8 = 0; }
 #endif
