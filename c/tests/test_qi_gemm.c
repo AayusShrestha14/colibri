@@ -15,7 +15,7 @@ static int check(int M, int N, int K, int fmt, int use_bias){
     for (int i = 0; i < M * K; i++) X[i] = frand(&s);
     for (int i = 0; i < N * K; i++) Wf[i] = frand(&s);
     for (int i = 0; i < N; i++) b[i] = frand(&s);
-    QiMat W = { fmt, N, K, Wf, NULL };
+    QiMat W = { fmt, N, K, Wf, NULL, 0 };
     if (fmt == QI_BF16) { for (int i = 0; i < N * K; i++) { Wb[i] = to_bf16(Wf[i]); Wf[i] = qi_bf16(Wb[i]); } W.w = Wb; }
     if (fmt == QI_I8) { qi_quantize_i8(Wf, N, K, Wq, sc); for (int n = 0; n < N; n++) for (int k = 0; k < K; k++) Wf[(int64_t)n*K+k] = Wq[(int64_t)n*K+k] * sc[n]; W.w = Wq; W.sc = sc; }
     qi_gemm(Y, X, M, &W, use_bias ? b : NULL);
@@ -39,7 +39,7 @@ int main(int argc, char **argv){
         int8_t *q = malloc((size_t)N * K); float *sc = malloc(sizeof(float) * N);
         uint32_t s = 7; for (size_t i = 0; i < (size_t)M * K; i++) X[i] = frand(&s);
         for (size_t i = 0; i < (size_t)N * K; i++) q[i] = (int8_t)(frand(&s) * 127); for (int i = 0; i < N; i++) sc[i] = 0.01f;
-        QiMat W = { QI_I8, N, K, q, sc };
+        QiMat W = { QI_I8, N, K, q, sc, 0 };
         qi_gemm(Y, X, M, &W, NULL);
         struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
         int reps = 3; for (int r = 0; r < reps; r++) qi_gemm(Y, X, M, &W, NULL);

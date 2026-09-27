@@ -1188,6 +1188,18 @@ endif
 qwen36$(EXE): qwen36.c sse41_kernels.h decode_batch.h serve_poll.h cli_args.h qwen36_tier.h expert_ffn.h idot.h st.h json.h compat.h omp_tune.h kv_prefix.h pin_pool.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h gsgemv.h qgemv.h $(QWEN36_TIER_SRC) $(CUDA_OBJ) .build-config
 	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
 
+# Qwen-Image-2.1 text-to-image (docs/qwen-image.md). It reads the diffusers
+# checkpoint as it is: no conversion step. qi_gemm.h is its one matrix kernel.
+ifneq ($(EXE),)
+.PHONY: qwenimage
+qwenimage: qwenimage$(EXE)
+endif
+qwenimage$(EXE): qwenimage.c qi_gemm.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h tok_unicode_deepseek.h qwen38_nfc.h qwen38_nfc_tables.h serve_poll.h compat.h .build-config
+	$(CC) $(CFLAGS) qwenimage.c -o qwenimage$(EXE) $(LDFLAGS)
+
+test_qi_gemm$(EXE): tests/test_qi_gemm.c qi_gemm.h
+	$(CC) $(CFLAGS) tests/test_qi_gemm.c -o test_qi_gemm$(EXE) $(LDFLAGS)
+
 # DeepSeek V4.1 Flash: one file, like every other portable engine. The fp4 experts
 # stream from the official checkpoint and quant.h's mxfp4 kernel reads them as they
 # are, so there is no conversion target here to go with it.

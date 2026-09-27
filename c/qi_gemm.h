@@ -38,6 +38,8 @@ typedef struct {
     int N, K;           /* rows (outputs) x columns (inputs) */
     const void *w;      /* [N][K] in fmt */
     const float *sc;    /* QI_I8: one scale per row; NULL otherwise */
+    int ld;             /* row stride in elements, 0 = K. Lets attention read one head's
+                         * columns of K straight out of the [T][heads*hd] projection. */
 } QiMat;
 
 #define QI_MR 6
@@ -53,7 +55,7 @@ static inline float qi_bf16(uint16_t h){ union { uint32_t u; float f; } v; v.u =
 static void qi_pack_w(float *panel, const QiMat *W, int n0, int nr, int k0, int kc){
     for (int j = 0; j < QI_NR; j++) {
         if (j >= nr) { for (int k = 0; k < kc; k++) panel[k*QI_NR + j] = 0.f; continue; }
-        int64_t row = (int64_t)(n0 + j) * W->K + k0;
+        int64_t row = (int64_t)(n0 + j) * (W->ld ? W->ld : W->K) + k0;
         if (W->fmt == QI_F32) {
             const float *s = (const float *)W->w + row;
             for (int k = 0; k < kc; k++) panel[k*QI_NR + j] = s[k];

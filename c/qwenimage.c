@@ -1,0 +1,1183 @@
+/* qwenimage.c -- Qwen-Image-2.1 text-to-image in pure C.
+ *
+ * The checkpoint is a diffusers directory with three networks that are never
+ * needed at the same time:
+ *
+ *   text_encoder  Qwen3-VL's language model (36 layers, 8B). Only a prefill: the
+ *                 last layer's hidden states, before the final norm, are the
+ *                 prompt's embedding. lm_head and the vision tower are not read.
+ *   transformer   the DiT: 32 single-stream blocks over [prompt ; image tokens].
+ *                 Prompt tokens are modulated as if t = 0 and attend causally, so
+ *                 their keys and values do not depend on the step: they are
+ *                 computed ONCE per prompt (the "prefix pass") and every step only
+ *                 runs the image tokens against that cache.
+ *   vae           decodes the final latent to RGBA (qwenimage_vae.h).
+ *
+ * Weights are read straight from the checkpoint's safetensors (bf16) and kept in
+ * int8 with one scale per row by default (COLI_IMG_BITS=16 keeps bf16, 32 f32).
+ * Activations stay f32. Every matrix product runs through qi_gemm.h.
+ *
+ * Usage:
+ *   qwenimage --model DIR --prompt "..." [--width W] [--height H] [--steps N]
+ *             [--seed S] --out image.png
+ *   qwenimage --model DIR --serve        line protocol, see serve_loop()
+ *   qwenimage --model DIR --ref REFDIR   compare every stage with a reference
+ *                                         dump (tools/make_qwenimage_tiny.py) */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <math.h>
+#include <time.h>
+#include <errno.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+#include "st.h"
+#include "json.h"
+#include "tok.h"
+#include "qwen38_nfc.h"
+#include "qi_gemm.h"
+#include "serve_poll.h"
+#if defined(__has_include)
+#if __has_include("qwenimage_vae.h")
+#include "qwenimage_vae.h"
+#define QI_HAVE_VAE 1
+#endif
+#endif
+
+static double now_s(void){
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec * 1e-9;
+}
+static void *xmalloc(size_t n){
+    void *p = malloc(n ? n : 1);
+    if (!p) { fprintf(stderr, "[qwenimage] out of memory (%zu bytes)\n", n); exit(1); }
+    return p;
+}
+static float *fmalloc(size_t n){ return (float *)xmalloc(n * sizeof(float)); }
+
+static char *read_file(const char *path){
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    char *b = xmalloc((size_t)n + 1);
+    if (fread(b, 1, (size_t)n, f) != (size_t)n) { fclose(f); free(b); return NULL; }
+    b[n] = 0; fclose(f);
+    return b;
+}
+static jval *read_json(const char *dir, const char *file, char **arena){
+    char path[2048]; snprintf(path, sizeof path, "%s/%s", dir, file);
+    char *text = read_file(path);
+    if (!text) { fprintf(stderr, "[qwenimage] cannot read %s\n", path); exit(1); }
+    jval *v = json_parse(text, arena);
+    free(text);
+    if (!v) { fprintf(stderr, "[qwenimage] bad JSON in %s\n", path); exit(1); }
+    return v;
+}
+static double jnum(jval *o, const char *k, double def){
+    jval *v = o ? json_get(o, k) : NULL;
+    return v && v->t == J_NUM ? v->num : def;
+}
+static int jbool(jval *o, const char *k, int def){
+    jval *v = o ? json_get(o, k) : NULL;
+    return v && v->t == J_BOOL ? v->boolean : def;
+}
+
+/* ---- weights ------------------------------------------------------------ */
+
+static int g_bits = 8;   /* COLI_IMG_BITS: storage of the big matrices */
+
+typedef struct { QiMat m; void *own; float *own_sc; } Lin;
+
+static st_tensor *need_tensor(shards *S, const char *name, int64_t n0, int64_t n1){
+    st_tensor *t = st_find(S, name);
+    if (!t) { fprintf(stderr, "[qwenimage] missing tensor %s\n", name); exit(1); }
+    int64_t numel = 1; for (int i = 0; i < t->rank; i++) numel *= t->shape[i];
+    if (numel != n0 * n1) {
+        fprintf(stderr, "[qwenimage] %s has %lld values, expected %lld x %lld\n",
+                name, (long long)numel, (long long)n0, (long long)n1);
+        exit(1);
+    }
+    return t;
+}
+
+/* bits: 8 = int8 rows, 16 = bf16, 32 = f32. Small matrices ask for 32. */
+static void lin_load(shards *S, const char *name, int N, int K, int bits, Lin *out){
+    need_tensor(S, name, N, K);
+    float *tmp = fmalloc((size_t)N * K);
+    st_read_f32_cap(S, name, tmp, (int64_t)N * K, 1);
+    memset(out, 0, sizeof *out);
+    out->m.N = N; out->m.K = K;
+    if (bits == 32) {
+        out->m.fmt = QI_F32; out->m.w = out->own = tmp;
+    } else if (bits == 16) {
+        uint16_t *b = xmalloc((size_t)N * K * 2);
+        #pragma omp parallel for schedule(static)
+        for (int64_t i = 0; i < (int64_t)N * K; i++) {
+            union { float f; uint32_t u; } v; v.f = tmp[i];
+            b[i] = (uint16_t)((v.u + 0x7fff + ((v.u >> 16) & 1)) >> 16);
+        }
+        free(tmp);
+        out->m.fmt = QI_BF16; out->m.w = out->own = b;
+    } else {
+        int8_t *q = xmalloc((size_t)N * K);
+        float *sc = fmalloc(N);
+        qi_quantize_i8(tmp, N, K, q, sc);
+        free(tmp);
+        out->m.fmt = QI_I8; out->m.w = out->own = q; out->m.sc = out->own_sc = sc;
+    }
+}
+static void lin_free(Lin *l){ free(l->own); free(l->own_sc); memset(l, 0, sizeof *l); }
+static size_t lin_bytes(const Lin *l){
+    size_t e = l->m.fmt == QI_F32 ? 4 : l->m.fmt == QI_BF16 ? 2 : 1;
+    return (size_t)l->m.N * l->m.K * e + (l->own_sc ? (size_t)l->m.N * 4 : 0);
+}
+static float *vec_load(shards *S, const char *name, int n){
+    need_tensor(S, name, n, 1);
+    float *v = fmalloc(n);
+    st_read_f32_cap(S, name, v, n, 1);
+    return v;
+}
+static inline void linear(float *y, const float *x, int M, const Lin *l){ qi_gemm(y, x, M, &l->m, NULL); }
+
+/* ---- small kernels -------------------------------------------------------- */
+
+static void rmsnorm_rows(float *y, const float *x, const float *w, int T, int D, float eps, int plus_one){
+    #pragma omp parallel for schedule(static)
+    for (int t = 0; t < T; t++) {
+        const float *r = x + (int64_t)t * D; float *o = y + (int64_t)t * D;
+        double ss = 0; for (int i = 0; i < D; i++) ss += (double)r[i] * r[i];
+        float s = 1.f / sqrtf((float)(ss / D) + eps);
+        for (int i = 0; i < D; i++) o[i] = r[i] * s * (plus_one ? w[i] + 1.f : w[i]);
+    }
+}
+/* LayerNorm without affine, then * (1 + scale). */
+static void layernorm_mod(float *y, const float *x, const float *scale, int T, int D, float eps){
+    #pragma omp parallel for schedule(static)
+    for (int t = 0; t < T; t++) {
+        const float *r = x + (int64_t)t * D; float *o = y + (int64_t)t * D;
+        double m = 0; for (int i = 0; i < D; i++) m += r[i];
+        m /= D;
+        double v = 0; for (int i = 0; i < D; i++) { double d = r[i] - m; v += d * d; }
+        v /= D;
+        float inv = 1.f / sqrtf((float)v + eps), mf = (float)m;
+        for (int i = 0; i < D; i++) o[i] = (r[i] - mf) * inv * (1.f + scale[i]);
+    }
+}
+static inline float silu(float x){ return x / (1.f + expf(-x)); }
+static inline float gelu_tanh(float x){
+    return 0.5f * x * (1.f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
+}
+
+/* Attention for every head: out[Tq][heads*hd] = softmax(Q K^T / sqrt(hd)) V.
+ * Q rows have stride ldq, K/V rows stride ldk; query head h reads kv head
+ * h / (heads/kvheads). causal >= 0: query i sees keys j <= i + causal. */
+static void attention(float *out, int ldo, const float *Q, int ldq, int Tq,
+                      const float *K, const float *V, int ldk, int Tk,
+                      int heads, int kvheads, int hd, int causal){
+    float *S = fmalloc((size_t)Tq * Tk);
+    float *vt = fmalloc((size_t)hd * Tk);
+    const float scale = 1.f / sqrtf((float)hd);
+    int group = heads / kvheads, vt_head = -1;
+    for (int h = 0; h < heads; h++) {
+        int kh = h / group;
+        QiMat Km = { QI_F32, Tk, hd, K + (int64_t)kh * hd, NULL, ldk };
+        qi_gemm_ld(S, Tk, Q + (int64_t)h * hd, ldq, Tq, &Km, NULL);
+        #pragma omp parallel for schedule(static)
+        for (int i = 0; i < Tq; i++) {
+            float *r = S + (int64_t)i * Tk;
+            int lim = causal >= 0 ? i + causal + 1 : Tk;
+            if (lim > Tk) lim = Tk;
+            float mx = -INFINITY;
+            for (int j = 0; j < lim; j++) { r[j] *= scale; if (r[j] > mx) mx = r[j]; }
+            double sum = 0;
+            for (int j = 0; j < lim; j++) { r[j] = expf(r[j] - mx); sum += r[j]; }
+            float inv = (float)(1.0 / sum);
+            for (int j = 0; j < lim; j++) r[j] *= inv;
+            for (int j = lim; j < Tk; j++) r[j] = 0.f;
+        }
+        if (kh != vt_head) {
+            #pragma omp parallel for schedule(static)
+            for (int d = 0; d < hd; d++)
+                for (int j = 0; j < Tk; j++) vt[(int64_t)d * Tk + j] = V[(int64_t)j * ldk + (int64_t)kh * hd + d];
+            vt_head = kh;
+        }
+        QiMat Vm = { QI_F32, hd, Tk, vt, NULL, 0 };
+        qi_gemm_ld(out + (int64_t)h * hd, ldo, S, Tk, Tq, &Vm, NULL);
+    }
+    free(S); free(vt);
+}
+
+/* ---- text encoder (Qwen3-VL language model, prefill only) ------------------ */
+
+typedef struct { Lin q, k, v, o, gate, up, down; float *ln1, *ln2, *qn, *kn; } TeLayer;
+typedef struct {
+    int hidden, layers, heads, kv, hd, inter, vocab;
+    float eps, theta;
+    shards S; int open;
+    st_tensor *embed;
+    TeLayer *L; int loaded;
+    Tok tok; int tok_loaded;
+    int im_start, im_end;
+} Te;
+
+static void te_config(Te *te, const char *model){
+    char dir[2048]; snprintf(dir, sizeof dir, "%s/text_encoder", model);
+    char *arena = NULL;
+    jval *root = read_json(dir, "config.json", &arena);
+    jval *c = json_get(root, "text_config"); if (!c) c = root;
+    te->hidden = (int)jnum(c, "hidden_size", 0);
+    te->layers = (int)jnum(c, "num_hidden_layers", 0);
+    te->heads = (int)jnum(c, "num_attention_heads", 0);
+    te->kv = (int)jnum(c, "num_key_value_heads", te->heads);
+    te->hd = (int)jnum(c, "head_dim", te->heads ? te->hidden / te->heads : 0);
+    te->inter = (int)jnum(c, "intermediate_size", 0);
+    te->vocab = (int)jnum(c, "vocab_size", 0);
+    te->eps = (float)jnum(c, "rms_norm_eps", 1e-6);
+    te->theta = (float)jnum(c, "rope_theta", 0);
+    if (te->theta == 0) {
+        jval *rp = json_get(c, "rope_parameters");
+        te->theta = (float)jnum(rp, "rope_theta", 5000000.0);
+    }
+    json_free(root); free(arena);
+    if (te->hidden <= 0 || te->layers <= 0 || te->heads <= 0 || te->kv <= 0 || te->hd <= 0 ||
+        te->heads % te->kv || te->inter <= 0 || te->vocab <= 0 || te->hd % 2) {
+        fprintf(stderr, "[qwenimage] text_encoder/config.json: unsupported shape\n"); exit(1);
+    }
+}
+
+static void te_open(Te *te, const char *model){
+    if (te->open) return;
+    char dir[2048]; snprintf(dir, sizeof dir, "%s/text_encoder", model);
+    memset(&te->S, 0, sizeof te->S);
+    st_init(&te->S, dir);
+    te->open = 1;
+    te->embed = need_tensor(&te->S, "model.language_model.embed_tokens.weight", te->vocab, te->hidden);
+    if (te->embed->dtype != 0 && te->embed->dtype != 2) {
+        fprintf(stderr, "[qwenimage] embed_tokens must be bf16 or f32\n"); exit(1);
+    }
+}
+
+static void te_load(Te *te, const char *model){
+    if (te->loaded) return;
+    te_open(te, model);
+    double t0 = now_s();
+    te->L = calloc(te->layers, sizeof(TeLayer));
+    int H = te->hidden, qd = te->heads * te->hd, kd = te->kv * te->hd;
+    char n[256];
+    size_t bytes = 0;
+    for (int l = 0; l < te->layers; l++) {
+        TeLayer *L = &te->L[l];
+#define TN(s) (snprintf(n, sizeof n, "model.language_model.layers.%d.%s", l, s), n)
+        lin_load(&te->S, TN("self_attn.q_proj.weight"), qd, H, g_bits, &L->q);
+        lin_load(&te->S, TN("self_attn.k_proj.weight"), kd, H, g_bits, &L->k);
+        lin_load(&te->S, TN("self_attn.v_proj.weight"), kd, H, g_bits, &L->v);
+        lin_load(&te->S, TN("self_attn.o_proj.weight"), H, qd, g_bits, &L->o);
+        lin_load(&te->S, TN("mlp.gate_proj.weight"), te->inter, H, g_bits, &L->gate);
+        lin_load(&te->S, TN("mlp.up_proj.weight"), te->inter, H, g_bits, &L->up);
+        lin_load(&te->S, TN("mlp.down_proj.weight"), H, te->inter, g_bits, &L->down);
+        L->ln1 = vec_load(&te->S, TN("input_layernorm.weight"), H);
+        L->ln2 = vec_load(&te->S, TN("post_attention_layernorm.weight"), H);
+        L->qn = vec_load(&te->S, TN("self_attn.q_norm.weight"), te->hd);
+        L->kn = vec_load(&te->S, TN("self_attn.k_norm.weight"), te->hd);
+#undef TN
+        bytes += lin_bytes(&L->q) + lin_bytes(&L->k) + lin_bytes(&L->v) + lin_bytes(&L->o) +
+                 lin_bytes(&L->gate) + lin_bytes(&L->up) + lin_bytes(&L->down);
+    }
+    te->loaded = 1;
+    fprintf(stderr, "[qwenimage] text encoder: %d layers, %.2f GB resident (%s), %.1f s\n",
+            te->layers, bytes / 1e9, g_bits == 8 ? "int8" : g_bits == 16 ? "bf16" : "f32", now_s() - t0);
+}
+
+static void te_unload(Te *te){
+    if (!te->loaded) return;
+    for (int l = 0; l < te->layers; l++) {
+        TeLayer *L = &te->L[l];
+        lin_free(&L->q); lin_free(&L->k); lin_free(&L->v); lin_free(&L->o);
+        lin_free(&L->gate); lin_free(&L->up); lin_free(&L->down);
+        free(L->ln1); free(L->ln2); free(L->qn); free(L->kn);
+    }
+    free(te->L); te->L = NULL; te->loaded = 0;
+}
+
+static void te_tokenizer(Te *te, const char *model){
+    if (te->tok_loaded) return;
+    char path[2048]; snprintf(path, sizeof path, "%s/processor/tokenizer.json", model);
+    FILE *f = fopen(path, "rb");
+    if (!f) snprintf(path, sizeof path, "%s/tokenizer/tokenizer.json", model);
+    else fclose(f);
+    memset(&te->tok, 0, sizeof te->tok);
+    tok_load(&te->tok, path);
+    te->tok_loaded = 1;
+    te->im_start = tok_id_of(&te->tok, "<|im_start|>");
+    te->im_end = tok_id_of(&te->tok, "<|im_end|>");
+    if (te->im_start < 0 || te->im_end < 0) {
+        fprintf(stderr, "[qwenimage] tokenizer has no <|im_start|>/<|im_end|>\n"); exit(1);
+    }
+}
+
+/* The pipeline's template, tokenized as one string (not through
+ * apply_chat_template: the checkpoint was trained on this one). */
+static const char *QI_SYS = "Comprehend and analyze the provided prompt.";
+
+static int *te_encode_prompt(Te *te, const char *prompt, int *n_out, int *drop_out){
+    char *norm = NULL; size_t norm_len = 0;
+    const char *p = prompt && *prompt ? prompt : " ";   /* the pipeline's rule: no empty prompt */
+    if (q38_nfc_normalize(p, strlen(p), &norm, &norm_len) != 0) { norm = strdup(p); norm_len = strlen(p); }
+    size_t cap = norm_len + 512;
+    char *text = xmalloc(cap);
+    snprintf(text, cap, "<|im_start|>system\n%s<|im_end|>\n<|im_start|>user\n%.*s<|im_end|>\n<|im_start|>assistant\n",
+             QI_SYS, (int)norm_len, norm);
+    int max = (int)strlen(text) + 16;
+    int *ids = xmalloc(sizeof(int) * max);
+    int n = tok_encode(&te->tok, text, (int)strlen(text), ids, max);
+    /* drop_idx: the tokens of the system turn, "<|im_start|>system\n...<|im_end|>\n" */
+    char sys[512]; snprintf(sys, sizeof sys, "<|im_start|>system\n%s<|im_end|>\n", QI_SYS);
+    int tmp[256];
+    int drop = tok_encode(&te->tok, sys, (int)strlen(sys), tmp, 256);
+    free(text); free(norm);
+    *n_out = n; *drop_out = drop;
+    return ids;
+}
+
+/* rotate-half RoPE over the full head (text only: Qwen3-VL's M-RoPE with three
+ * equal position components is the plain 1D rotary). */
+static void te_rope(float *x, int T, int nh, int hd, int ld, float theta){
+    int half = hd / 2;
+    float *inv = fmalloc(half);
+    for (int i = 0; i < half; i++) inv[i] = 1.f / powf(theta, (float)(2 * i) / (float)hd);
+    #pragma omp parallel for schedule(static)
+    for (int t = 0; t < T; t++)
+        for (int h = 0; h < nh; h++) {
+            float *r = x + (int64_t)t * ld + (int64_t)h * hd;
+            for (int i = 0; i < half; i++) {
+                float a = (float)t * inv[i], c = cosf(a), s = sinf(a);
+                float x0 = r[i], x1 = r[i + half];
+                r[i] = x0 * c - x1 * s;
+                r[i + half] = x1 * c + x0 * s;
+            }
+        }
+    free(inv);
+}
+
+/* ids[T] -> hidden[T][hidden]: the last layer's output before the final norm. */
+static float *te_forward(Te *te, const int *ids, int T){
+    int H = te->hidden, qd = te->heads * te->hd, kd = te->kv * te->hd, I = te->inter;
+    float *x = fmalloc((size_t)T * H), *h = fmalloc((size_t)T * H);
+    float *q = fmalloc((size_t)T * qd), *k = fmalloc((size_t)T * kd), *v = fmalloc((size_t)T * kd);
+    float *a = fmalloc((size_t)T * qd), *g = fmalloc((size_t)T * I), *u = fmalloc((size_t)T * I);
+    int esz = te->embed->dtype == 0 ? 2 : 4;
+    void *row = xmalloc((size_t)H * esz);
+    for (int t = 0; t < T; t++) {
+        if (ids[t] < 0 || ids[t] >= te->vocab) { fprintf(stderr, "[qwenimage] token id %d out of range\n", ids[t]); exit(1); }
+        st_pread_full(te->embed->fd, row, (int64_t)H * esz, te->embed->off + (int64_t)ids[t] * H * esz, "embed row");
+        float *dst = x + (int64_t)t * H;
+        if (esz == 2) for (int i = 0; i < H; i++) dst[i] = qi_bf16(((uint16_t *)row)[i]);
+        else memcpy(dst, row, (size_t)H * 4);
+    }
+    free(row);
+    for (int l = 0; l < te->layers; l++) {
+        TeLayer *L = &te->L[l];
+        rmsnorm_rows(h, x, L->ln1, T, H, te->eps, 0);
+        linear(q, h, T, &L->q); linear(k, h, T, &L->k); linear(v, h, T, &L->v);
+        rmsnorm_rows(q, q, L->qn, T * te->heads, te->hd, te->eps, 0);
+        rmsnorm_rows(k, k, L->kn, T * te->kv, te->hd, te->eps, 0);
+        te_rope(q, T, te->heads, te->hd, qd, te->theta);
+        te_rope(k, T, te->kv, te->hd, kd, te->theta);
+        attention(a, qd, q, qd, T, k, v, kd, T, te->heads, te->kv, te->hd, 0);
+        linear(h, a, T, &L->o);
+        for (int64_t i = 0; i < (int64_t)T * H; i++) x[i] += h[i];
+        rmsnorm_rows(h, x, L->ln2, T, H, te->eps, 0);
+        linear(g, h, T, &L->gate); linear(u, h, T, &L->up);
+        #pragma omp parallel for schedule(static)
+        for (int64_t i = 0; i < (int64_t)T * I; i++) g[i] = silu(g[i]) * u[i];
+        linear(h, g, T, &L->down);
+        for (int64_t i = 0; i < (int64_t)T * H; i++) x[i] += h[i];
+    }
+    free(h); free(q); free(k); free(v); free(a); free(g); free(u);
+    return x;
+}
+
+/* ---- DiT ------------------------------------------------------------------- */
+
+typedef struct { Lin q, k, v, o, gate, proj, out; float *nq, *nk; } DitBlock;
+typedef struct {
+    int layers, heads, hd, dim, mlp, in_ch, ctx, axes[3];
+    float eps;
+    int causal_condition;
+    Lin img_in, t1, t2, mod, norm_out, proj_out, txt1, txt2;
+    float *txt_norm;
+    DitBlock *B;
+    int loaded;
+} Dit;
+
+static void dit_config(Dit *d, const char *model){
+    char dir[2048]; snprintf(dir, sizeof dir, "%s/transformer", model);
+    char *arena = NULL;
+    jval *c = read_json(dir, "config.json", &arena);
+    d->layers = (int)jnum(c, "num_layers", 0);
+    d->heads = (int)jnum(c, "num_attention_heads", 0);
+    d->hd = (int)jnum(c, "attention_head_dim", 0);
+    d->dim = d->heads * d->hd;
+    d->mlp = d->dim * (int)jnum(c, "mlp_ratio", 3);
+    d->in_ch = (int)jnum(c, "in_channels", 64);
+    d->ctx = (int)jnum(c, "context_in_dim", 0);
+    d->eps = (float)jnum(c, "eps", 1e-6);
+    d->causal_condition = jbool(c, "causal_condition", 1);
+    int patch = (int)jnum(c, "patch_size", 1), outc = (int)jnum(c, "out_channels", d->in_ch);
+    jval *ax = json_get(c, "axes_dims_rope");
+    int ok = ax && ax->t == J_ARR && ax->len == 3;
+    for (int i = 0; ok && i < 3; i++) d->axes[i] = (int)ax->kids[i]->num;
+    json_free(c); free(arena);
+    if (!ok || d->axes[0] + d->axes[1] + d->axes[2] != d->hd || d->layers <= 0 || d->heads <= 0 ||
+        d->hd % 2 || patch != 1 || outc != d->in_ch || d->ctx <= 0 || !d->causal_condition) {
+        fprintf(stderr, "[qwenimage] transformer/config.json: unsupported shape "
+                        "(needs patch_size 1, causal_condition, axes summing to the head dim)\n");
+        exit(1);
+    }
+}
+
+static void dit_load(Dit *d, const char *model){
+    if (d->loaded) return;
+    char dir[2048]; snprintf(dir, sizeof dir, "%s/transformer", model);
+    shards S; memset(&S, 0, sizeof S);
+    st_init(&S, dir);
+    double t0 = now_s();
+    int D = d->dim;
+    lin_load(&S, "img_in.weight", D, d->in_ch, 32, &d->img_in);
+    lin_load(&S, "time_text_embed.timestep_embedder.linear_1.weight", D, 256, 32, &d->t1);
+    lin_load(&S, "time_text_embed.timestep_embedder.linear_2.weight", D, D, 32, &d->t2);
+    lin_load(&S, "modulation.1.weight", 4 * D, D, g_bits, &d->mod);
+    lin_load(&S, "norm_out.linear.weight", D, D, 32, &d->norm_out);
+    lin_load(&S, "proj_out.weight", d->in_ch, D, 32, &d->proj_out);
+    lin_load(&S, "txt_in.in_layer.weight", D, d->ctx, g_bits, &d->txt1);
+    lin_load(&S, "txt_in.out_layer.weight", D, D, g_bits, &d->txt2);
+    d->txt_norm = vec_load(&S, "txt_in.text_norm.weight", d->ctx);
+    d->B = calloc(d->layers, sizeof(DitBlock));
+    char n[256];
+    size_t bytes = 0;
+    for (int l = 0; l < d->layers; l++) {
+        DitBlock *B = &d->B[l];
+#define BN(s) (snprintf(n, sizeof n, "transformer_blocks.%d.%s", l, s), n)
+        lin_load(&S, BN("attn.to_q.weight"), D, D, g_bits, &B->q);
+        lin_load(&S, BN("attn.to_k.weight"), D, D, g_bits, &B->k);
+        lin_load(&S, BN("attn.to_v.weight"), D, D, g_bits, &B->v);
+        lin_load(&S, BN("attn.to_out.0.weight"), D, D, g_bits, &B->o);
+        lin_load(&S, BN("img_mlp.gate_layer.weight"), d->mlp, D, g_bits, &B->gate);
+        lin_load(&S, BN("img_mlp.proj.weight"), d->mlp, D, g_bits, &B->proj);
+        lin_load(&S, BN("img_mlp.out.weight"), D, d->mlp, g_bits, &B->out);
+        B->nq = vec_load(&S, BN("attn.norm_q.weight"), d->hd);
+        B->nk = vec_load(&S, BN("attn.norm_k.weight"), d->hd);
+#undef BN
+        bytes += lin_bytes(&B->q) + lin_bytes(&B->k) + lin_bytes(&B->v) + lin_bytes(&B->o) +
+                 lin_bytes(&B->gate) + lin_bytes(&B->proj) + lin_bytes(&B->out);
+    }
+    st_destroy(&S);
+    d->loaded = 1;
+    fprintf(stderr, "[qwenimage] transformer: %d blocks, %.2f GB resident, %.1f s\n",
+            d->layers, (bytes + lin_bytes(&d->mod) + lin_bytes(&d->txt1) + lin_bytes(&d->txt2)) / 1e9,
+            now_s() - t0);
+}
+
+/* The sinusoidal embedding of the timestep, then the two linears. `t` is the
+ * scheduler's timestep (sigma * 1000); the pipeline divides it by 1000 and the
+ * embedding multiplies it back, so do the same float round trip. */
+static void dit_temb(Dit *d, float t, float *temb){
+    float tt = (t / 1000.f) * 1000.f;
+    float e[256];
+    const int half = 128;
+    for (int i = 0; i < half; i++) {
+        float f = expf((float)(-9.210340371976184) * (float)i / (float)half);  /* -ln(10000) */
+        float a = tt * f;
+        e[i] = cosf(a); e[half + i] = sinf(a);
+    }
+    float *h = fmalloc(d->dim);
+    qi_gemm(h, e, 1, &d->t1.m, NULL);
+    for (int i = 0; i < d->dim; i++) h[i] = silu(h[i]);
+    qi_gemm(temb, h, 1, &d->t2.m, NULL);
+    free(h);
+}
+/* mod[4*dim] = [scale1 | gate1 | scale2 | gate2], outs[dim] = the final norm's scale */
+static void dit_modulation(Dit *d, float t, float *mod, float *outs){
+    float *temb = fmalloc(d->dim), *s = fmalloc(d->dim);
+    dit_temb(d, t, temb);
+    for (int i = 0; i < d->dim; i++) s[i] = silu(temb[i]);
+    qi_gemm(mod, s, 1, &d->mod.m, NULL);
+    qi_gemm(outs, s, 1, &d->norm_out.m, NULL);
+    free(temb); free(s);
+}
+
+/* cos/sin for the three-axis RoPE: tokens x hd/2 complex frequencies. */
+static void dit_rope_table(const Dit *d, const int *pos3, int T, float *cs, float *sn){
+    int half = d->hd / 2;
+    float *freq = fmalloc(half); int *axis = xmalloc(sizeof(int) * half);
+    int j = 0;
+    for (int a = 0; a < 3; a++)
+        for (int i = 0; i < d->axes[a] / 2; i++, j++) {
+            freq[j] = 1.f / powf(10000.f, (float)(2 * i) / (float)d->axes[a]);
+            axis[j] = a;
+        }
+    #pragma omp parallel for schedule(static)
+    for (int t = 0; t < T; t++)
+        for (int i = 0; i < half; i++) {
+            float ang = (float)pos3[t * 3 + axis[i]] * freq[i];
+            cs[(int64_t)t * half + i] = cosf(ang);
+            sn[(int64_t)t * half + i] = sinf(ang);
+        }
+    free(freq); free(axis);
+}
+/* interleaved pairs (2i, 2i+1) rotated as complex numbers */
+static void dit_rope_apply(float *x, int T, int heads, int hd, const float *cs, const float *sn){
+    int half = hd / 2, D = heads * hd;
+    #pragma omp parallel for schedule(static)
+    for (int t = 0; t < T; t++)
+        for (int h = 0; h < heads; h++) {
+            float *r = x + (int64_t)t * D + (int64_t)h * hd;
+            const float *c = cs + (int64_t)t * half, *s = sn + (int64_t)t * half;
+            for (int i = 0; i < half; i++) {
+                float a = r[2 * i], b = r[2 * i + 1];
+                r[2 * i] = a * c[i] - b * s[i];
+                r[2 * i + 1] = a * s[i] + b * c[i];
+            }
+        }
+}
+
+/* The prompt side of the DiT, computed once per prompt: per block, the keys and
+ * values of the text tokens (after norm and RoPE). */
+typedef struct { int L; float **K, **V; } Prefix;
+
+static void prefix_free(Prefix *p, int layers){
+    if (p->K) for (int l = 0; l < layers; l++) { free(p->K[l]); free(p->V[l]); }
+    free(p->K); free(p->V); memset(p, 0, sizeof *p);
+}
+
+/* One block over T tokens. q/k/v are written into kbuf/vbuf at row koff (the
+ * caller lays the prefix before the image tokens); attention runs over the
+ * first ktotal rows. causal: -1 full, >=0 as in attention(). */
+typedef struct { float *h, *q, *a, *g, *u; } DitScratch;
+
+static void dit_block(Dit *d, DitBlock *B, float *x, int T, const float *mod,
+                      float *kbuf, float *vbuf, int koff, int ktotal, int causal,
+                      const float *cs, const float *sn, DitScratch *w, int need_out){
+    int D = d->dim;
+    const float *scale1 = mod, *gate1 = mod + D, *scale2 = mod + 2 * D, *gate2 = mod + 3 * D;
+    layernorm_mod(w->h, x, scale1, T, D, d->eps);
+    float *k = kbuf + (int64_t)koff * D, *v = vbuf + (int64_t)koff * D;
+    linear(w->q, w->h, T, &B->q); linear(k, w->h, T, &B->k); linear(v, w->h, T, &B->v);
+    rmsnorm_rows(w->q, w->q, B->nq, T * d->heads, d->hd, d->eps, 0);
+    rmsnorm_rows(k, k, B->nk, T * d->heads, d->hd, d->eps, 0);
+    dit_rope_apply(w->q, T, d->heads, d->hd, cs, sn);
+    dit_rope_apply(k, T, d->heads, d->hd, cs, sn);
+    if (!need_out) return;
+    attention(w->a, D, w->q, D, T, kbuf, vbuf, D, ktotal, d->heads, d->heads, d->hd, causal);
+    linear(w->h, w->a, T, &B->o);
+    #pragma omp parallel for schedule(static)
+    for (int t = 0; t < T; t++)
+        for (int i = 0; i < D; i++) x[(int64_t)t * D + i] += tanhf(gate1[i]) * w->h[(int64_t)t * D + i];
+    layernorm_mod(w->h, x, scale2, T, D, d->eps);
+    linear(w->g, w->h, T, &B->gate); linear(w->u, w->h, T, &B->proj);
+    #pragma omp parallel for schedule(static)
+    for (int64_t i = 0; i < (int64_t)T * d->mlp; i++) w->g[i] = silu(w->g[i]) * w->u[i];
+    linear(w->h, w->g, T, &B->out);
+    #pragma omp parallel for schedule(static)
+    for (int t = 0; t < T; t++)
+        for (int i = 0; i < D; i++) x[(int64_t)t * D + i] += tanhf(gate2[i]) * w->h[(int64_t)t * D + i];
+}
+
+static void scratch_alloc(DitScratch *w, const Dit *d, int T){
+    w->h = fmalloc((size_t)T * d->dim); w->q = fmalloc((size_t)T * d->dim); w->a = fmalloc((size_t)T * d->dim);
+    w->g = fmalloc((size_t)T * d->mlp); w->u = fmalloc((size_t)T * d->mlp);
+}
+static void scratch_free(DitScratch *w){ free(w->h); free(w->q); free(w->a); free(w->g); free(w->u); }
+
+/* emb[L][ctx] (the text encoder's output after drop_idx) -> per-block K/V of the prefix. */
+static void dit_prefix(Dit *d, const float *emb, int L, Prefix *p, float *txt_out /* optional [L][dim] */){
+    int D = d->dim;
+    float *n = fmalloc((size_t)L * d->ctx), *x = fmalloc((size_t)L * D);
+    rmsnorm_rows(n, emb, d->txt_norm, L, d->ctx, d->eps, 1);
+    linear(x, n, L, &d->txt1);
+    for (int64_t i = 0; i < (int64_t)L * D; i++) x[i] = gelu_tanh(x[i]);
+    free(n);
+    float *y = fmalloc((size_t)L * D);
+    linear(y, x, L, &d->txt2);
+    free(x); x = y;
+    if (txt_out) memcpy(txt_out, x, (size_t)L * D * 4);
+    float *mod = fmalloc(4 * (size_t)D), *outs = fmalloc(D);
+    dit_modulation(d, 0.f, mod, outs);
+    int *pos = xmalloc(sizeof(int) * 3 * L);
+    for (int t = 0; t < L; t++) pos[3 * t] = pos[3 * t + 1] = pos[3 * t + 2] = t;
+    float *cs = fmalloc((size_t)L * d->hd / 2), *sn = fmalloc((size_t)L * d->hd / 2);
+    dit_rope_table(d, pos, L, cs, sn);
+    p->L = L;
+    p->K = calloc(d->layers, sizeof(float *)); p->V = calloc(d->layers, sizeof(float *));
+    DitScratch w; scratch_alloc(&w, d, L);
+    for (int l = 0; l < d->layers; l++) {
+        p->K[l] = fmalloc((size_t)L * D); p->V[l] = fmalloc((size_t)L * D);
+        /* the last block's output is never read: only its keys and values are */
+        dit_block(d, &d->B[l], x, L, mod, p->K[l], p->V[l], 0, L, 0, cs, sn, &w, l + 1 < d->layers);
+    }
+    scratch_free(&w);
+    free(x); free(mod); free(outs); free(pos); free(cs); free(sn);
+}
+
+/* noise_pred[N][in_ch] for the image tokens at timestep t. */
+typedef struct { float *kbuf, *vbuf, *cs, *sn, *x; DitScratch w; int N; } DitStep;
+
+static void dit_step_init(DitStep *s, Dit *d, const Prefix *p, int gh, int gw){
+    int N = gh * gw, T = p->L + N;
+    s->N = N;
+    s->kbuf = fmalloc((size_t)T * d->dim); s->vbuf = fmalloc((size_t)T * d->dim);
+    s->cs = fmalloc((size_t)N * d->hd / 2); s->sn = fmalloc((size_t)N * d->hd / 2);
+    s->x = fmalloc((size_t)N * d->dim);
+    scratch_alloc(&s->w, d, N);
+    /* image tokens: frame = the position after the text, height and width centred on zero */
+    int *pos = xmalloc(sizeof(int) * 3 * N);
+    for (int y = 0; y < gh; y++)
+        for (int xx = 0; xx < gw; xx++) {
+            int t = y * gw + xx;
+            pos[3 * t] = p->L;
+            pos[3 * t + 1] = y - (gh - gh / 2);
+            pos[3 * t + 2] = xx - (gw - gw / 2);
+        }
+    dit_rope_table(d, pos, N, s->cs, s->sn);
+    free(pos);
+}
+static void dit_step_free(DitStep *s){
+    free(s->kbuf); free(s->vbuf); free(s->cs); free(s->sn); free(s->x); scratch_free(&s->w);
+}
+
+static void dit_forward(Dit *d, const Prefix *p, DitStep *s, const float *lat, float t, float *out){
+    int D = d->dim, N = s->N, L = p->L;
+    float *mod = fmalloc(4 * (size_t)D), *outs = fmalloc(D);
+    dit_modulation(d, t, mod, outs);
+    linear(s->x, lat, N, &d->img_in);
+    for (int l = 0; l < d->layers; l++) {
+        memcpy(s->kbuf, p->K[l], (size_t)L * D * 4);
+        memcpy(s->vbuf, p->V[l], (size_t)L * D * 4);
+        dit_block(d, &d->B[l], s->x, N, mod, s->kbuf, s->vbuf, L, L + N, -1, s->cs, s->sn, &s->w, 1);
+    }
+    layernorm_mod(s->w.h, s->x, outs, N, D, d->eps);
+    linear(out, s->w.h, N, &d->proj_out);
+    free(mod); free(outs);
+}
+
+/* ---- scheduler ------------------------------------------------------------- */
+
+typedef struct { double base_seq, max_seq, base_shift, max_shift, shift_terminal; int dynamic, exponential; } Sched;
+
+static void sched_config(Sched *s, const char *model){
+    char dir[2048]; snprintf(dir, sizeof dir, "%s/scheduler", model);
+    char *arena = NULL;
+    jval *c = read_json(dir, "scheduler_config.json", &arena);
+    s->base_seq = jnum(c, "base_image_seq_len", 256);
+    s->max_seq = jnum(c, "max_image_seq_len", 4096);
+    s->base_shift = jnum(c, "base_shift", 0.5);
+    s->max_shift = jnum(c, "max_shift", 1.15);
+    jval *st = json_get(c, "shift_terminal");
+    s->shift_terminal = st && st->t == J_NUM ? st->num : 0;
+    s->dynamic = jbool(c, "use_dynamic_shifting", 1);
+    jval *ty = json_get(c, "time_shift_type");
+    s->exponential = !(ty && ty->t == J_STR && !strcmp(ty->str, "linear"));
+    int shift_one = jnum(c, "shift", 1.0) == 1.0;
+    int odd = jbool(c, "use_karras_sigmas", 0) || jbool(c, "use_exponential_sigmas", 0) ||
+              jbool(c, "use_beta_sigmas", 0) || jbool(c, "invert_sigmas", 0) || jbool(c, "stochastic_sampling", 0);
+    json_free(c); free(arena);
+    if (!s->dynamic || odd || !shift_one) {
+        fprintf(stderr, "[qwenimage] scheduler_config.json: only the dynamic-shift Euler schedule is implemented\n");
+        exit(1);
+    }
+}
+
+/* sig[steps+1] (last = 0) and ts[steps] = sig * 1000, float math like numpy's
+ * float32 arrays in the pipeline. */
+static void sched_sigmas(const Sched *s, int steps, int seq_len, float *sig, float *ts, double *mu_out){
+    double m = (s->max_shift - s->base_shift) / (s->max_seq - s->base_seq);
+    double mu = seq_len * m + (s->base_shift - m * s->base_seq);
+    float e = (float)exp(mu);
+    for (int i = 0; i < steps; i++) {
+        double lin = steps == 1 ? 1.0 : 1.0 + (1.0 / steps - 1.0) * i / (steps - 1);
+        float t = (float)lin;
+        sig[i] = s->exponential ? e / (e + (1.f / t - 1.f)) : (float)mu / ((float)mu + (1.f / t - 1.f));
+    }
+    if (s->shift_terminal > 0) {
+        float scale = (1.f - sig[steps - 1]) / (float)(1.0 - s->shift_terminal);
+        for (int i = 0; i < steps; i++) sig[i] = 1.f - (1.f - sig[i]) / scale;
+    }
+    sig[steps] = 0.f;
+    for (int i = 0; i < steps; i++) ts[i] = sig[i] * 1000.f;
+    if (mu_out) *mu_out = mu;
+}
+
+/* ---- RNG: splitmix64 + Box-Muller -------------------------------------------- */
+
+static uint64_t g_rng;
+static uint64_t rng_next(void){
+    uint64_t z = (g_rng += 0x9E3779B97F4A7C15ull);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+static void randn(float *x, size_t n, uint64_t seed){
+    g_rng = seed * 0x2545F4914F6CDD1Dull + 1;
+    for (size_t i = 0; i < n; i += 2) {
+        double u1 = ((rng_next() >> 11) + 1.0) / 9007199254740993.0, u2 = (rng_next() >> 11) / 9007199254740992.0;
+        double r = sqrt(-2.0 * log(u1)), a = 6.283185307179586 * u2;
+        x[i] = (float)(r * cos(a));
+        if (i + 1 < n) x[i + 1] = (float)(r * sin(a));
+    }
+}
+
+/* ---- PNG (stored deflate blocks: valid, uncompressed, no zlib) ---------------- */
+
+static uint32_t crc_tab[256];
+static void crc_init(void){
+    for (uint32_t n = 0; n < 256; n++) {
+        uint32_t c = n;
+        for (int k = 0; k < 8; k++) c = c & 1 ? 0xedb88320u ^ (c >> 1) : c >> 1;
+        crc_tab[n] = c;
+    }
+}
+static uint32_t crc_upd(uint32_t c, const uint8_t *b, size_t n){
+    for (size_t i = 0; i < n; i++) c = crc_tab[(c ^ b[i]) & 0xff] ^ (c >> 8);
+    return c;
+}
+static void be32(uint8_t *p, uint32_t v){ p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v; }
+static void png_chunk(FILE *f, const char *type, const uint8_t *data, uint32_t n){
+    uint8_t h[8]; be32(h, n); memcpy(h + 4, type, 4);
+    fwrite(h, 1, 8, f);
+    if (n) fwrite(data, 1, n, f);
+    uint32_t c = crc_upd(0xffffffffu, (const uint8_t *)type, 4);
+    c = crc_upd(c, data, n) ^ 0xffffffffu;
+    uint8_t t[4]; be32(t, c); fwrite(t, 1, 4, f);
+}
+static int write_png(const char *path, const uint8_t *rgba, int w, int h){
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    crc_init();
+    static const uint8_t sig[8] = { 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
+    fwrite(sig, 1, 8, f);
+    uint8_t ih[13]; be32(ih, w); be32(ih + 4, h); ih[8] = 8; ih[9] = 6; ih[10] = ih[11] = ih[12] = 0;
+    png_chunk(f, "IHDR", ih, 13);
+    size_t raw_n = (size_t)h * (1 + (size_t)w * 4);
+    uint8_t *raw = xmalloc(raw_n);
+    for (int y = 0; y < h; y++) { raw[(size_t)y * (1 + w * 4)] = 0; memcpy(raw + (size_t)y * (1 + w * 4) + 1, rgba + (size_t)y * w * 4, (size_t)w * 4); }
+    size_t blocks = (raw_n + 65534) / 65535;
+    size_t z_n = 2 + raw_n + blocks * 5 + 4;
+    uint8_t *z = xmalloc(z_n), *o = z;
+    *o++ = 0x78; *o++ = 0x01;
+    uint32_t a = 1, b = 0;
+    for (size_t off = 0; off < raw_n; off += 65535) {
+        size_t n = raw_n - off < 65535 ? raw_n - off : 65535;
+        *o++ = off + n == raw_n ? 1 : 0;
+        *o++ = n & 0xff; *o++ = n >> 8; *o++ = ~n & 0xff; *o++ = (~n >> 8) & 0xff;
+        memcpy(o, raw + off, n); o += n;
+    }
+    for (size_t i = 0; i < raw_n; i++) { a = (a + raw[i]) % 65521; b = (b + a) % 65521; }
+    be32(o, (b << 16) | a); o += 4;
+    png_chunk(f, "IDAT", z, (uint32_t)(o - z));
+    png_chunk(f, "IEND", NULL, 0);
+    free(raw); free(z);
+    return fclose(f);
+}
+
+/* ---- the pipeline ------------------------------------------------------------ */
+
+typedef struct {
+    char model[2048];
+    Te te; Dit dit; Sched sch;
+#ifdef QI_HAVE_VAE
+    QiVae *vae;
+#endif
+    int te_resident;
+    /* the last prompt's prefix: a new seed for the same prompt skips the text
+     * encoder and the prefix pass entirely */
+    char *last_prompt; Prefix prefix;
+} Engine;
+
+typedef struct { const char *id; int (*cancelled)(const char *id); } Progress;
+
+static void emit_progress(const Progress *pg, const char *stage, int step, int steps, double t0){
+    if (!pg || !pg->id) return;
+    printf("PROGRESS {\"id\":\"%s\",\"stage\":\"%s\",\"step\":%d,\"steps\":%d,\"elapsed\":%.2f}\n",
+           pg->id, stage, step, steps, now_s() - t0);
+    fflush(stdout);
+}
+
+static void engine_init(Engine *e, const char *model){
+    memset(e, 0, sizeof *e);
+    snprintf(e->model, sizeof e->model, "%s", model);
+    te_config(&e->te, model);
+    dit_config(&e->dit, model);
+    sched_config(&e->sch, model);
+    te_tokenizer(&e->te, model);
+    if (e->te.hidden != e->dit.ctx) {
+        fprintf(stderr, "[qwenimage] text encoder hidden %d != transformer context %d\n", e->te.hidden, e->dit.ctx);
+        exit(1);
+    }
+}
+
+/* The prompt's prefix, cached for the next request with the same prompt. */
+static int engine_prefix(Engine *e, const char *prompt, float **emb_out, int *L_out){
+    if (e->last_prompt && !strcmp(e->last_prompt, prompt) && e->prefix.K && !emb_out) {
+        *L_out = e->prefix.L; return 1;
+    }
+    prefix_free(&e->prefix, e->dit.layers);
+    free(e->last_prompt); e->last_prompt = NULL;
+    int n, drop;
+    int *ids = te_encode_prompt(&e->te, prompt, &n, &drop);
+    if (n <= drop) { fprintf(stderr, "[qwenimage] empty prompt after the template\n"); free(ids); return -1; }
+    te_load(&e->te, e->model);
+    float *h = te_forward(&e->te, ids, n);
+    free(ids);
+    if (!e->te_resident) te_unload(&e->te);
+    int L = n - drop;
+    float *emb = fmalloc((size_t)L * e->te.hidden);
+    memcpy(emb, h + (int64_t)drop * e->te.hidden, (size_t)L * e->te.hidden * 4);
+    free(h);
+    dit_load(&e->dit, e->model);
+    dit_prefix(&e->dit, emb, L, &e->prefix, NULL);
+    if (emb_out) *emb_out = emb; else free(emb);
+    e->last_prompt = strdup(prompt);
+    *L_out = L;
+    return 0;
+}
+
+/* Generates one image. rgba is [height][width][4]. Returns 0, or -1 with msg. */
+static int engine_generate(Engine *e, const char *prompt, int width, int height, int steps, uint64_t seed,
+                           uint8_t *rgba, double timings[3], const Progress *pg, char *msg, size_t msgn){
+    double t0 = now_s();
+    int gh = height / 16, gw = width / 16, N = gh * gw, C = e->dit.in_ch;
+    emit_progress(pg, "encode", 0, steps, t0);
+    int L;
+    if (engine_prefix(e, prompt, NULL, &L) < 0) { snprintf(msg, msgn, "empty prompt"); return -1; }
+    double t1 = now_s();
+    float *lat = fmalloc((size_t)N * C), *np = fmalloc((size_t)N * C);
+    randn(lat, (size_t)N * C, seed);
+    float *sig = fmalloc(steps + 1), *ts = fmalloc(steps);
+    sched_sigmas(&e->sch, steps, N, sig, ts, NULL);
+    DitStep s; dit_step_init(&s, &e->dit, &e->prefix, gh, gw);
+    int rc = 0;
+    for (int i = 0; i < steps; i++) {
+        emit_progress(pg, "denoise", i, steps, t0);
+        if (pg && pg->cancelled && pg->cancelled(pg->id)) { snprintf(msg, msgn, "cancelled"); rc = -1; break; }
+        double ts0 = now_s();
+        dit_forward(&e->dit, &e->prefix, &s, lat, ts[i], np);
+        float dt = sig[i + 1] - sig[i];
+        for (int64_t k = 0; k < (int64_t)N * C; k++) lat[k] += dt * np[k];
+        fprintf(stderr, "[qwenimage] step %d/%d  t=%.1f  %.2f s\n", i + 1, steps, ts[i], now_s() - ts0);
+    }
+    dit_step_free(&s);
+    double t2 = now_s();
+    if (rc == 0) {
+        emit_progress(pg, "decode", steps, steps, t0);
+#ifdef QI_HAVE_VAE
+        if (!e->vae) {
+            char dir[2100]; snprintf(dir, sizeof dir, "%s/vae", e->model);
+            e->vae = qiv_load(dir);
+            if (!e->vae) { snprintf(msg, msgn, "cannot load the VAE"); rc = -1; }
+        }
+        if (rc == 0 && qiv_decode(e->vae, lat, gh, gw, rgba, NULL) != 0) { snprintf(msg, msgn, "VAE decode failed"); rc = -1; }
+#else
+        /* no VAE compiled in: show the first three latent channels, stretched */
+        for (int y = 0; y < height; y++)
+            for (int x = 0; x < width; x++) {
+                const float *z = lat + ((int64_t)(y / 16) * gw + x / 16) * C;
+                uint8_t *o = rgba + ((int64_t)y * width + x) * 4;
+                for (int c = 0; c < 3; c++) { float v = 128.f + 40.f * z[c]; o[c] = v < 0 ? 0 : v > 255 ? 255 : (uint8_t)v; }
+                o[3] = 255;
+            }
+#endif
+    }
+    double t3 = now_s();
+    if (timings) { timings[0] = t1 - t0; timings[1] = t2 - t1; timings[2] = t3 - t2; }
+    free(lat); free(np); free(sig); free(ts);
+    return rc;
+}
+
+static int check_size(int w, int h, int steps, char *msg, size_t n){
+    if (w < 256 || h < 256 || w > 2048 || h > 2048 || w % 32 || h % 32) {
+        snprintf(msg, n, "width and height must be multiples of 32 between 256 and 2048 (got %dx%d)", w, h);
+        return -1;
+    }
+    if (steps < 1 || steps > 200) { snprintf(msg, n, "steps must be between 1 and 200 (got %d)", steps); return -1; }
+    return 0;
+}
+
+/* ---- serve ------------------------------------------------------------------- */
+
+/* Our own line reader on fd 0: stdio's buffer would hide a CANCEL that arrived
+ * together with the GEN from coli_serve_stdin_ready(). */
+static char g_in[1 << 16]; static size_t g_in_n;
+static char *read_line(int block){
+    for (;;) {
+        char *nl = memchr(g_in, '\n', g_in_n);
+        if (nl) {
+            size_t len = (size_t)(nl - g_in);
+            char *line = xmalloc(len + 1);
+            memcpy(line, g_in, len); line[len] = 0;
+            memmove(g_in, nl + 1, g_in_n - len - 1); g_in_n -= len + 1;
+            return line;
+        }
+        if (!block && !coli_serve_stdin_ready()) return NULL;
+        if (g_in_n == sizeof g_in) { g_in_n = 0; continue; }      /* an absurd line: drop it */
+        ssize_t r = read(0, g_in + g_in_n, sizeof g_in - g_in_n);
+        if (r <= 0) return NULL;
+        g_in_n += (size_t)r;
+    }
+}
+
+static int g_cancel_pending;
+static char g_cancel_id[128];
+static int serve_cancelled(const char *id){
+    char *line;
+    while ((line = read_line(0))) {
+        if (!strncmp(line, "CANCEL ", 7)) {
+            char *arena = NULL; jval *j = json_parse(line + 7, &arena);
+            jval *v = j ? json_get(j, "id") : NULL;
+            if (v && v->t == J_STR) { snprintf(g_cancel_id, sizeof g_cancel_id, "%s", v->str); g_cancel_pending = 1; }
+            if (j) json_free(j);
+            free(arena);
+        }
+        free(line);
+    }
+    return g_cancel_pending && !strcmp(g_cancel_id, id);
+}
+
+static void json_escape_out(const char *s){
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\') printf("\\%c", c);
+        else if (c < 0x20) printf("\\u%04x", c);
+        else putchar(c);
+    }
+}
+static void send_error(const char *id, const char *m){
+    printf("ERROR {\"id\":\""); json_escape_out(id); printf("\",\"message\":\""); json_escape_out(m); printf("\"}\n");
+    fflush(stdout);
+}
+
+static int serve_loop(Engine *e, int dw, int dh, int dsteps){
+    printf("READY {\"model\":\"qwen-image-2.1\",\"default_width\":%d,\"default_height\":%d,\"default_steps\":%d,"
+           "\"min_side\":256,\"max_side\":2048,\"multiple\":32}\n", dw, dh, dsteps);
+    fflush(stdout);
+    char *line;
+    while ((line = read_line(1))) {
+        if (strncmp(line, "GEN ", 4)) { free(line); continue; }       /* CANCEL with nothing running, noise */
+        char *arena = NULL;
+        jval *j = json_parse(line + 4, &arena);
+        char id[128] = "?", msg[512] = "";
+        jval *v;
+        if (j && (v = json_get(j, "id")) && v->t == J_STR) snprintf(id, sizeof id, "%s", v->str);
+        const char *prompt = j && (v = json_get(j, "prompt")) && v->t == J_STR ? v->str : NULL;
+        int w = (int)jnum(j, "width", dw), h = (int)jnum(j, "height", dh), steps = (int)jnum(j, "steps", dsteps);
+        uint64_t seed = (uint64_t)jnum(j, "seed", (double)(time(NULL) & 0x7fffffff));
+        if (!j) send_error(id, "bad GEN line (not JSON)");
+        else if (!prompt || !*prompt) send_error(id, "empty prompt");
+        else if (check_size(w, h, steps, msg, sizeof msg)) send_error(id, msg);
+        else {
+            g_cancel_pending = 0;
+            uint8_t *rgba = xmalloc((size_t)w * h * 4);
+            double tm[3];
+            Progress pg = { id, serve_cancelled };
+            if (engine_generate(e, prompt, w, h, steps, seed, rgba, tm, &pg, msg, sizeof msg)) send_error(id, msg);
+            else {
+                printf("IMAGE {\"id\":\""); json_escape_out(id);
+                printf("\",\"width\":%d,\"height\":%d,\"channels\":4,\"bytes\":%lld,\"seed\":%llu,\"steps\":%d,"
+                       "\"timings\":{\"encode\":%.2f,\"denoise\":%.2f,\"decode\":%.2f}}\n",
+                       w, h, (long long)w * h * 4, (unsigned long long)seed, steps, tm[0], tm[1], tm[2]);
+                fwrite(rgba, 1, (size_t)w * h * 4, stdout);
+                putchar('\n');
+                fflush(stdout);
+            }
+            free(rgba);
+        }
+        if (j) json_free(j);
+        free(arena); free(line);
+    }
+    return 0;
+}
+
+/* ---- oracle ------------------------------------------------------------------ */
+
+/* Compare a computed tensor with the reference: max abs error and the ratio of
+ * norms of the error and the reference. */
+static double cmp(const char *what, const float *got, const float *want, size_t n){
+    double emax = 0, en = 0, wn = 0;
+    for (size_t i = 0; i < n; i++) {
+        double d = (double)got[i] - want[i];
+        if (fabs(d) > emax) emax = fabs(d);
+        en += d * d; wn += (double)want[i] * want[i];
+    }
+    double rel = wn > 0 ? sqrt(en / wn) : sqrt(en);
+    fprintf(stderr, "[oracle] %-26s n=%-9zu max|err| %.3e  rel %.3e\n", what, n, emax, rel);
+    return rel;
+}
+static float *ref_tensor(shards *S, const char *name, int64_t *n){
+    st_tensor *t = st_find(S, name);
+    if (!t) return NULL;
+    int64_t numel = 1; for (int i = 0; i < t->rank; i++) numel *= t->shape[i];
+    float *v = fmalloc((size_t)numel);
+    if (t->dtype == 6) {    /* int64 ids */
+        int64_t *raw = xmalloc((size_t)numel * 8);
+        st_pread_full(t->fd, raw, numel * 8, t->off, "ref");
+        for (int64_t i = 0; i < numel; i++) v[i] = (float)raw[i];
+        free(raw);
+    } else st_read_f32(S, name, v, 0);
+    if (n) *n = numel;
+    return v;
+}
+
+static int run_oracle(Engine *e, const char *refdir){
+    char *arena = NULL;
+    jval *meta = read_json(refdir, "ref.json", &arena);
+    jval *pv = json_get(meta, "prompt");
+    const char *prompt = pv && pv->t == J_STR ? pv->str : NULL;
+    int width = (int)jnum(meta, "width", 0), height = (int)jnum(meta, "height", 0);
+    int steps = (int)jnum(meta, "steps", 0), drop_ref = (int)jnum(meta, "drop_idx", -1);
+    if (!prompt || !width || !height || !steps) { fprintf(stderr, "[oracle] ref.json needs prompt/width/height/steps\n"); return 2; }
+    shards R; memset(&R, 0, sizeof R); st_init(&R, refdir);
+    int fails = 0;
+    /* 1. tokens */
+    int n, drop;
+    int *ids = te_encode_prompt(&e->te, prompt, &n, &drop);
+    int64_t nref = 0; float *rid = ref_tensor(&R, "input_ids", &nref);
+    int tok_ok = rid && nref == n && drop == drop_ref;
+    for (int i = 0; tok_ok && i < n; i++) tok_ok = (int)rid[i] == ids[i];
+    fprintf(stderr, "[oracle] tokens: %d (ref %lld), drop_idx %d (ref %d): %s\n", n, (long long)nref, drop, drop_ref,
+            tok_ok ? "IDENTICAL" : "DIFFERENT");
+    fails += !tok_ok;
+    /* 2. text encoder -> prompt_embeds (from the reference ids, so a tokenizer
+     * difference does not hide everything after it) */
+    te_load(&e->te, e->model);
+    int *use = ids; int nuse = n;
+    if (!tok_ok && rid) { use = xmalloc(sizeof(int) * nref); for (int64_t i = 0; i < nref; i++) use[i] = (int)rid[i]; nuse = (int)nref; drop = drop_ref; }
+    float *h = te_forward(&e->te, use, nuse);
+    int L = nuse - drop;
+    float *emb_ref = ref_tensor(&R, "prompt_embeds", NULL);
+    if (emb_ref) fails += cmp("prompt_embeds", h + (int64_t)drop * e->te.hidden, emb_ref, (size_t)L * e->te.hidden) > 1e-3;
+    /* 3. DiT: prefix from the REFERENCE embeddings, then every step from the
+     * reference latents of that step, so errors do not compound across stages */
+    dit_load(&e->dit, e->model);
+    float *emb = emb_ref ? emb_ref : h + (int64_t)drop * e->te.hidden;
+    float *txt = fmalloc((size_t)L * e->dit.dim);
+    Prefix P; memset(&P, 0, sizeof P);
+    dit_prefix(&e->dit, emb, L, &P, txt);
+    float *txt_ref = ref_tensor(&R, "txt_in_out", NULL);
+    if (txt_ref) fails += cmp("txt_in output", txt, txt_ref, (size_t)L * e->dit.dim) > 1e-3;
+    int gh = height / 16, gw = width / 16, N = gh * gw, C = e->dit.in_ch;
+    float *sig = fmalloc(steps + 1), *ts = fmalloc(steps);
+    double mu;
+    sched_sigmas(&e->sch, steps, N, sig, ts, &mu);
+    float *sig_ref = ref_tensor(&R, "sigmas", NULL);
+    if (sig_ref) fails += cmp("sigmas", sig, sig_ref, steps + 1) > 1e-6;
+    DitStep s; dit_step_init(&s, &e->dit, &P, gh, gw);
+    float *np = fmalloc((size_t)N * C), *lat = ref_tensor(&R, "latents_init", NULL);
+    float *mine = fmalloc((size_t)N * C);
+    if (!lat) { fprintf(stderr, "[oracle] ref has no latents_init\n"); return 2; }
+    memcpy(mine, lat, (size_t)N * C * 4);
+    char name[64];
+    for (int i = 0; i < steps; i++) {
+        snprintf(name, sizeof name, "latents_%d", i);
+        float *in = i == 0 ? lat : ref_tensor(&R, name, NULL);
+        if (!in) in = mine;
+        dit_forward(&e->dit, &P, &s, in, ts[i], np);
+        snprintf(name, sizeof name, "noise_pred_%d", i);
+        float *want = ref_tensor(&R, name, NULL);
+        if (want) { char w[64]; snprintf(w, sizeof w, "noise_pred step %d", i); fails += cmp(w, np, want, (size_t)N * C) > 1e-2; free(want); }
+        /* the chained trajectory, from our own predictions only */
+        if (in != mine) dit_forward(&e->dit, &P, &s, mine, ts[i], np);
+        float dt = sig[i + 1] - sig[i];
+        for (int64_t k = 0; k < (int64_t)N * C; k++) mine[k] += dt * np[k];
+        if (in != lat && in != mine) free(in);
+    }
+    float *fin = ref_tensor(&R, "latents_final", NULL);
+    if (fin) fails += cmp("final latents (chained)", mine, fin, (size_t)N * C) > 2e-2;
+#ifdef QI_HAVE_VAE
+    {
+        char dir[2100]; snprintf(dir, sizeof dir, "%s/vae", e->model);
+        QiVae *vae = qiv_load(dir);
+        if (vae && fin) {
+            uint8_t *rgba = xmalloc((size_t)width * height * 4);
+            float *of = fmalloc((size_t)4 * width * height);
+            qiv_decode(vae, fin, gh, gw, rgba, of);
+            float *img_ref = ref_tensor(&R, "image_float", NULL);
+            if (img_ref) fails += cmp("VAE output (ref latents)", of, img_ref, (size_t)4 * width * height) > 1e-3;
+            free(img_ref); free(rgba); free(of);
+            qiv_free(vae);
+        }
+    }
+#endif
+    fprintf(stderr, "[oracle] %s\n", fails ? "MISMATCH" : "all stages within tolerance");
+    return fails ? 1 : 0;
+}
+
+/* ---- main -------------------------------------------------------------------- */
+
+static void usage(void){
+    fprintf(stderr,
+        "usage: qwenimage --model DIR --prompt TEXT [--width 768] [--height 432] [--steps 8] [--seed N] --out FILE.png\n"
+        "       qwenimage --model DIR --serve\n"
+        "       qwenimage --model DIR --ref REFDIR\n"
+        "env:   COLI_IMG_BITS=8|16|32 weight storage (default 8: int8 rows)\n"
+        "       COLI_IMG_TE=resident|stage  keep the text encoder loaded between prompts (serve default: resident)\n");
+}
+
+int main(int argc, char **argv){
+    const char *model = NULL, *prompt = NULL, *out = NULL, *ref = NULL;
+    int width = 768, height = 432, steps = 8, serve = 0;
+    uint64_t seed = 42; int seed_set = 0;
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
+        if (!strcmp(a, "--model") && v) { model = v; i++; }
+        else if (!strcmp(a, "--prompt") && v) { prompt = v; i++; }
+        else if (!strcmp(a, "--out") && v) { out = v; i++; }
+        else if (!strcmp(a, "--ref") && v) { ref = v; i++; }
+        else if (!strcmp(a, "--width") && v) { width = atoi(v); i++; }
+        else if (!strcmp(a, "--height") && v) { height = atoi(v); i++; }
+        else if (!strcmp(a, "--steps") && v) { steps = atoi(v); i++; }
+        else if (!strcmp(a, "--seed") && v) { seed = strtoull(v, NULL, 10); seed_set = 1; i++; }
+        else if (!strcmp(a, "--threads") && v) {
+#ifdef _OPENMP
+            omp_set_num_threads(atoi(v));
+#endif
+            i++;
+        }
+        else if (!strcmp(a, "--serve")) serve = 1;
+        else { usage(); return 2; }
+    }
+    if (!model || (!serve && !ref && !getenv("QWENIMAGE_PRINT_TOKENS") && (!prompt || !out))) { usage(); return 2; }
+    const char *b = getenv("COLI_IMG_BITS");
+    if (b && *b) { g_bits = atoi(b); if (g_bits != 8 && g_bits != 16 && g_bits != 32) { usage(); return 2; } }
+    if (!seed_set && !serve && !ref) seed = (uint64_t)time(NULL);
+    static Engine e;
+    engine_init(&e, model);
+    if (ref) return run_oracle(&e, ref);
+    if (getenv("QWENIMAGE_PRINT_TOKENS")) {          /* tokenizer check against the processor */
+        int n, drop; int *ids = te_encode_prompt(&e.te, prompt ? prompt : "", &n, &drop);
+        printf("drop %d ids", drop);
+        for (int i = 0; i < n; i++) printf(" %d", ids[i]);
+        printf("\n"); free(ids); return 0;
+    }
+    if (serve) {
+        const char *te = getenv("COLI_IMG_TE");
+        e.te_resident = !(te && !strcmp(te, "stage"));
+        te_load(&e.te, model);
+        dit_load(&e.dit, model);
+        return serve_loop(&e, width, height, steps);
+    }
+    char msg[512];
+    if (check_size(width, height, steps, msg, sizeof msg)) { fprintf(stderr, "%s\n", msg); return 2; }
+    uint8_t *rgba = xmalloc((size_t)width * height * 4);
+    double tm[3];
+    if (engine_generate(&e, prompt, width, height, steps, seed, rgba, tm, NULL, msg, sizeof msg)) {
+        fprintf(stderr, "[qwenimage] %s\n", msg); return 1;
+    }
+    if (write_png(out, rgba, width, height)) { fprintf(stderr, "[qwenimage] cannot write %s\n", out); return 1; }
+    fprintf(stderr, "[qwenimage] %s  %dx%d  %d steps  seed %llu  encode %.1f s  denoise %.1f s  decode %.1f s\n",
+            out, width, height, steps, (unsigned long long)seed, tm[0], tm[1], tm[2]);
+    return 0;
+}
