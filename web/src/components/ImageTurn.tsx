@@ -164,12 +164,14 @@ export function ImageControls({ size, custom, steps, seed, seedValid, onSize, on
       <input aria-label={t("image.width")} inputMode="numeric" value={width}
         className={cn(!validSide(Number(width)) && "invalid")}
         onChange={(event) => { setWidth(event.target.value); side("width", event.target.value, false) }}
-        onBlur={(event) => side("width", event.target.value, true)} />
+        onBlur={(event) => side("width", event.target.value, true)}
+        onKeyDown={(event) => { if (event.key === "Enter") side("width", event.currentTarget.value, true) }} />
       <span aria-hidden="true">×</span>
       <input aria-label={t("image.height")} inputMode="numeric" value={height}
         className={cn(!validSide(Number(height)) && "invalid")}
         onChange={(event) => { setHeight(event.target.value); side("height", event.target.value, false) }}
-        onBlur={(event) => side("height", event.target.value, true)} />
+        onBlur={(event) => side("height", event.target.value, true)}
+        onKeyDown={(event) => { if (event.key === "Enter") side("height", event.currentTarget.value, true) }} />
     </span>}
     <label className="image-chip" title={t("image.steps")}>
       <Footprints aria-hidden="true" />
@@ -179,7 +181,12 @@ export function ImageControls({ size, custom, steps, seed, seedValid, onSize, on
           const value = Number(event.target.value)
           if (event.target.value && Number.isInteger(value) && value >= 1 && value <= MAX_STEPS) onSteps(value)
         }}
-        onBlur={(event) => { const value = clampSteps(Number(event.target.value || steps)); setStepsText(String(value)); onSteps(value) }} />
+        onBlur={(event) => { const value = clampSteps(Number(event.target.value || steps)); setStepsText(String(value)); onSteps(value) }}
+        onKeyDown={(event) => {
+          /* Enter submits the form without a blur first: commit what is on screen */
+          if (event.key !== "Enter") return
+          const value = clampSteps(Number(event.currentTarget.value || steps)); setStepsText(String(value)); onSteps(value)
+        }} />
       <span className="image-unit">{t("image.stepsUnit")}</span>
     </label>
     <label className={cn("image-chip", !seedValid && "invalid")} title={t("image.seedHelp")}>

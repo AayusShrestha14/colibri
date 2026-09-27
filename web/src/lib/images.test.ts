@@ -27,8 +27,8 @@ describe("image sizes", () => {
 })
 
 describe("steps and seed", () => {
-  it("keeps steps a whole number from 1 to 100", () => {
-    expect([0, 8, 8.6, 500, Number.NaN].map(clampSteps)).toEqual([1, 8, 9, 100, 8])
+  it("keeps steps a whole number from 1 to 200 (the gateway's range)", () => {
+    expect([0, 8, 8.6, 500, Number.NaN].map(clampSteps)).toEqual([1, 8, 9, 200, 8])
   })
 
   it("reads an empty seed as random and refuses anything that is not a whole number", () => {
@@ -91,5 +91,13 @@ describe("transcript and files", () => {
     const blob = dataUrlBlob("data:image/png;base64,iVBORw0KGgo=")
     expect(blob.type).toBe("image/png")
     expect([...new Uint8Array(await blob.arrayBuffer())]).toEqual([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+  })
+})
+
+describe("parseSeed range", () => {
+  it("refuses a seed above what the gateway accepts", () => {
+    expect(parseSeed("4294967295")).toBe(4294967295)
+    expect(parseSeed("4294967296")).toBeUndefined()
+    expect(parseSeed("5000000000")).toBeUndefined()
   })
 })

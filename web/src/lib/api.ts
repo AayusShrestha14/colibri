@@ -466,10 +466,17 @@ async function streamImage(options: GenerateImageOptions): Promise<ImageGenerati
   try {
     while (!finished) {
       const { value, done } = await reader.read()
+      const before = buffer.length
       buffer += decoder.decode(value, { stream: !done })
-      const parsed = extractSSEEvents(buffer)
-      buffer = parsed.rest
-      parsed.events.forEach(consume)
+      /* A frame ends at a blank line. A chunk that brings none cannot complete
+         one, so the pending frame (the finished image is megabytes of base64)
+         is not split again: re-splitting it on every chunk was quadratic. The
+         three characters before the chunk catch a boundary cut in half. */
+      if (done || /\r?\n\r?\n/.test(buffer.slice(Math.max(0, before - 3)))) {
+        const parsed = extractSSEEvents(buffer)
+        buffer = parsed.rest
+        parsed.events.forEach(consume)
+      }
       if (done) break
     }
   } catch (cause) {

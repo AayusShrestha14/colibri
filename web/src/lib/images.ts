@@ -22,11 +22,13 @@ export const SIZE_PRESETS: ReadonlyArray<ImageSize & { ratio: string }> = [
 
 export const DEFAULT_SIZE: ImageSize = { width: 768, height: 512 }
 export const DEFAULT_STEPS = 8
-export const MAX_STEPS = 100
+export const MAX_STEPS = 200
 /* A seed the UI draws itself fits a signed 32-bit integer, whatever the engine
    keeps it in. The gateway is still sent an explicit seed every time, so a new
    seed is really new even on a server that would fall back to a fixed one. */
 export const MAX_RANDOM_SEED = 2 ** 31
+/* The largest seed the gateway accepts (image_engine.MAX_SEED). */
+export const MAX_SEED = 2 ** 32 - 1
 
 export const sizeKey = ({ width, height }: ImageSize) => `${width}x${height}`
 
@@ -65,7 +67,7 @@ export function parseSeed(text: string): number | null | undefined {
   if (!trimmed) return null
   if (!/^\d+$/.test(trimmed)) return undefined
   const seed = Number(trimmed)
-  return Number.isSafeInteger(seed) ? seed : undefined
+  return Number.isSafeInteger(seed) && seed <= MAX_SEED ? seed : undefined
 }
 
 export function randomSeed(random: () => number = Math.random) {
