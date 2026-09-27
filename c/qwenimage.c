@@ -91,7 +91,7 @@ static int jbool(jval *o, const char *k, int def){
 /* ---- weights ------------------------------------------------------------ */
 
 static int g_bits = 8;   /* COLI_IMG_BITS: storage of the big matrices */
-static int g_act8 = 0;   /* COLI_IMG_ACT8=1: int8 activations on the int8 matrices (VNNI) */
+static int g_act8 = 1;   /* COLI_IMG_ACT8=0 turns off the int8 activations of the DiT blocks (VNNI) */
 
 /* act8: this matrix may take int8 activations (COLI_IMG_ACT8). Only the DiT's
  * block matrices do. Measured on the real model: the text encoder's hidden
@@ -815,7 +815,34 @@ typedef struct {
     char *last_prompt; Prefix prefix;
 } Engine;
 
-typedef struct { const char *id; int (*cancelled)(const char *id); } Progress;
+typedef struct { const char *id; int (*cancelled)(const char *id); int preview; } Progress;
+
+#include "qwenimage_preview.h"   /* QI_PREVIEW_RGB: the fitted latent -> RGB map */
+
+/* The picture as it stands after a step: the flow-matching estimate of the clean
+ * latent (x0 = x_t - sigma * v) through a linear latent -> RGB map, one pixel per
+ * latent pixel. 64x3 multiply-adds per token: free next to a DiT step. */
+static void emit_preview(const Progress *pg, int step, const float *lat, const float *v, float sigma,
+                         int gh, int gw, int C){
+    if (!pg || !pg->id || !pg->preview || C != 64) return;
+    size_t n = (size_t)gh * gw * 3;
+    uint8_t *rgb = xmalloc(n);
+    for (int t = 0; t < gh * gw; t++) {
+        const float *x = lat + (int64_t)t * C, *u = v + (int64_t)t * C;
+        for (int c = 0; c < 3; c++) {
+            float a = QI_PREVIEW_RGB[64][c];
+            for (int k = 0; k < 64; k++) a += (x[k] - sigma * u[k]) * QI_PREVIEW_RGB[k][c];
+            a = a * 255.f + 0.5f;
+            rgb[t * 3 + c] = a < 0 ? 0 : a > 255 ? 255 : (uint8_t)a;
+        }
+    }
+    printf("PREVIEW {\"id\":\"%s\",\"step\":%d,\"width\":%d,\"height\":%d,\"channels\":3,\"bytes\":%zu}\n",
+           pg->id, step, gw, gh, n);
+    fwrite(rgb, 1, n, stdout);
+    putchar('\n');
+    fflush(stdout);
+    free(rgb);
+}
 
 static void emit_progress(const Progress *pg, const char *stage, int step, int steps, double t0){
     if (!pg || !pg->id) return;
@@ -884,6 +911,7 @@ static int engine_generate(Engine *e, const char *prompt, int width, int height,
         double ts0 = now_s();
         g_t_lin = g_t_att = 0;
         dit_forward(&e->dit, &e->prefix, &s, lat, ts[i], np);
+        emit_preview(pg, i + 1, lat, np, sig[i], gh, gw, C);
         float dt = sig[i + 1] - sig[i];
         for (int64_t k = 0; k < (int64_t)N * C; k++) lat[k] += dt * np[k];
         double tstep = now_s() - ts0;
@@ -1003,7 +1031,7 @@ static int serve_loop(Engine *e, int dw, int dh, int dsteps){
             g_cancel_pending = 0;
             uint8_t *rgba = xmalloc((size_t)w * h * 4);
             double tm[3];
-            Progress pg = { id, serve_cancelled };
+            Progress pg = { id, serve_cancelled, (int)jnum(j, "preview", 0) };
             if (engine_generate(e, prompt, w, h, steps, seed, rgba, tm, &pg, msg, sizeof msg)) send_error(id, msg);
             else {
                 printf("IMAGE {\"id\":\""); json_escape_out(id);
@@ -1201,7 +1229,7 @@ static void usage(void){
         "       qwenimage --model DIR --serve\n"
         "       qwenimage --model DIR --ref REFDIR\n"
         "env:   COLI_IMG_BITS=8|16|32 weight storage (default 8: int8 rows)\n"
-        "       COLI_IMG_ACT8=1  int8 activations in the DiT blocks (VNNI, about 2x on the step; 30.1 dB vs 35.6)\n"
+        "       COLI_IMG_ACT8=0  f32 activations in the DiT (default where VNNI exists: int8, about 2x per step)\n"
         "       COLI_IMG_TE=resident|stage  keep the text encoder loaded between prompts (serve default: resident)\n");
 }
 
@@ -1231,11 +1259,15 @@ int main(int argc, char **argv){
     if (!model || (!serve && !ref && !getenv("QWENIMAGE_PRINT_TOKENS") && (!prompt || !out))) { usage(); return 2; }
     const char *b = getenv("COLI_IMG_BITS");
     if (b && *b) { g_bits = atoi(b); if (g_bits != 8 && g_bits != 16 && g_bits != 32) { usage(); return 2; } }
+    /* On by default where VNNI exists: measured 2x on the step (768x512: 34.3 -> 18.3 s
+     * per step on 8 Zen 4 cores) with pictures that cannot be told apart by eye
+     * (fox and neon-sign prompts; 30.1 dB against the f32 reference, 35.6 without). */
     const char *a8 = getenv("COLI_IMG_ACT8");
-    g_act8 = a8 && *a8 == '1';
+    g_act8 = !(a8 && *a8 == '0');
     g_prof = getenv("QWENIMAGE_PROF") != NULL;
 #ifndef QI_HAVE_VNNI
-    if (g_act8) { fprintf(stderr, "[qwenimage] COLI_IMG_ACT8 needs VNNI; this build has none, staying on f32 activations\n"); g_act8 = 0; }
+    if (g_act8 && a8 && *a8 == '1') fprintf(stderr, "[qwenimage] COLI_IMG_ACT8 needs VNNI; this build has none, staying on f32 activations\n");
+    g_act8 = 0;
 #endif
     if (!seed_set && !serve && !ref) seed = (uint64_t)time(NULL);
     static Engine e;
