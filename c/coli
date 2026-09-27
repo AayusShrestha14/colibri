@@ -2007,6 +2007,7 @@ IMAGE_CHAT_COMMANDS = {
     "steps":  "N         denoising steps (more is slower and usually cleaner)",
     "seed":   "N|random  fix the seed to reproduce an image, or a new one each time",
     "render": "MODE      how images are drawn: kitty | iterm | sixel | blocks | none",
+    "save":   "[PATH]    a copy of the last image: a folder, or a file name (.png is added)",
     "help":   "          this list",
     "quit":   "          leave (also :q)",
 }
@@ -2246,9 +2247,10 @@ def image_settings(a, info):
         if problem: sys.exit(f"{C.yel}--seed: {problem}{C.r}")
     return {"width": width, "height": height, "steps": steps, "seed": seed}
 
-def generate_image(backend, prompt, settings, protocol, out=None, stream=None):
+def generate_image(backend, prompt, settings, protocol, out=None, stream=None, last=None):
     """One image: progress, the picture drawn in the terminal, the PNG on disk.
-    Returns the saved path, or None when it was cancelled or failed (said)."""
+    Returns the saved path, or None when it was cancelled or failed (said).
+    `last`, when given, is filled with the PNG and where it went, for /save."""
     import term_image
     from image_engine import (ImageCancelled, ImageEngineError, random_seed, save_png,
                               image_dir)
@@ -2297,9 +2299,40 @@ def generate_image(backend, prompt, settings, protocol, out=None, stream=None):
     print(f"  {C.dgray}└─ {result['width']}x{result['height']} · seed {result['seed']} · "
           f"{result['steps']} steps · {elapsed:.0f}s{(' (' + parts + ')') if parts else ''}{C.r}",
           file=stream)
+    if last is not None:
+        last.update(png=result["png"], path=path, prompt=prompt, seed=result["seed"])
     if path:
         print(f"  {C.grn}✓{C.r} saved {path}\n", file=stream)
     return path
+
+
+def save_last_image(last, where):
+    """/save: the last image, where the user says. A folder keeps the automatic
+    name, a name gets .png when it has no extension, a Windows path pasted into
+    WSL is translated like an attachment's, and an existing file is never
+    overwritten: the images folder already holds every picture, so /save only
+    ever adds a copy. Returns (path, None) or (None, why)."""
+    if not last.get("png"):
+        return None, "no image yet: describe one first"
+    if not where:
+        return (last["path"], None) if last.get("path") else (None, "give a path: /save PATH")
+    target = to_local_path(where)
+    if os.path.isdir(target):
+        name = os.path.basename(last["path"]) if last.get("path") else f"colibri-s{last['seed']}.png"
+        target = os.path.join(target, name)
+    elif not os.path.splitext(target)[1]:
+        target += ".png"
+    if os.path.exists(target):
+        return None, f"{target} already exists: choose another name"
+    folder = os.path.dirname(os.path.abspath(target))
+    if not os.path.isdir(folder):
+        return None, f"no such folder: {folder}"
+    try:
+        with open(target, "xb") as handle:
+            handle.write(last["png"])
+    except OSError as error:
+        return None, f"cannot write {target}: {error}"
+    return target, None
 
 def image_repl(a, backend, model_id):
     """coli chat for an image model: every line is a prompt, every answer a picture."""
@@ -2312,7 +2345,7 @@ def image_repl(a, backend, model_id):
     print(f"  {C.grn}✦ {model_id}{C.r} {C.dim}· {backend.mode} · images are saved to "
           f"{image_dir()}{C.r}")
     print(f"  {C.dim}describe an image and press Enter · Ctrl-C stops it · /size /steps /seed · "
-          f"/help · :q exits{C.r}")
+          f"/save · /help · :q exits{C.r}")
     print(f"  {C.dim}{settings['width']}x{settings['height']} · {settings['steps']} steps · seed "
           f"{settings['seed'] if settings['seed'] is not None else 'random'} · drawn with "
           f"{protocol} ({why}){C.r}\n")
@@ -2321,6 +2354,7 @@ def image_repl(a, backend, model_id):
                            {"size": presets, "seed": ["random"],
                             "render": list(term_image.PROTOCOLS)})
     w = term_w() - 4
+    last = {}                                  # the last image, for /save
     while True:
         if TTY:
             print(f"  {C.dgray}╭{'─'*w}╮{C.r}")
@@ -2375,6 +2409,12 @@ def image_repl(a, backend, model_id):
             if problem: print(f"  {C.yel}  {problem}, or /seed random{C.r}\n"); continue
             settings["seed"] = seed
             print(f"  {C.dim}✦ seed {seed}: the same prompt now gives the same image{C.r}\n"); continue
+        if name == "save":
+            path, why = save_last_image(last, rest.strip())
+            if why: print(f"  {C.yel}  {why}{C.r}\n")
+            elif rest.strip(): print(f"  {C.grn}✓{C.r} saved {path}\n")
+            else: print(f"  {C.dim}✦ the last image is at {path} (/save PATH for a copy elsewhere){C.r}\n")
+            continue
         if name == "render":
             choice = rest.strip().lower()
             if choice not in term_image.PROTOCOLS:
@@ -2382,7 +2422,7 @@ def image_repl(a, backend, model_id):
             protocol = choice
             print(f"  {C.dim}✦ images drawn with {protocol}{C.r}\n"); continue
         print(f"\n  {C.teal}◆ colibri{C.r}")
-        generate_image(backend, msg, settings, protocol)
+        generate_image(backend, msg, settings, protocol, last=last)
         if not backend.alive:
             print(f"  {C.yel}the engine is gone; start coli chat again{C.r}"); break
 

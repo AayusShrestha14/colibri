@@ -96,6 +96,7 @@ Commands (TAB completes them, and the sizes after `/size`):
 | `/seed N` | fixed seed: the same prompt then gives the same image |
 | `/seed random` | a new seed for every image (the default) |
 | `/render MODE` | how images are drawn: `kitty`, `iterm`, `sixel`, `blocks`, `none` |
+| `/save [PATH]` | a copy of the last image where you want it: a folder (the name is kept) or a file name (`.png` is added); never overwrites. Alone, it says where the image already is |
 | `/help`, `/quit` | the list, and leave (`:q` works too) |
 
 The first size, steps and seed can also be given as flags:
@@ -142,7 +143,9 @@ time, the prompt and the seed:
 ```
 
 `COLI_IMAGE_DIR=/some/folder` puts them elsewhere. Nothing is overwritten: a
-second image with the same name gets `-2`, `-3`, ...
+second image with the same name gets `-2`, `-3`, ... The path is printed under
+every image, and `/save PATH` in `coli chat` keeps a copy of the last one where
+you choose (a Windows path such as `C:\Users\me\Desktop` works from WSL).
 
 ## Terminal support
 

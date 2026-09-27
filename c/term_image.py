@@ -385,24 +385,6 @@ def render_iterm(png, columns, indent="  ", name="colibri.png", env=None):
 
 
 _BAYER4 = (0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5)
-_LEVELS = (6, 7, 6)                     # 252 colours: sixel terminals allow 256
-
-
-def _sixel_tables():
-    tables = []
-    for c, levels in enumerate(_LEVELS):
-        weight = (_LEVELS[1] * _LEVELS[2], _LEVELS[2], 1)[c]
-        step = 255 / (levels - 1)
-        per_threshold = []
-        for d in _BAYER4:
-            bias = (d + 0.5) / 16 - 0.5
-            per_threshold.append([min(levels - 1, max(0, int(v / step + 0.5 + bias))) * weight
-                                  for v in range(256)])
-        tables.append(per_threshold)
-    return tables
-
-
-_SIXEL_TABLES = None
 _SIXEL_CHARS = bytes(range(63, 127))
 _SIXEL_RUN = re.compile(r"(.)\1{3,}")
 
@@ -412,40 +394,86 @@ def _run_length(match):
     return f"!{len(run)}{run[0]}"
 
 
+def _median_cut(histogram, colours):
+    """Up to `colours` boxes over a {15-bit colour: count} histogram, cut where
+    the pixels are: each time the box with the widest spread (weighted by how
+    many pixels it holds) is split at the weighted median of its widest axis.
+    Returns (palette of 8-bit RGB tuples, {15-bit colour: palette index})."""
+    def spread(box):
+        best = None
+        for shift in (10, 5, 0):
+            values = [(key >> shift) & 31 for key, _count in box]
+            extent = max(values) - min(values)
+            if best is None or extent > best[0]:
+                best = (extent, shift)
+        return best
+
+    boxes = [list(histogram.items())]
+    while len(boxes) < colours:
+        scored = []
+        for index, box in enumerate(boxes):
+            if len(box) < 2:
+                continue
+            extent, shift = spread(box)
+            if extent:
+                scored.append((extent * sum(count for _key, count in box), index, shift))
+        if not scored:
+            break
+        _score, index, shift = max(scored)
+        box = sorted(boxes.pop(index), key=lambda item: (item[0] >> shift) & 31)
+        half, running, cut = sum(count for _key, count in box) / 2, 0, 1
+        for position, (_key, count) in enumerate(box):
+            running += count
+            if running >= half:
+                cut = min(max(position + 1, 1), len(box) - 1)
+                break
+        boxes += [box[:cut], box[cut:]]
+    palette, lookup = [], {}
+    for index, box in enumerate(boxes):
+        total = sum(count for _key, count in box) or 1
+        channel = []
+        for shift in (10, 5, 0):
+            mean = sum((((key >> shift) & 31) * 8 + 4) * count for key, count in box) / total
+            channel.append(int(mean + 0.5))
+        palette.append(tuple(channel))
+        for key, _count in box:
+            lookup[key] = index
+    return palette, lookup
+
+
 def render_sixel(pixels, width, height, channels, max_width_px, max_height_px=None,
                  indent="  "):
-    """DEC sixel with a fixed 6x7x6 palette and a 4x4 ordered dither.
+    """DEC sixel with a palette chosen from the picture itself.
 
-    A fixed palette costs nothing to choose and never needs a second pass over
-    the image; the dither hides the banding it would otherwise leave in the
-    smooth gradients generated images are full of. Bands of six rows are
+    A fixed palette (the first version: 6x7x6 colours and a 4x4 ordered dither)
+    showed as grain all over a photograph. Here the 255 colours come from a
+    median cut of the picture's own 15-bit histogram, and each pixel takes the
+    colour of the box its 15-bit value fell in, so no nearest-colour search runs
+    per pixel. A light 4x4 ordered offset before the 15-bit truncation keeps the
+    smooth gradients of generated images from banding. Bands of six rows are
     encoded colour by colour with run-length compression."""
-    global _SIXEL_TABLES
-    if _SIXEL_TABLES is None:
-        _SIXEL_TABLES = _sixel_tables()
     max_height_px = max_height_px or 10**6
     new_width, new_height = fit(width, height, max_width_px, max_height_px)
     small = resize(pixels, width, height, channels, new_width, new_height)
     rgb = flatten(small, new_width, new_height, channels)
-    red, green, blue = _SIXEL_TABLES
-    index = bytearray(new_width * new_height)
+    keys = [0] * (new_width * new_height)
+    histogram = {}
     for y in range(new_height):
         row_base = y * new_width
-        threshold_row = (y & 3) * 4
+        bayer_row = (y & 3) * 4
         for x in range(new_width):
-            d = threshold_row + (x & 3)
+            offset = _BAYER4[bayer_row + (x & 3)] >> 1          # 0..7, under one 5-bit step
             p = (row_base + x) * 3
-            index[row_base + x] = (red[d][rgb[p]] + green[d][rgb[p + 1]] +
-                                   blue[d][rgb[p + 2]])
-    used = set(index)
+            key = (min(255, rgb[p] + offset) >> 3) << 10 | (min(255, rgb[p + 1] + offset) >> 3) << 5 \
+                | (min(255, rgb[p + 2] + offset) >> 3)
+            keys[row_base + x] = key
+            histogram[key] = histogram.get(key, 0) + 1
+    palette, lookup = _median_cut(histogram, 255)
+    index = bytes(lookup[key] for key in keys)
     out = [indent, "\x1bPq", f'"1;1;{new_width};{new_height}']
-    levels = _LEVELS
-    for colour in sorted(used):
-        r = colour // (levels[1] * levels[2])
-        g = colour // levels[2] % levels[1]
-        b = colour % levels[2]
-        out.append(f"#{colour};2;{r * 100 // (levels[0] - 1)};{g * 100 // (levels[1] - 1)};"
-                   f"{b * 100 // (levels[2] - 1)}")
+    for colour in sorted(set(index)):
+        r, g, b = palette[colour]
+        out.append(f"#{colour};2;{r * 100 // 255};{g * 100 // 255};{b * 100 // 255}")
     translate = bytes.maketrans(bytes(range(64)), _SIXEL_CHARS)
     for band in range(0, new_height, 6):
         masks = {}

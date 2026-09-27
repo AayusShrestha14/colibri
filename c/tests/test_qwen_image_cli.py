@@ -128,7 +128,7 @@ class LauncherTest(unittest.TestCase):
 
     def test_image_commands_share_the_completion_machinery(self):
         self.assertEqual(set(self.cli.IMAGE_CHAT_COMMANDS),
-                         {"size", "steps", "seed", "render", "help", "quit"})
+                         {"size", "steps", "seed", "render", "save", "help", "quit"})
         self.assertEqual(self.cli.chat_command("/size 1024x576"), ("size", "1024x576"))
 
 
@@ -219,6 +219,30 @@ class CommandsTest(unittest.TestCase):
         self.assertIn("unknown command", result.stdout)
         self.assertIn("1024x576", result.stdout)             # /size lists the presets
         self.assertIn("seed 7", result.stdout)
+
+    def test_chat_save_copies_the_last_image(self):
+        # The picture is always saved in the images folder; /save adds a copy
+        # where the user says: a folder keeps the name, a bare name gets .png,
+        # and an existing file is never overwritten.
+        import tempfile
+        with tempfile.TemporaryDirectory() as elsewhere:
+            named = Path(elsewhere) / "poster"
+            script = (f"/save {named}\n"                            # nothing yet
+                      "/size 256x256\n/steps 2\n/seed 9\nan owl on a branch\n"
+                      f"/save\n/save {named}\n/save {named}\n/save {elsewhere}\n"
+                      f"/save {elsewhere}/missing/x.png\n:q\n")
+            result = run_coli(["chat", "--model", self.model, "--no-attach"], self.env,
+                              stdin=script)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            auto = sorted(self.images.glob("*.png"))
+            self.assertEqual(len(auto), 1, result.stdout)
+            self.assertIn("no image yet", result.stdout)
+            self.assertIn(f"the last image is at {auto[0]}", result.stdout)
+            copy = named.with_suffix(".png")
+            self.assertEqual(copy.read_bytes(), auto[0].read_bytes())
+            self.assertIn("already exists", result.stdout)
+            self.assertEqual((Path(elsewhere) / auto[0].name).read_bytes(), auto[0].read_bytes())
+            self.assertIn("no such folder", result.stdout)
 
     def test_chat_attached_to_a_running_serve(self):
         from openai_server import APIServer
