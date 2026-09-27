@@ -5855,6 +5855,9 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
             # Its own process class: the image engine speaks a line-and-JSON
             # protocol with binary frames, not the text engines' byte stream.
             runtime = image_engine.ImageEngine(engine, model, env=env)
+            # Same lifetime rule as the text engines on Windows: a job object
+            # takes the engine down with this server, however the server ends.
+            runtime._win_job = _win_kill_on_close_job(getattr(runtime.process, "pid", None))
             print(f"[image] {model_id}: default {runtime.info['default_width']}x"
                   f"{runtime.info['default_height']}, {runtime.info['default_steps']} steps",
                   file=sys.stderr)
