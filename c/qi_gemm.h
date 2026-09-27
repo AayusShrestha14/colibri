@@ -157,6 +157,125 @@ static inline void qi_gemm(float *Y, const float *X, int M, const QiMat *W, cons
     qi_gemm_ld(Y, W->N, X, W->K, M, W, bias);
 }
 
+/* ---- int8 x int8 (opt-in): the activations quantized per row too ---------
+ *
+ * With VNNI one vpdpbusd does four multiply-adds per 32-bit lane where an FMA
+ * does one, so a DiT step is compute-bound on a quarter of the instructions.
+ * The price is an 8-bit activation (one scale per row, amax/127): that is a
+ * quality question, measured against the oracle, not assumed. vpdpbusd wants
+ * unsigned x signed bytes, so x is stored as q+128 and 128*sum(w) comes off the
+ * int32 sum at the end. The int32 sum over the whole K cannot overflow:
+ * K * 255 * 127 stays under 2^31 up to K = 66000.
+ *
+ * Only for QI_I8 weights and only where VNNI exists (AVX-VNNI, or AVX-512 VNNI
+ * with VL); qi_gemm_act8() falls back to qi_gemm() otherwise. */
+#if (defined(__AVXVNNI__) || (defined(__AVX512VNNI__) && defined(__AVX512VL__))) && defined(__AVX2__)
+#define QI_HAVE_VNNI 1
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+#define QI_DPBUSD(acc, a, b) _mm256_dpbusd_epi32(acc, a, b)
+#else
+#define QI_DPBUSD(acc, a, b) _mm256_dpbusd_avx_epi32(acc, a, b)
+#endif
+
+/* W rows [n0, n0+nr), all K (padded to Kp, a multiple of 4), as [Kp/4][16][4]
+ * bytes, plus the sum of each row for the +128 correction. */
+static void qi_pack_w8(int8_t *panel, int32_t *wsum, const QiMat *W, int n0, int nr, int Kp){
+    const int K = W->K, ld = W->ld ? W->ld : K;
+    for (int j = 0; j < QI_NR; j++) {
+        int32_t s = 0;
+        const int8_t *r = j < nr ? (const int8_t *)W->w + (int64_t)(n0 + j) * ld : NULL;
+        for (int k = 0; k < Kp; k++) {
+            int8_t v = r && k < K ? r[k] : 0;
+            panel[(k >> 2) * (QI_NR * 4) + j * 4 + (k & 3)] = v;
+            s += v;
+        }
+        wsum[j] = s;
+    }
+}
+
+static void qi_kernel8(float *Y, int ldy, const uint8_t *X, int Kp, const int8_t *panel,
+                       const int32_t *wsum, const float *sx, const float *sw, int mr, int nr, const float *bias){
+    __m256i c[QI_MR][2];
+    for (int i = 0; i < QI_MR; i++) c[i][0] = c[i][1] = _mm256_setzero_si256();
+    const int kq = Kp >> 2;
+    if (mr == QI_MR) {
+        for (int q = 0; q < kq; q++) {
+            __m256i b0 = _mm256_loadu_si256((const __m256i *)(panel + q * 64));
+            __m256i b1 = _mm256_loadu_si256((const __m256i *)(panel + q * 64 + 32));
+            for (int i = 0; i < QI_MR; i++) {
+                int32_t a4; memcpy(&a4, X + (int64_t)i * Kp + q * 4, 4);
+                __m256i a = _mm256_set1_epi32(a4);
+                c[i][0] = QI_DPBUSD(c[i][0], a, b0);
+                c[i][1] = QI_DPBUSD(c[i][1], a, b1);
+            }
+        }
+    } else {
+        for (int q = 0; q < kq; q++) {
+            __m256i b0 = _mm256_loadu_si256((const __m256i *)(panel + q * 64));
+            __m256i b1 = _mm256_loadu_si256((const __m256i *)(panel + q * 64 + 32));
+            for (int i = 0; i < mr; i++) {
+                int32_t a4; memcpy(&a4, X + (int64_t)i * Kp + q * 4, 4);
+                __m256i a = _mm256_set1_epi32(a4);
+                c[i][0] = QI_DPBUSD(c[i][0], a, b0);
+                c[i][1] = QI_DPBUSD(c[i][1], a, b1);
+            }
+        }
+    }
+    int32_t t[QI_NR];
+    for (int i = 0; i < mr; i++) {
+        _mm256_storeu_si256((__m256i *)t, c[i][0]);
+        _mm256_storeu_si256((__m256i *)(t + 8), c[i][1]);
+        for (int j = 0; j < nr; j++)
+            Y[(int64_t)i * ldy + j] = (float)(t[j] - 128 * wsum[j]) * sx[i] * sw[j] + (bias ? bias[j] : 0.f);
+    }
+}
+#endif
+
+/* Y = X . W^T with X quantized to int8 per row. W must be QI_I8. */
+static void qi_gemm_act8(float *Y, int ldy, const float *X, int ldx, int M, const QiMat *W, const float *bias){
+#ifdef QI_HAVE_VNNI
+    const int N = W->N, K = W->K, Kp = (K + 3) & ~3;
+    if (W->fmt != QI_I8 || M <= 0 || N <= 0) { qi_gemm_ld(Y, ldy, X, ldx, M, W, bias); return; }
+    uint8_t *xq = (uint8_t *)malloc((size_t)M * Kp);
+    float *sx = (float *)malloc(sizeof(float) * (size_t)M);
+    if (!xq || !sx) { fprintf(stderr, "OOM qi_gemm_act8\n"); exit(1); }
+    #pragma omp parallel for schedule(static)
+    for (int m = 0; m < M; m++) {
+        const float *r = X + (int64_t)m * ldx;
+        float am = 0.f;
+        for (int k = 0; k < K; k++) { float a = r[k] < 0 ? -r[k] : r[k]; if (a > am) am = a; }
+        float s = am > 1e-30f ? am / 127.f : 1.f, inv = 1.f / s;
+        sx[m] = s;
+        uint8_t *d = xq + (int64_t)m * Kp;
+        for (int k = 0; k < K; k++) { float v = r[k] * inv; int iv = (int)(v < 0 ? v - 0.5f : v + 0.5f); d[k] = (uint8_t)(iv + 128); }
+        for (int k = K; k < Kp; k++) d[k] = 128;
+    }
+    const int nblocks = (N + QI_NR - 1) / QI_NR, mblocks = (M + QI_MC - 1) / QI_MC;
+    #pragma omp parallel
+    {
+        int8_t *panel = (int8_t *)aligned_alloc(64, (size_t)Kp * QI_NR);
+        int32_t wsum[QI_NR];
+        if (!panel) { fprintf(stderr, "OOM qi_gemm_act8 panel\n"); exit(1); }
+        #pragma omp for schedule(dynamic, 1) collapse(2)
+        for (int nb = 0; nb < nblocks; nb++)
+            for (int mb = 0; mb < mblocks; mb++) {
+                int n0 = nb * QI_NR, nr = N - n0 < QI_NR ? N - n0 : QI_NR;
+                int m0 = mb * QI_MC, mc = M - m0 < QI_MC ? M - m0 : QI_MC;
+                qi_pack_w8(panel, wsum, W, n0, nr, Kp);
+                for (int i = 0; i < mc; i += QI_MR) {
+                    int mr = mc - i < QI_MR ? mc - i : QI_MR;
+                    qi_kernel8(Y + (int64_t)(m0 + i) * ldy + n0, ldy, xq + (int64_t)(m0 + i) * Kp, Kp,
+                               panel, wsum, sx + m0 + i, W->sc + n0, mr, nr, bias ? bias + n0 : NULL);
+                }
+            }
+        free(panel);
+    }
+    free(xq); free(sx);
+#else
+    qi_gemm_ld(Y, ldy, X, ldx, M, W, bias);
+#endif
+}
+
 /* Per-row int8 quantization of an f32 matrix (max-abs / 127, round to nearest). */
 static void qi_quantize_i8(const float *src, int N, int K, int8_t *q, float *sc){
     #pragma omp parallel for schedule(static)

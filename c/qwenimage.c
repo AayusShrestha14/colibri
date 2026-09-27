@@ -90,6 +90,7 @@ static int jbool(jval *o, const char *k, int def){
 /* ---- weights ------------------------------------------------------------ */
 
 static int g_bits = 8;   /* COLI_IMG_BITS: storage of the big matrices */
+static int g_act8 = 0;   /* COLI_IMG_ACT8=1: int8 activations on the int8 matrices (VNNI) */
 
 typedef struct { QiMat m; void *own; float *own_sc; } Lin;
 
@@ -142,7 +143,10 @@ static float *vec_load(shards *S, const char *name, int n){
     st_read_f32_cap(S, name, v, n, 1);
     return v;
 }
-static inline void linear(float *y, const float *x, int M, const Lin *l){ qi_gemm(y, x, M, &l->m, NULL); }
+static inline void linear(float *y, const float *x, int M, const Lin *l){
+    if (g_act8 && l->m.fmt == QI_I8) qi_gemm_act8(y, l->m.N, x, l->m.K, M, &l->m, NULL);
+    else qi_gemm(y, x, M, &l->m, NULL);
+}
 
 /* ---- small kernels -------------------------------------------------------- */
 
@@ -1123,6 +1127,7 @@ static void usage(void){
         "       qwenimage --model DIR --serve\n"
         "       qwenimage --model DIR --ref REFDIR\n"
         "env:   COLI_IMG_BITS=8|16|32 weight storage (default 8: int8 rows)\n"
+        "       COLI_IMG_ACT8=1  int8 activations on the int8 matrices (VNNI, about 2x; quality measured separately)\n"
         "       COLI_IMG_TE=resident|stage  keep the text encoder loaded between prompts (serve default: resident)\n");
 }
 
@@ -1152,6 +1157,11 @@ int main(int argc, char **argv){
     if (!model || (!serve && !ref && !getenv("QWENIMAGE_PRINT_TOKENS") && (!prompt || !out))) { usage(); return 2; }
     const char *b = getenv("COLI_IMG_BITS");
     if (b && *b) { g_bits = atoi(b); if (g_bits != 8 && g_bits != 16 && g_bits != 32) { usage(); return 2; } }
+    const char *a8 = getenv("COLI_IMG_ACT8");
+    g_act8 = a8 && *a8 == '1';
+#ifndef QI_HAVE_VNNI
+    if (g_act8) { fprintf(stderr, "[qwenimage] COLI_IMG_ACT8 needs VNNI; this build has none, staying on f32 activations\n"); g_act8 = 0; }
+#endif
     if (!seed_set && !serve && !ref) seed = (uint64_t)time(NULL);
     static Engine e;
     engine_init(&e, model);
