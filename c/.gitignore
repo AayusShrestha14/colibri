@@ -51,7 +51,6 @@ glm53
 qwen36
 qwenimage
 qwenimage.exe
-test_qi_gemm
 shaders/attention_absorb.spv
 shaders/qmatmul_gate_up.spv
 shaders/rmsnorm.spv

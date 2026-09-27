@@ -1021,8 +1021,8 @@ jobs:
           # weights, so each stage must match to summation order; the engine exits
           # non-zero on a mismatch, and the RGBA must agree to 1 in 1000 bytes.
           python3 tools/make_qwenimage_tiny.py qwenimage_tiny
-          make qwenimage test_qi_gemm tests/test_qwenimage_vae
-          ./test_qi_gemm
+          make qwenimage tests/test_qi_gemm tests/test_qwenimage_vae
+          tests/test_qi_gemm
           COLI_IMG_BITS=16 COLI_IMG_ACT8=0 ./qwenimage --model qwenimage_tiny --ref qwenimage_tiny/ref
       - name: "The VAE alone: tiny decoder at two latent shapes"
         run: |
@@ -1409,7 +1409,7 @@ jobs:
       # rieseguiva un binario non strumentato. Uno di quei test era rosso da
       # settimane senza che nessuno potesse vederlo.
       - name: Build the engines those tests exercise
-        run: make -C c kimi_k3 inkling colibri olmoe qwen38 qwen36 deepseek_v41
+        run: make -C c kimi_k3 inkling colibri olmoe qwen38 qwen36 deepseek_v41 qwenimage
       - name: Python test suite
         run: cd c && python3 -m unittest discover -s tests -p 'test_*.py'
 
