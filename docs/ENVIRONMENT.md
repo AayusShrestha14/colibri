@@ -488,7 +488,7 @@ Read **only** by `c/deepseek_v41.c`. See [deepseek-v41.md](deepseek-v41.md).
 | `V41_DSPARK` | on when the checkpoint carries the head | DeepSeek V4.1: `0` disables the DSpark draft head, which is then not loaded. Drafts never change what a turn produces, only how many forwards it takes: measured +17% on the real checkpoint from a cold cache (24 tokens in 99.3 s against 116.6). |
 | `V41_DSPARK_MAX` | the checkpoint's `dspark_block_size` | DeepSeek V4.1: how many drafted tokens go in front of the main model per round. Fewer costs less when a round is rejected and caps the win when it is not. |
 | `V41_DSPARK_MINACC` | 60 | DeepSeek V4.1: percent of drafts that must be accepted over a window of ten before drafting pauses for 64 tokens. 60 is the measured break-even. |
-| `V41_SPEC_FORCE` | unset | DeepSeek V4.1, oracle mode only: draft the reference's own tokens (`1`), corrupt the last one (`2`), or keep the head's (`3`), so the verification path runs on a fixture whose draft head is random noise. |
+| `V41_SPEC_FORCE` | unset | DeepSeek V4.1, oracle mode only: draft the reference's own tokens (`1`), corrupt the last one (`2`), keep the head's (`3`), corrupt the first one (`4`) or a different one each round (`5`), so the verification path runs on a fixture whose draft head is random noise. |
 
 ## OLMoE engine (`olmoe`)
 

@@ -825,9 +825,12 @@ jobs:
           # accepted and the verification path would never run. V41_SPEC_FORCE drafts
           # the reference's own tokens instead: 1 accepts the whole block, 2 corrupts
           # the last draft so a round is rejected part way and the rollback runs, 3
-          # keeps the head's drafts, which is what serving does. All three have to
-          # reproduce the reference token for token, at any cache capacity.
-          for force in 1 2 3; do
+          # keeps the head's drafts, which is what serving does, 4 rejects the first
+          # draft of every round (all drafted rows rolled back, what serving at 10-30%
+          # acceptance does most of the time) and 5 a different one each round. All
+          # of them have to reproduce the reference token for token, at any cache
+          # capacity.
+          for force in 1 2 3 4 5; do
             for cap in 1 8; do
               echo "::group::V41_SPEC_FORCE=$force cap=$cap"
               SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=$force ./deepseek_v41 "$cap" dsv41_tiny/ref.json
