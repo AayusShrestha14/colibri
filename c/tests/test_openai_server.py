@@ -29,6 +29,7 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            render_chat_qwen38, render_chat_v4, render_chat_dsv41,
                            _dsv4_tool_calls, serve,
                            resolve_generation_prompt, split_thinking_reply,
+                           detect_chat_flavor,
                            starts_in_reasoning,
                            stop_policy, tune_child_env)
 
@@ -229,6 +230,30 @@ class TemplateTest(unittest.TestCase):
                 # Without preserve_thinking the block leaves the history either way.
                 self.assertIn("<|im_start|>assistant\nParis.<|im_end|>",
                               render_chat_qwen(first + [past, follow], enable_thinking=True))
+
+    def test_qwen38_template_on_the_qwen36_engine(self):
+        """#1757: Qwen3.8-27B is a dense model of Qwen3.5's architecture, so the qwen36
+        engine runs it, but it ships Qwen3.8's chat_template.jinja. The gateway renders
+        the template the checkpoint carries, not its engine family's."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            template = Path(d) / "chat_template.jinja"
+            template.write_text("{%- set resolved_reasoning_effort = "
+                                "reasoning_effort|default('xhigh') %}", encoding="utf-8")
+            self.assertEqual(detect_chat_flavor("qwen36", d), "qwen38")
+            self.assertIsNone(detect_chat_flavor("glm53", d))
+            template.write_text("{%- if enable_thinking is defined %}", encoding="utf-8")
+            self.assertIsNone(detect_chat_flavor("qwen36", d))
+            template.unlink()
+            self.assertIsNone(detect_chat_flavor("qwen36", d))
+        history = [{"role": "user", "content": "Capital of France?"}]
+        with patch("openai_server.ARCH", "qwen36"), patch("openai_server.CHAT_FLAVOR", "qwen38"):
+            for thinking in (True, False):
+                self.assertEqual(render_chat_for_arch(history, thinking, "xhigh"),
+                                 render_chat_qwen38(history, thinking, "xhigh"))
+        with patch("openai_server.ARCH", "qwen36"):
+            self.assertNotEqual(render_chat_for_arch(history, True, "xhigh"),
+                                render_chat_qwen38(history, True, "xhigh"))
 
     def test_kimi_renders_tool_declaration_and_choice(self):
         tools = [{"type": "function", "function": {
@@ -2159,6 +2184,16 @@ class HTTPTest(unittest.TestCase):
                     "model": "test-model", "messages": history, "preserve_thinking": "yes"})
             self.addCleanup(caught.exception.close)
             self.assertEqual(caught.exception.code, 400)
+
+    def test_qwen38_template_defaults_to_xhigh_thinking_on_the_qwen36_engine(self):
+        """What the flavor changes over the wire: with no thinking field, a Qwen3.8
+        template reasons at xhigh by default, as the qwen38 family does."""
+        history = [{"role": "user", "content": "Capital of France?"}]
+        with patch("openai_server.ARCH", "qwen36"), patch("openai_server.CHAT_FLAVOR", "qwen38"):
+            with self.request("/v1/chat/completions", {
+                    "model": "test-model", "messages": history}) as response:
+                self.assertEqual(response.status, 200)
+        self.assertEqual(self.engine.calls[-1][0], render_chat_qwen38(history, True, "xhigh"))
 
     def test_a_well_formed_forced_tool_choice_still_runs(self):
         """The read above must not change the shape clients actually send."""

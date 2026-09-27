@@ -330,6 +330,18 @@ def main():
             print("WARNING: tokenizer.json not found; the engine will need TOK=<path>")
     except Exception as e:
         print(f"WARNING: could not fetch tokenizer.json ({e}); the engine will need TOK=<path>")
+    # The chat template travels with the container: the gateway renders what the
+    # checkpoint was trained on, and a Qwen3.8 template on this engine (Qwen3.8-27B,
+    # #1757) is recognised from this file.
+    for extra in ("chat_template.jinja", "tokenizer_config.json", "generation_config.json"):
+        try:
+            extra_path = (hf_hub_download(args.repo, extra, token=token) if args.repo
+                          else str(src_dir / extra))
+        except Exception:
+            continue
+        if Path(extra_path).is_file():
+            shutil.copy2(extra_path, out / extra)
+            print(f"{extra} -> {out / extra}")
 
     # ---- build weight map (key -> shard file) ----
     if idx_path:
@@ -571,10 +583,14 @@ def main():
         "n_layers": int(mcfg["num_hidden_layers"]),
         "n_active": len(all_idx),
         "layer_types": layer_types,
-        "num_experts": int(mcfg["num_experts"]),
-        "topk": int(mcfg["num_experts_per_tok"]),
-        "moe_inter": int(mcfg.get("moe_intermediate_size", mcfg.get("intermediate_size", 0) // 2)),
-        "shared_inter": int(mcfg.get("shared_expert_intermediate_size", mcfg.get("moe_intermediate_size", 0))),
+        # A dense checkpoint of the family (no num_experts: Qwen3.5 / Qwen3.8 27B) routes
+        # nothing; the engine loads its MLP as an ungated shared expert of that width.
+        "num_experts": int(mcfg.get("num_experts", 0)),
+        "topk": int(mcfg.get("num_experts_per_tok", 0)) if mcfg.get("num_experts") else 0,
+        "moe_inter": (int(mcfg.get("moe_intermediate_size", mcfg.get("intermediate_size", 0) // 2))
+                      if mcfg.get("num_experts") else 0),
+        "shared_inter": (int(mcfg.get("shared_expert_intermediate_size", mcfg.get("moe_intermediate_size", 0)))
+                         if mcfg.get("num_experts") else int(mcfg["intermediate_size"])),
         "rms_eps": float(mcfg.get("rms_norm_eps", 1e-6)),
         "ebits": args.ebits,
         "scoring_func": mcfg.get("scoring_func", "softmax"),

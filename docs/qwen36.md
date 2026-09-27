@@ -194,13 +194,14 @@ tier takes one format per expert and refuses a mixed container with a line
 
 ## Which checkpoints, and what the banner calls them
 
-Two Qwen checkpoints declare `model_type: qwen3_5_moe_text` and resolve to
-this engine:
+Three Qwen checkpoints resolve to this engine: two MoE ones that declare
+`model_type: qwen3_5_moe_text`, and a dense one that declares `qwen3_5`:
 
 | checkpoint | layers | experts | hidden | banner |
 |---|---|---|---|---|
 | Qwen/Qwen3.6-35B-A3B | 40 (10 attention) | 256, top-8 | 2048 | `Qwen3.6-35B-A3B · 35B MoE` |
 | Qwen/Qwen3.8-2.4T-A95B | 92 (23 attention) | 512, top-10 | 8192 | `Qwen3.8-2.4T-A95B · 2.4T MoE` |
+| Qwen/Qwen3.8-27B | 64 (16 attention) | none: one MLP of 17408 per layer | 5120 | `Qwen3.8-27B · 27B` |
 
 The registry names a checkpoint by its geometry (`display_variants` on the
 `qwen36` descriptor), so the banner says what is on disk. A config that
@@ -216,6 +217,48 @@ is hold the experts: the warmstart keeps every expert in RAM by design (see
 `--ram` below), which is ~1.4 TB of int4 for 2.4T. Serving it needs the
 disk-streaming design, not this one. The conversion and the geometry checks
 are in place so that work starts from a verified shape, not from a guess.
+
+### The dense 27B
+
+Qwen3.8-27B (#1757) is `Qwen3_5ForConditionalGeneration`: the same Gated
+DeltaNet + gated attention layers, with one SwiGLU MLP per layer and no
+router. The engine loads that MLP as the shared expert, ungated, and routes
+nothing; the converter writes `num_experts: 0` and the MLP width into
+`qwen36_meta.json`. It ships Qwen3.8's `chat_template.jinja`, not Qwen3.6's
+(the same file the qwen38 renderer is pinned to): the converter copies it
+into the container, and the gateway recognises it and renders with the
+Qwen3.8 rules (reasoning on by default at `xhigh`, the XML tool-call form,
+history that keeps its thinking) while the engine stays qwen36. The API model
+id is `qwen3.8-27b-colibri`.
+
+```bash
+python3 tools/convert_qwen36.py --model <Qwen3.8-27B download> --out q27_c
+./coli chat --model q27_c --gpu none
+```
+
+The container keeps the weights in f16 (51 GB) and the engine quantizes
+them while loading. Every weight is read for every token, so speed is set by
+memory bandwidth, not by the disk. Measured on a 16-thread CPU server
+(8 OpenMP threads), perplexity over 1000 tokens of human-written text:
+
+| dense weights | RSS | scoring | perplexity, English | perplexity, Italian |
+|---|---|---|---|---|
+| int8 (default) | 29.1 GB | 2.25 tok/s | 4.85 | 11.19 |
+| `COLI_DENSE_BITS=4 COLI_DENSE_INT4=shexp,lmhead` | 21.6 GB | 3.15 tok/s | 4.94 (+1.8%) | 11.69 (+4.5%) |
+| `COLI_DENSE_BITS=4` (everything) | 18.8 GB | 3.72 tok/s | 5.02 (+3.5%) | 12.15 (+8.6%) |
+
+Through the gateway (`coli serve`), greedy decode ran at 2.1 tok/s in int8 and
+3.45 tok/s with everything in int4, after a load of 73 and 114 s; the answers
+to the same English, Italian and Turkish questions were the same but for a word.
+
+The MLP is 17 of the 27 billion parameters, so int4 on the MLP and the LM head
+keeps most of the saving at half the loss. With a matrix in int4 the engine
+no longer keeps its int8 copy (`COLI_DENSE_KEEP_I8=1` does); that is what
+brings the full int4 run from 42.4 to 18.8 GB.
+
+Not yet: the CUDA tier (a dense checkpoint runs on the CPU), the vision
+tower and the MTP head (both skipped by the converter), and an int4
+container on disk.
 
 ### The converter's tensor contract
 

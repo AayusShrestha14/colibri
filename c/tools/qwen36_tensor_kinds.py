@@ -46,6 +46,10 @@ LAYER_KINDS = frozenset((
     "mlp.shared_expert.up_proj.weight",
     "mlp.shared_expert.down_proj.weight",
     "mlp.shared_expert_gate.weight",
+    # dense checkpoints of the family (Qwen3.5 / Qwen3.8 27B): the whole MLP, no router
+    "mlp.gate_proj.weight",
+    "mlp.up_proj.weight",
+    "mlp.down_proj.weight",
     # routed experts, fused layout (real checkpoints): one tensor per layer
     "mlp.experts.gate_up_proj",
     "mlp.experts.down_proj",

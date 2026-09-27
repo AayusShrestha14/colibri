@@ -1091,10 +1091,20 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     cap = int(cache_bytes // per_cap) if per_cap else 0
     if configured_experts:
         cap = min(cap, configured_experts)
+    if geometry.dense:
+        # Nothing to cache: the engine still takes a cache size, and one slot is
+        # the smallest it accepts; no slot is ever filled.
+        cap = 1
     warm_bytes = min(max(0, info["expert_bytes"] - hot_bytes), cache_bytes)
     cold_bytes = max(0, info["expert_bytes"] - hot_bytes - warm_bytes)
 
-    if cap < 1:
+    if geometry.dense:
+        if info["dense_bytes"] + runtime_bytes > ram_budget:
+            warnings.append(
+                f"a dense model keeps every weight resident: {format_bytes(info['dense_bytes'])} "
+                f"of weights (as stored; the engine quantizes them at load) do not fit the "
+                f"RAM budget of {format_bytes(ram_budget)}")
+    elif cap < 1:
         warnings.append("RAM budget cannot hold one expert slot per sparse layer")
     if gpu_indices is not None and len(gpus) != len(set(gpu_indices)):
         warnings.append("one or more requested GPUs were not detected")
@@ -1130,7 +1140,11 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     resident_expert = hot_bytes + warm_bytes
     projected_hit = resident_expert / total_expert if total_expert else 1.0
 
-    if cold_bytes:
+    if geometry.dense:
+        bottleneck = ("GPU compute (dense model, weights in VRAM)" if trunk_placed else
+                      "RAM bandwidth (dense model: every weight is read for every token)")
+        bottleneck_class = "compute" if trunk_placed else "memory"
+    elif cold_bytes:
         bottleneck = "disk expert misses"
         bottleneck_class = "disk"
     elif warm_bytes and planning_gpus:
@@ -1198,12 +1212,14 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         # Un motore solo-CPU non ha un tier VRAM: annunciarlo comunque fa
         # scrivere al piano una riga che nessuno puo' eseguire.
         "decisions": ([{"target": "VRAM", "reason": "dense trunk as int8 residents"}]
-                      if trunk_placed else []) +
-                     ([{"target": "VRAM", "reason": "profile-ranked hot experts"}]
-                      if resolved.descriptor.supports_accelerator else []) + [
-            {"target": "RAM", "reason": "warm experts execute on CPU without quality loss"},
-            {"target": "Disk", "reason": "immutable recovery source for cold experts"},
-        ],
+                      if trunk_placed else []) + (
+            [{"target": "RAM", "reason": "dense model: every weight resident, read every token"}]
+            if geometry.dense else
+            ([{"target": "VRAM", "reason": "profile-ranked hot experts"}]
+             if resolved.descriptor.supports_accelerator else []) + [
+                {"target": "RAM", "reason": "warm experts execute on CPU without quality loss"},
+                {"target": "Disk", "reason": "immutable recovery source for cold experts"},
+            ]),
         "warnings": warnings,
         # #379: read-only surfacing of the cached Metal-cache storage probe, if
         # the engine has already measured this model dir. gbs is None unless

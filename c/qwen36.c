@@ -1208,6 +1208,21 @@ static int dense_int4_wanted(const char *tag){
  * touch out->w -- the caller sets that (or leaves it, e.g. load_tq frees it
  * right after). `tag` selects the int4 planar copy per dense_int4_wanted
  * (NULL/COLI_DENSE_BITS!=4: skipped, out->q4 stays NULL). */
+/* Whether a matrix that got its int4 copy keeps the int8 one too. Only the CUDA
+ * placer reads it (it uploads int8 rows); on the CPU matmul_d takes the int4 copy
+ * whenever there is one, so keeping both doubled the trunk for nothing: measured on
+ * Qwen3.8-27B with COLI_DENSE_BITS=4, 42.4 GB resident against 29.1 in int8 (#1757).
+ * COLI_DENSE_KEEP_I8=1 keeps both. */
+static int dense_keep_i8(void){
+    static int v = -1;
+    if (v < 0) {
+        v = getenv("COLI_DENSE_KEEP_I8") && getenv("COLI_DENSE_KEEP_I8")[0] == '1';
+#ifdef COLI_CUDA
+        { const char *cu = getenv("COLI_CUDA"); if (cu && *cu == '1') v = 1; }
+#endif
+    }
+    return v;
+}
 static void qw_quantize(const float *W, int I, int O, const char *tag, QW *out) {
     int8_t *q = malloc((size_t)O*I); float *sc = malloc((size_t)O*sizeof(float));
     if (!q || !sc) { fprintf(stderr, "OOM qw_quantize\n"); exit(1); }
@@ -1226,6 +1241,7 @@ static void qw_quantize(const float *W, int I, int O, const char *tag, QW *out) 
         if (q4 && sg) {
             pack_int4_g64_planar(W, q4, sg, O, I);
             out->q4 = q4; out->sg = sg; out->ng = I/64;
+            if (!dense_keep_i8()) { free(out->q); free(out->sc); out->q = NULL; out->sc = NULL; }
         } else { free(q4); free(sg); }
     }
 }
@@ -1233,7 +1249,7 @@ static void matmul_d(float *y, const float *x, const QW *w, int S, int I, int O)
 #ifdef COLI_QWEN_BATCH_TEST
     g_qwen_matmul_d_calls++;
 #endif
-    if (w->q) {
+    if (w->q || w->q4) {
         if (w->q4 || dense_idot_on()) {
             /* integer dot: the activation rows to int8 once, then the K1b
              * grouped kernel (int4 planar) or the per-row int8 kernel */
@@ -1250,6 +1266,7 @@ static void matmul_d(float *y, const float *x, const QW *w, int S, int I, int O)
                 return;
             }
             free(xq); free(sx); free(xsg);      /* out of memory: the f32 path below */
+            if (!w->q) { fprintf(stderr, "OOM in the int4 dense GEMV (no int8 copy to fall back on)\n"); exit(1); }
         }
         if (S > 1 && dense_batch_on())
             matmul_q_batch(y, x, w->q, w->sc, S, I, O);
@@ -1368,14 +1385,22 @@ static void validate_cfg(const Cfg *c, int n_layers_from_config) {
              n_layers_from_config, c->n_layers);
     CFG_NEED(c->hidden > 0 && c->hidden <= 65536, "hidden %d out of range", c->hidden);
     CFG_NEED(c->vocab > 0, "vocab %d must be positive", c->vocab);
-    CFG_NEED(c->n_experts > 0 && c->n_experts <= 1024,
-             "num_experts %d out of range 1..1024 (keep[] in moe())", c->n_experts);
-    CFG_NEED(c->topk > 0 && c->topk <= 256,
-             "topk %d out of range 1..256 (idx[]/val[] in moe())", c->topk);
-    CFG_NEED(c->topk <= c->n_experts, "topk %d exceeds num_experts %d",
-             c->topk, c->n_experts);
-    CFG_NEED(c->inter > 0 && c->shared_inter > 0,
-             "moe_inter %d / shared_inter %d must be positive", c->inter, c->shared_inter);
+    if (c->n_experts == 0) {
+        /* A dense checkpoint of the same family (Qwen3.5 / Qwen3.8 27B, #1757): the
+         * layer's MLP is loaded as the shared expert, ungated, and nothing is routed. */
+        CFG_NEED(c->topk == 0, "a dense model (num_experts 0) routes nothing, but topk is %d",
+                 c->topk);
+        CFG_NEED(c->shared_inter > 0, "dense MLP width %d must be positive", c->shared_inter);
+    } else {
+        CFG_NEED(c->n_experts > 0 && c->n_experts <= 1024,
+                 "num_experts %d out of range 1..1024 (keep[] in moe())", c->n_experts);
+        CFG_NEED(c->topk > 0 && c->topk <= 256,
+                 "topk %d out of range 1..256 (idx[]/val[] in moe())", c->topk);
+        CFG_NEED(c->topk <= c->n_experts, "topk %d exceeds num_experts %d",
+                 c->topk, c->n_experts);
+        CFG_NEED(c->inter > 0 && c->shared_inter > 0,
+                 "moe_inter %d / shared_inter %d must be positive", c->inter, c->shared_inter);
+    }
     CFG_NEED(c->q_heads > 0 && c->kv_heads > 0 && c->head_dim > 0,
              "attention dims q_heads=%d kv_heads=%d head_dim=%d must be positive",
              c->q_heads, c->kv_heads, c->head_dim);
@@ -1552,7 +1577,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     if (load_boundaries) {
         m->embed = load_t_n(m, "model.embed_tokens.weight", (int64_t)c->vocab * c->hidden);
         load_tq(m, "lm_head.weight", c->hidden, c->vocab, quantize_dense, "lmhead", &m->lm_head);
-        if (m->lm_head.q) { qcount++; qfreed += (double)c->hidden * c->vocab * sizeof(float); }
+        if (m->lm_head.q || m->lm_head.q4) { qcount++; qfreed += (double)c->hidden * c->vocab * sizeof(float); }
         m->final_norm = load_t_n(m, "model.norm.weight", c->hidden);
     }
     m->L = calloc((size_t)c->n_layers, sizeof(Layer));
@@ -1563,7 +1588,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     for (int i = 0; i < c->n_layers; i++) m->active_of[i] = i;
     char nm[256];
     int q_out = c->q_heads * c->q_head_dim, kv_out = c->kv_heads * c->k_head_dim;
-    #define QCOUNT(field) do { if ((field).q) { qcount++; qfreed += (double)(field).I * (field).O * sizeof(float); } } while (0)
+    #define QCOUNT(field) do { if ((field).q || (field).q4) { qcount++; qfreed += (double)(field).I * (field).O * sizeof(float); } } while (0)
     for (int i = layer_begin; i < layer_end; i++) {
         int ai = m->active_of[i];        /* == i for Phase 2 */
         Layer *l = &m->L[i];
@@ -1572,9 +1597,11 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         LD(in_ln,  "input_layernorm.weight", c->hidden);
         LD(post_ln,"post_attention_layernorm.weight", c->hidden);
         #undef LD
-        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.weight", ai);
-        load_tq(m, nm, c->hidden, c->n_experts, quantize_dense, "router", &l->gate);
-        QCOUNT(l->gate);
+        if (c->n_experts) {
+            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.weight", ai);
+            load_tq(m, nm, c->hidden, c->n_experts, quantize_dense, "router", &l->gate);
+            QCOUNT(l->gate);
+        } else l->gate = (QW){0};
         /* q/k norms are per-head [head_dim]; only on attention layers, load if present */
         if (c->has_qk_norm) {
             snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.q_norm.weight", ai);
@@ -1584,18 +1611,20 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         } else { l->qn = NULL; l->kn = NULL; }
         /* router correction bias (optional) */
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.e_score_correction_bias", ai);
-        if (st_has(&m->S, nm)) { l->gate_bias = falloc(c->n_experts); st_read_f32(&m->S, nm, l->gate_bias, 0); }
+        if (c->n_experts && st_has(&m->S, nm)) { l->gate_bias = falloc(c->n_experts); st_read_f32(&m->S, nm, l->gate_bias, 0); }
         else l->gate_bias = NULL;
-        /* shared expert (dense, int8-during-load) */
-        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert.gate_proj.weight", ai);
+        /* shared expert (dense, int8-during-load). A dense model's MLP is the same
+         * SwiGLU under mlp.{gate,up,down}_proj, with no gate in front of it. */
+        const char *shp = c->n_experts ? "mlp.shared_expert." : "mlp.";
+        snprintf(nm,sizeof(nm),"model.layers.%d.%sgate_proj.weight", ai, shp);
         load_tq(m, nm, c->hidden, c->shared_inter, quantize_dense, "shexp", &l->sh_g); QCOUNT(l->sh_g);
-        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert.up_proj.weight", ai);
+        snprintf(nm,sizeof(nm),"model.layers.%d.%sup_proj.weight", ai, shp);
         load_tq(m, nm, c->hidden, c->shared_inter, quantize_dense, "shexp", &l->sh_u); QCOUNT(l->sh_u);
-        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert.down_proj.weight", ai);
+        snprintf(nm,sizeof(nm),"model.layers.%d.%sdown_proj.weight", ai, shp);
         load_tq(m, nm, c->shared_inter, c->hidden, quantize_dense, "shexp", &l->sh_d); QCOUNT(l->sh_d);
         /* shared_expert_gate: Linear(hidden -> 1), sigmoid-gated shared expert */
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert_gate.weight", ai);
-        l->sh_gate = st_has(&m->S, nm) ? load_t_n(m, nm, c->hidden) : NULL;
+        l->sh_gate = c->n_experts && st_has(&m->S, nm) ? load_t_n(m, nm, c->hidden) : NULL;
         if (c->is_attn[i]) {
             /* Gated Attention (full_attention) layer, dense projections int8-during-load */
             snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.q_proj.weight", ai);
@@ -2372,6 +2401,14 @@ static void route_footer(FILE *f, const Model *m) {
 
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
+    if (E == 0) {
+        memset(out, 0, (int64_t)S*D*sizeof(float));
+        float *g = falloc(c->shared_inter), *u = falloc(c->shared_inter), *hh = falloc(D);
+        qwen_shared_experts_cpu(m, l, x, S, out, g, u, hh);
+        free(g); free(u); free(hh);
+        (void)layer;
+        return;
+    }
     float *logits = falloc((int64_t)S*E);
     double _tr = tm_now();
     matmul_d(logits, x, &l->gate, S, D, E);
@@ -3012,7 +3049,7 @@ static void *pilot_worker(void *arg) {
 }
 
 static void pilot_prefetch(Model *m, int lnext, const float *x, int S) {
-    if (lnext < 0 || lnext >= m->c.n_layers) return;
+    if (lnext < 0 || lnext >= m->c.n_layers || m->c.n_experts == 0) return;
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts;
     ensure_pilot_worker_started(m);
     float *logits = falloc((int64_t)S * E);
@@ -3529,6 +3566,9 @@ static void dash_hex(const uint8_t *bytes,int n,char *hex){
 }
 static void emap_emit(Model *m){
     const Cfg *c=&m->c; const int rows=c->n_layers, cols=c->n_experts;
+    /* A dense model has no expert grid. "EMAP 64 0 " would be a three-field line,
+     * and the gateway stops its dispatcher on a line it cannot parse (#1757). */
+    if(cols==0) return;
     uint8_t *cells=calloc((size_t)rows*cols,1);
     pthread_mutex_lock(&g_pilot_mx);
     for(int i=0;i<rows;i++) for(int e=0;e<cols;e++)
@@ -3539,6 +3579,7 @@ static void emap_emit(Model *m){
 }
 static void hits_emit(Model *m){
     const Cfg *c=&m->c; const int rows=c->n_layers, cols=c->n_experts, nb=(rows*cols+7)/8;
+    if(cols==0) return;   /* see emap_emit */
     if(!m->ehit) ehit_mark(m,-1,-1);
     uint8_t *bm=calloc((size_t)nb,1); int bit=0;
     for(int i=0;i<rows;i++) for(int e=0;e<cols;e++,bit++)
@@ -3909,7 +3950,8 @@ int main(int argc, char **argv) {
     /* Una riga, sempre: e' l'unico modo di verificare il probe dall'esterno
      * (CI sul container tiny int8, #1331) senza una scheda. */
     fprintf(stderr, "[qwen36] expert format on disk: %s\n",
-            expert_mixed ? "int4 gate/up + int8 down (mixed; CPU path, no VRAM tier yet)"
+            m.c.n_experts == 0 ? "none (dense model: every layer's MLP is resident)"
+            : expert_mixed ? "int4 gate/up + int8 down (mixed; CPU path, no VRAM tier yet)"
                          : expert_is_int4 ? "int4 packed (tier fmt=4)" : "int8 (tier fmt=1)");
     g_expert_is_int4 = expert_is_int4;
     g_expert_mixed = expert_mixed; g_expert_down_gs = expert_mixed ? m.c.expert_down_gs : 0;
@@ -3931,7 +3973,7 @@ int main(int argc, char **argv) {
     }
     if (expert_mixed && getenv("COLI_CUDA") && getenv("COLI_CUDA")[0] == '1')
         fprintf(stderr, "[qwen36] COLI_CUDA=1 ignored: the VRAM expert tier does not take the mixed layout yet (one format per expert)\n");
-    if (!expert_mixed &&
+    if (!expert_mixed && m.c.n_experts > 0 &&
         qt_init(m.c.n_layers, m.c.n_experts, m.c.hidden, m.c.inter, cap, m.c.topk,
                 m.c.expert_gs, expert_is_int4)) {
         fprintf(stderr, "[gpu] MoE experts -> CUDA VRAM tier\n");
