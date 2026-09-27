@@ -260,8 +260,13 @@ static void te_config(Te *te, const char *model){
         te->theta = (float)jnum(rp, "rope_theta", 5000000.0);
     }
     json_free(root); free(arena);
-    if (te->hidden <= 0 || te->layers <= 0 || te->heads <= 0 || te->kv <= 0 || te->hd <= 0 ||
-        te->heads % te->kv || te->inter <= 0 || te->vocab <= 0 || te->hd % 2) {
+    /* Model files come from mirrors nobody vouches for: every dimension that
+     * sizes a buffer is bounded, and products are formed in 64 bits, so a config
+     * cannot wrap an int into a small allocation that a loop then overruns. */
+    if (te->hidden <= 0 || te->hidden > 65536 || te->layers <= 0 || te->layers > 1024 ||
+        te->heads <= 0 || te->heads > 1024 || te->kv <= 0 || te->hd <= 0 || te->hd > 1024 ||
+        te->heads % te->kv || te->inter <= 0 || te->inter > (1 << 18) || te->vocab <= 0 ||
+        te->vocab > (1 << 22) || te->hd % 2 || (int64_t)te->heads * te->hd > 65536) {
         fprintf(stderr, "[qwenimage] text_encoder/config.json: unsupported shape\n"); exit(1);
     }
 }
@@ -438,8 +443,10 @@ static void dit_config(Dit *d, const char *model){
     d->layers = (int)jnum(c, "num_layers", 0);
     d->heads = (int)jnum(c, "num_attention_heads", 0);
     d->hd = (int)jnum(c, "attention_head_dim", 0);
-    d->dim = d->heads * d->hd;
-    d->mlp = d->dim * (int)jnum(c, "mlp_ratio", 3);
+    int mlp_ratio = (int)jnum(c, "mlp_ratio", 3);
+    int64_t dim64 = (int64_t)d->heads * d->hd;
+    d->dim = dim64 > 0 && dim64 <= 65536 ? (int)dim64 : 0;
+    d->mlp = mlp_ratio >= 1 && mlp_ratio <= 16 ? d->dim * mlp_ratio : 0;
     d->in_ch = (int)jnum(c, "in_channels", 64);
     d->ctx = (int)jnum(c, "context_in_dim", 0);
     d->eps = (float)jnum(c, "eps", 1e-6);
@@ -447,10 +454,15 @@ static void dit_config(Dit *d, const char *model){
     int patch = (int)jnum(c, "patch_size", 1), outc = (int)jnum(c, "out_channels", d->in_ch);
     jval *ax = json_get(c, "axes_dims_rope");
     int ok = ax && ax->t == J_ARR && ax->len == 3;
-    for (int i = 0; ok && i < 3; i++) d->axes[i] = (int)ax->kids[i]->num;
+    for (int i = 0; ok && i < 3; i++) {
+        d->axes[i] = ax->kids[i]->t == J_NUM ? (int)ax->kids[i]->num : -1;
+        ok = d->axes[i] > 0 && d->axes[i] % 2 == 0;   /* each axis fills whole complex pairs */
+    }
     json_free(c); free(arena);
-    if (!ok || d->axes[0] + d->axes[1] + d->axes[2] != d->hd || d->layers <= 0 || d->heads <= 0 ||
-        d->hd % 2 || patch != 1 || outc != d->in_ch || d->ctx <= 0 || !d->causal_condition) {
+    if (!ok || d->axes[0] + d->axes[1] + d->axes[2] != d->hd || d->layers <= 0 || d->layers > 1024 ||
+        d->heads <= 0 || d->heads > 1024 || d->hd <= 0 || d->hd > 1024 || d->hd % 2 || d->dim <= 0 ||
+        d->mlp <= 0 || d->in_ch <= 0 || d->in_ch > 1024 || patch != 1 || outc != d->in_ch ||
+        d->ctx <= 0 || d->ctx > 65536 || !d->causal_condition) {
         fprintf(stderr, "[qwenimage] transformer/config.json: unsupported shape "
                         "(needs patch_size 1, causal_condition, axes summing to the head dim)\n");
         exit(1);
@@ -822,6 +834,9 @@ typedef struct { const char *id; int (*cancelled)(const char *id); int preview; 
 /* The picture as it stands after a step: the flow-matching estimate of the clean
  * latent (x0 = x_t - sigma * v) through a linear latent -> RGB map, one pixel per
  * latent pixel. 64x3 multiply-adds per token: free next to a DiT step. */
+static void json_escape_out(const char *s);
+static void send_error(const char *id, const char *m);
+
 static void emit_preview(const Progress *pg, int step, const float *lat, const float *v, float sigma,
                          int gh, int gw, int C){
     if (!pg || !pg->id || !pg->preview || C != 64) return;
@@ -836,8 +851,8 @@ static void emit_preview(const Progress *pg, int step, const float *lat, const f
             rgb[t * 3 + c] = a < 0 ? 0 : a > 255 ? 255 : (uint8_t)a;
         }
     }
-    printf("PREVIEW {\"id\":\"%s\",\"step\":%d,\"width\":%d,\"height\":%d,\"channels\":3,\"bytes\":%zu}\n",
-           pg->id, step, gw, gh, n);
+    printf("PREVIEW {\"id\":\""); json_escape_out(pg->id);
+    printf("\",\"step\":%d,\"width\":%d,\"height\":%d,\"channels\":3,\"bytes\":%zu}\n", step, gw, gh, n);
     fwrite(rgb, 1, n, stdout);
     putchar('\n');
     fflush(stdout);
@@ -846,8 +861,8 @@ static void emit_preview(const Progress *pg, int step, const float *lat, const f
 
 static void emit_progress(const Progress *pg, const char *stage, int step, int steps, double t0){
     if (!pg || !pg->id) return;
-    printf("PROGRESS {\"id\":\"%s\",\"stage\":\"%s\",\"step\":%d,\"steps\":%d,\"elapsed\":%.2f}\n",
-           pg->id, stage, step, steps, now_s() - t0);
+    printf("PROGRESS {\"id\":\""); json_escape_out(pg->id);
+    printf("\",\"stage\":\"%s\",\"step\":%d,\"steps\":%d,\"elapsed\":%.2f}\n", stage, step, steps, now_s() - t0);
     fflush(stdout);
 }
 
@@ -862,10 +877,49 @@ static void engine_init(Engine *e, const char *model){
         fprintf(stderr, "[qwenimage] text encoder hidden %d != transformer context %d\n", e->te.hidden, e->dit.ctx);
         exit(1);
     }
+    /* The VAE is loaded only when the first image is decoded; its geometry is
+     * checked now, so a VAE that does not fit the DiT (latent channels, 16x
+     * upsampling, which the image buffers are sized from) fails at start-up
+     * and not after a whole denoise. */
+    char dir[2100]; snprintf(dir, sizeof dir, "%s/vae", model);
+    char *arena = NULL;
+    jval *v = read_json(dir, "config.json", &arena);
+    jval *dm = json_get(v, "dim_mult");
+    int zdim = (int)jnum(v, "z_dim", 0), ok = dm && dm->t == J_ARR && dm->len >= 1 && dm->len <= 8;
+    for (int i = 0; ok && i < dm->len; i++) ok = dm->kids[i]->t == J_NUM && dm->kids[i]->num >= 1;
+    int scale = ok ? 1 << (dm->len - 1) : 0;
+    json_free(v); free(arena);
+    if (!ok || scale != 16 || zdim != e->dit.in_ch) {
+        fprintf(stderr, "[qwenimage] vae/config.json: z_dim %d and a %dx upsampling do not fit the transformer "
+                        "(%d latent channels, 16x)\n", zdim, scale, e->dit.in_ch);
+        exit(1);
+    }
 }
 
+#ifdef QI_HAVE_VAE
+/* qiv_load plus the same geometry check, against the weights actually loaded. */
+static QiVae *engine_vae(Engine *e, char *msg, size_t msgn){
+    char dir[2100]; snprintf(dir, sizeof dir, "%s/vae", e->model);
+    QiVae *v = qiv_load(dir);
+    if (!v) { snprintf(msg, msgn, "cannot load the VAE"); return NULL; }
+    if (v->scale != 16 || v->z_dim != e->dit.in_ch) {
+        snprintf(msg, msgn, "the VAE (z_dim %d, %dx) does not fit the transformer (%d channels, 16x)",
+                 v->z_dim, v->scale, e->dit.in_ch);
+        qiv_free(v);
+        return NULL;
+    }
+    return v;
+}
+#endif
+
 /* The prompt's prefix, cached for the next request with the same prompt. */
-static int engine_prefix(Engine *e, const char *prompt, float **emb_out, int *L_out){
+/* Prompt tokens, template included. Attention over the prompt keeps a full
+ * score matrix, so an unbounded prompt is an unbounded allocation (40000 digits,
+ * one token each, took 6.4 GB on the tiny model); the pipeline's own prompts
+ * are a few dozen tokens. */
+#define QI_MAX_PROMPT_TOKENS 1024
+
+static int engine_prefix(Engine *e, const char *prompt, float **emb_out, int *L_out, char *msg, size_t msgn){
     if (e->last_prompt && !strcmp(e->last_prompt, prompt) && e->prefix.K && !emb_out) {
         *L_out = e->prefix.L; return 1;
     }
@@ -873,7 +927,11 @@ static int engine_prefix(Engine *e, const char *prompt, float **emb_out, int *L_
     free(e->last_prompt); e->last_prompt = NULL;
     int n, drop;
     int *ids = te_encode_prompt(&e->te, prompt, &n, &drop);
-    if (n <= drop) { fprintf(stderr, "[qwenimage] empty prompt after the template\n"); free(ids); return -1; }
+    if (n <= drop) { snprintf(msg, msgn, "empty prompt"); free(ids); return -1; }
+    if (n > QI_MAX_PROMPT_TOKENS) {
+        snprintf(msg, msgn, "prompt too long: %d tokens, the limit is %d", n, QI_MAX_PROMPT_TOKENS);
+        free(ids); return -1;
+    }
     te_load(&e->te, e->model);
     float *h = te_forward(&e->te, ids, n);
     free(ids);
@@ -897,7 +955,7 @@ static int engine_generate(Engine *e, const char *prompt, int width, int height,
     int gh = height / 16, gw = width / 16, N = gh * gw, C = e->dit.in_ch;
     emit_progress(pg, "encode", 0, steps, t0);
     int L;
-    if (engine_prefix(e, prompt, NULL, &L) < 0) { snprintf(msg, msgn, "empty prompt"); return -1; }
+    if (engine_prefix(e, prompt, NULL, &L, msg, msgn) < 0) return -1;
     double t1 = now_s();
     float *lat = fmalloc((size_t)N * C), *np = fmalloc((size_t)N * C);
     randn(lat, (size_t)N * C, seed);
@@ -924,11 +982,7 @@ static int engine_generate(Engine *e, const char *prompt, int width, int height,
     if (rc == 0) {
         emit_progress(pg, "decode", steps, steps, t0);
 #ifdef QI_HAVE_VAE
-        if (!e->vae) {
-            char dir[2100]; snprintf(dir, sizeof dir, "%s/vae", e->model);
-            e->vae = qiv_load(dir);
-            if (!e->vae) { snprintf(msg, msgn, "cannot load the VAE"); rc = -1; }
-        }
+        if (!e->vae && !(e->vae = engine_vae(e, msg, msgn))) rc = -1;
         if (rc == 0 && qiv_decode(e->vae, lat, gh, gw, rgba, NULL) != 0) { snprintf(msg, msgn, "VAE decode failed"); rc = -1; }
 #else
         /* no VAE compiled in: show the first three latent channels, stretched */
@@ -952,7 +1006,10 @@ static int check_size(int w, int h, int steps, char *msg, size_t n){
         snprintf(msg, n, "width and height must be multiples of 32 between 256 and 2048 (got %dx%d)", w, h);
         return -1;
     }
-    if (steps < 1 || steps > 200) { snprintf(msg, n, "steps must be between 1 and 200 (got %d)", steps); return -1; }
+    /* One step is refused, as the reference would give NaN: with shift_terminal
+     * the schedule's last sigma is also its first, and the stretch divides by
+     * 1 - sigma = 0 (diffusers' stretch_shift_to_terminal does the same). */
+    if (steps < 2 || steps > 200) { snprintf(msg, n, "steps must be between 2 and 200 (got %d)", steps); return -1; }
     return 0;
 }
 
@@ -960,20 +1017,59 @@ static int check_size(int w, int h, int steps, char *msg, size_t n){
 
 /* Our own line reader on fd 0: stdio's buffer would hide a CANCEL that arrived
  * together with the GEN from coli_serve_stdin_ready(). */
-static char g_in[1 << 16]; static size_t g_in_n;
+/* The buffer grows up to QI_MAX_LINE (the gateway's own body limit). A longer
+ * line is read through to its newline and discarded, and read_line hands back
+ * "TOOLONG <id>" with the id found at its start, so the client that sent it
+ * gets an ERROR instead of waiting forever for an answer to a request the
+ * engine never saw. */
+#define QI_MAX_LINE ((size_t)4 << 20)
+static char *g_in; static size_t g_in_n, g_in_cap;
+static int g_skipping; static char g_skip_id[128];
+
+static void note_line_id(const char *buf, size_t n){
+    snprintf(g_skip_id, sizeof g_skip_id, "?");
+    const char *k = NULL;                /* memmem is not in the Windows CRT */
+    for (size_t i = 0; i + 6 <= (n < 4096 ? n : 4096); i++)
+        if (!memcmp(buf + i, "\"id\":\"", 6)) { k = buf + i; break; }
+    if (!k) return;
+    k += 6;
+    size_t i = 0;
+    while (i + 1 < sizeof g_skip_id && k + i < buf + n && k[i] != '"' && k[i] != '\\' && (unsigned char)k[i] >= 0x20) {
+        g_skip_id[i] = k[i]; i++;
+    }
+    g_skip_id[i] = 0;
+}
+
 static char *read_line(int block){
     for (;;) {
-        char *nl = memchr(g_in, '\n', g_in_n);
+        char *nl = g_in_n ? memchr(g_in, '\n', g_in_n) : NULL;
         if (nl) {
             size_t len = (size_t)(nl - g_in);
-            char *line = xmalloc(len + 1);
-            memcpy(line, g_in, len); line[len] = 0;
+            char *line;
+            if (g_skipping) {                 /* the tail of an overlong line */
+                g_skipping = 0;
+                line = xmalloc(sizeof g_skip_id + 16);
+                snprintf(line, sizeof g_skip_id + 16, "TOOLONG %s", g_skip_id);
+            } else {
+                line = xmalloc(len + 1);
+                memcpy(line, g_in, len); line[len] = 0;
+            }
             memmove(g_in, nl + 1, g_in_n - len - 1); g_in_n -= len + 1;
             return line;
         }
+        if (g_in_n == QI_MAX_LINE) {
+            if (!g_skipping) { note_line_id(g_in, g_in_n); g_skipping = 1; }
+            g_in_n = 0;
+        }
         if (!block && !coli_serve_stdin_ready()) return NULL;
-        if (g_in_n == sizeof g_in) { g_in_n = 0; continue; }      /* an absurd line: drop it */
-        ssize_t r = read(0, g_in + g_in_n, sizeof g_in - g_in_n);
+        if (g_in_n == g_in_cap) {
+            size_t cap = g_in_cap ? g_in_cap * 2 : (size_t)1 << 16;
+            if (cap > QI_MAX_LINE) cap = QI_MAX_LINE;
+            char *grown = realloc(g_in, cap);
+            if (!grown) { fprintf(stderr, "[qwenimage] out of memory reading stdin\n"); exit(1); }
+            g_in = grown; g_in_cap = cap;
+        }
+        ssize_t r = read(0, g_in + g_in_n, g_in_cap - g_in_n);
         if (r <= 0) return NULL;
         g_in_n += (size_t)r;
     }
@@ -981,10 +1077,26 @@ static char *read_line(int block){
 
 static int g_cancel_pending;
 static char g_cancel_id[128];
+/* Lines that arrive while an image is being made and are not a CANCEL for it
+ * (a GEN from a client that gave up waiting, say) are kept for serve_loop,
+ * never dropped: a dropped GEN is a client waiting forever for its answer. */
+static char *g_later[64]; static int g_later_n;
 static int serve_cancelled(const char *id){
     char *line;
     while ((line = read_line(0))) {
-        if (!strncmp(line, "CANCEL ", 7)) {
+        if (strncmp(line, "CANCEL ", 7)) {
+            if (g_later_n < (int)(sizeof g_later / sizeof g_later[0])) { g_later[g_later_n++] = line; continue; }
+            if (!strncmp(line, "GEN ", 4)) {        /* the queue is full: answer rather than drop */
+                char *arena = NULL; jval *j = json_parse(line + 4, &arena);
+                jval *v = j ? json_get(j, "id") : NULL;
+                send_error(v && v->t == J_STR ? v->str : "?", "engine busy");
+                if (j) json_free(j);
+                free(arena);
+            }
+            free(line);
+            continue;
+        }
+        {
             char *arena = NULL; jval *j = json_parse(line + 7, &arena);
             jval *v = j ? json_get(j, "id") : NULL;
             if (v && v->t == J_STR) { snprintf(g_cancel_id, sizeof g_cancel_id, "%s", v->str); g_cancel_pending = 1; }
@@ -1014,7 +1126,12 @@ static int serve_loop(Engine *e, int dw, int dh, int dsteps){
            "\"min_side\":256,\"max_side\":2048,\"multiple\":32}\n", dw, dh, dsteps);
     fflush(stdout);
     char *line;
-    while ((line = read_line(1))) {
+    for (;;) {
+        if (g_later_n) {                              /* what came in during the last image */
+            line = g_later[0];
+            memmove(g_later, g_later + 1, sizeof g_later[0] * (size_t)--g_later_n);
+        } else if (!(line = read_line(1))) break;
+        if (!strncmp(line, "TOOLONG ", 8)) { send_error(line + 8, "request line too long"); free(line); continue; }
         if (strncmp(line, "GEN ", 4)) { free(line); continue; }       /* CANCEL with nothing running, noise */
         char *arena = NULL;
         jval *j = json_parse(line + 4, &arena);
@@ -1177,8 +1294,9 @@ static int run_oracle(Engine *e, const char *refdir){
     dit_step_free(&s);
 #ifdef QI_HAVE_VAE
     {
-        char dir[2100]; snprintf(dir, sizeof dir, "%s/vae", e->model);
-        QiVae *vae = qiv_load(dir);
+        char vmsg[256];
+        QiVae *vae = engine_vae(e, vmsg, sizeof vmsg);
+        if (!vae) { fprintf(stderr, "[oracle] %s\n", vmsg); fails++; }
         if (vae && fin) {
             uint8_t *rgba = xmalloc((size_t)width * height * 4);
             float *of = fmalloc((size_t)4 * width * height);

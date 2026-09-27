@@ -279,6 +279,14 @@ static QiVae *qiv_load(const char *vae_dir){
     for (int i = 0; i < v->z_dim; i++) { v->mean[i] = (float)jmean->kids[i]->num; v->std[i] = (float)jstd->kids[i]->num; }
 
     int nm = jm->len, dims[QIV_MAX_BLOCKS + 1], tup[QIV_MAX_BLOCKS];
+    /* Every width is a product of two config numbers that size buffers and a
+     * divisor in qiv_dup_table: positive and bounded, or refused. */
+    for (int i = 0; i < nm; i++)
+        if (jm->kids[i]->t != J_NUM || jm->kids[i]->num < 1 || jm->kids[i]->num > 64 || base > 4096) {
+            snprintf(err, sizeof err, "dim_mult entries must be whole numbers from 1 to 64 (base %d)", base); goto fail; }
+    for (int i = 0; i < nm - 1; i++)
+        if (jt->kids[i]->t != J_BOOL) { snprintf(err, sizeof err, "temperal_downsample must hold booleans"); goto fail; }
+    if (v->z_dim > 4096) { snprintf(err, sizeof err, "z_dim %d is out of range", v->z_dim); goto fail; }
     dims[0] = base * (int)jm->kids[nm - 1]->num;
     for (int i = 0; i < nm; i++) dims[i + 1] = base * (int)jm->kids[nm - 1 - i]->num;
     for (int i = 0; i < nm - 1; i++) tup[i] = jt->kids[nm - 2 - i]->boolean;   /* temperal_upsample = reversed */
