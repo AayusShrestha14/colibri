@@ -217,10 +217,13 @@ class TensorKindsTest(unittest.TestCase):
 
     def test_every_27b_tensor_is_placed(self):
         """The dense checkpoint: the MoE kinds are absent, the dense MLP is placed, the
-        mtp head and the vision tower are skipped."""
+        vision tower is converted (#1757) and the mtp head is skipped."""
         prefix, placed = self._classify_all(_concrete(QWEN38_27B))
         self.assertEqual(prefix, "model.language_model.")
-        self.assertEqual({p[1] for p in placed if p[0] == "skip"}, {"mtp", "visual"})
+        self.assertEqual({p[1] for p in placed if p[0] == "skip"}, {"mtp"})
+        vision = [p[1] for p in placed if p[0] == "vision"]
+        self.assertEqual(len(vision), 3)                       # the three listed kinds
+        self.assertTrue(all(not v.startswith("visual.") for v in vision), vision)
         layer = {p[2] for p in placed if p[0] == "layer"}
         self.assertTrue(DENSE_MLP_KINDS <= layer)
         self.assertFalse({k for k in layer if k.startswith("mlp.") and k not in DENSE_MLP_KINDS})
@@ -228,7 +231,8 @@ class TensorKindsTest(unittest.TestCase):
     def test_every_35b_tensor_is_placed(self):
         prefix, placed = self._classify_all(_concrete(QWEN36_35B))
         self.assertEqual(prefix, "model.language_model.")
-        self.assertEqual({p[1] for p in placed if p[0] == "skip"}, {"mtp", "visual"})
+        self.assertEqual({p[1] for p in placed if p[0] == "skip"}, {"mtp"})
+        self.assertTrue(any(p[0] == "vision" for p in placed))
         self.assertEqual(sum(p[0] == "layer" for p in placed),
                          sum(p[0] == "layer" for p in self._classify_all(
                              _concrete(QWEN38_2P4T))[1]))
@@ -263,8 +267,7 @@ class TensorKindsTest(unittest.TestCase):
                     classify(name, "model.")
 
     def test_skip_groups_have_a_stated_reason(self):
-        for group in ("mtp", "visual"):
-            self.assertTrue(skip_reason(group))
+        self.assertTrue(skip_reason("mtp"))
         self.assertEqual(skip_reason("nope"), "")
 
     def test_layer_kinds_are_exact_suffixes(self):

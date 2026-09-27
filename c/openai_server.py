@@ -2063,6 +2063,19 @@ def expand_qwen38_images(messages, model_dir, max_tokens=None):
     return rewritten, images
 
 
+def qwen36_has_vision(model_dir):
+    """Whether a qwen36 container carries its vision tower (#1757). The converter
+    writes the tower's shape into qwen36_meta.json only when it copied the weights;
+    older containers, and text-only checkpoints, have none."""
+    if not model_dir:
+        return False
+    try:
+        meta = json.loads((Path(model_dir) / "qwen36_meta.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(meta, dict) and isinstance(meta.get("vision"), dict)
+
+
 def expand_glm53_images(messages, model_dir):
     """Sostituisce le parti immagine coi loro segnaposto e ne estrae le patch.
 
@@ -5303,8 +5316,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 raise APIError(400, "one image per request for now; the engine "
                                     "holds a single pending image.", "messages")
             image = images[0] if images else None
-        elif ARCH == "qwen38":
-            ceiling = os.environ.get("Q38_MAX_IMAGE_TOKENS")
+        elif ARCH == "qwen38" or (ARCH == "qwen36" and qwen36_has_vision(
+                getattr(self.server.engine, "model_dir", None))):
+            # Qwen3.5/3.6/3.8 share the tower and the preprocessor, so qwen36
+            # checkpoints converted with their tower take the same path (#1757).
+            ceiling = os.environ.get("Q38_MAX_IMAGE_TOKENS" if ARCH == "qwen38"
+                                     else "Q36_MAX_IMAGE_TOKENS")
             messages, images = expand_qwen38_images(
                 messages, getattr(self.server.engine, "model_dir", None),
                 int(ceiling) if ceiling else None)

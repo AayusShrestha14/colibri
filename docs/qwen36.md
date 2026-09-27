@@ -256,9 +256,38 @@ keeps most of the saving at half the loss. With a matrix in int4 the engine
 no longer keeps its int8 copy (`COLI_DENSE_KEEP_I8=1` does); that is what
 brings the full int4 run from 42.4 to 18.8 GB.
 
-Not yet: the CUDA tier (a dense checkpoint runs on the CPU), the vision
-tower and the MTP head (both skipped by the converter), and an int4
-container on disk.
+#### Images
+
+Qwen3.8-27B reads images. Its vision tower is the ViT of the whole family
+(27 blocks, hidden 1152, patch 16, 2x2 merge; only the output width follows
+the text model), so the engine runs it through the same `qwen38_vision.h`
+the qwen38 engine uses, now split across OpenMP threads. The converter copies
+it into `model-vision.safetensors` and writes its shape into
+`qwen36_meta.json`, together with `preprocessor_config.json`.
+
+What is specific to this family is where the image sits in the rope. The
+attention layers use interleaved M-RoPE (`mrope_section` [11, 11, 10]): an
+image token at merged (row, col) is rotated by (start, start + row,
+start + col), the text after the image resumes at start + max(rows, cols),
+and every later position carries that offset (HF's `rope_deltas`). The
+engine follows `Qwen3_5Model.get_rope_index` exactly; with plain 1D
+positions the tiny oracle below loses 10 of 16 tokens.
+
+An image reaches it the way it reaches the other vision engines: a path in
+a `coli chat` message, an attachment in `coli web`, or an `image_url` part
+on `/v1/chat/completions`. One image per request. `Q36_MAX_IMAGE_TOKENS`
+caps the tokens an image costs (the preprocessor's own ceiling is far above
+what a CPU prefill wants); the image is shrunk, not cropped.
+
+`tools/make_qwen36_vl_tiny.py` builds a toy `Qwen3_5ForConditionalGeneration`
+and a reference from transformers with one 4 x 8-patch image; the engine
+matches it token for token, and `tests/test_qwen36_vision_serve.py` holds the
+IMAGE frame path to the same tokens. Qwen3.6-35B carries the same tower, so a
+35B container converted with this converter gets images too; only the 27B has
+been run with real pictures.
+
+Not yet: the CUDA tier (a dense checkpoint runs on the CPU), the MTP head
+(skipped by the converter), video, and an int4 container on disk.
 
 ### The converter's tensor contract
 

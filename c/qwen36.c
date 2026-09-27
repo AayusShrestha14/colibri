@@ -68,6 +68,7 @@ static int qwen36_max_ctx(void) {
 #include "qwen36_tier.h"   /* optional CUDA VRAM expert tier */
 #include "expert_ffn.h"    /* routed experts: planar int4 kernel + layer runner */
 #include "idot.h"          /* integer dot kernels for the dense trunk (COLI_DENSE_IDOT, COLI_DENSE_BITS) */
+#include "qwen38_vision.h" /* the ViT: the same tower in Qwen3.5/3.6/3.8 (#1757) */
 #ifdef COLI_SEGMENT_ADAPTER
 #include "segment_runtime.h"
 #include "segment_adapters.h"
@@ -689,6 +690,16 @@ typedef struct {
      * per expert, [gate int4 packed | up int4 packed | down int8], 2*inter*hidden
      * bytes -- told apart from int4 (1.5x) and int8 (3x) by size, like today. */
     int expert_down_bits, expert_down_gs;
+    /* Vision (#1757). The tower is the same in Qwen3.5, 3.6 and 3.8 -- only its
+     * output width follows the text model -- so the qwen38 one is reused. 0 depth
+     * = text only (a container converted without it, or a text-only checkpoint). */
+    int vis_depth, vis_hidden, vis_heads, vis_inter, vis_patch, vis_merge;
+    int vis_temporal, vis_in_ch, vis_out_hidden, vis_num_pos;
+    int image_token;
+    /* Interleaved M-RoPE: frequency j rotates by the height position when
+     * j % 3 == 1 and j < 3*sec[1], by the width one when j % 3 == 2 and
+     * j < 3*sec[2], else by the temporal one. Text has all three equal. */
+    int mrope_section[3];
 } Cfg;
 
 /* ---- Dense int8: a dense matrix that is quantized to int8 during load
@@ -782,6 +793,14 @@ typedef struct {
     int resident_mode;         /* 0 off; 1 pin this-prompt experts (CPU no-evict -> GPU resident) */
     int resident_collecting;   /* prefill in progress, collecting routed experts */
     int first_step;            /* the first step() call is the prefill */
+    /* Vision, for the turn that carries an image. vis_map maps an ABSOLUTE
+     * position to a row of vis_rows or -1; mpos holds the (t, h, w) rope
+     * positions of the prompt, and past it every axis is pos + rope_delta
+     * (HF's mrope_position_deltas). All of it is dropped after the turn. */
+    Q38Vision vis; int vis_ready;
+    float *vis_rows; int vis_rows_n;
+    int *vis_map, vis_map_len;
+    int *mpos, mpos_len, rope_delta;
 } Model;
 
 static pthread_mutex_t g_pilot_mx = PTHREAD_MUTEX_INITIALIZER;
@@ -1350,6 +1369,8 @@ static void load_cfg(Cfg *c, const char *snap) {
     c->n_experts = 256; c->topk = 8; c->inter = 512; c->shared_inter = 512;
     c->n_group = 1; c->topk_group = 1; c->norm_topk = 1; c->has_qk_norm = 1; c->has_bias = 0;
     c->attn_output_gate = 1; c->n_active = 0;
+    c->vis_depth = 0; c->image_token = -1;
+    c->mrope_section[0] = 11; c->mrope_section[1] = 11; c->mrope_section[2] = 10;
     if (c->n_layers <= 0 || c->n_layers > 512) { fprintf(stderr, "load_cfg: n_layers=%d out of range 1..512\n", c->n_layers); exit(1); }
     c->is_attn = calloc((size_t)c->n_layers, sizeof(uint8_t));
     for (int i = 0; i < c->n_layers; i++) c->is_attn[i] = (i % 4 == 3) ? 1 : 0;
@@ -1400,6 +1421,25 @@ static void validate_cfg(const Cfg *c, int n_layers_from_config) {
                  c->topk, c->n_experts);
         CFG_NEED(c->inter > 0 && c->shared_inter > 0,
                  "moe_inter %d / shared_inter %d must be positive", c->inter, c->shared_inter);
+    }
+    if (c->vis_depth) {
+        CFG_NEED(c->vis_depth > 0 && c->vis_depth <= 64, "vision depth %d out of range", c->vis_depth);
+        CFG_NEED(c->vis_hidden > 0 && c->vis_hidden <= 8192 && c->vis_heads > 0 &&
+                 c->vis_hidden % c->vis_heads == 0, "vision hidden %d / heads %d", c->vis_hidden, c->vis_heads);
+        CFG_NEED(c->vis_inter > 0 && c->vis_inter <= 65536, "vision inter %d", c->vis_inter);
+        CFG_NEED(c->vis_patch > 0 && c->vis_patch <= 64 && c->vis_merge > 0 && c->vis_merge <= 8 &&
+                 c->vis_temporal > 0 && c->vis_temporal <= 8 && c->vis_in_ch > 0 && c->vis_in_ch <= 8,
+                 "vision patch %d merge %d temporal %d channels %d", c->vis_patch, c->vis_merge,
+                 c->vis_temporal, c->vis_in_ch);
+        CFG_NEED(c->vis_num_pos > 0 && c->vis_num_pos <= 65536, "vision positions %d", c->vis_num_pos);
+        CFG_NEED(c->vis_out_hidden == c->hidden, "vision tower writes %d wide rows into a %d-wide model",
+                 c->vis_out_hidden, c->hidden);
+        CFG_NEED(c->image_token >= 0 && c->image_token < c->vocab, "image_token_id %d outside the vocabulary",
+                 c->image_token);
+        CFG_NEED(c->mrope_section[0] >= 0 && c->mrope_section[1] >= 0 && c->mrope_section[2] >= 0 &&
+                 2 * (c->mrope_section[0] + c->mrope_section[1] + c->mrope_section[2]) == c->rotary_dim,
+                 "mrope_section %d+%d+%d does not cover rotary_dim %d", c->mrope_section[0],
+                 c->mrope_section[1], c->mrope_section[2], c->rotary_dim);
     }
     CFG_NEED(c->q_heads > 0 && c->kv_heads > 0 && c->head_dim > 0,
              "attention dims q_heads=%d kv_heads=%d head_dim=%d must be positive",
@@ -1473,6 +1513,21 @@ static void load_meta(Cfg *c, const char *snap) {
         if((v=json_get(r,"norm_topk_prob"))&&v->t==J_BOOL) c->norm_topk=v->boolean;
         if((v=json_get(r,"has_bias"))&&v->t==J_BOOL) c->has_bias=v->boolean;
         if((v=json_get(r,"has_qk_norm"))&&v->t==J_BOOL) c->has_qk_norm=v->boolean;
+        if((v=json_get(r,"image_token_id"))&&v->t==J_NUM) c->image_token=(int)v->num;
+        if((v=json_get(r,"mrope_section"))&&v->t==J_ARR&&v->len==3)
+            for(int k=0;k<3;k++) if(v->kids[k]->t==J_NUM) c->mrope_section[k]=(int)v->kids[k]->num;
+        {   /* the tower, written by the converter only when it copied the weights */
+            jval *vv = json_get(r,"vision");
+            if (vv && vv->t==J_OBJ) {
+                jval *w;
+                #define GV(name,field) if((w=json_get(vv,name))&&w->t==J_NUM) c->field=(int)w->num
+                GV("depth",vis_depth); GV("hidden",vis_hidden); GV("heads",vis_heads);
+                GV("inter",vis_inter); GV("patch",vis_patch); GV("merge",vis_merge);
+                GV("temporal",vis_temporal); GV("in_ch",vis_in_ch);
+                GV("out_hidden",vis_out_hidden); GV("num_pos",vis_num_pos);
+                #undef GV
+            }
+        }
         /* derive rotary_dim from head_dim * partial_rotary_factor (HF formula) */
         if (c->partial_rotary_factor > 0.f)
             c->rotary_dim = (int)(c->head_dim * c->partial_rotary_factor + 0.5f);
@@ -1542,6 +1597,118 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
     if (getenv("COLI_KEEP_F32")) out->w = p; else { free(p); out->w = NULL; }
 }
 
+/* ---------- vision (#1757) ----------
+ * The weights are the checkpoint's own model.visual.*, copied by the converter,
+ * read as f32 like every other small tensor here. */
+static void q36_vis_linear(Model *m, Q38Linear *l, const char *stem, int out, int in) {
+    char nm[256];
+    snprintf(nm, sizeof nm, "model.visual.%s.weight", stem);
+    l->w = load_t_n(m, nm, (int64_t)out * in);
+    snprintf(nm, sizeof nm, "model.visual.%s.bias", stem);
+    l->b = st_has(&m->S, nm) ? load_t_n(m, nm, out) : NULL;
+    l->out = out; l->in = in;
+}
+static void q36_vis_norm(Model *m, Q38Norm *n, const char *stem, int width) {
+    char nm[256];
+    snprintf(nm, sizeof nm, "model.visual.%s.weight", stem); n->w = load_t_n(m, nm, width);
+    snprintf(nm, sizeof nm, "model.visual.%s.bias", stem);   n->b = load_t_n(m, nm, width);
+}
+static void q36_load_vision(Model *m) {
+    Cfg *c = &m->c;
+    if (!c->vis_depth) return;
+    if (!st_has(&m->S, "model.visual.pos_embed.weight")) {
+        fprintf(stderr, "[qwen36] qwen36_meta.json describes a vision tower but the container has none; text only\n");
+        c->vis_depth = 0; return;
+    }
+    Q38Vision *v = &m->vis;
+    memset(v, 0, sizeof *v);
+    v->depth = c->vis_depth; v->hidden = c->vis_hidden; v->heads = c->vis_heads;
+    v->head_dim = c->vis_hidden / c->vis_heads; v->inter = c->vis_inter;
+    v->patch = c->vis_patch; v->merge = c->vis_merge; v->temporal = c->vis_temporal;
+    v->in_ch = c->vis_in_ch; v->out_hidden = c->vis_out_hidden;
+    v->num_pos = c->vis_num_pos; v->side = (int)(sqrt((double)c->vis_num_pos) + 0.5);
+    v->eps = 1e-6f;
+    if (v->side * v->side != v->num_pos) {
+        fprintf(stderr, "[qwen36] vision num_position_embeddings %d is not a square grid -- refusing\n", v->num_pos);
+        exit(1);
+    }
+    q36_vis_linear(m, &v->patch_embed, "patch_embed.proj", v->hidden, v->in_ch * v->temporal * v->patch * v->patch);
+    v->pos_embed = load_t_n(m, "model.visual.pos_embed.weight", (int64_t)v->num_pos * v->hidden);
+    v->blocks = calloc((size_t)v->depth, sizeof(Q38VBlock));
+    if (!v->blocks) { fprintf(stderr, "OOM vision blocks\n"); exit(1); }
+    for (int i = 0; i < v->depth; i++) {
+        char stem[96];
+        snprintf(stem, sizeof stem, "blocks.%d.norm1", i);          q36_vis_norm(m, &v->blocks[i].norm1, stem, v->hidden);
+        snprintf(stem, sizeof stem, "blocks.%d.norm2", i);          q36_vis_norm(m, &v->blocks[i].norm2, stem, v->hidden);
+        snprintf(stem, sizeof stem, "blocks.%d.attn.qkv", i);       q36_vis_linear(m, &v->blocks[i].qkv, stem, 3 * v->hidden, v->hidden);
+        snprintf(stem, sizeof stem, "blocks.%d.attn.proj", i);      q36_vis_linear(m, &v->blocks[i].proj, stem, v->hidden, v->hidden);
+        snprintf(stem, sizeof stem, "blocks.%d.mlp.linear_fc1", i); q36_vis_linear(m, &v->blocks[i].fc1, stem, v->inter, v->hidden);
+        snprintf(stem, sizeof stem, "blocks.%d.mlp.linear_fc2", i); q36_vis_linear(m, &v->blocks[i].fc2, stem, v->hidden, v->inter);
+    }
+    int wide = v->hidden * v->merge * v->merge;
+    q36_vis_norm(m, &v->merger_norm, "merger.norm", v->hidden);
+    q36_vis_linear(m, &v->merger_fc1, "merger.linear_fc1", wide, wide);
+    q36_vis_linear(m, &v->merger_fc2, "merger.linear_fc2", v->out_hidden, wide);
+    m->vis_ready = 1;
+    fprintf(stderr, "[qwen36] vision tower: %d blocks, hidden %d, %d heads, patch %d, merge %d\n",
+            v->depth, v->hidden, v->heads, v->patch, v->merge);
+}
+
+static void q36_vision_detach(Model *m) {
+    free(m->vis_rows); free(m->vis_map); free(m->mpos);
+    m->vis_rows = NULL; m->vis_map = NULL; m->mpos = NULL;
+    m->vis_rows_n = m->vis_map_len = m->mpos_len = m->rope_delta = 0;
+}
+
+/* Run the tower on one image and lay its rows and rope positions over the prompt
+ * `ids` (absolute positions 0..n-1). One image per prompt: its placeholders must
+ * be one contiguous run of exactly as many tokens as the merged grid gives.
+ * Positions follow HF Qwen3_5Model.get_rope_index: text counts up on all three
+ * axes; the image's token (row, col) sits at (start, start+row, start+col); the
+ * text after it resumes at start + max(rows, cols); past the prompt every axis
+ * is pos + rope_delta, rope_delta = max position + 1 - n. */
+static int q36_vision_attach(Model *m, const float *patches, int grid_h, int grid_w,
+                             const int *ids, int n) {
+    Cfg *c = &m->c;
+    if (!m->vis_ready || n <= 0) return -1;
+    if (grid_h <= 0 || grid_w <= 0 || grid_h % c->vis_merge || grid_w % c->vis_merge) return -1;
+    int lh = grid_h / c->vis_merge, lw = grid_w / c->vis_merge, tokens = lh * lw;
+    int first = -1, slots = 0;
+    for (int i = 0; i < n; i++) if (ids[i] == c->image_token) { if (first < 0) first = i; slots++; }
+    if (slots != tokens || first < 0) {
+        fprintf(stderr, "[qwen36] prompt has %d image placeholders but the grid gives %d tokens\n", slots, tokens);
+        return -1;
+    }
+    for (int i = first; i < first + tokens; i++)
+        if (ids[i] != c->image_token) {
+            fprintf(stderr, "[qwen36] the image placeholders are not one contiguous run (one image per prompt)\n");
+            return -1;
+        }
+    q36_vision_detach(m);
+    m->vis_rows = calloc((size_t)tokens * c->hidden, sizeof(float));
+    m->vis_map = malloc((size_t)n * sizeof(int));
+    m->mpos = malloc((size_t)n * 3 * sizeof(int));
+    if (!m->vis_rows || !m->vis_map || !m->mpos) { q36_vision_detach(m); return -1; }
+    if (q38_vision_forward(&m->vis, patches, grid_h, grid_w, m->vis_rows) != tokens) { q36_vision_detach(m); return -1; }
+    int cur = 0, maxpos = -1;
+    for (int i = 0; i < n; i++) {
+        int *pp = m->mpos + (size_t)i * 3;
+        if (i >= first && i < first + tokens) {
+            int k = i - first, start = cur;
+            m->vis_map[i] = k;
+            pp[0] = start; pp[1] = start + k / lw; pp[2] = start + k % lw;
+            if (k == tokens - 1) cur = start + (lh > lw ? lh : lw);
+        } else {
+            m->vis_map[i] = -1;
+            pp[0] = pp[1] = pp[2] = cur++;
+        }
+        for (int a = 0; a < 3; a++) if (pp[a] > maxpos) maxpos = pp[a];
+    }
+    m->vis_rows_n = tokens; m->vis_map_len = n; m->mpos_len = n;
+    m->rope_delta = maxpos + 1 - n;
+    return tokens;
+}
+
 static void model_init_range(Model *m, const char *snap, int cap, int bits,
                              int layer_begin, int layer_end,
                              int load_boundaries, int allocate_state) {
@@ -1579,6 +1746,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         load_tq(m, "lm_head.weight", c->hidden, c->vocab, quantize_dense, "lmhead", &m->lm_head);
         if (m->lm_head.q || m->lm_head.q4) { qcount++; qfreed += (double)c->hidden * c->vocab * sizeof(float); }
         m->final_norm = load_t_n(m, "model.norm.weight", c->hidden);
+        q36_load_vision(m);
     }
     m->L = calloc((size_t)c->n_layers, sizeof(Layer));
     /* Phase 2: the converter stores EVERY layer (Gated-Attention + Gated DeltaNet)
@@ -2102,6 +2270,26 @@ static void rope_head_partial(float *x, int pos, int rope_dim, int head_dim, flo
     }
 }
 
+/* The same rotation with a position per axis (interleaved M-RoPE, see Cfg).
+ * With the three positions equal it is rope_head_partial, operation for
+ * operation. */
+static void rope_head_mrope(float *x, const int pos3[3], const int sec[3], int rope_dim, float theta) {
+    int h = rope_dim / 2;
+    for (int j = 0; j < h; j++) {
+        int axis = (j % 3 == 1 && j < 3 * sec[1]) ? 1 : (j % 3 == 2 && j < 3 * sec[2]) ? 2 : 0;
+        float inv = powf(theta, -2.0f * j / rope_dim);
+        float ang = pos3[axis] * inv, cs = cosf(ang), sn = sinf(ang);
+        float a = x[j], b = x[j+h];
+        x[j]   = a*cs - b*sn;
+        x[j+h] = b*cs + a*sn;
+    }
+}
+static inline void mrope_at(const Model *m, int p, int pos3[3]) {
+    if (m->mpos && p >= 0 && p < m->mpos_len) {
+        pos3[0] = m->mpos[(size_t)p * 3]; pos3[1] = m->mpos[(size_t)p * 3 + 1]; pos3[2] = m->mpos[(size_t)p * 3 + 2];
+    } else pos3[0] = pos3[1] = pos3[2] = p + m->rope_delta;
+}
+
 /* Gated Attention (GQA) matching HF Qwen3_5MoeAttention:
  *  - q_proj outputs query(head_dim) ++ attn_output_gate(head_dim); k/v are head_dim.
  *  - per-head q/k RMSNorm (weight [head_dim], 1.0+weight).
@@ -2143,12 +2331,14 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         for (int hh = 0; hh < H; hh++) {
             float *qh = query + ((int64_t)s*H + hh)*hd;
             if (l->qn) rmsnorm_row(qh, qh, l->qn, hd, c->eps);
-            rope_head_partial(qh, pos_base + s, rotary, hd, c->theta);
+            if (m->mpos || m->rope_delta) { int p3[3]; mrope_at(m, pos_base + s, p3); rope_head_mrope(qh, p3, c->mrope_section, rotary, c->theta); }
+            else rope_head_partial(qh, pos_base + s, rotary, hd, c->theta);
         }
         for (int kvh = 0; kvh < KV; kvh++) {
             float *kh = k + (int64_t)s*KV*kvd + kvh*kvd;
             if (l->kn) rmsnorm_row(kh, kh, l->kn, kvd, c->eps);
-            rope_head_partial(kh, pos_base + s, rotary, kvd, c->theta);
+            if (m->mpos || m->rope_delta) { int p3[3]; mrope_at(m, pos_base + s, p3); rope_head_mrope(kh, p3, c->mrope_section, rotary, c->theta); }
+            else rope_head_partial(kh, pos_base + s, rotary, kvd, c->theta);
         }
     }
     for (int s = 0; s < S; s++) for (int kvh = 0; kvh < KV; kvh++) {
@@ -2957,13 +3147,19 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
                     ids[s], c->vocab - 1);
             exit(1);
         }
-        memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
+        int vrow = (m->vis_map && pos_base + s < m->vis_map_len) ? m->vis_map[pos_base + s] : -1;
+        if (vrow >= 0 && vrow < m->vis_rows_n)   /* an image placeholder: the tower's row */
+            memcpy(x + (int64_t)s*D, m->vis_rows + (int64_t)vrow*D, D*sizeof(float));
+        else
+            memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
     }
     layers_forward_range(m, x, S, pos_base, 0, c->n_layers, 1, lf);
     /* Recorded HERE, where the tokens actually entered the state, rather than
      * derived from the caller's bookkeeping: the invariant that fed[0..len-1]
      * are the ids the state was built from is the whole safety argument. */
     kv_prefix_record(&m->kvp, ids, pos_base, S);
+    /* the placeholders' ids do not say which picture they held */
+    if (m->vis_map && m->vis_rows_n > 0) kv_prefix_taint(&m->kvp);
     m->token_count += S; m->freq_token_count += S;
     if (!m->hot_pinned && m->hot_n > 0 && m->freq_token_count >= m->warmup_tokens) pin_hot_experts(m);
     m->kv_len = pos_base + S;
@@ -3394,10 +3590,39 @@ typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int
                  int pin;        /* SUBMIT pin=1: fotografa lo stato dopo il prefill */
                } ServeReq;
 
+/* An image waiting for the SUBMIT that uses it (IMAGE <id> <bytes> <grid_h>
+ * <grid_w>, then the float32 patches and a newline -- the frame serve_codec.h
+ * defines and the gateway already sends to qwen38). A second one before the
+ * SUBMIT replaces the first, and says so. */
+static struct { unsigned char *patches; unsigned long long bytes; int grid_h, grid_w, present; } g_pending_image;
+static void q36_pending_image_clear(void){
+    free(g_pending_image.patches);
+    memset(&g_pending_image, 0, sizeof g_pending_image);
+}
+
 static int serve_read_req(ServeReq *q){
     char line[512], cmd[16], id[64];
     if(!fgets(line,sizeof(line),stdin)) return -1;
     if(sscanf(line,"%15s %63s",cmd,id)<2) return 0;
+    if(!strcmp(cmd,"IMAGE")){
+        /* The payload is consumed whatever happens next: left in the stream it
+         * would be read as the following frame's header. A header that does not
+         * say how long the payload is cannot be skipped, so it ends the session. */
+        unsigned long long bytes; int gh, gw;
+        if(sscanf(line,"%*s %*s %llu %d %d",&bytes,&gh,&gw)!=3 || bytes>(1ull<<30) || gh<1 || gw<1){
+            printf("ERROR %s bad image header\n",id); fflush(stdout); return -1;
+        }
+        unsigned char *buf = malloc((size_t)bytes + 1);
+        if(!buf){ printf("ERROR %s out of memory\n",id); fflush(stdout); return -1; }
+        if(bytes && fread(buf,1,(size_t)bytes,stdin)!=(size_t)bytes){ free(buf); return -1; }
+        int t = fgetc(stdin); if(t=='\r') t = fgetc(stdin);
+        if(t!='\n'){ free(buf); return -1; }
+        if(g_pending_image.present) fprintf(stderr,"[qwen36] a second image arrived before its SUBMIT; dropping the first\n");
+        q36_pending_image_clear();
+        g_pending_image.patches = buf; g_pending_image.bytes = bytes;
+        g_pending_image.grid_h = gh; g_pending_image.grid_w = gw; g_pending_image.present = 1;
+        return 0;
+    }
     if(!strcmp(cmd,"CANCEL")||!strcmp(cmd,"STOP")) return 0;
     if(strcmp(cmd,"SUBMIT")) return 0;
     int slot, plen, max_tok; float temp, top_p;
@@ -3608,6 +3833,25 @@ static int qwen36_serve_budget(int np, int max_tok, int max_ctx, int read_only){
 static void serve_one(Model *m, ServeReq *q){
     int *ids=NULL, np=0;
     encode_text(q->payload, &ids, &np);          /* payload is raw prompt text; qwen36 adds no BOS */
+    if(g_pending_image.present){
+        Cfg *vc = &m->c;
+        if(!m->vis_ready){
+            printf("ERROR %s this engine has no vision tower; images are not supported\n",q->id);
+            fflush(stdout); q36_pending_image_clear(); free(ids); return;
+        }
+        unsigned long long want = (unsigned long long)g_pending_image.grid_h*g_pending_image.grid_w*
+            vc->vis_in_ch*vc->vis_temporal*vc->vis_patch*vc->vis_patch*sizeof(float);
+        if(g_pending_image.bytes!=want){
+            printf("ERROR %s BAD_IMAGE bytes=%llu expected=%llu\n",q->id,g_pending_image.bytes,want);
+            fflush(stdout); q36_pending_image_clear(); free(ids); return;
+        }
+        if(q36_vision_attach(m,(const float*)g_pending_image.patches,g_pending_image.grid_h,
+                             g_pending_image.grid_w,ids,np)<0){
+            printf("ERROR %s BAD_IMAGE the prompt and the grid disagree\n",q->id);
+            fflush(stdout); q36_pending_image_clear(); free(ids); return;
+        }
+        q36_pending_image_clear();
+    }
     int max_ctx = qwen36_max_ctx();
     int budget = qwen36_serve_budget(np, q->max_tok, max_ctx, q->logprobs > 0);
     if(budget < 0){
@@ -3748,7 +3992,7 @@ static void serve_loop(Model *m){
          * "routed now" flash worked while the residency colour never moved.
          * inkling.c, kimi_k3.c, qwen38.c, deepseek_v41.c and colibri.c
          * already do this. */
-        if(r==2){ serve_one(m,&q); free(q.payload); emap_emit(m); }
+        if(r==2){ serve_one(m,&q); q36_vision_detach(m); free(q.payload); emap_emit(m); }
     }
 }
 
@@ -3868,6 +4112,7 @@ int main(int argc, char **argv) {
 
 
     int is_ref = 0;
+    jval *ref_image = NULL;      /* {"grid_h", "grid_w", "patches": [...]}: one image for the oracle */
     int rplen = (int)strlen(refpath);
     if (rplen>=5 && strcmp(refpath+rplen-5, ".json")==0) is_ref = 1;
 
@@ -3895,6 +4140,7 @@ int main(int argc, char **argv) {
         fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
         buf=malloc(n+1); if (fread(buf,1,n,f)!=(size_t)n) {} buf[n]=0; fclose(f);
         jval *ref = json_parse(buf, &arena);
+        ref_image = ref ? json_get(ref, "image") : NULL;
         prompt = read_int_array(ref,"prompt_ids",&np);
         full   = read_int_array(ref,"full_ids",&nfull);
         n_new  = nfull - np;
@@ -3922,6 +4168,27 @@ int main(int argc, char **argv) {
     g_expert_gs = m.c.expert_gs;
     if (g_expert_gs) fprintf(stderr, "[qwen36] group-scaled experts: gs=%d\n", g_expert_gs);
     fprintf(stderr, "resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
+    if (ref_image && ref_image->t == J_OBJ) {
+        jval *gh = json_get(ref_image, "grid_h"), *gw = json_get(ref_image, "grid_w");
+        jval *pv = json_get(ref_image, "patches");
+        if (!gh || !gw || !pv || gh->t != J_NUM || gw->t != J_NUM || pv->t != J_ARR) {
+            fprintf(stderr, "ref.json image needs grid_h, grid_w and patches\n"); return 1;
+        }
+        float *px = malloc((size_t)pv->len * sizeof(float));
+        if (!px) { fprintf(stderr, "OOM image patches\n"); return 1; }
+        for (int i = 0; i < pv->len; i++) px[i] = pv->kids[i]->t == J_NUM ? (float)pv->kids[i]->num : 0.f;
+        Cfg *vc = &m.c;
+        long long want = (long long)gh->num * (long long)gw->num * vc->vis_in_ch * vc->vis_temporal * vc->vis_patch * vc->vis_patch;
+        if (!m.vis_ready || pv->len != want ||
+            q36_vision_attach(&m, px, (int)gh->num, (int)gw->num, prompt, np) < 0) {
+            fprintf(stderr, "the ref.json image does not fit this model (%d values, %lld expected, tower %s)\n",
+                    pv->len, want, m.vis_ready ? "loaded" : "absent");
+            return 1;
+        }
+        free(px);
+        fprintf(stderr, "[qwen36] oracle image: %dx%d patches, %d tokens, rope delta %d\n",
+                (int)gh->num, (int)gw->num, m.vis_rows_n, m.rope_delta);
+    }
     /* dense matrices are quantized to int8 (+ int4 planar per COLI_DENSE_BITS/
      * COLI_DENSE_INT4, see dense_int4_wanted) during model_init above
      * (COLI_DENSE_I8=0 disables it) -- see load_tq/QW; model_init_range

@@ -29,7 +29,7 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            render_chat_qwen38, render_chat_v4, render_chat_dsv41,
                            _dsv4_tool_calls, serve,
                            resolve_generation_prompt, split_thinking_reply,
-                           detect_chat_flavor,
+                           detect_chat_flavor, qwen36_has_vision,
                            starts_in_reasoning,
                            stop_policy, tune_child_env)
 
@@ -230,6 +230,22 @@ class TemplateTest(unittest.TestCase):
                 # Without preserve_thinking the block leaves the history either way.
                 self.assertIn("<|im_start|>assistant\nParis.<|im_end|>",
                               render_chat_qwen(first + [past, follow], enable_thinking=True))
+
+    def test_qwen36_images_follow_the_container(self):
+        """#1757: a qwen36 container converted with its vision tower says so in
+        qwen36_meta.json, and only then does the gateway turn image parts into
+        patches for the engine; an older or text-only container keeps refusing them."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            self.assertFalse(qwen36_has_vision(d))
+            meta = Path(d) / "qwen36_meta.json"
+            meta.write_text(json.dumps({"num_experts": 0}), encoding="utf-8")
+            self.assertFalse(qwen36_has_vision(d))
+            meta.write_text(json.dumps({"vision": {"depth": 27}}), encoding="utf-8")
+            self.assertTrue(qwen36_has_vision(d))
+            meta.write_text("not json", encoding="utf-8")
+            self.assertFalse(qwen36_has_vision(d))
+        self.assertFalse(qwen36_has_vision(None))
 
     def test_qwen38_template_on_the_qwen36_engine(self):
         """#1757: Qwen3.8-27B is a dense model of Qwen3.5's architecture, so the qwen36
