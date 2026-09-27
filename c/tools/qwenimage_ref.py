@@ -106,7 +106,7 @@ def release_memory():
 
 def log(msg: str):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}  (anon {rss_gb():.1f} GB, file {rss_gb('RssFile'):.1f} GB, "
-          f"avail {mem_available_gb():.1f} GB)", flush=True)
+          f"avail {mem_available_gb():.1f} GB, load {os.getloadavg()[0]:.1f})", flush=True)
 
 
 class MemoryGuard:
@@ -310,6 +310,7 @@ def encode_prompts(model_dir: Path, prompts: list[str], dtype: torch.dtype, dump
             with torch.no_grad():
                 prompt_embeds, mask, image_pad_mask = pipe.encode_prompt(prompt=prompt, device=torch.device("cpu"))
             enc_s = time.time() - t1
+            enc_load = os.getloadavg()[0]
             if mask is not None and not bool(mask.all()):
                 raise SystemExit("unexpected padding mask for a single prompt")
             if bool(image_pad_mask.any()):
@@ -330,6 +331,7 @@ def encode_prompts(model_dir: Path, prompts: list[str], dtype: torch.dtype, dump
                 "prompt_embeds": f32(prompt_embeds[0]),
                 "prompt_embeds_is_prenorm_last_layer": pre_norm,
                 "encode_s": enc_s,
+                "encode_loadavg": enc_load,
             }
             if dump:
                 rec["te_hidden"] = captured["hidden"]
@@ -381,6 +383,7 @@ class DenoiseRecorder:
         self.noise_pred = []
         self.latents = []
         self.step_s = []
+        self.step_load = []
         self.step0 = {}
         self.stats = {"blocks": {}, "noise_pred": [], "latents": []}
         self.prev_out = {}
@@ -415,6 +418,7 @@ class DenoiseRecorder:
 
     def _model_post(self, module, args, output):
         self.step_s.append(time.time() - self._t0)
+        self.step_load.append(os.getloadavg()[0])
         noise = f32(output[0][0, -self.n:])
         if self.dump:
             self.noise_pred.append(noise)
@@ -530,7 +534,7 @@ def denoise(model_dir: Path, runs: list[dict], dtype: torch.dtype, dump: bool, r
         outs.append({
             "final": f32(final[0]), "sigmas": f32(pipe.scheduler.sigmas), "timesteps": f32(pipe.scheduler.timesteps),
             "mu": float(mu), "timestep_in": rec.timestep_in, "noise_pred": rec.noise_pred, "latents": rec.latents,
-            "step0": rec.step0, "step_s": rec.step_s, "denoise_s": total_s,
+            "step0": rec.step0, "step_s": rec.step_s, "step_load": rec.step_load, "denoise_s": total_s,
             "redundancy": rec.stats if rec.redundancy else None,
         })
         rec = None  # it holds the transformer; the model is freed below only if nothing else does
@@ -570,7 +574,8 @@ def decode(model_dir: Path, items: list[dict], dump: bool):
                 image = pipe.vae.decode(latents, return_dict=False)[0][:, :, 0]
                 pil = pipe.image_processor.postprocess(image, output_type="pil")[0]
             dec_s = time.time() - t1
-            out = {"pil": pil, "rgba": torch.from_numpy(np.array(pil)).contiguous(), "decode_s": dec_s}
+            out = {"pil": pil, "rgba": torch.from_numpy(np.array(pil)).contiguous(), "decode_s": dec_s,
+                   "loadavg": os.getloadavg()[0]}
             if dump:
                 out["vae_in"] = f32(latents[0, :, 0])
                 out["vae_out"] = f32(image[0])
@@ -823,7 +828,8 @@ def main() -> int:
         encs, te_info = encode_prompts(model_dir, [args.prompt], te_dtype, args.dump, guard)
         enc = encs[0]
         te_cfg = te_info["config"]
-        timings["encode"] = {"load_s": te_info["load_s"], "compute_s": enc["encode_s"], "dtype": te_info["dtype"]}
+        timings["encode"] = {"load_s": te_info["load_s"], "compute_s": enc["encode_s"],
+                             "loadavg_1min": enc["encode_loadavg"], "dtype": te_info["dtype"]}
         peak["after_encode"] = te_info["peak_rss_gb"]
 
     # 2. transformer
@@ -862,8 +868,9 @@ def main() -> int:
         out_dir = args.out if len(steps_list) == 1 else args.out / f"steps_{steps}"
         t = {"encode": timings["encode"],
              "denoise": {"load_s": tr_info["load_s"], "total_s": den["denoise_s"], "per_step_s": den["step_s"],
-                         "dtype": tr_info["dtype"]},
-             "decode": {"load_s": vae_info["load_s"], "compute_s": dec["decode_s"], "dtype": vae_info["dtype"]},
+                         "loadavg_1min_after_step": den["step_load"], "dtype": tr_info["dtype"]},
+             "decode": {"load_s": vae_info["load_s"], "compute_s": dec["decode_s"], "loadavg_1min": dec["loadavg"],
+                        "dtype": vae_info["dtype"]},
              "threads": args.threads}
         meta = {"model": str(model_dir), "width": width, "height": height, "steps": steps, "seed": args.seed,
                 "latents_init": latents_init, "latents_note": latents_note,
