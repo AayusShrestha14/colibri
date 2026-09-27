@@ -1162,9 +1162,22 @@ static int run_oracle(Engine *e, const char *refdir){
                 fails += big > rt->nbytes / 1000;
                 free(want);
             }
-            char out[2200]; snprintf(out, sizeof out, "%s/oracle_c.png", refdir);
+            const char *tag = getenv("QWENIMAGE_ORACLE_TAG");
+            char out[2200]; snprintf(out, sizeof out, "%s/oracle_c%s%s.png", refdir, tag ? "_" : "", tag ? tag : "");
             qiv_decode(vae, mine, gh, gw, rgba, NULL);
             if (!write_png(out, rgba, width, height)) fprintf(stderr, "[oracle] our own chained image: %s\n", out);
+            /* PSNR of the RGB of our chained image against the reference's: the
+             * number that says what int8 weights or activations cost in pixels */
+            if (rt && rt->nbytes == (int64_t)width * height * 4) {
+                uint8_t *want = xmalloc((size_t)rt->nbytes);
+                st_pread_full(rt->fd, want, rt->nbytes, rt->off, "rgba");
+                double se = 0; int64_t np3 = 0;
+                for (int64_t k = 0; k < rt->nbytes; k++) if ((k & 3) != 3) { double d = (double)rgba[k] - want[k]; se += d * d; np3++; }
+                double mse = se / np3;
+                fprintf(stderr, "[oracle] chained image vs reference: PSNR %.2f dB (MSE %.3f)\n",
+                        mse > 0 ? 10.0 * log10(255.0 * 255.0 / mse) : 99.0, mse);
+                free(want);
+            }
             free(img_ref); free(rgba); free(of);
             qiv_free(vae);
         }

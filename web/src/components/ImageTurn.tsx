@@ -46,7 +46,7 @@ export function ImageProgressCard({ request, run, onCancel }: { request: Generat
   const progress = run.progress
   const fraction = progressFraction(progress)
   const stage = !progress ? t(run.plain ? "image.stage.working" : "image.stage.queued")
-    : progress.stage === "denoise" ? t("image.stage.denoise", { step: Math.max(1, progress.step), steps: progress.steps })
+    : progress.stage === "denoise" ? t("image.stage.denoise", { step: Math.min(progress.steps, progress.step + 1), steps: progress.steps })
     : progress.stage === "encode" || progress.stage === "decode" ? t(`image.stage.${progress.stage}`)
     : t("image.stage.working")
   return <div className="image-turn" style={turnWidth(request.width, request.height)}>
