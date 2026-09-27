@@ -15,10 +15,10 @@
  * + SiLU, conv_out, clamp to [-1, 1], then VaeImageProcessor.postprocess
  * ((x*0.5 + 0.5).clamp(0, 1) * 255, numpy round-half-even, uint8).
  *
- * Activations are channel-last [H][W][C]. A 3x3 conv is im2col times the weight
- * through qi_gemm; the weight is permuted at load to [Cout][ky][kx][Cin] so an
- * im2col row is nine contiguous copies of Cin floats. The im2col only exists for
- * a band of output rows (qiv_col_floats), and the input rows a band has consumed
+ * Activations are channel-last [H][W][C]. A 3x3 conv is one qi_gemm per band of
+ * output rows over a 3x (not 9x) im2col, see qiv_conv3; the weight is permuted
+ * at load to [Cout][kx][ky][Cin] to match. The im2col only exists for a band of
+ * output rows (qiv_col_floats), and the input rows a band has consumed
  * are handed back to the OS when nothing reads them later (qiv_release): at
  * 1024x1024 the last up blocks hold 288-channel maps of 1.2 GB each, and without
  * that the decode would not fit next to the rest of the pipeline.
@@ -56,7 +56,7 @@ static size_t qiv_attn_floats = (size_t)4 << 20;
 
 typedef struct {
     int cin, cout, k;       /* k = 1 or 3 */
-    float *w, *b;           /* w: [cout][ky][kx][cin] */
+    float *w, *b;           /* w: [cout][kx][ky][cin] */
     QiMat m;
 } QivConv;
 
@@ -146,13 +146,14 @@ static int qiv_load_conv(shards *S, QiVae *v, const char *pfx, int cin, int cout
     float *w = qiv_read(S, nm, (int64_t)cout * cin * k * k, err, errn);
     if (!w) return -1;
     if (k > 1) {
-        /* [cout][cin][ky][kx] -> [cout][ky][kx][cin] */
+        /* [cout][cin][ky][kx] -> [cout][kx][ky][cin], the order qiv_conv3 reads taps in */
         float *p = qiv_alloc((size_t)cout * cin * k * k);
         if (!p) { free(w); snprintf(err, errn, "out of memory"); return -1; }
         for (int o = 0; o < cout; o++)
             for (int i = 0; i < cin; i++)
-                for (int t = 0; t < k * k; t++)
-                    p[((size_t)o * k * k + t) * cin + i] = w[((size_t)o * cin + i) * k * k + t];
+                for (int ky = 0; ky < k; ky++)
+                    for (int kx = 0; kx < k; kx++)
+                        p[((size_t)o * k * k + kx * k + ky) * cin + i] = w[((size_t)o * cin + i) * k * k + ky * k + kx];
         free(w); w = p;
     }
     snprintf(nm, sizeof nm, "%s.bias", pfx);
@@ -360,28 +361,35 @@ typedef struct {
 
 /* y[Ho][Wo][cout] = conv3x3(pre(x)) (+ epilogue), with pre = RMS norm + SiLU if
  * gamma, and x nearest-upsampled 2x first if up. Processed in bands of output
- * rows: prepared input rows (with halo and zero padding) -> im2col -> qi_gemm. */
+ * rows. P holds the band's input rows after pre, with a one-row halo and a zero
+ * column on each side (width Wp = Wo + 2). Q interleaves three consecutive P
+ * rows: Q[r][u][ky] = P[r + ky][u]. Then the nine taps of output pixel (r, u)
+ * are the 9*C contiguous floats at Q[r][u], ordered [kx][ky][c], and the next
+ * pixel starts 3*C floats later: a GEMM with ldx = 3*C over the rows r*Wp + u
+ * reads them in place. Q costs 3 copies of the input instead of the 9 of a full
+ * im2col; the two rows per band that straddle a line end are computed and
+ * dropped. */
 static int qiv_conv3(const QivConv *cv, float *x, int H, int W, const float *gamma, int up,
                      float *y, const QivEpi *ep){
-    const int C = cv->cin, Co = cv->cout, K = 9 * C;
+    const int C = cv->cin, Co = cv->cout, C3 = 3 * C;
     const int Ho = H << up, Wo = W << up, Wp = Wo + 2;
     const float scale = (float)sqrt((double)C);
-    size_t rowcol = (size_t)Wo * K;
-    int band = (int)(qiv_col_floats / rowcol);
+    const size_t rowq = (size_t)Wp * C3;
+    int band = (int)(qiv_col_floats / rowq);
     if (band < 1) band = 1;
     if (band > Ho) band = Ho;
     float *P = qiv_alloc((size_t)(band + 2) * Wp * C);
-    float *col = qiv_alloc((size_t)band * rowcol);
-    float *T = qiv_alloc((size_t)band * Wo * Co);
+    float *Q = qiv_alloc((size_t)band * rowq);
+    float *T = qiv_alloc((size_t)band * Wp * Co);
     float *T2 = ep && ep->sc ? qiv_alloc((size_t)band * Wo * Co) : NULL;
-    if (!P || !col || !T || (ep && ep->sc && !T2)) { free(P); free(col); free(T); free(T2); return -1; }
+    if (!P || !Q || !T || (ep && ep->sc && !T2)) { free(P); free(Q); free(T); free(T2); return -1; }
     const size_t xtot = (size_t)H * W * C;
     const int scC = ep && ep->sc ? ep->sc->cin : 0;
     size_t xrel = 0, screl = 0, duprel = 0;
 
     for (int y0 = 0; y0 < Ho; y0 += band) {
         const int nb = Ho - y0 < band ? Ho - y0 : band;
-        /* prepared rows r = 0..nb+1 hold virtual row y0-1+r, one zero column each side */
+        /* P row r = virtual input row y0-1+r */
         #pragma omp parallel for collapse(2) schedule(static)
         for (int r = 0; r < nb + 2; r++)
             for (int u = 0; u < Wp; u++) {
@@ -394,28 +402,29 @@ static int qiv_conv3(const QivConv *cv, float *x, int H, int W, const float *gam
             }
         #pragma omp parallel for collapse(2) schedule(static)
         for (int r = 0; r < nb; r++)
-            for (int u = 0; u < Wo; u++) {
-                float *d = col + ((size_t)r * Wo + u) * K;
+            for (int u = 0; u < Wp; u++) {
+                float *d = Q + ((size_t)r * Wp + u) * C3;
                 for (int ky = 0; ky < 3; ky++)
-                    memcpy(d + ky * 3 * C, P + ((size_t)(r + ky) * Wp + u) * C, sizeof(float) * 3 * C);
+                    memcpy(d + ky * C, P + ((size_t)(r + ky) * Wp + u) * C, sizeof(float) * C);
             }
-        const int M = nb * Wo;
-        qi_gemm(T, col, M, &cv->m, cv->b);
-        if (T2) qi_gemm(T2, ep->scx + (size_t)y0 * Wo * scC, M, &ep->sc->m, ep->sc->b);
-        #pragma omp parallel for schedule(static)
-        for (int p = 0; p < M; p++) {
-            float *t = T + (size_t)p * Co;
-            size_t gp = (size_t)y0 * Wo + p;
-            if (T2) { const float *t2 = T2 + (size_t)p * Co; for (int o = 0; o < Co; o++) t[o] += t2[o]; }
-            if (ep && ep->dup) {
-                int Y = y0 + p / Wo, X = p % Wo;
-                const float *s = ep->dup + ((size_t)(Y >> 1) * (Wo >> 1) + (X >> 1)) * ep->dupC;
-                const int *tab = ep->dupt + ((Y & 1) * 2 + (X & 1));
-                for (int o = 0; o < Co; o++) t[o] += s[tab[o * 4]];
+        qi_gemm_ld(T, Co, Q, C3, nb * Wp - 2, &cv->m, cv->b);
+        if (T2) qi_gemm(T2, ep->scx + (size_t)y0 * Wo * scC, nb * Wo, &ep->sc->m, ep->sc->b);
+        #pragma omp parallel for collapse(2) schedule(static)
+        for (int r = 0; r < nb; r++)
+            for (int u = 0; u < Wo; u++) {
+                const int p = r * Wo + u;
+                float *t = T + ((size_t)r * Wp + u) * Co;
+                size_t gp = (size_t)y0 * Wo + p;
+                if (T2) { const float *t2 = T2 + (size_t)p * Co; for (int o = 0; o < Co; o++) t[o] += t2[o]; }
+                if (ep && ep->dup) {
+                    int Y = y0 + r;
+                    const float *s = ep->dup + ((size_t)(Y >> 1) * (Wo >> 1) + (u >> 1)) * ep->dupC;
+                    const int *tab = ep->dupt + ((Y & 1) * 2 + (u & 1));
+                    for (int o = 0; o < Co; o++) t[o] += s[tab[o * 4]];
+                }
+                if (ep && ep->res) { const float *rr = ep->res + gp * Co; for (int o = 0; o < Co; o++) t[o] += rr[o]; }
+                memcpy(y + gp * Co, t, sizeof(float) * Co);
             }
-            if (ep && ep->res) { const float *rr = ep->res + gp * Co; for (int o = 0; o < Co; o++) t[o] += rr[o]; }
-            memcpy(y + gp * Co, t, sizeof(float) * Co);
-        }
         const int y1 = y0 + nb;
         if (ep && ep->rel_x) {
             size_t upto = y1 >= Ho ? xtot : (size_t)((y1 - 1) >> up) * W * C;
@@ -431,7 +440,7 @@ static int qiv_conv3(const QivConv *cv, float *x, int H, int W, const float *gam
             qiv_release((float *)ep->dup, tot, duprel, upto); duprel = upto;
         }
     }
-    free(P); free(col); free(T); free(T2);
+    free(P); free(Q); free(T); free(T2);
     return 0;
 }
 
