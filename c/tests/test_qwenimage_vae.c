@@ -4,8 +4,9 @@
  *                                          each case twice: default bands, then one-row bands (--bands)
  *   test_qwenimage_vae --vae DIR --ref DIR [--tol T] [--bands] [--ppm PREFIX]
  *   test_qwenimage_vae --vae DIR --bench HxW [--ppm PREFIX]      random latent: time and peak RSS
- *   test_qwenimage_vae --vae DIR --latent STDIR NAME HxW [--ppm PREFIX]
- *                                          decode one [h*w][z] tensor, e.g. a pipeline's final latents
+ *   test_qwenimage_vae --vae DIR --latent STDIR NAME HxW [--expect OUT RGBA] [--ppm PREFIX]
+ *                                          decode one [h*w][z] tensor, e.g. a pipeline's final latents,
+ *                                          and compare with tensors OUT and RGBA of the same file
  *
  * A reference case is case{k}.z [h][w][z] (normalized latents), case{k}.out
  * [4][16h][16w] (vae.decode after the clamp) and case{k}.rgba [16h][16w][4]
@@ -70,9 +71,49 @@ static int run(QiVae *v, const float *z, int h, int w, uint8_t **rgba_o, float *
     return rc;
 }
 
+/* decode z and compare with the reference float output ro and bytes rr; returns 1 if ok */
+static int check(QiVae *v, const float *z, int h, int w, const float *ro, const uint8_t *rr,
+                 double tol, const char *ppm, int k){
+    const size_t HW = (size_t)h * w * v->scale * v->scale;
+    uint8_t *rgba; float *f; double secs;
+    if (run(v, z, h, w, &rgba, &f, &secs)) return 0;
+    double maxerr = 0, sumerr = 0;
+    for (size_t i = 0; i < HW * v->out_ch; i++) {
+        double e = fabs((double)f[i] - ro[i]);
+        sumerr += e; if (e > maxerr) maxerr = e;
+    }
+    size_t ndiff = 0; int maxd = 0;
+    for (size_t i = 0; i < HW * 4; i++) {
+        int d = abs((int)rgba[i] - (int)rr[i]);
+        if (d) { ndiff++; if (d > maxd) maxd = d; }
+    }
+    int ok = maxerr <= tol && maxd <= 1 && ndiff * 1000 <= HW * 4;
+    printf("  %s float max|err| %.3g (mean %.3g, tol %.1g); uint8: %zu of %zu differ, max diff %d\n",
+           ok ? "ok  " : "FAIL", maxerr, sumerr / (HW * v->out_ch), tol, ndiff, HW * 4, maxd);
+    if (ppm) write_ppm(ppm, k, rgba, h * v->scale, w * v->scale);
+    free(rgba); free(f);
+    return ok;
+}
+
+static float *read_f32(shards *S, const char *name, int64_t numel){
+    st_tensor *t = st_find(S, name);
+    if (!t || t->numel != numel) { fprintf(stderr, "%s: missing or not %lld elements\n", name, (long long)numel); return NULL; }
+    float *p = malloc(sizeof(float) * numel);
+    st_read_f32(S, name, p, 0);
+    return p;
+}
+
+static uint8_t *read_u8(shards *S, const char *name, int64_t n){
+    st_tensor *t = st_find(S, name);
+    if (!t || t->nbytes != n) { fprintf(stderr, "%s: missing or not %lld bytes\n", name, (long long)n); return NULL; }
+    uint8_t *p = malloc(n);
+    st_read_raw(S, name, p, 0);
+    return p;
+}
+
 int main(int argc, char **argv){
     const char *vae_dir = NULL, *ref_dir = NULL, *bench = NULL, *ppm = NULL;
-    const char *lat_dir = NULL, *lat_name = NULL, *lat_hw = NULL;
+    const char *lat_dir = NULL, *lat_name = NULL, *lat_hw = NULL, *exp_out = NULL, *exp_rgba = NULL;
     double tol = 1e-3;
     int bands = 0;
     char vbuf[4096], rbuf[4096];
@@ -84,6 +125,7 @@ int main(int argc, char **argv){
         else if (!strcmp(argv[i], "--tol") && i + 1 < argc) tol = atof(argv[++i]);
         else if (!strcmp(argv[i], "--bands")) bands = 1;
         else if (!strcmp(argv[i], "--latent") && i + 3 < argc) { lat_dir = argv[++i]; lat_name = argv[++i]; lat_hw = argv[++i]; }
+        else if (!strcmp(argv[i], "--expect") && i + 2 < argc) { exp_out = argv[++i]; exp_rgba = argv[++i]; }
         else if (argv[i][0] != '-' && !vae_dir) {
             snprintf(vbuf, sizeof vbuf, "%s/vae", argv[i]); snprintf(rbuf, sizeof rbuf, "%s/vae_ref", argv[i]);
             vae_dir = vbuf; ref_dir = rbuf; bands = 1;
@@ -101,65 +143,55 @@ int main(int argc, char **argv){
     if (bench || lat_dir) {
         int h = 0, w = 0;
         if (sscanf(bench ? bench : lat_hw, "%dx%d", &h, &w) != 2 || h <= 0 || w <= 0) { fprintf(stderr, "bad HxW\n"); return 2; }
-        float *z = malloc(sizeof(float) * h * w * v->z_dim);
+        const int64_t nz = (int64_t)h * w * v->z_dim, HW = (int64_t)h * w * v->scale * v->scale;
+        float *z = NULL, *ro = NULL;
+        uint8_t *rr = NULL;
+        shards L;
         if (bench) {
+            z = malloc(sizeof(float) * nz);
             uint64_t s = 42;
-            for (size_t i = 0; i < (size_t)h * w * v->z_dim; i += 2) {   /* Box-Muller: N(0, 1) like the DiT's output scale */
+            for (int64_t i = 0; i < nz; i += 2) {   /* Box-Muller: N(0, 1), the scale of the DiT's output */
                 s = s * 6364136223846793005ull + 1442695040888963407ull; double u1 = ((s >> 11) + 1.0) / 9007199254740993.0;
                 s = s * 6364136223846793005ull + 1442695040888963407ull; double u2 = (s >> 11) / 9007199254740992.0;
                 double r = sqrt(-2 * log(u1));
                 z[i] = (float)(r * cos(2 * M_PI * u2));
-                if (i + 1 < (size_t)h * w * v->z_dim) z[i + 1] = (float)(r * sin(2 * M_PI * u2));
+                if (i + 1 < nz) z[i + 1] = (float)(r * sin(2 * M_PI * u2));
             }
         } else {
-            shards L; st_init(&L, lat_dir);
-            st_tensor *t = st_find(&L, lat_name);
-            if (!t || t->numel != (int64_t)h * w * v->z_dim) { fprintf(stderr, "%s: missing or not %d elements\n", lat_name, h * w * v->z_dim); return 1; }
-            st_read_f32(&L, lat_name, z, 0);
+            st_init(&L, lat_dir);
+            if (!(z = read_f32(&L, lat_name, nz))) return 1;
+            if (exp_out && (!(ro = read_f32(&L, exp_out, HW * v->out_ch)) || !(rr = read_u8(&L, exp_rgba, HW * 4)))) return 1;
             st_destroy(&L);
         }
-        uint8_t *rgba; float *f; double secs;
-        if (run(v, z, h, w, &rgba, &f, &secs)) return 1;
-        if (ppm) write_ppm(ppm, 0, rgba, h * v->scale, w * v->scale);
-        free(z); free(rgba); free(f);
+        printf("latent %dx%d%s%s\n", h, w, lat_name ? " from " : " (random)", lat_name ? lat_name : "");
+        if (ro) fails += !check(v, z, h, w, ro, rr, tol, ppm, 0);
+        else {
+            uint8_t *rgba; float *f; double secs;
+            if (run(v, z, h, w, &rgba, &f, &secs)) return 1;
+            if (ppm) write_ppm(ppm, 0, rgba, h * v->scale, w * v->scale);
+            free(rgba); free(f);
+        }
+        free(z); free(ro); free(rr);
     } else {
         shards R; st_init(&R, ref_dir);
         for (int k = 0;; k++) {
             char nz[64], no[64], nr[64];
             snprintf(nz, sizeof nz, "case%d.z", k); snprintf(no, sizeof no, "case%d.out", k); snprintf(nr, sizeof nr, "case%d.rgba", k);
-            st_tensor *tz = st_find(&R, nz), *to = st_find(&R, no), *tr = st_find(&R, nr);
+            st_tensor *tz = st_find(&R, nz);
             if (!tz) { if (k == 0) { fprintf(stderr, "no case0.z in %s\n", ref_dir); fails++; } break; }
-            if (tz->rank != 3 || tz->shape[2] != v->z_dim || !to || !tr) { fprintf(stderr, "%s: malformed case\n", nz); fails++; break; }
-            int h = (int)tz->shape[0], w = (int)tz->shape[1], H = h * v->scale, W = w * v->scale;
-            size_t HW = (size_t)H * W;
-            if (to->numel != (int64_t)HW * v->out_ch || tr->nbytes != (int64_t)HW * 4) { fprintf(stderr, "case%d: reference size mismatch\n", k); fails++; break; }
-            float *z = malloc(sizeof(float) * tz->numel), *ro = malloc(sizeof(float) * to->numel);
-            uint8_t *rr = malloc(HW * 4);
-            st_read_f32(&R, nz, z, 0); st_read_f32(&R, no, ro, 0); st_read_raw(&R, nr, rr, 0);
+            if (tz->rank != 3 || tz->shape[2] != v->z_dim) { fprintf(stderr, "%s: malformed case\n", nz); fails++; break; }
+            int h = (int)tz->shape[0], w = (int)tz->shape[1];
+            int64_t HW = (int64_t)h * w * v->scale * v->scale;
+            float *z = read_f32(&R, nz, tz->numel), *ro = read_f32(&R, no, HW * v->out_ch);
+            uint8_t *rr = read_u8(&R, nr, HW * 4);
+            if (!z || !ro || !rr) { fails++; break; }
             for (int pass = 0; pass < (bands ? 2 : 1); pass++) {
                 /* pass 1: one output row per band and 16-query attention blocks,
                  * so a tiny model crosses every band edge the real one does */
                 qiv_col_floats = pass ? 1 : (size_t)16 << 20;
                 qiv_attn_floats = pass ? 1 : (size_t)4 << 20;
                 printf("case%d: latent %dx%d%s\n", k, h, w, pass ? ", one-row bands" : "");
-                uint8_t *rgba; float *f; double secs;
-                if (run(v, z, h, w, &rgba, &f, &secs)) { fails++; break; }
-                double maxerr = 0, sumerr = 0;
-                for (size_t i = 0; i < HW * v->out_ch; i++) {
-                    double e = fabs((double)f[i] - ro[i]);
-                    sumerr += e; if (e > maxerr) maxerr = e;
-                }
-                size_t ndiff = 0; int maxd = 0;
-                for (size_t i = 0; i < HW * 4; i++) {
-                    int d = abs((int)rgba[i] - (int)rr[i]);
-                    if (d) { ndiff++; if (d > maxd) maxd = d; }
-                }
-                int ok = maxerr <= tol && maxd <= 1 && ndiff * 1000 <= HW * 4;
-                printf("  %s float max|err| %.3g (mean %.3g, tol %.1g); uint8: %zu of %zu differ, max diff %d\n",
-                       ok ? "ok  " : "FAIL", maxerr, sumerr / (HW * v->out_ch), tol, ndiff, HW * 4, maxd);
-                fails += !ok;
-                if (ppm && !pass) write_ppm(ppm, k, rgba, H, W);
-                free(rgba); free(f);
+                fails += !check(v, z, h, w, ro, rr, tol, pass ? NULL : ppm, k);
             }
             free(z); free(ro); free(rr);
         }
