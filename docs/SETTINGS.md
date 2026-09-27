@@ -1,6 +1,6 @@
 # CLI & Settings Reference
 
-Command-line settings for the two user-facing programs: the **`coli`** CLI and the **`openai_server.py`** server. The underlying `glm` engine is driven by environment variables — see [ENVIRONMENT.md](ENVIRONMENT.md).
+Command-line settings for the two user-facing programs: the **`coli`** CLI and the **`openai_server.py`** server. The engines underneath (`colibri`, `glm53`, `kimi_k3`, `inkling`, `qwen36`, `qwen38`, `deepseek_v4`, `deepseek_v41`, `olmoe`) are driven by environment variables: see [ENVIRONMENT.md](ENVIRONMENT.md), which says which engine reads which.
 
 **Updated for the contribution based on `upstream/dev @ 21e7a35`** (argparse definitions in `c/coli` and `c/openai_server.py`). See [MAINTAINING-DOCS.md](MAINTAINING-DOCS.md) to regenerate.
 
