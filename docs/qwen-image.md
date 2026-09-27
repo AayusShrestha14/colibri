@@ -14,6 +14,17 @@ The same front ends as the text models reach it:
 - `coli serve` (and `coli web`) expose `POST /v1/images/generations`, the
   OpenAI images API.
 
+<p align="center">
+  <img src="media/qwen-image-web.png" width="820" alt="the web UI: the prompt, and the image colibri generated for it, with size, steps, seed and time">
+</p>
+<p align="center">
+  <img src="media/qwen-image-tui.png" width="820" alt="coli chat: the same prompt and seed, the image drawn inside the terminal with half blocks, then saved as a PNG">
+</p>
+
+Both pictures come from the real checkpoint on an 8-core CPU server, same
+prompt and seed: the web UI above, `coli chat` attached to the same server
+below (half blocks, the mode that works in every terminal).
+
 ## Download
 
 The checkpoint is about 33 GB: a text encoder (Qwen3-VL, 17.5 GB bf16), the
@@ -48,8 +59,11 @@ safetensors headers):
 With the text encoder on demand it is loaded for each prompt and freed before
 denoising starts, so the peak is the larger of the two phases, at the cost of
 reading it again for every prompt. Working buffers (the activations, the
-VAE's full-resolution feature maps) come on top of both numbers:
-TBD (being measured).
+VAE's full-resolution feature maps) come on top of both numbers. Measured on
+the real checkpoint: `coli run` at 768x512 peaks at **9.0 GB** (the text
+encoder is freed before denoising), and a `coli serve` that keeps everything
+loaded holds **14.0 GB** once it is ready. The VAE's own working set at
+1024x1024 is 1.9 GB on top of its weights.
 
 ```sh
 coli plan --model ~/Models/Qwen-Image-2.1          # both schedules against your free RAM
@@ -61,6 +75,10 @@ coli plan --model ~/Models/Qwen-Image-2.1 --json   # the same as JSON
 ```sh
 coli chat --model ~/Models/Qwen-Image-2.1
 ```
+
+<p align="center">
+  <img src="media/qwen-image-tui-preview.png" width="720" alt="coli chat while the image is forming: the live preview redrawn in the terminal, denoising step 3 of 8">
+</p>
 
 Every line you type is a prompt. While the engine works, a status line shows
 the stage (encoding the prompt, denoising step k of N, decoding) and the
@@ -105,7 +123,10 @@ only the path on stdout.
   image tokens 2x2, which is why 32 and not 16: 16:9 is 1024x576 or 512x288,
   never 768x432. The default is 768x512. The presets, the same ones the web UI
   offers: 512x512, 768x512, 512x768, 1024x576, 576x1024, 1024x1024.
-- **Steps**: default 8, from 1 to 200.
+- **Steps**: default 8, from 1 to 200. Eight is a good draft for photographs;
+  16 gives visibly better anatomy and colour and is what text inside the
+  picture needs to come out legible (compared on the reference pipeline at
+  8, 16 and 30 steps; 30 adds little over 16). Time grows with the steps.
 - **Seed**: an integer from 0 to 4294967295. When you do not choose one, a
   random seed is drawn and printed with the image, so any picture can be made
   again. Seeds are the engine's own: the same seed does not give the same image
@@ -210,7 +231,34 @@ with `"capabilities": ["image_generation"]` and its size rules;
 
 ## Timings
 
-TBD (being measured).
+Measured on a server with 8 Zen 4 cores (AVX-512, 8 OpenMP threads), 768x512,
+8 steps, int8 weights:
+
+| | per denoising step | one image |
+|---|---|---|
+| int8 activations in the DiT (default where VNNI exists) | 18.3 to 19.6 s | 3.4 min with `coli run` (load included), 2 min 40 s through a loaded `coli serve` |
+| f32 activations (`COLI_IMG_ACT8=0`) | 34.3 s | 5.5 min with `coli run` |
+
+- The text encoder and the prompt's side of the transformer take about 3.5 s
+  on a loaded server, and nothing at all when the same prompt comes back with
+  a new seed: they are computed once per prompt and kept.
+- The VAE decodes 512x512 in 7 s, 768x512 in 10 to 12 s, 1024x1024 in 29 s.
+- For reference, the diffusers pipeline in PyTorch runs the same step in
+  17.2 s in bf16 on the same machine, and its f32 run peaked at 31.8 GB of
+  RAM; colibri stays within 9 GB and needs neither Python nor torch to
+  generate.
+- The int8 activations are what VNNI makes fast (four multiply-adds per lane
+  instead of one). They are kept out of the text encoder, whose hidden states
+  carry a few very large channels that one scale per token cannot hold, and
+  used only in the transformer's blocks: against the f32 reference the image
+  scores 30.1 dB with them and 35.6 dB without, and by eye the two cannot be
+  told apart.
+
+Every stage of the engine is checked against the diffusers pipeline: on the
+real checkpoint in f32 the text encoder, all eight denoising steps and the VAE
+agree to about one part in a million, and of the million bytes of the final
+image 13 differ, each by one. A tiny random pipeline in the same layout runs the
+same comparison in CI.
 
 ## License
 
