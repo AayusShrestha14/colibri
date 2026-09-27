@@ -3,7 +3,7 @@ import { ChevronDown, Copy, Dices, Download, Footprints, Proportions, RefreshCw,
 
 import type { GeneratedImage, ImageProgress } from "@/lib/api"
 import {
-  MAX_STEPS, SIZE_PRESETS, clampSteps, duration, elapsedClock, presetOf, progressFraction,
+  MAX_STEPS, MIN_STEPS, SIZE_PRESETS, clampSteps, duration, elapsedClock, presetOf, progressFraction,
   sizeKey, snapSide, validSide, type ImageSize,
 } from "@/lib/images"
 import { cn } from "@/lib/utils"
@@ -179,7 +179,7 @@ export function ImageControls({ size, custom, steps, seed, seedValid, onSize, on
         onChange={(event) => {
           setStepsText(event.target.value)
           const value = Number(event.target.value)
-          if (event.target.value && Number.isInteger(value) && value >= 1 && value <= MAX_STEPS) onSteps(value)
+          if (event.target.value && Number.isInteger(value) && value >= MIN_STEPS && value <= MAX_STEPS) onSteps(value)
         }}
         onBlur={(event) => { const value = clampSteps(Number(event.target.value || steps)); setStepsText(String(value)); onSteps(value) }}
         onKeyDown={(event) => {

@@ -27,8 +27,8 @@ describe("image sizes", () => {
 })
 
 describe("steps and seed", () => {
-  it("keeps steps a whole number from 1 to 200 (the gateway's range)", () => {
-    expect([0, 8, 8.6, 500, Number.NaN].map(clampSteps)).toEqual([1, 8, 9, 200, 8])
+  it("keeps steps a whole number from 2 to 200 (the gateway's range)", () => {
+    expect([0, 8, 8.6, 500, Number.NaN].map(clampSteps)).toEqual([2, 8, 9, 200, 8])
   })
 
   it("reads an empty seed as random and refuses anything that is not a whole number", () => {

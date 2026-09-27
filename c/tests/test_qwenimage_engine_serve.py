@@ -55,9 +55,46 @@ class RealEngineServe(unittest.TestCase):
         self.assertEqual(len(self.generate(1)["rgba"]), 256 * 256 * 4)
 
     def test_cancel_keeps_the_engine(self):
+        # Through the client: a job long enough that the CANCEL, sent at the first
+        # frame, lands before the last step (two steps of the tiny model can finish
+        # before it arrives, which would be a race, not a result).
         with self.assertRaises(image_engine.ImageCancelled):
-            self.generate(2, cancelled=lambda: True)
+            self.engine.generate("a fox", 512, 512, 100, 2, cancelled=lambda: True)
         self.assertEqual(len(self.generate(2)["rgba"]), 256 * 256 * 4)
+
+    def test_cancel_pipelined_with_its_gen(self):
+        # The protocol itself: a CANCEL written right behind its GEN is answered
+        # "cancelled", whatever the speed of the machine.
+        self.engine._send("GEN", {"id": "c1", "prompt": "x", "width": 256, "height": 256, "steps": 2})
+        self.engine._send("CANCEL", {"id": "c1"})
+        self.assertEqual(self._final("c1"), "cancelled")
+
+    def test_abandoned_request_does_not_swallow_the_next(self):
+        # A callback that raises leaves generate() without the final frame while
+        # the engine is still drawing: the engine keeps the next GEN instead of
+        # dropping it, and the client drains the abandoned frames first.
+        def boom(frame):
+            if frame.get("stage") == "denoise":
+                raise ConnectionResetError("client went away")
+        with self.assertRaises(ConnectionResetError):
+            self.engine.generate("a fox", 512, 512, 6, 1, on_progress=boom)
+        self.assertEqual(len(self.generate(5)["rgba"]), 256 * 256 * 4)
+
+    def test_engine_refuses_what_it_cannot_do(self):
+        with self.assertRaisesRegex(image_engine.ImageEngineError, "prompt too long"):
+            self.engine.generate("7" * 4000, 256, 256, 2, 1)    # 4 KB, one token per digit
+        for steps in (1, 201):
+            with self.assertRaises(image_engine.ImageEngineError):
+                self.engine._send("GEN", {"id": "raw", "prompt": "x", "width": 256, "height": 256, "steps": steps})
+                raise image_engine.ImageEngineError(self._final("raw"))
+        self.assertEqual(len(self.generate(6)["rgba"]), 256 * 256 * 4)
+
+    def _final(self, rid):
+        while True:
+            kind, body, _payload = self.engine.events.get(timeout=60)
+            if body.get("id") == rid and kind in ("IMAGE", "ERROR"):
+                self.assertEqual(kind, "ERROR", body)
+                return body.get("message")
 
     def test_progress_counts_completed_steps(self):
         seen = []

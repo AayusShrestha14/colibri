@@ -23,6 +23,8 @@ export const SIZE_PRESETS: ReadonlyArray<ImageSize & { ratio: string }> = [
 export const DEFAULT_SIZE: ImageSize = { width: 768, height: 512 }
 export const DEFAULT_STEPS = 8
 export const MAX_STEPS = 200
+/* One step is refused by the engine (its schedule divides by zero there). */
+export const MIN_STEPS = 2
 /* A seed the UI draws itself fits a signed 32-bit integer, whatever the engine
    keeps it in. The gateway is still sent an explicit seed every time, so a new
    seed is really new even on a server that would fall back to a fixed one. */
@@ -57,7 +59,7 @@ export function parseSize(text: string | null): ImageSize | null {
 
 export function clampSteps(value: number) {
   if (!Number.isFinite(value)) return DEFAULT_STEPS
-  return Math.min(MAX_STEPS, Math.max(1, Math.round(value)))
+  return Math.min(MAX_STEPS, Math.max(MIN_STEPS, Math.round(value)))
 }
 
 /* An empty field means "draw a new seed"; anything else must be a whole

@@ -5038,7 +5038,13 @@ class APIHandler(BaseHTTPRequestHandler):
             for name, value in queue_headers.items():
                 self.send_header(name, value)
             self.send_cors_headers()
-            self.end_headers()
+            try:
+                self.end_headers()
+            except OSError:
+                # The client left between admission and the first frame: count
+                # it as gone, so the generation is cancelled like any hang-up
+                # instead of this exception abandoning it mid-image.
+                state["connected"] = False
 
         def write(data):
             with lock:

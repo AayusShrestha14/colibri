@@ -202,8 +202,8 @@ def check(request, info):
             return (f"{key} {value} is not a multiple of {info['multiple']} in "
                     f"[{info['min_side']}, {info['max_side']}]")
     steps = request.get("steps", info["default_steps"])
-    if isinstance(steps, bool) or not isinstance(steps, int) or not 1 <= steps <= MAX_STEPS:
-        return f"steps must be an integer in [1, {MAX_STEPS}]"
+    if isinstance(steps, bool) or not isinstance(steps, int) or not 2 <= steps <= MAX_STEPS:
+        return f"steps must be an integer in [2, {MAX_STEPS}]"
     seed = request.get("seed", 0)
     if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
         return "seed must be a non-negative integer"

@@ -44,11 +44,20 @@ DEFAULT_INFO = {"model": "qwen-image-2.1", "default_width": 768, "default_height
 # groups, so 16:9 is 1024x576, never 768x432.
 SIZE_PRESETS = ((512, 512), (768, 512), (512, 768), (1024, 576), (576, 1024), (1024, 1024))
 MAX_STEPS = 200
+# One step is refused: the schedule's terminal stretch divides by zero there, and
+# the reference pipeline gives NaN too.
+MIN_STEPS = 2
 MAX_SEED = 2**32 - 1
 # A frame larger than the biggest legal image is a desynchronised stream, not
 # a picture: 2048 x 2048 x 4 is 16 MiB, so anything past 64 MiB is refused
 # before a single byte of it is allocated.
 MAX_FRAME_BYTES = 64 << 20
+# The prompt, in UTF-8 bytes. The engine caps the tokens too (1024 with the
+# template); this refuses early, before a multi-megabyte GEN line is written.
+MAX_PROMPT_BYTES = 8192
+# How long a new request waits for the final frame of one that was abandoned
+# (its client vanished, a callback raised) before the engine is given up on.
+ABANDONED_TIMEOUT = 600
 _FRAMES = ("READY", "PROGRESS", "PREVIEW", "IMAGE", "ERROR")
 
 
@@ -146,6 +155,7 @@ class ImageEngine:
         self.events = queue.Queue()
         self.dead = None                      # why the engine is gone, once it is
         self._seq = 0
+        self._abandoned = None                # id of a request left without its final frame
         try:
             self.info = self._await_ready(load_timeout)
         except BaseException:
@@ -280,9 +290,12 @@ class ImageEngine:
         polled between frames and on every idle tick; with `interruptible` the
         first Ctrl-C sends CANCEL and keeps waiting (the engine is still busy
         until it answers), the second one propagates."""
+        if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+            raise ImageRequestError(f"`prompt` is longer than {MAX_PROMPT_BYTES} bytes.", "prompt")
         with self.lock:
             if self.dead:
                 raise ImageEngineError(self.dead)
+            self._finish_abandoned()
             self._seq += 1
             rid = f"r{self._seq}"
             self._send("GEN", {"id": rid, "prompt": prompt, "width": width, "height": height,
@@ -295,61 +308,99 @@ class ImageEngine:
                     cancel_sent = True
                     self._send("CANCEL", {"id": rid})
 
-            while True:
-                try:
+            finished = False
+            try:
+                while True:
                     try:
-                        kind, body, payload = self.events.get(timeout=0.2)
-                    except queue.Empty:
-                        if cancelled is not None and cancelled():
-                            cancel()
-                        if on_idle is not None:
-                            on_idle()
+                        try:
+                            kind, body, payload = self.events.get(timeout=0.2)
+                        except queue.Empty:
+                            if cancelled is not None and cancelled():
+                                cancel()
+                            if on_idle is not None:
+                                on_idle()
+                            continue
+                    except KeyboardInterrupt:
+                        if not interruptible or cancel_sent:
+                            raise
+                        cancel()
+                        if on_interrupt is not None:
+                            on_interrupt()
                         continue
-                except KeyboardInterrupt:
-                    if not interruptible or cancel_sent:
-                        raise
-                    cancel()
-                    if on_interrupt is not None:
-                        on_interrupt()
-                    continue
-                if kind == "_error":
-                    self.dead = f"the image engine protocol broke: {body.get('message')}"
-                    continue                  # the _eof that follows raises
-                if kind == "_eof":
+                    if kind == "_error":
+                        self.dead = f"the image engine protocol broke: {body.get('message')}"
+                        continue                  # the _eof that follows raises
+                    if kind == "_eof":
+                        try:
+                            code = self.process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            code = None
+                        self.dead = self.dead or f"the image engine exited ({describe_exit(code)})"
+                        raise ImageEngineError(self.dead)
+                    if body.get("id") not in (rid, None, ""):
+                        continue                  # a frame for an abandoned request
+                    if kind == "PROGRESS":
+                        if on_progress is not None:
+                            on_progress(body)
+                    elif kind == "PREVIEW":
+                        if on_preview is not None:
+                            on_preview(body, payload)
+                    elif kind == "IMAGE":
+                        finished = True          # the engine is done with this request
+                        width_out, height_out = body.get("width"), body.get("height")
+                        channels = body.get("channels", 4)
+                        if (not isinstance(width_out, int) or not isinstance(height_out, int) or
+                                channels != 4 or len(payload) != width_out * height_out * 4):
+                            raise ImageEngineError(
+                                f"IMAGE frame does not describe its payload ({width_out}x{height_out}"
+                                f"x{channels}, {len(payload)} bytes)")
+                        return {"width": width_out, "height": height_out, "channels": 4,
+                                "seed": body.get("seed", seed), "steps": body.get("steps", steps),
+                                "timings": body.get("timings") or {}, "rgba": payload}
+                    elif kind == "ERROR":
+                        finished = True
+                        message = str(body.get("message") or "unknown engine error")
+                        if message == "cancelled":
+                            # A cancel is an outcome, not a failure, whoever asked
+                            # for it: shown and reported as such.
+                            raise ImageCancelled()
+                        raise ImageEngineError(message)
+                    if cancelled is not None and cancelled():
+                        cancel()
+            finally:
+                if not finished and not self.dead:
+                    # Left without the final frame (a callback raised, the caller was
+                    # interrupted): the engine is still drawing. Ask it to stop, and make
+                    # the next request drain this one's frames first, or they would be
+                    # taken for its own.
                     try:
-                        code = self.process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        code = None
-                    self.dead = self.dead or f"the image engine exited ({describe_exit(code)})"
-                    raise ImageEngineError(self.dead)
-                if body.get("id") not in (rid, None, ""):
-                    continue                  # a frame for an abandoned request
-                if kind == "PROGRESS":
-                    if on_progress is not None:
-                        on_progress(body)
-                elif kind == "PREVIEW":
-                    if on_preview is not None:
-                        on_preview(body, payload)
-                elif kind == "IMAGE":
-                    width_out, height_out = body.get("width"), body.get("height")
-                    channels = body.get("channels", 4)
-                    if (not isinstance(width_out, int) or not isinstance(height_out, int) or
-                            channels != 4 or len(payload) != width_out * height_out * 4):
-                        raise ImageEngineError(
-                            f"IMAGE frame does not describe its payload ({width_out}x{height_out}"
-                            f"x{channels}, {len(payload)} bytes)")
-                    return {"width": width_out, "height": height_out, "channels": 4,
-                            "seed": body.get("seed", seed), "steps": body.get("steps", steps),
-                            "timings": body.get("timings") or {}, "rgba": payload}
-                elif kind == "ERROR":
-                    message = str(body.get("message") or "unknown engine error")
-                    if message == "cancelled":
-                        # A cancel is an outcome, not a failure, whoever asked
-                        # for it: shown and reported as such.
-                        raise ImageCancelled()
-                    raise ImageEngineError(message)
-                if cancelled is not None and cancelled():
-                    cancel()
+                        if not cancel_sent:
+                            self._send("CANCEL", {"id": rid})
+                    except ImageEngineError:
+                        pass
+                    self._abandoned = rid
+
+    def _finish_abandoned(self):
+        """Drain the frames of an abandoned request up to its final one."""
+        rid, self._abandoned = self._abandoned, None
+        if rid is None:
+            return
+        deadline = time.monotonic() + ABANDONED_TIMEOUT
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                self.dead = "the image engine did not finish an abandoned request"
+                self._kill_quietly()
+                raise ImageEngineError(self.dead)
+            try:
+                kind, body, _payload = self.events.get(timeout=min(left, 1.0))
+            except queue.Empty:
+                continue
+            if kind in ("_error", "_eof"):
+                self.events.put((kind, body, None))   # the request that follows sees it
+                return
+            if kind in ("IMAGE", "ERROR") and body.get("id") == rid:
+                return
 
     def close(self, timeout=10):
         """stdin EOF is the engine's clean exit; escalate only if it ignores it."""
@@ -430,8 +481,8 @@ def random_seed():
 
 
 def check_steps(steps):
-    if isinstance(steps, bool) or not isinstance(steps, int) or not 1 <= steps <= MAX_STEPS:
-        return f"steps must be an integer between 1 and {MAX_STEPS}"
+    if isinstance(steps, bool) or not isinstance(steps, int) or not MIN_STEPS <= steps <= MAX_STEPS:
+        return f"steps must be an integer between {MIN_STEPS} and {MAX_STEPS}"
     return None
 
 
@@ -451,6 +502,8 @@ def image_request(body, info):
     prompt = body.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         raise ImageRequestError("`prompt` must be a non-empty string.", "prompt")
+    if len(prompt.encode("utf-8", "surrogatepass")) > MAX_PROMPT_BYTES:
+        raise ImageRequestError(f"`prompt` is longer than {MAX_PROMPT_BYTES} bytes.", "prompt")
     n = body.get("n", 1)
     if n is not None and (isinstance(n, bool) or n != 1):
         raise ImageRequestError("Only `n`: 1 is supported; the engine draws one image at a "

@@ -134,16 +134,16 @@ class ImagesEndpointTest(unittest.TestCase):
     def test_same_seed_same_image_other_seed_other_image(self):
         def pixels(seed):
             _s, _h, raw = self.gw.generate(prompt="a lighthouse", size="256x256", seed=seed,
-                                           steps=1)
+                                           steps=2)
             return png_pixels(json.loads(raw)["data"][0]["b64_json"])[3]
         self.assertEqual(pixels(11), pixels(11))
         self.assertNotEqual(pixels(11), pixels(12))
 
     def test_width_and_height_fields_and_defaults(self):
-        status, _h, raw = self.gw.generate(prompt="x", width=256, height=512, steps=1)
+        status, _h, raw = self.gw.generate(prompt="x", width=256, height=512, steps=2)
         self.assertEqual(status, 200, raw)
         self.assertEqual(json.loads(raw)["colibri"]["height"], 512)
-        status, _h, raw = self.gw.generate(prompt="x", steps=1)
+        status, _h, raw = self.gw.generate(prompt="x", steps=2)
         meta = json.loads(raw)["colibri"]
         info = self.gw.engine.info
         self.assertEqual((meta["width"], meta["height"]),
@@ -215,7 +215,12 @@ class ImagesEndpointTest(unittest.TestCase):
                 self.assertEqual((status, error["param"]), (400, "n"))
 
     def test_other_bad_parameters(self):
-        for key, value in (("steps", 0), ("steps", 10**6), ("seed", -1), ("seed", "x"),
+        # A prompt past MAX_PROMPT_BYTES is refused before it reaches the engine: a
+        # 72 KB one used to be written as one GEN line the engine never answered.
+        status, _h, raw = self.gw.generate(prompt="x" * 8193, size="256x256")
+        status, error = self.error(status, raw)
+        self.assertEqual((status, error["param"]), (400, "prompt"))
+        for key, value in (("steps", 0), ("steps", 1), ("steps", 10**6), ("seed", -1), ("seed", "x"),
                            ("response_format", "url"), ("output_format", "jpeg"),
                            ("stream", "yes"), ("partial_images", -1)):
             with self.subTest(key=key, value=value):
@@ -260,7 +265,7 @@ class ImagesEndpointTest(unittest.TestCase):
         self.assertEqual(status, 403)
         status, headers, _raw = self.gw.request(
             "/v1/images/generations",
-            {"model": MODEL_ID, "prompt": "x", "size": "256x256", "steps": 1},
+            {"model": MODEL_ID, "prompt": "x", "size": "256x256", "steps": 2},
             headers={"Origin": "http://localhost:5173"})
         self.assertEqual(status, 200)
         self.assertEqual(headers.get("Access-Control-Allow-Origin"), "http://localhost:5173")
@@ -280,12 +285,12 @@ class ImagesEndpointTest(unittest.TestCase):
                                            "stream": True})
         self.assertEqual(status, 500)
         # And the engine is still serving.
-        status, _h, _raw = self.gw.generate(prompt="fine", size="256x256", steps=1)
+        status, _h, _raw = self.gw.generate(prompt="fine", size="256x256", steps=2)
         self.assertEqual(status, 200)
 
     def test_stray_engine_output_does_not_break_the_protocol(self):
         status, _h, raw = self.gw.generate(prompt="__stub_garbage__ a boat", size="256x256",
-                                           steps=1)
+                                           steps=2)
         self.assertEqual(status, 200, raw)
 
 
@@ -315,7 +320,7 @@ class ImagesFailureTest(unittest.TestCase):
             deadline = time.time() + 10
             while gw.server.scheduler.snapshot()["active"] == 0 and time.time() < deadline:
                 time.sleep(0.02)
-            status, headers, raw = gw.generate(prompt="second", size="256x256", steps=1)
+            status, headers, raw = gw.generate(prompt="second", size="256x256", steps=2)
             self.assertEqual(status, 503, raw)
             self.assertEqual(json.loads(raw)["error"]["code"], "queue_full")
             first.join(timeout=20)
@@ -346,7 +351,7 @@ class ImagesFailureTest(unittest.TestCase):
             self.assertTrue(gw.engine.alive)
             # 20 steps at 0.3 s would be 6 s; the next request starts right away.
             started = time.time()
-            status, _h, _raw = gw.generate(prompt="next", size="256x256", steps=1)
+            status, _h, _raw = gw.generate(prompt="next", size="256x256", steps=2)
             self.assertEqual(status, 200)
             self.assertLess(time.time() - started, 5)
         finally:

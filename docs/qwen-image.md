@@ -123,7 +123,7 @@ only the path on stdout.
   image tokens 2x2, which is why 32 and not 16: 16:9 is 1024x576 or 512x288,
   never 768x432. The default is 768x512. The presets, the same ones the web UI
   offers: 512x512, 768x512, 512x768, 1024x576, 576x1024, 1024x1024.
-- **Steps**: default 8, from 1 to 200. Eight is a good draft for photographs;
+- **Steps**: default 8, from 2 to 200. Eight is a good draft for photographs;
   16 gives visibly better anatomy and colour and is what text inside the
   picture needs to come out legible (compared on the reference pipeline at
   8, 16 and 30 steps; 30 adds little over 16). Time grows with the steps.

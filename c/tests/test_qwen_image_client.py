@@ -214,11 +214,11 @@ class ImageEngineTest(unittest.TestCase):
     def test_engine_error_leaves_the_engine_usable(self):
         engine = self.engine()
         with self.assertRaisesRegex(ie.ImageEngineError, "stub failure"):
-            engine.generate("__stub_error__", 256, 256, 1, 1)
+            engine.generate("__stub_error__", 256, 256, 2, 1)
         with self.assertRaisesRegex(ie.ImageEngineError, "multiple of 32"):
-            engine.generate("x", 250, 256, 1, 1)      # the engine's own validation
+            engine.generate("x", 250, 256, 2, 1)      # the engine's own validation
         self.assertTrue(engine.alive)
-        self.assertEqual(engine.generate("x", 256, 256, 1, 1)["width"], 256)
+        self.assertEqual(engine.generate("x", 256, 256, 2, 1)["width"], 256)
 
     def test_cancel_between_steps(self):
         engine = self.engine(delay=0.2)
@@ -229,7 +229,7 @@ class ImageEngineTest(unittest.TestCase):
                             cancelled=lambda: len(seen) >= 2)
         self.assertLess(time.time() - started, 4)       # 30 steps would take 6 s
         self.assertTrue(engine.alive)
-        self.assertEqual(engine.generate("y", 256, 256, 1, 2)["seed"], 2)
+        self.assertEqual(engine.generate("y", 256, 256, 2, 2)["seed"], 2)
 
     def test_a_crash_is_reported_and_the_engine_marked_dead(self):
         engine = self.engine()
@@ -237,11 +237,11 @@ class ImageEngineTest(unittest.TestCase):
             engine.generate("__stub_crash__", 256, 256, 4, 1)
         self.assertFalse(engine.alive)
         with self.assertRaises(ie.ImageEngineError):
-            engine.generate("x", 256, 256, 1, 1)
+            engine.generate("x", 256, 256, 2, 1)
 
     def test_stray_output_is_ignored(self):
         engine = self.engine()
-        result = engine.generate("__stub_garbage__", 256, 256, 1, 1)
+        result = engine.generate("__stub_garbage__", 256, 256, 2, 1)
         self.assertEqual(result["width"], 256)
         self.assertTrue(any("stray" in line for line in self.logs))
 

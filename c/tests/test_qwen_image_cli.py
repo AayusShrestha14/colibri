@@ -272,7 +272,7 @@ class CommandsTest(unittest.TestCase):
             self.assertEqual(entry["id"], "qwen-image-2.1-colibri")
             self.assertEqual(entry["capabilities"], ["image_generation"])
             body = json.dumps({"model": entry["id"], "prompt": "x", "size": "256x256",
-                               "steps": 1}).encode()
+                               "steps": 2}).encode()
             req = Request(f"http://127.0.0.1:{port}/v1/images/generations", data=body,
                           headers={"Content-Type": "application/json"})
             with urlopen(req, timeout=30) as r:
