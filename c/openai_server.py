@@ -2029,6 +2029,17 @@ def _preprocess_qwen38_image(data, model_dir, max_tokens=None):
     return preprocess(data, model_dir, max_tokens)
 
 
+def _text_part(part, index, position):
+    """A text part's text for the image expanders, which join the parts themselves:
+    a `text` that is not a string reached "".join as TypeError, which do_POST
+    answers with 500, where content_text() already answers 400."""
+    text = part.get("text", "")
+    if not isinstance(text, str):
+        raise APIError(400, "Text content parts require a string `text` field.",
+                       f"messages.{index}.content.{position}.text")
+    return text
+
+
 def expand_qwen38_images(messages, model_dir, max_tokens=None):
     """Replace image parts with their placeholders and pull out the patches.
 
@@ -2036,18 +2047,18 @@ def expand_qwen38_images(messages, model_dir, max_tokens=None):
     so the renderer treats them like any other turn."""
     images = []
     rewritten = []
-    for message in messages:
+    for index, message in enumerate(messages):
         content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, list):
             rewritten.append(message)
             continue
         pieces = []
-        for part in content:
+        for position, part in enumerate(content):
             if not isinstance(part, dict):
                 continue
             kind = part.get("type")
             if kind == "text":
-                pieces.append(part.get("text", ""))
+                pieces.append(_text_part(part, index, position))
             elif kind in ("image_url", "input_image"):
                 url = (part.get("image_url") or {}).get("url") if kind == "image_url" \
                       else part.get("image_url") or part.get("url")
@@ -2084,18 +2095,18 @@ def expand_glm53_images(messages, model_dir):
     testuale puro, quindi il renderer li tratta come qualunque altro turno."""
     images = []
     rewritten = []
-    for message in messages:
+    for index, message in enumerate(messages):
         content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, list):
             rewritten.append(message)
             continue
         pieces = []
-        for part in content:
+        for position, part in enumerate(content):
             if not isinstance(part, dict):
                 continue
             kind = part.get("type")
             if kind == "text":
-                pieces.append(part.get("text", ""))
+                pieces.append(_text_part(part, index, position))
             elif kind in ("image_url", "input_image"):
                 url = (part.get("image_url") or {}).get("url") if kind == "image_url" \
                       else part.get("image_url") or part.get("url")
@@ -2122,18 +2133,18 @@ DSV41_IMAGE_PLACEHOLDER = "<｜deepseek_image｜>"
 def expand_dsv41_images(messages, model_dir, max_tokens=None):
     """Replace image parts with their placeholder span and pull out the patches."""
     images, rewritten = [], []
-    for message in messages:
+    for index, message in enumerate(messages):
         content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, list):
             rewritten.append(message)
             continue
         pieces = []
-        for part in content:
+        for position, part in enumerate(content):
             if not isinstance(part, dict):
                 continue
             kind = part.get("type")
             if kind == "text":
-                pieces.append(part.get("text", ""))
+                pieces.append(_text_part(part, index, position))
             elif kind in ("image_url", "input_image"):
                 url = (part.get("image_url") or {}).get("url") if kind == "image_url" \
                       else part.get("image_url") or part.get("url")
@@ -2302,14 +2313,23 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
     if tools:
         prompt.append(_glm53_tool_block(tools))
 
-    for message in messages:
+    for index, message in enumerate(messages):
         if not isinstance(message, dict):
             raise APIError(400, "each message must be an object.", "messages")
         role = message.get("role")
         content = message.get("content")
         if isinstance(content, list):                 # parti multimodali: solo il testo
-            content = "".join(part.get("text", "") for part in content
-                              if isinstance(part, dict) and part.get("type") == "text")
+            texts = []
+            for position, part in enumerate(content):
+                if not isinstance(part, dict) or part.get("type") != "text":
+                    continue
+                text = part.get("text", "")
+                # a non-string text reached "".join as TypeError, which do_POST answers 500
+                if not isinstance(text, str):
+                    raise APIError(400, "Text content parts require a string `text` field.",
+                                   f"messages.{index}.content.{position}.text")
+                texts.append(text)
+            content = "".join(texts)
         content = content or ""
         if role == "user":
             prompt.append(f"<|user|>{content}")

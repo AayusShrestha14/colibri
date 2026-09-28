@@ -2316,6 +2316,35 @@ class HTTPTest(unittest.TestCase):
             self.assertEqual(json.load(response)["object"], "chat.completion")
 
 
+    def test_a_text_part_whose_text_is_not_a_string_is_a_client_error(self):
+        """{"type": "text", "text": 5} answered HTTP 500 on GLM-5.3, Qwen3.8 and V4.1.
+
+        The other renderers read content through content_text(), which already
+        answers 400. The image expanders of these three, and the GLM-5.3
+        renderer, join the text parts themselves, and "".join raised TypeError,
+        which do_POST turns into its catch-all 500.
+        """
+        def request(text):
+            return {"model": "test-model",
+                    "messages": [{"role": "user", "content": [
+                        {"type": "text", "text": "look at "},
+                        {"type": "text", "text": text}]}]}
+        for arch in ("glm53", "qwen38", "deepseek_v41"):
+            for text in (5, None, ["hi"], {"value": "hi"}):
+                with self.subTest(arch=arch, text=text):
+                    with patch("openai_server.ARCH", arch):
+                        with self.assertRaises(HTTPError) as caught:
+                            self.request("/v1/chat/completions", request(text))
+                    self.addCleanup(caught.exception.close)
+                    self.assertEqual(caught.exception.code, 400)
+                    self.assertEqual(json.loads(caught.exception.read())["error"]["param"],
+                                     "messages.0.content.1.text")
+            with self.subTest(arch=arch, text="well formed"):
+                with patch("openai_server.ARCH", arch):
+                    with self.request("/v1/chat/completions", request("this")) as response:
+                        self.assertEqual(response.status, 200)
+                self.assertIn("look at this", self.engine.calls[-1][0])
+
 class ClientHangupTest(unittest.TestCase):
     """A client that disconnects mid-response must not print a traceback.
 
