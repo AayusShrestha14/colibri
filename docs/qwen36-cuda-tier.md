@@ -282,8 +282,9 @@ By default expert `eid` is homed on device `eid % n_gpus` in *every* layer,
 so each layer's group is issued to both cards and `qt_take` waits for the
 slower one -- measured on the 3070 + Quadro RTX 4000 pair, `take` 5.2 ms per
 token against 0.2 on one card. `QT_HOME=layer` homes every expert of a layer
-on one device, chosen per layer range in proportion to the cards' allowances
-(or `QT_LAYER_SPLIT=<n>` layers on the first card), puts the layer's trunk
+on one device, chosen per layer range by each card's allowance divided by
+the time it needs for a dense GEMV (probed at startup with a 64 MB int8
+matrix; `QT_LAYER_SPLIT=<n>` layers on the first card overrides), puts the layer's trunk
 components on the same device and lm_head on the last layer's, and issues a
 group to exactly one device: the token runs the first layers on one card and
 the rest on the other, like llama.cpp's layer split. Budgets, warmstart, LFRU
@@ -296,7 +297,9 @@ to 9.4 ms at 99.7 % residency, but the pipeline ends level with the 3070 alone
 -- 33.6 ms/token at a 28/12 split against 31.8-33.1 -- because lm_head (+2.8
 ms) and twelve DeltaNet layers (+1.6 ms) now run on the slower card. Two equal
 cards would keep the MoE gain without that price. Cold, two cards win either
-way (45.3 against 52.3 ms), since more experts are resident at once.
+way (45.3 against 52.3 ms), since more experts are resident at once. For the
+record, Ollama 0.34.4 on the same pair shows the same shape: 38.1 tok/s on the
+3070 alone, 36.6-37.5 on both cards, 33.0 on the Quadro alone.
 
 ## Measured (Threadripper 3945WX 12C, RTX 3070 8 GB + Quadro RTX 4000 8 GB, Qwen3.6-35B-A3B int4, 200-token decode)
 
