@@ -96,6 +96,15 @@ Audio is accepted only by Inkling checkpoints with
 audio support. The default bind address is localhost; set `COLI_API_KEY` before
 exposing the server beyond the machine.
 
+The hosted-platform bookkeeping fields `store`, `metadata`, `service_tier`,
+`user`, `safety_identifier`, `parallel_tool_calls`, `prompt_cache_key`,
+`verbosity`, `web_search_options`, `moderation`, and
+`stream_options.include_obfuscation` are accepted and intentionally ignored:
+they have no local equivalent and do not affect generation. Unsupported
+result-shaping requests are refused explicitly: `best_of` values above 1, a
+non-empty `logit_bias`, `suffix` infill, and audio output requested through
+`modalities`.
+
 ### `seed`
 
 `seed` is accepted (not rejected) for OpenAI-API request-shape compatibility;

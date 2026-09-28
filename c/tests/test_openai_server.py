@@ -273,6 +273,21 @@ class TemplateTest(unittest.TestCase):
         self.assertEqual(patches.shape[0], grid_h * grid_w)
         self.assertIn("what is this?", messages[0]["content"])
 
+    def test_an_image_url_that_is_not_an_object_is_a_client_error(self):
+        """{"type": "image_url", "image_url": "data:..."} (or a number) made the image
+        expanders call .get("url") on a string, an AttributeError that do_POST answered
+        with 500 on GLM-5.3, Qwen3.8 and DeepSeek V4.1. It is the client's error: 400."""
+        from openai_server import expand_dsv41_images, expand_glm53_images, expand_qwen38_images
+        for expand in (expand_glm53_images, expand_qwen38_images, expand_dsv41_images):
+            for value in ("data:image/png;base64,AAAA", 5, ["x"]):
+                with self.subTest(expand=expand.__name__, value=value):
+                    with self.assertRaises(APIError) as caught:
+                        expand([{"role": "user", "content": [
+                            {"type": "text", "text": "what is this?"},
+                            {"type": "image_url", "image_url": value}]}], None)
+                    self.assertEqual(caught.exception.status, 400)
+                    self.assertIn("`image_url` must be an object", str(caught.exception))
+
     def test_qwen38_template_on_the_qwen36_engine(self):
         """#1757: Qwen3.8-27B is a dense model of Qwen3.5's architecture, so the qwen36
         engine runs it, but it ships Qwen3.8's chat_template.jinja. The gateway renders
@@ -1627,6 +1642,49 @@ class BaseWireContractTest(unittest.TestCase):
         self.assertEqual(frames, [b"SUBMIT 1 0 11 4 0 0.9\nComplete me\n"])
 
 
+class OpenAIHonestySetTest(unittest.TestCase):
+    def test_refuses_unsupported_result_shaping_fields(self):
+        cases = (
+            ({"best_of": 2}, "best_of", "unsupported_value"),
+            ({"logit_bias": {"42": 100}}, "logit_bias", "unsupported_value"),
+            ({"suffix": " after"}, "suffix", "unsupported_parameter"),
+            ({"modalities": ["audio"]}, "modalities", "unsupported_value"),
+        )
+        for fields, param, code in cases:
+            with self.subTest(param=param), self.assertRaises(APIError) as caught:
+                generation_options(fields, 16)
+            self.assertEqual(caught.exception.status, 400)
+            self.assertEqual(caught.exception.param, param)
+            self.assertEqual(caught.exception.code, code)
+            self.assertIn(f"`{param}`", caught.exception.message)
+
+    def test_accepts_noop_values(self):
+        generation_options({"best_of": 1, "logit_bias": {}, "suffix": None,
+                            "modalities": ["text"]}, 16)
+
+    def test_intentionally_ignored_fields_return_200_and_do_not_reach_engine(self):
+        base = {"model": "test-model", "prompt": "Complete me",
+                "temperature": 0, "max_tokens": 4}
+        ignored = {
+            "store": True,
+            "metadata": {"trace": "request-1"},
+            "service_tier": "default",
+            "user": "user-1",
+            "safety_identifier": "safe-1",
+            "parallel_tool_calls": True,
+            "prompt_cache_key": "cache-1",
+            "verbosity": "low",
+            "web_search_options": {},
+            "moderation": True,
+            "stream_options": {"include_obfuscation": True},
+        }
+        status_plain, _, frames_plain = _capture_frames(base)
+        status_ignored, _, frames_ignored = _capture_frames({**base, **ignored})
+        self.assertEqual(status_plain, 200)
+        self.assertEqual(status_ignored, 200)
+        self.assertEqual(frames_ignored, frames_plain)
+
+
 class SeedOptionTest(unittest.TestCase):
     """`generation_options()` accepts a `seed` field without raising."""
 
@@ -2315,6 +2373,70 @@ class HTTPTest(unittest.TestCase):
             self.assertEqual(response.status, 200)
             self.assertEqual(json.load(response)["object"], "chat.completion")
 
+    def test_a_past_tool_call_whose_function_is_not_an_object_is_a_client_error(self):
+        """A replayed tool call with `function: "search"` answered HTTP 500.
+
+        The fallback, Kimi and Qwen3.8 renderers already answer 400. GLM, GLM-5.3
+        and DeepSeek V4/V4.1 called .get() on the value, and the AttributeError
+        became do_POST's 500 "The colibri engine failed to process the request."
+        """
+        def history(function):
+            return {"model": "test-model", "messages": [
+                {"role": "user", "content": "run it"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "x", "type": "function", "function": function}]},
+                {"role": "tool", "tool_call_id": "x", "content": "done"},
+                {"role": "user", "content": "and now?"},
+            ]}
+        cases = [("search", "messages.1.tool_calls.0.function"),
+                 (["search"], "messages.1.tool_calls.0.function"),
+                 (5, "messages.1.tool_calls.0.function"),
+                 (None, "messages.1.tool_calls.0.function"),
+                 ({"name": 5, "arguments": "{}"}, "messages.1.tool_calls.0.function.name")]
+        for arch in ("glm", "glm53", "deepseek_v4", "deepseek_v41"):
+            for function, param in cases:
+                with self.subTest(arch=arch, function=function):
+                    with patch("openai_server.ARCH", arch):
+                        with self.assertRaises(HTTPError) as caught:
+                            self.request("/v1/chat/completions", history(function))
+                    self.addCleanup(caught.exception.close)
+                    self.assertEqual(caught.exception.code, 400)
+                    self.assertEqual(json.loads(caught.exception.read())["error"]["param"], param)
+            with self.subTest(arch=arch, function="well formed"):
+                with patch("openai_server.ARCH", arch):
+                    with self.request("/v1/chat/completions",
+                                      history({"name": "fn", "arguments": "{}"})) as response:
+                        self.assertEqual(response.status, 200)
+
+
+    def test_a_text_part_whose_text_is_not_a_string_is_a_client_error(self):
+        """{"type": "text", "text": 5} answered HTTP 500 on GLM-5.3, Qwen3.8 and V4.1.
+
+        The other renderers read content through content_text(), which already
+        answers 400. The image expanders of these three, and the GLM-5.3
+        renderer, join the text parts themselves, and "".join raised TypeError,
+        which do_POST turns into its catch-all 500.
+        """
+        def request(text):
+            return {"model": "test-model",
+                    "messages": [{"role": "user", "content": [
+                        {"type": "text", "text": "look at "},
+                        {"type": "text", "text": text}]}]}
+        for arch in ("glm53", "qwen38", "deepseek_v41"):
+            for text in (5, None, ["hi"], {"value": "hi"}):
+                with self.subTest(arch=arch, text=text):
+                    with patch("openai_server.ARCH", arch):
+                        with self.assertRaises(HTTPError) as caught:
+                            self.request("/v1/chat/completions", request(text))
+                    self.addCleanup(caught.exception.close)
+                    self.assertEqual(caught.exception.code, 400)
+                    self.assertEqual(json.loads(caught.exception.read())["error"]["param"],
+                                     "messages.0.content.1.text")
+            with self.subTest(arch=arch, text="well formed"):
+                with patch("openai_server.ARCH", arch):
+                    with self.request("/v1/chat/completions", request("this")) as response:
+                        self.assertEqual(response.status, 200)
+                self.assertIn("look at this", self.engine.calls[-1][0])
 
 class ClientHangupTest(unittest.TestCase):
     """A client that disconnects mid-response must not print a traceback.

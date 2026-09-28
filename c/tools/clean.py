@@ -26,9 +26,10 @@ FILES = [
     "glm", "glm.exe",                       # pre-rename name of the colibri engine
     "iobench", "iobench.exe",
     "backend_cuda.o", "backend_loader.o", "qwen36_tier.o",
-    # VK=1 and XDNA=1 objects. Left behind once their .d is cleaned, an
-    # object would sit in the tree with no record of the headers it read.
-    "backend_vulkan.o", "backend_xdna.o",
+    # VK=1, XDNA=1 and METAL=1 (qwen36's qpack) objects. Left behind once
+    # their .d is cleaned, an object would sit in the tree with no record of
+    # the headers it read.
+    "backend_vulkan.o", "backend_xdna.o", "qwen36_qpack.o", "qpack.o",
     "backend_cuda_test", "backend_cuda_test.exe",
     "mxfp4_expert_cuda_test", "mxfp4_expert_cuda_test.exe",
     "backend_cuda_bench", "backend_cuda_bench.exe",
@@ -38,6 +39,7 @@ FILES = [
     "coli_hip.dll", "coli_hip.lib", "coli_hip.exp", "coli_hip.pdb",
     "deepseek_v4", "deepseek_v4.exe", "deepseek_v4.cflags", "deepseek_v4.cudaflags",
     "deepseek_v41", "deepseek_v41.exe",
+    "qwenimage", "qwenimage.exe",
     "native_quant.o", "native_quant_parallel.o", "native_quant_dual.o",
     "native_quant_batch_avx512.o", "native_quant_fp4_rows16.o",
 ]

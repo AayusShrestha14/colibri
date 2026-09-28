@@ -23,6 +23,9 @@ vision), **Inkling** (975B), **Kimi K3** (2.8T), **DeepSeek V4 Flash** (284B), *
 **Qwen3.8-Flash-Next** (125B + 51B n-gram), **Qwen3.6** (35B-A3B) and
 **OLMoE** (7B) —
 one C file each, the same `coli chat` / `coli serve` / `coli web` front end.
+Images too: **Qwen-Image-2.1** generates pictures from text, shown inline in
+the terminal by `coli chat` and served at `POST /v1/images/generations`
+([qwen-image.md](docs/qwen-image.md)).
 [Full roster ↓](#other-supported-models)
 
 > **Colibrì is an inference engine you can run today, and an open research

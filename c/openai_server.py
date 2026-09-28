@@ -22,6 +22,7 @@ import uuid
 
 import v4_dsml                      # vendored DeepSeek V4 DSML reference primitives
 import v41_dsml                     # ...and V4.1's, whose tag names differ by a space
+import image_engine                 # the qwenimage serve protocol, PNG and request rules
 from family_registry import (FamilyConfigError, UnknownFamilyError, family_by_id,
                              family_ids, resolve_model)
 from family_registry import default_model_id as registry_default_model_id
@@ -323,6 +324,28 @@ def _fallback_tool_preamble(tools):
                "<arg_key>{arg-key}</arg_key><arg_value>{arg-value}</arg_value>"
                + BOX_END)
     return "".join(out)
+
+
+def _history_tool_calls(tool_calls, index):
+    """A past assistant message's tool_calls, checked as _fallback_tool_calls and
+    _qwen38_tool_calls check them, for the renderers that read `function` without
+    looking: GLM, GLM-5.3 and DeepSeek V4/V4.1 raised AttributeError on a
+    `function` that is not an object, which do_POST answers with HTTP 500."""
+    if tool_calls is None:
+        return []
+    if not isinstance(tool_calls, list):
+        raise APIError(400, "`tool_calls` must be an array.", f"messages.{index}.tool_calls")
+    for position, call in enumerate(tool_calls):
+        where = f"messages.{index}.tool_calls.{position}"
+        if not isinstance(call, dict):
+            raise APIError(400, "Each tool call must be an object.", where)
+        fn = call.get("function", call)
+        if not isinstance(fn, dict):
+            raise APIError(400, "`function` must be an object.", f"{where}.function")
+        name = fn.get("name")
+        if name is not None and not isinstance(name, str):
+            raise APIError(400, "`function.name` must be a string.", f"{where}.function.name")
+    return tool_calls
 
 
 def _fallback_tool_calls(tool_calls, index):
@@ -1300,7 +1323,7 @@ def render_chat_v4(messages, enable_thinking=False, reasoning_effort=None, tools
             content = content_text(raw, f"messages.{index}.content") if raw is not None else ""
             merged.append({"role": role, "content": content,
                            "reasoning_content": message.get("reasoning_content"),
-                           "tool_calls": message.get("tool_calls")})
+                           "tool_calls": _history_tool_calls(message.get("tool_calls"), index)})
             continue
         raw = message.get("content")
         text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
@@ -1904,8 +1927,8 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
                 raise APIError(400, "`reasoning_content` must be a string.",
                                f"messages.{index}.reasoning_content")
             prompt.append(f"<|assistant|><think>{reasoning}</think>{text.strip()}")
-            for tc in (message.get("tool_calls") or []):
-                fn = tc.get("function", tc) if isinstance(tc, dict) else {}
+            for tc in _history_tool_calls(message.get("tool_calls"), index):
+                fn = tc.get("function", tc)
                 args = fn.get("arguments", "{}")
                 if isinstance(args, str):
                     try:
@@ -1949,6 +1972,21 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
 # numero giusto. Cosi' il renderer non deve sapere niente di immagini.
 GLM53_IMAGE_OPEN, GLM53_IMAGE, GLM53_IMAGE_CLOSE = (
     "<|begin_of_image|>", "<|image|>", "<|end_of_image|>")
+
+
+def _image_part_url(part, kind):
+    """The URL an image content part names. An `image_url` part carries an object,
+    `{"url": ...}`, and an `input_image` part the URL itself. `.get("url")` on an
+    `image_url` that was a string or a number raised AttributeError, which do_POST
+    answers with 500; that is the client's error, so it is a 400 here."""
+    value = part.get("image_url")
+    if kind != "image_url":
+        return value or part.get("url")
+    if value is None:
+        return None                       # _image_bytes_from_url answers the missing url
+    if not isinstance(value, dict):
+        raise APIError(400, "`image_url` must be an object with a `url`.", "messages")
+    return value.get("url")
 
 
 def _image_bytes_from_url(url):
@@ -2028,6 +2066,17 @@ def _preprocess_qwen38_image(data, model_dir, max_tokens=None):
     return preprocess(data, model_dir, max_tokens)
 
 
+def _text_part(part, index, position):
+    """A text part's text for the image expanders, which join the parts themselves:
+    a `text` that is not a string reached "".join as TypeError, which do_POST
+    answers with 500, where content_text() already answers 400."""
+    text = part.get("text", "")
+    if not isinstance(text, str):
+        raise APIError(400, "Text content parts require a string `text` field.",
+                       f"messages.{index}.content.{position}.text")
+    return text
+
+
 def expand_qwen38_images(messages, model_dir, max_tokens=None):
     """Replace image parts with their placeholders and pull out the patches.
 
@@ -2035,21 +2084,20 @@ def expand_qwen38_images(messages, model_dir, max_tokens=None):
     so the renderer treats them like any other turn."""
     images = []
     rewritten = []
-    for message in messages:
+    for index, message in enumerate(messages):
         content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, list):
             rewritten.append(message)
             continue
         pieces = []
-        for part in content:
+        for position, part in enumerate(content):
             if not isinstance(part, dict):
                 continue
             kind = part.get("type")
             if kind == "text":
-                pieces.append(part.get("text", ""))
+                pieces.append(_text_part(part, index, position))
             elif kind in ("image_url", "input_image"):
-                url = (part.get("image_url") or {}).get("url") if kind == "image_url" \
-                      else part.get("image_url") or part.get("url")
+                url = _image_part_url(part, kind)
                 data = _image_bytes_from_url(url)
                 patches, grid_h, grid_w = _preprocess_qwen38_image(
                     data, model_dir, max_tokens)
@@ -2083,21 +2131,20 @@ def expand_glm53_images(messages, model_dir):
     testuale puro, quindi il renderer li tratta come qualunque altro turno."""
     images = []
     rewritten = []
-    for message in messages:
+    for index, message in enumerate(messages):
         content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, list):
             rewritten.append(message)
             continue
         pieces = []
-        for part in content:
+        for position, part in enumerate(content):
             if not isinstance(part, dict):
                 continue
             kind = part.get("type")
             if kind == "text":
-                pieces.append(part.get("text", ""))
+                pieces.append(_text_part(part, index, position))
             elif kind in ("image_url", "input_image"):
-                url = (part.get("image_url") or {}).get("url") if kind == "image_url" \
-                      else part.get("image_url") or part.get("url")
+                url = _image_part_url(part, kind)
                 data = _image_bytes_from_url(url)
                 patches, grid_h, grid_w = _preprocess_image(data, model_dir)
                 tokens = (grid_h // 2) * (grid_w // 2)
@@ -2121,21 +2168,20 @@ DSV41_IMAGE_PLACEHOLDER = "<｜deepseek_image｜>"
 def expand_dsv41_images(messages, model_dir, max_tokens=None):
     """Replace image parts with their placeholder span and pull out the patches."""
     images, rewritten = [], []
-    for message in messages:
+    for index, message in enumerate(messages):
         content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, list):
             rewritten.append(message)
             continue
         pieces = []
-        for part in content:
+        for position, part in enumerate(content):
             if not isinstance(part, dict):
                 continue
             kind = part.get("type")
             if kind == "text":
-                pieces.append(part.get("text", ""))
+                pieces.append(_text_part(part, index, position))
             elif kind in ("image_url", "input_image"):
-                url = (part.get("image_url") or {}).get("url") if kind == "image_url" \
-                      else part.get("image_url") or part.get("url")
+                url = _image_part_url(part, kind)
                 data = _image_bytes_from_url(url)
                 patches, grid_h, grid_w, llm_h, llm_w = _preprocess_dsv41_image(
                     data, model_dir, max_tokens)
@@ -2301,14 +2347,23 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
     if tools:
         prompt.append(_glm53_tool_block(tools))
 
-    for message in messages:
+    for index, message in enumerate(messages):
         if not isinstance(message, dict):
             raise APIError(400, "each message must be an object.", "messages")
         role = message.get("role")
         content = message.get("content")
         if isinstance(content, list):                 # parti multimodali: solo il testo
-            content = "".join(part.get("text", "") for part in content
-                              if isinstance(part, dict) and part.get("type") == "text")
+            texts = []
+            for position, part in enumerate(content):
+                if not isinstance(part, dict) or part.get("type") != "text":
+                    continue
+                text = part.get("text", "")
+                # a non-string text reached "".join as TypeError, which do_POST answers 500
+                if not isinstance(text, str):
+                    raise APIError(400, "Text content parts require a string `text` field.",
+                                   f"messages.{index}.content.{position}.text")
+                texts.append(text)
+            content = "".join(texts)
         content = content or ""
         if role == "user":
             prompt.append(f"<|user|>{content}")
@@ -2323,7 +2378,7 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
                 content = content.split("</think>")[-1]
             opened = f"<think>{reasoning}</think>" if isinstance(reasoning, str) else "<think></think>"
             body = content.strip()
-            calls = _glm53_tool_calls(message.get("tool_calls"))
+            calls = _glm53_tool_calls(_history_tool_calls(message.get("tool_calls"), index))
             # The template writes "\n<tool_call>". The model, on a turn that is
             # nothing but a tool call, writes "</think><tool_call>" with no
             # newline between them, and that one token is enough to throw away
@@ -2428,7 +2483,7 @@ def _dsv41_merge_turns(messages):
                                f"messages.{index}.reasoning_content")
             turns.append({"role": "assistant", "content": text,
                           "reasoning_content": reasoning,
-                          "tool_calls": message.get("tool_calls")})
+                          "tool_calls": _history_tool_calls(message.get("tool_calls"), index)})
         elif role in ("user", "tool"):
             block = ({"kind": "tool_result", "id": message.get("tool_call_id") or "",
                       "text": v41_dsml.render_tool_result(text)} if role == "tool"
@@ -2784,19 +2839,57 @@ def split_thinking_reply(text, enable_thinking=True, add_generation_prompt=True)
     return "".join(thinking), "".join(answer)
 
 
-def _anthropic_block_text(blocks, param):
-    """Text out of an Anthropic content array (tool_result content is the same shape)."""
+def _anthropic_image_part(block, where):
+    """An Anthropic `image` block as the OpenAI-shaped part expand_*_images() reads.
+
+    A base64 source becomes the same data: URI a client of /v1/chat/completions would
+    send, so both endpoints hand the expander one picture in one shape. A `url` source
+    is passed through as-is: the expander already refuses to fetch remote URLs, and
+    the Anthropic client must meet that refusal, not a second one."""
+    source = block.get("source")
+    if not isinstance(source, dict):
+        raise APIError(400, "`image` blocks require a `source` object.", f"{where}.source")
+    kind = source.get("type")
+    if kind == "base64":
+        media_type, data = source.get("media_type"), source.get("data")
+        if not isinstance(media_type, str) or not media_type:
+            raise APIError(400, "`image.source.media_type` is required for base64 sources.",
+                           f"{where}.source.media_type")
+        if not isinstance(data, str) or not data:
+            raise APIError(400, "`image.source.data` is required for base64 sources.",
+                           f"{where}.source.data")
+        return {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{data}"}}
+    if kind == "url":
+        url = source.get("url")
+        if not isinstance(url, str) or not url:
+            raise APIError(400, "`image.source.url` is required for url sources.",
+                           f"{where}.source.url")
+        return {"type": "image_url", "image_url": {"url": url}}
+    raise APIError(400, "`image.source.type` must be base64 or url.", f"{where}.source.type",
+                   "unsupported_content_type")
+
+
+def _anthropic_block_text(blocks, param, images=None):
+    """Text out of an Anthropic content array (tool_result content is the same shape).
+
+    With `images`, a list, `image` blocks are allowed and their OpenAI-shaped parts are
+    appended to it instead of raising: a tool_result can carry a picture (Claude Code's
+    Read on an image file does), and the caller decides which turn it rides on."""
     if isinstance(blocks, str):
         return blocks
     if not isinstance(blocks, list):
         raise APIError(400, "Content must be a string or an array of blocks.", param)
     parts = []
     for index, block in enumerate(blocks):
+        where = f"{param}.{index}"
+        if isinstance(block, dict) and block.get("type") == "image" and images is not None:
+            images.append(_anthropic_image_part(block, where))
+            continue
         if not isinstance(block, dict) or block.get("type") != "text":
             raise APIError(400, "Colibri currently supports text blocks only here.",
-                           f"{param}.{index}", "unsupported_content_type")
+                           where, "unsupported_content_type")
         if not isinstance(block.get("text"), str):
-            raise APIError(400, "Text blocks require a string `text` field.", f"{param}.{index}.text")
+            raise APIError(400, "Text blocks require a string `text` field.", f"{where}.text")
         parts.append(block["text"])
     return "".join(parts)
 
@@ -2833,7 +2926,10 @@ def anthropic_to_openai(body):
         if not isinstance(content, list):
             raise APIError(400, "Message content must be a string or an array of blocks.",
                            f"messages.{index}.content")
-        texts, reasoning, calls, results = [], [], [], []
+        # `parts` keeps the user's text and image blocks in the order the client put
+        # them; `carried` collects pictures found inside tool_result blocks, which
+        # ride the user turn that follows the tool turns (the tool role is text).
+        texts, parts, carried, reasoning, calls, results = [], [], [], [], [], []
         for j, block in enumerate(content):
             where = f"messages.{index}.content.{j}"
             if not isinstance(block, dict):
@@ -2843,6 +2939,12 @@ def anthropic_to_openai(body):
                 if not isinstance(block.get("text"), str):
                     raise APIError(400, "Text blocks require a string `text` field.", f"{where}.text")
                 texts.append(block["text"])
+                parts.append({"type": "text", "text": block["text"]})
+            elif kind == "image":
+                if role != "user":
+                    raise APIError(400, "`image` blocks are valid only in user messages.",
+                                   where, "unsupported_content_type")
+                parts.append(_anthropic_image_part(block, where))
             elif kind == "thinking":
                 if role != "assistant":
                     raise APIError(400, "`thinking` blocks are valid only in assistant messages.",
@@ -2868,13 +2970,19 @@ def anthropic_to_openai(body):
                               "function": {"name": name,
                                            "arguments": json.dumps(arguments, ensure_ascii=False)}})
             elif kind == "tool_result":
+                pictures = []
                 results.append({"role": "tool",
                                 "tool_call_id": block.get("tool_use_id") or "",
                                 "content": _anthropic_block_text(block.get("content", ""),
-                                                                 f"{where}.content")})
+                                                                 f"{where}.content", pictures)})
+                if pictures and role != "user":
+                    raise APIError(400, "`image` blocks are valid only in user messages.",
+                                   where, "unsupported_content_type")
+                carried.extend(pictures)
             else:
-                raise APIError(400, "Colibri supports `text`, `tool_use` and `tool_result` "
-                               "content blocks only.", f"{where}.type", "unsupported_content_type")
+                raise APIError(400, "Colibri supports `text`, `image`, `tool_use` and "
+                               "`tool_result` content blocks only.", f"{where}.type",
+                               "unsupported_content_type")
         # tool results precede the user's own text: they answer the previous assistant turn
         messages.extend(results)
         text = "".join(texts)
@@ -2886,6 +2994,11 @@ def anthropic_to_openai(body):
                 if calls:
                     entry["tool_calls"] = calls
                 messages.append(entry)
+        elif carried or any(part["type"] != "text" for part in parts):
+            # A picture is in this turn: the content stays a parts list, which is
+            # what expand_*_images() reads. Pictures out of tool results come first,
+            # right after the tool turns that produced them.
+            messages.append({"role": "user", "content": carried + parts})
         elif text or not results:
             messages.append({"role": "user", "content": text})
     return messages
@@ -3118,6 +3231,21 @@ class ToolSideband:
 def generation_options(body, limit):
     if body.get("n", 1) != 1:
         raise APIError(400, "Colibri currently supports `n=1` only.", "n", "unsupported_value")
+    best_of = body.get("best_of", 1)
+    if best_of not in (None, 1):
+        raise APIError(400, "Colibri currently supports `best_of` equal to 1 only.",
+                       "best_of", "unsupported_value")
+    logit_bias = body.get("logit_bias")
+    if logit_bias not in (None, {}):
+        raise APIError(400, "Colibri does not support a non-empty `logit_bias` yet.",
+                       "logit_bias", "unsupported_value")
+    if body.get("suffix") is not None:
+        raise APIError(400, "Colibri does not support `suffix` infill yet.",
+                       "suffix", "unsupported_parameter")
+    modalities = body.get("modalities")
+    if isinstance(modalities, list) and "audio" in modalities:
+        raise APIError(400, "Colibri does not support audio output via `modalities`.",
+                       "modalities", "unsupported_value")
     # `tools`/`functions` are handled by render_chat (declaration) + parse_tool_calls (output).
     # Validate tools/functions structure early so malformed input fails with a clear error.
     tools_raw = body.get("tools") or body.get("functions")
@@ -3960,6 +4088,21 @@ def model_object(model_id, created):
     return {"id": model_id, "object": "model", "created": created, "owned_by": "colibri"}
 
 
+def is_image_engine(engine):
+    """True when the server fronts a text-to-image engine rather than a chat one.
+    Decided by the engine object, not by the ARCH global, so a server built in a
+    test (or embedded) with an ImageEngine behaves as one."""
+    return getattr(engine, "modality", "text") == "image"
+
+
+# The endpoints that only make sense for a chat model, refused with a pointer
+# when the model draws images instead.
+TEXT_ENDPOINTS = ("/v1/chat/completions", "/v1/completions", "/v1/messages", "/v1/brio",
+                  "/v1/systemone")
+IMAGE_OPTION_KEYS = ("default_width", "default_height", "default_steps", "min_side",
+                     "max_side", "multiple")
+
+
 def _positive_env(name, default):
     try:
         value = int(os.environ.get(name, "") or default)
@@ -4013,6 +4156,17 @@ class APIServer(ThreadingHTTPServer):
         self._conn_live = 0
         self._conn_by_ip = {}
         self._conn_owner = {}
+
+    def model_entry(self):
+        """The /v1/models object. An image model says so, and carries the size
+        rules its engine announced, so a client can build a valid request
+        without trial and error."""
+        entry = model_object(self.model_id, self.created)
+        if is_image_engine(self.engine):
+            info = getattr(self.engine, "info", None) or {}
+            entry["capabilities"] = ["image_generation"]
+            entry["image"] = {key: info.get(key) for key in IMAGE_OPTION_KEYS}
+        return entry
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, *args, **kwargs):
         started = time.monotonic()
@@ -4402,6 +4556,9 @@ class APIHandler(BaseHTTPRequestHandler):
                     if tiers: payload["tiers"] = tiers
                     hwinfo = getattr(self.server.engine, "hwinfo", None) if self.server.engine else None
                     if hwinfo: payload["hwinfo"] = hwinfo
+                    if is_image_engine(self.server.engine):
+                        payload["capabilities"] = ["image_generation"]
+                        payload["image"] = dict(getattr(self.server.engine, "info", None) or {})
                 self.send_json(200, payload, request_id)
                 return
             if path == "/experts":
@@ -4432,10 +4589,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 return
             self.require_auth()
             if path == "/v1/models":
-                self.send_json(200, {"object": "list", "data": [model_object(
-                    self.server.model_id, self.server.created)]}, request_id)
+                self.send_json(200, {"object": "list", "data": [self.server.model_entry()]},
+                               request_id)
             elif path.startswith("/v1/models/") and unquote(path[11:]) == self.server.model_id:
-                self.send_json(200, model_object(self.server.model_id, self.server.created), request_id)
+                self.send_json(200, self.server.model_entry(), request_id)
             else:
                 raise APIError(404, "Not found.", None, "not_found")
         except APIError as error:
@@ -4465,7 +4622,13 @@ class APIHandler(BaseHTTPRequestHandler):
             # served model answers whatever name was asked for.
             if path != "/v1/systemone":
                 self.check_model(body)
-            if path == "/v1/chat/completions":
+            if is_image_engine(self.server.engine) and path in TEXT_ENDPOINTS:
+                raise APIError(400, f"`{self.server.model_id}` is an image generation model and "
+                                    "does not chat: POST /v1/images/generations instead.",
+                               "model", "unsupported_endpoint")
+            if path == "/v1/images/generations":
+                self.image_generation(body, request_id)
+            elif path == "/v1/chat/completions":
                 self.chat_completion(body, request_id)
             elif path == "/v1/completions":
                 self.completion(body, request_id)
@@ -4909,6 +5072,184 @@ class APIHandler(BaseHTTPRequestHandler):
                            "output_tokens": result["usage"]["read_tokens"]}}
         self.send_json(200, reply, request_id, result.get("_headers"))
 
+    # ------------------------------------------------------------- images
+    #
+    # POST /v1/images/generations, the OpenAI shape plus a `colibri` block with
+    # what was actually drawn (the seed above all: without it an image cannot be
+    # reproduced). One image at a time through the same scheduler as chat, so
+    # the queue, its limits and /metrics mean the same thing for both.
+    def image_generation(self, body, request_id):
+        engine = self.server.engine
+        if not is_image_engine(engine):
+            raise APIError(400, f"`{self.server.model_id}` does not generate images: it is a "
+                                "chat model (POST /v1/chat/completions).",
+                           "model", "unsupported_endpoint")
+        try:
+            request = image_engine.image_request(body, engine.info)
+        except image_engine.ImageRequestError as error:
+            raise APIError(400, str(error), error.param, "invalid_value")
+        stream = body.get("stream", False)
+        if not isinstance(stream, bool):
+            raise APIError(400, "`stream` must be a boolean.", "stream")
+        partial_images = body.get("partial_images")
+        if partial_images is not None and (isinstance(partial_images, bool) or
+                                           not isinstance(partial_images, int) or
+                                           not 0 <= partial_images <= 16):
+            raise APIError(400, "`partial_images` must be an integer between 0 and 16.",
+                           "partial_images")
+        created = int(time.time())
+        with contextlib.ExitStack() as stack:
+            try:
+                queue_wait, _slot = stack.enter_context(
+                    self.server.scheduler.admit(self.client_disconnected))
+            except APIError as error:
+                if error.status == 429:
+                    # The contract's word for "busy past the queue" is 503: an
+                    # image takes minutes, and a client that retries after a
+                    # second, as 429 invites, only refills the queue.
+                    raise APIError(503, error.message, None, error.code, "server_error",
+                                   error.headers) from None
+                raise
+            if not engine.alive:
+                raise APIError(503, f"The image engine is not running ({engine.dead or 'exited'}).",
+                               None, "engine_unavailable", "server_error")
+            queue_headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000))}
+            if stream:
+                self._image_stream(engine, request, request_id, created, queue_headers,
+                                   partial_images)
+                return
+            try:
+                result = engine.generate(request["prompt"], request["width"], request["height"],
+                                         request["steps"], request["seed"], preview=False,
+                                         cancelled=self.client_disconnected)
+            except image_engine.ImageCancelled:
+                raise ClientCancelled() from None
+            except image_engine.ImageEngineError as error:
+                raise APIError(500, f"The image engine failed: {error}", None, "engine_error",
+                               "server_error") from None
+            self.send_json(200, self._image_payload(result, created), request_id, queue_headers)
+
+    @staticmethod
+    def _image_payload(result, created):
+        import base64
+        png = image_engine.encode_png(result["width"], result["height"], result["rgba"], 4)
+        return {"created": created,
+                "data": [{"b64_json": base64.b64encode(png).decode("ascii"),
+                          "revised_prompt": None}],
+                "colibri": {"width": result["width"], "height": result["height"],
+                            "seed": result["seed"], "steps": result["steps"],
+                            "timings": result["timings"]}}
+
+    def _image_stream(self, engine, request, request_id, created, queue_headers,
+                      partial_images):
+        """SSE: progress, optional partial images, completed, [DONE].
+
+        The 200 is committed on the engine's first frame, not before: an engine
+        that refuses the request outright still answers with a real HTTP error
+        instead of an error event inside a stream that already said OK."""
+        import base64
+        lock = threading.Lock()
+        state = {"started": False, "connected": True, "last": time.monotonic(), "partials": 0}
+
+        def start():
+            if state["started"]:
+                return
+            state["started"] = True
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Connection", "close")
+            self.close_connection = True
+            self.send_header("x-request-id", request_id)
+            for name, value in queue_headers.items():
+                self.send_header(name, value)
+            self.send_cors_headers()
+            try:
+                self.end_headers()
+            except OSError:
+                # The client left between admission and the first frame: count
+                # it as gone, so the generation is cancelled like any hang-up
+                # instead of this exception abandoning it mid-image.
+                state["connected"] = False
+
+        def write(data):
+            with lock:
+                if not state["connected"]:
+                    return
+                try:
+                    self.wfile.write(data)
+                    self.wfile.flush()
+                    state["last"] = time.monotonic()
+                except OSError:
+                    state["connected"] = False
+
+        def event(name, data):
+            start()
+            write(f"event: {name}\ndata: "
+                  f"{json.dumps(data, ensure_ascii=False, separators=(',', ':'))}\n\n".encode())
+
+        def cancelled():
+            return not state["connected"] or self.client_disconnected()
+
+        def on_progress(frame):
+            event("image_generation.progress",
+                  {key: frame.get(key) for key in ("stage", "step", "steps", "elapsed")})
+
+        def on_preview(frame, pixels):
+            limit = partial_images
+            if limit is not None:
+                # Spread a requested number of partial images over the run
+                # instead of spending them on the first steps.
+                steps = max(1, int(frame.get("steps") or request["steps"]))
+                due = (state["partials"] + 1) * steps / (limit + 1)
+                if state["partials"] >= limit or int(frame.get("step") or 0) < due:
+                    return
+            channels = frame.get("channels", 3)
+            try:
+                png = image_engine.encode_png(frame["width"], frame["height"], pixels, channels)
+            except (KeyError, TypeError, ValueError) as error:
+                sys.stderr.write(f"[api] {request_id}: unusable PREVIEW frame ({error})\n")
+                return
+            event("image_generation.partial_image",
+                  {"b64_json": base64.b64encode(png).decode("ascii"),
+                   "partial_image_index": state["partials"]})
+            state["partials"] += 1
+
+        def on_idle():
+            # SSE comments keep proxies and idle timers from closing a stream
+            # that is legitimately silent through a long denoising step.
+            if state["started"] and time.monotonic() - state["last"] >= 10:
+                write(b": keepalive\n\n")
+
+        try:
+            result = engine.generate(request["prompt"], request["width"], request["height"],
+                                     request["steps"], request["seed"],
+                                     preview=partial_images != 0, on_progress=on_progress,
+                                     on_preview=on_preview, cancelled=cancelled,
+                                     on_idle=on_idle)
+        except image_engine.ImageCancelled:
+            if not state["started"]:
+                raise ClientCancelled() from None
+            # Once the 200 is out, every ending is an event: a client still
+            # listening (the web UI) is told the image will not come, then the
+            # stream closes the way every stream closes.
+            event("error", {"error": {"message": "cancelled", "type": "cancelled",
+                                      "param": None, "code": "cancelled"}})
+            write(b"data: [DONE]\n\n")
+            raise ClientCancelled() from None       # counted as cancelled, not completed
+        except image_engine.ImageEngineError as error:
+            if not state["started"]:
+                raise APIError(500, f"The image engine failed: {error}", None, "engine_error",
+                               "server_error") from None
+            event("error", {"error": {"message": f"The image engine failed: {error}",
+                                      "type": "server_error", "param": None,
+                                      "code": "engine_error"}})
+            write(b"data: [DONE]\n\n")
+            return
+        event("image_generation.completed", self._image_payload(result, created))
+        write(b"data: [DONE]\n\n")
+
     def _fail(self, error, request_id):
         """Report an error, unless the response is already on the wire. Once a streaming 200
         is committed, a second status line would be framed as SSE body -- clients saw a whole
@@ -5295,40 +5636,7 @@ class APIHandler(BaseHTTPRequestHandler):
         tools = body.get("tools") or body.get("functions") or None
         tool_choice = body.get("tool_choice")
         audio_clips = [] if ARCH == "inkling" else None
-        messages = body.get("messages")
-        # Le immagini diventano segnaposto PRIMA del rendering: il renderer
-        # tratta poi turni di solo testo, e il conto dei segnaposto e quello
-        # degli embedding non possono divergere.
-        image = None
-        if ARCH == "glm53":
-            messages, images = expand_glm53_images(
-                messages, getattr(self.server.engine, "model_dir", None))
-            if len(images) > 1:
-                raise APIError(400, "one image per request for now; the engine "
-                                    "holds a single pending image.", "messages")
-            image = images[0] if images else None
-        elif ARCH == "deepseek_v41":
-            ceiling = os.environ.get("V41_MAX_IMAGE_TOKENS")
-            messages, images = expand_dsv41_images(
-                messages, getattr(self.server.engine, "model_dir", None),
-                int(ceiling) if ceiling else None)
-            if len(images) > 1:
-                raise APIError(400, "one image per request for now; the engine "
-                                    "holds a single pending image.", "messages")
-            image = images[0] if images else None
-        elif ARCH == "qwen38" or (ARCH == "qwen36" and qwen36_has_vision(
-                getattr(self.server.engine, "model_dir", None))):
-            # Qwen3.5/3.6/3.8 share the tower and the preprocessor, so qwen36
-            # checkpoints converted with their tower take the same path (#1757).
-            ceiling = os.environ.get("Q38_MAX_IMAGE_TOKENS" if ARCH == "qwen38"
-                                     else "Q36_MAX_IMAGE_TOKENS")
-            messages, images = expand_qwen38_images(
-                messages, getattr(self.server.engine, "model_dir", None),
-                int(ceiling) if ceiling else None)
-            if len(images) > 1:
-                raise APIError(400, "one image per request for now; the engine "
-                                    "holds a single pending image.", "messages")
-            image = images[0] if images else None
+        messages, image = self.expand_images(body.get("messages"))
         add_generation_prompt = resolve_generation_prompt(messages, body)
         prompt = render_chat_for_arch(messages, enable_thinking, reasoning_effort,
                                       tools, tool_choice, audio_out=audio_clips,
@@ -5340,6 +5648,34 @@ class APIHandler(BaseHTTPRequestHandler):
                         audio=b"".join(audio_clips) if audio_clips else None,
                         image=image)
 
+    def expand_images(self, messages):
+        """(messages with placeholders, the one image or None) for this engine's family.
+
+        Le immagini diventano segnaposto PRIMA del rendering: il renderer tratta
+        poi turni di solo testo, e il conto dei segnaposto e quello degli
+        embedding non possono divergere. Both chat endpoints come through here,
+        so a picture is one thing whichever API delivered it."""
+        model_dir = getattr(self.server.engine, "model_dir", None)
+        if ARCH == "glm53":
+            messages, images = expand_glm53_images(messages, model_dir)
+        elif ARCH == "deepseek_v41":
+            ceiling = os.environ.get("V41_MAX_IMAGE_TOKENS")
+            messages, images = expand_dsv41_images(messages, model_dir,
+                                                   int(ceiling) if ceiling else None)
+        elif ARCH == "qwen38" or (ARCH == "qwen36" and qwen36_has_vision(model_dir)):
+            # Qwen3.5/3.6/3.8 share the tower and the preprocessor, so qwen36
+            # checkpoints converted with their tower take the same path (#1757).
+            ceiling = os.environ.get("Q38_MAX_IMAGE_TOKENS" if ARCH == "qwen38"
+                                     else "Q36_MAX_IMAGE_TOKENS")
+            messages, images = expand_qwen38_images(messages, model_dir,
+                                                    int(ceiling) if ceiling else None)
+        else:
+            return messages, None
+        if len(images) > 1:
+            raise APIError(400, "one image per request for now; the engine "
+                                "holds a single pending image.", "messages")
+        return messages, images[0] if images else None
+
     # ---- Anthropic /v1/messages (#343) ----------------------------------------------------
     ANTHROPIC_STOP = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
 
@@ -5349,7 +5685,7 @@ class APIHandler(BaseHTTPRequestHandler):
             if body.get(unsupported) not in (None, [], ""):
                 raise APIError(400, f"Colibri does not support `{unsupported}` ({why}) yet.",
                                unsupported, "unsupported_value")
-        messages = anthropic_to_openai(body)
+        messages, image = self.expand_images(anthropic_to_openai(body))
         tools, tool_choice = anthropic_tools(body)
         thinking = body.get("thinking")
         if thinking is not None and not isinstance(thinking, dict):
@@ -5382,10 +5718,10 @@ class APIHandler(BaseHTTPRequestHandler):
                                       add_generation_prompt=add_generation_prompt,
                                       preserve_thinking=not enable_thinking)
         self.anthropic_generation(translated, prompt, request_id, tools, enable_thinking,
-                                  add_generation_prompt)
+                                  add_generation_prompt, image)
 
     def anthropic_generation(self, body, prompt, request_id, tools, enable_thinking,
-                             add_generation_prompt=True):
+                             add_generation_prompt=True, image=None):
         maximum, temperature, top_p, grammar, _stop_sequences = generation_options(
             body, self.server.max_tokens)
         # Same policy as /v1/chat/completions: `body` is the translated OpenAI-shaped
@@ -5454,7 +5790,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 stats = self.server.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
                     self.client_disconnected, grammar=grammar, stopped=generation_stopped,
-                    **({"on_tool": sideband.feed} if sideband.enabled else {}))
+                    **({"on_tool": sideband.feed} if sideband.enabled else {}),
+                    **({"image": image} if image is not None else {}))
                 stop_filter.finish()
                 sideband.finish()
                 content, stop_reason = blocks_and_stop("".join(output), stats,
@@ -5598,7 +5935,8 @@ class APIHandler(BaseHTTPRequestHandler):
             stats = self.server.generate(
                 prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
                 lambda: not connected[0], grammar=grammar, stopped=generation_stopped,
-                **({"on_tool": sideband.feed} if sideband.enabled else {}))
+                **({"on_tool": sideband.feed} if sideband.enabled else {}),
+                **({"image": image} if image is not None else {}))
             stop_filter.finish()
             sideband.finish()
             if split:
@@ -5696,7 +6034,18 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
         if kv_slots > family.limits.max_kv_slots:
             raise ValueError(f"{family.id} engine supports at most "
                              f"{family.limits.max_kv_slots} KV slot(s)")
-        runtime = Engine(engine,model,cap,max_tokens,env,kv_slots,family)
+        if family.modality == "image":
+            # Its own process class: the image engine speaks a line-and-JSON
+            # protocol with binary frames, not the text engines' byte stream.
+            runtime = image_engine.ImageEngine(engine, model, env=env)
+            # Same lifetime rule as the text engines on Windows: a job object
+            # takes the engine down with this server, however the server ends.
+            runtime._win_job = _win_kill_on_close_job(getattr(runtime.process, "pid", None))
+            print(f"[image] {model_id}: default {runtime.info['default_width']}x"
+                  f"{runtime.info['default_height']}, {runtime.info['default_steps']} steps",
+                  file=sys.stderr)
+        else:
+            runtime = Engine(engine,model,cap,max_tokens,env,kv_slots,family)
         server.engine = runtime
         print(f"OpenAI-compatible API listening on http://{host}:{port}/v1", file=sys.stderr)
         signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
