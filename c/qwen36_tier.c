@@ -76,7 +76,13 @@ static void wait_take_locked(void){
 }
 
 static QSlot *qs(int layer, int eid){ return &G.slot[(size_t)layer*G.ne + eid]; }
-static int home(int eid){ return eid % G.ndev; }
+/* Expert homes. Default: expert eid lives on device index eid % ndev in every
+ * layer (each layer's group joins across the cards). QT_HOME=layer: every
+ * expert of layer l lives on one device, chosen per layer range, so a token
+ * runs each layer on one card and the cards form a pipeline -- no per-layer
+ * join, which on unequal cards is what the slower one paced (measured: take
+ * 5.2 ms/token on two cards against 0.2 on one). */
+static int home2(int layer, int eid);
 
 /* Staging: packed int4 (g|u|d) two's-complement -> offset-binary (XOR 0x88,
  * the upload format of backend_cuda fmt=2) + copy the scales (gs|us|ds). */
@@ -183,7 +189,7 @@ static void *uploader(void *arg){
             if(a)coli_cuda_tensor_free(a); if(b)coli_cuda_tensor_free(b); if(ct)coli_cuda_tensor_free(ct);
         } else pthread_mutex_unlock(&G.mx);
 
-        int dv = G.dev[home(eid)];
+        int dv = G.dev[home2(layer,eid)];
         /* passo fra le tre matrici nello staging: int4 impacchettato = mezzo
          * byte per elemento, int8 = uno. */
         size_t mb=(size_t)G.D*G.Ih/(G.wfmt==4?2:1);
@@ -220,7 +226,7 @@ static void *uploader(void *arg){
         pthread_mutex_lock(&G.mx);
         QSlot *s=qs(layer,eid);
         if(ok){ s->tg=tg; s->tu=tu; s->td=td; s->resident=1; G.uploads++; }
-        else  { int hd=home(eid); G.used[hd]-=G.exp_bytes;
+        else  { int hd=home2(layer,eid); G.used[hd]-=G.exp_bytes;
                 G.budget[hd]=G.used[hd];   /* device genuinely full: stop trying */ }
         s->queued=0;
         G.inflight--;
@@ -304,6 +310,10 @@ static int qt_place_named(const char *component){
  * so the array is n_layers wide and the attention slots stay empty. */
 #define QT_DN_MAX_LAYERS 128
 static struct { ColiCudaTensor *t; int dev, on; } G_dnp[QT_DN_MAX_LAYERS];
+static int G_home_layer;                          /* QT_HOME=layer */
+static uint8_t G_layer_dev[QT_DN_MAX_LAYERS];     /* device INDEX per layer in that mode */
+static int home(int eid){ return eid % G.ndev; }   /* the expert-index mapping (tests read it too) */
+static int home2(int layer, int eid){ return G_home_layer ? G_layer_dev[layer] : home(eid); }
 
 /* ---- automatic placement (COLI_PLACE unset or "auto") ------------------ */
 /* The hand-written list above is a measurement tool. Nobody running a 6 GB
@@ -391,8 +401,7 @@ static double auto_displaced_value(int di, size_t room, int k, size_t exp_bytes,
                                    int nl, int ne, int topk, const uint32_t *heat0,
                                    double *p_marginal_out){
     size_t homed = 0;
-    for(int e = 0; e < ne; e++) if(e % G.ndev == di) homed++;
-    homed *= (size_t)nl;
+    for(int l = 0; l < nl; l++) for(int e = 0; e < ne; e++) if(home2(l, e) == di) homed++;
     size_t fit = room / exp_bytes;
     if(fit >= homed){ *p_marginal_out = 0; return 0; }   /* room to spare: displaces nothing */
     if(k <= 0){ *p_marginal_out = 0; return 0; }
@@ -409,7 +418,7 @@ static double auto_displaced_value(int di, size_t room, int k, size_t exp_bytes,
         double sum = 0;
         for(int e = 0; e < ne; e++) sum += (double)heat0[(size_t)l*ne + e];
         for(int e = 0; e < ne; e++){
-            if(e % G.ndev != di) continue;
+            if(home2(l, e) != di) continue;
             double pe = sum > 0 ? (double)topk * heat0[(size_t)l*ne + e] / sum : (double)topk / ne;
             p[m++] = pe > 1.0 ? 1.0 : pe;
         }
@@ -465,6 +474,9 @@ static void auto_place(int nl, int ne, int topk, const size_t *capacity, const u
             size_t bytes = G_offer[o].bytes;
             int di = 0;
             for(int i = 1; i < G.ndev; i++) if(room[i] > room[di]) di = i;
+            /* pipeline homes: a layer's trunk goes where its experts live, lm_head
+             * to the last layer's card -- the token then changes card once */
+            if(G_home_layer) di = is_lmh ? G_layer_dev[nl-1] : G_layer_dev[G_offer[o].layer < QT_DN_MAX_LAYERS ? G_offer[o].layer : nl-1];
             /* a layer's out_proj goes where its in_proj went when that card has
              * the room: with both on one device the whole DeltaNet layer can run
              * there (qt_dn_gpu_init), which is worth more than balancing bytes */
@@ -667,6 +679,27 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
         }
     }
     if(auto_mode()){
+    /* QT_HOME=layer: expert homes per layer range, proportional to the cards'
+     * allowances unless QT_LAYER_SPLIT=<n> says how many layers the first card
+     * takes (two cards). Layers on one card form a pipeline stage. */
+    G_home_layer = 0;
+    { const char *hm = getenv("QT_HOME");
+      if(hm && !strcmp(hm, "layer") && G.ndev > 1 && nl <= QT_DN_MAX_LAYERS){
+          G_home_layer = 1;
+          double tot = 0; for(int i = 0; i < G.ndev; i++) tot += (double)capacity[i];
+          const char *sp = getenv("QT_LAYER_SPLIT"); int k = (sp && *sp) ? atoi(sp) : -1;
+          for(int l = 0; l < nl; l++){
+              int di = G.ndev - 1;
+              if(k >= 0 && k <= nl && G.ndev == 2) di = l < k ? 0 : 1;
+              else { double f = (l + 0.5) / nl, acc = 0; for(int i = 0; i < G.ndev; i++){ acc += tot > 0 ? capacity[i] / tot : 1.0 / G.ndev; if(f < acc){ di = i; break; } } }
+              G_layer_dev[l] = (uint8_t)di;
+          }
+          for(int i = 0; i < G.ndev; i++){
+              int lo = -1, hi = -1, n = 0;
+              for(int l = 0; l < nl; l++) if(G_layer_dev[l] == i){ if(lo < 0) lo = l; hi = l; n++; }
+              fprintf(stderr,"[qtier] homes: layers %d-%d (%d) with their experts and trunk on dev %d\n", lo, hi, n, G.dev[i]);
+          }
+      } }
         if(G_offer_n) auto_place(nl, ne, topk, capacity, G.heat0);
         else { G_auto_on = 1; G_auto_lmh = QT_PLACE_CPU; for(int l=0;l<QT_DN_MAX_LAYERS;l++) G_auto_dnp[l]=QT_PLACE_CPU; }
     } else {
@@ -709,7 +742,10 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
          * -- including the slow card, whose take() paces every layer (the
          * measured reason asymmetric expert placement lost). */
         int ed=qt_place_of("experts",0);
-        if(ed==QT_PLACE_ALL){
+        if(G_home_layer){
+            /* layer homes: every card keeps the experts of its own layers,
+             * whatever a hand-written list reserved on it */
+        } else if(ed==QT_PLACE_ALL){
             /* experts=all: every COLI_GPUS card keeps its experts, reserved or
              * not -- the form for "trunk on the fast card, experts on both" */
             fprintf(stderr,"[place] experts=all -> Experten auf allen %d Karten, auch den reservierten\n",G.ndev);
@@ -933,7 +969,7 @@ static int enqueue_locked(int layer,int eid,int v_layer,int v_eid,int reserved){
     if(G.th_stop) return 0;
     if(s->resident||s->queued||!s->g4) return 0;
     if(G.qn>=QT_QCAP){ G.q_full_skips++; return 0; }
-    int hd=home(eid);
+    int hd=home2(layer,eid);
     if(!reserved && v_eid<0 && G.used[hd]+G.exp_bytes>G.budget[hd]) return 0;
     size_t mb=(size_t)G.D*G.Ih/(G.wfmt==4?2:1);   /* buffer di staging: int8/fp8 = 1 byte/elemento */
     uint8_t *w=malloc(3*mb); float *sc=malloc((2*G.sc_gu+G.sc_d)*sizeof(float));
@@ -963,12 +999,12 @@ static void stream_forget(QSlot *s){ s->g4=s->u4=s->d4=NULL; s->gs=s->us=s->ds=N
 static void stream_promote_locked(int layer,int eid){
     QSlot *s=qs(layer,eid);
     if(s->resident||s->queued) return;
-    int hd=home(eid);
+    int hd=home2(layer,eid);
     if(G.used[hd]+G.exp_bytes<=G.budget[hd]){ enqueue_locked(layer,eid,-1,-1,0); return; }
     size_t n=(size_t)G.nl*G.ne; int cold=-1; uint32_t ch=0;
     for(size_t i=0;i<n;i++){
         QSlot *c=&G.slot[i];
-        if(home((int)(i%G.ne))!=hd || !c->resident || c->queued) continue;
+        if(home2((int)(i/G.ne),(int)(i%G.ne))!=hd || !c->resident || c->queued) continue;
         if(cold<0||c->heat<ch){ cold=(int)i; ch=c->heat; }
     }
     if(cold<0 || !tier_should_promote(s->heat,ch)) return;
@@ -1032,7 +1068,7 @@ int qt_fill_next(int *layer,int *eid){
     }
     while((size_t)G.fill_cur<n){
         int gi=G.fill_order[G.fill_cur];
-        int l=gi/G.ne, e=gi%G.ne, hd=home(e);
+        int l=gi/G.ne, e=gi%G.ne, hd=home2(l,e);
         QSlot *s=qs(l,e);
         int full=1; for(int i=0;i<G.ndev;i++) if(G.used[i]+G.exp_bytes<=G.budget[i]) full=0;
         if(full){ pthread_mutex_unlock(&G.mx); return 0; }
@@ -1065,7 +1101,7 @@ int qt_plan_fill(int *layers,int *eids,int max){
         int full=1; for(int i=0;i<G.ndev;i++) if(G.used[i]+G.exp_bytes<=G.budget[i]) full=0;
         if(full) break;
         int gi=G.fill_order[G.fill_cur++];
-        int l=gi/G.ne, e=gi%G.ne, hd=home(e);
+        int l=gi/G.ne, e=gi%G.ne, hd=home2(l,e);
         QSlot *s=qs(l,e);
         if(s->resident||s->queued||s->planned) continue;
         if(G.used[hd]+G.exp_bytes>G.budget[hd]) continue;
@@ -1094,7 +1130,7 @@ void qt_note_planned(int layer,int eid,
          * both keeps the bytes out of the budget for the life of the process
          * and "if(resident||queued||planned) continue" never reconsiders the
          * expert. #1331 was this leak for every expert of an int8 container. */
-        if(s->planned){ G.used[home(eid)]-=G.exp_bytes; s->planned=0; }
+        if(s->planned){ G.used[home2(layer,eid)]-=G.exp_bytes; s->planned=0; }
         pthread_mutex_unlock(&G.mx);
         return;
     }
@@ -1103,7 +1139,7 @@ void qt_note_planned(int layer,int eid,
     while(G.qn>=QT_QCAP && !G.th_stop) wait_take_locked();
     if(!enqueue_locked(layer,eid,-1,-1,1)){
         /* not enqueueable (e.g. already resident): return the reservation */
-        if(s->planned) G.used[home(eid)]-=G.exp_bytes;
+        if(s->planned) G.used[home2(layer,eid)]-=G.exp_bytes;
     }
     s->planned=0;
     if(G_fp8_stream) stream_forget(s);
@@ -1137,7 +1173,7 @@ static void qt_lfru_tick_locked(void){
         for(size_t i=0;i<n;i++){
             QSlot *s=&G.slot[i];
             int e=(int)(i%G.ne);
-            if(home(e)!=di) continue;
+            if(home2((int)(i/G.ne),e)!=di) continue;
             if(s->resident && !s->queued){ if(cold<0||s->heat<ch){ cold=(int)i; ch=s->heat; } }
             else if(!s->resident && !s->queued && s->g4){ if(hot<0||s->heat>hh){ hot=(int)i; hh=s->heat; } }
         }
@@ -1173,7 +1209,7 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
     for(int k=0;k<K;k++){
         QSlot *s=qs(layer,eids[k]);
         if(s->resident){
-            int di=home(eids[k]); int c=G.is_cnt[di];
+            int di=home2(layer,eids[k]); int c=G.is_cnt[di];
             tg[di][c]=s->tg; tu[di][c]=s->tu; td[di][c]=s->td;
             G.is_k[di][c]=k; G.is_cnt[di]=c+1;
             mask|=1u<<k; G.hits[di]++;
