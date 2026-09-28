@@ -326,6 +326,28 @@ def _fallback_tool_preamble(tools):
     return "".join(out)
 
 
+def _history_tool_calls(tool_calls, index):
+    """A past assistant message's tool_calls, checked as _fallback_tool_calls and
+    _qwen38_tool_calls check them, for the renderers that read `function` without
+    looking: GLM, GLM-5.3 and DeepSeek V4/V4.1 raised AttributeError on a
+    `function` that is not an object, which do_POST answers with HTTP 500."""
+    if tool_calls is None:
+        return []
+    if not isinstance(tool_calls, list):
+        raise APIError(400, "`tool_calls` must be an array.", f"messages.{index}.tool_calls")
+    for position, call in enumerate(tool_calls):
+        where = f"messages.{index}.tool_calls.{position}"
+        if not isinstance(call, dict):
+            raise APIError(400, "Each tool call must be an object.", where)
+        fn = call.get("function", call)
+        if not isinstance(fn, dict):
+            raise APIError(400, "`function` must be an object.", f"{where}.function")
+        name = fn.get("name")
+        if name is not None and not isinstance(name, str):
+            raise APIError(400, "`function.name` must be a string.", f"{where}.function.name")
+    return tool_calls
+
+
 def _fallback_tool_calls(tool_calls, index):
     """Render assistant tool_calls in the format parse_tool_calls() reads."""
     out = []
@@ -1301,7 +1323,7 @@ def render_chat_v4(messages, enable_thinking=False, reasoning_effort=None, tools
             content = content_text(raw, f"messages.{index}.content") if raw is not None else ""
             merged.append({"role": role, "content": content,
                            "reasoning_content": message.get("reasoning_content"),
-                           "tool_calls": message.get("tool_calls")})
+                           "tool_calls": _history_tool_calls(message.get("tool_calls"), index)})
             continue
         raw = message.get("content")
         text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
@@ -1905,8 +1927,8 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
                 raise APIError(400, "`reasoning_content` must be a string.",
                                f"messages.{index}.reasoning_content")
             prompt.append(f"<|assistant|><think>{reasoning}</think>{text.strip()}")
-            for tc in (message.get("tool_calls") or []):
-                fn = tc.get("function", tc) if isinstance(tc, dict) else {}
+            for tc in _history_tool_calls(message.get("tool_calls"), index):
+                fn = tc.get("function", tc)
                 args = fn.get("arguments", "{}")
                 if isinstance(args, str):
                     try:
@@ -2302,7 +2324,7 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
     if tools:
         prompt.append(_glm53_tool_block(tools))
 
-    for message in messages:
+    for index, message in enumerate(messages):
         if not isinstance(message, dict):
             raise APIError(400, "each message must be an object.", "messages")
         role = message.get("role")
@@ -2324,7 +2346,7 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
                 content = content.split("</think>")[-1]
             opened = f"<think>{reasoning}</think>" if isinstance(reasoning, str) else "<think></think>"
             body = content.strip()
-            calls = _glm53_tool_calls(message.get("tool_calls"))
+            calls = _glm53_tool_calls(_history_tool_calls(message.get("tool_calls"), index))
             # The template writes "\n<tool_call>". The model, on a turn that is
             # nothing but a tool call, writes "</think><tool_call>" with no
             # newline between them, and that one token is enough to throw away
@@ -2429,7 +2451,7 @@ def _dsv41_merge_turns(messages):
                                f"messages.{index}.reasoning_content")
             turns.append({"role": "assistant", "content": text,
                           "reasoning_content": reasoning,
-                          "tool_calls": message.get("tool_calls")})
+                          "tool_calls": _history_tool_calls(message.get("tool_calls"), index)})
         elif role in ("user", "tool"):
             block = ({"kind": "tool_result", "id": message.get("tool_call_id") or "",
                       "text": v41_dsml.render_tool_result(text)} if role == "tool"

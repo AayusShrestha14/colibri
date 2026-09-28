@@ -2315,6 +2315,41 @@ class HTTPTest(unittest.TestCase):
             self.assertEqual(response.status, 200)
             self.assertEqual(json.load(response)["object"], "chat.completion")
 
+    def test_a_past_tool_call_whose_function_is_not_an_object_is_a_client_error(self):
+        """A replayed tool call with `function: "search"` answered HTTP 500.
+
+        The fallback, Kimi and Qwen3.8 renderers already answer 400. GLM, GLM-5.3
+        and DeepSeek V4/V4.1 called .get() on the value, and the AttributeError
+        became do_POST's 500 "The colibri engine failed to process the request."
+        """
+        def history(function):
+            return {"model": "test-model", "messages": [
+                {"role": "user", "content": "run it"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "x", "type": "function", "function": function}]},
+                {"role": "tool", "tool_call_id": "x", "content": "done"},
+                {"role": "user", "content": "and now?"},
+            ]}
+        cases = [("search", "messages.1.tool_calls.0.function"),
+                 (["search"], "messages.1.tool_calls.0.function"),
+                 (5, "messages.1.tool_calls.0.function"),
+                 (None, "messages.1.tool_calls.0.function"),
+                 ({"name": 5, "arguments": "{}"}, "messages.1.tool_calls.0.function.name")]
+        for arch in ("glm", "glm53", "deepseek_v4", "deepseek_v41"):
+            for function, param in cases:
+                with self.subTest(arch=arch, function=function):
+                    with patch("openai_server.ARCH", arch):
+                        with self.assertRaises(HTTPError) as caught:
+                            self.request("/v1/chat/completions", history(function))
+                    self.addCleanup(caught.exception.close)
+                    self.assertEqual(caught.exception.code, 400)
+                    self.assertEqual(json.loads(caught.exception.read())["error"]["param"], param)
+            with self.subTest(arch=arch, function="well formed"):
+                with patch("openai_server.ARCH", arch):
+                    with self.request("/v1/chat/completions",
+                                      history({"name": "fn", "arguments": "{}"})) as response:
+                        self.assertEqual(response.status, 200)
+
 
 class ClientHangupTest(unittest.TestCase):
     """A client that disconnects mid-response must not print a traceback.
