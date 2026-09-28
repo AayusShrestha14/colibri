@@ -264,6 +264,31 @@ ms -- the expert groups are bound by GPU time and by the slower card's
 `COLI_GPUS` card even when a hand-written list reserves some of them for the
 trunk (the default hands a reserved card's experts back to the others, #1361).
 
+### Two cards as a pipeline (`QT_HOME=layer`)
+
+By default expert `eid` is homed on device `eid % n_gpus` in *every* layer,
+so each layer's group is issued to both cards and `qt_take` waits for the
+slower one -- measured on the 3070 + Quadro RTX 4000 pair, `take` 5.2 ms per
+token against 0.2 on one card. `QT_HOME=layer` homes every expert of a layer
+on one device, chosen per layer range in proportion to the cards' allowances
+(or `QT_LAYER_SPLIT=<n>` layers on the first card), puts the layer's trunk
+components on the same device and lm_head on the last layer's, and issues a
+group to exactly one device: the token runs the first layers on one card and
+the rest on the other, like llama.cpp's layer split. Budgets, warmstart, LFRU
+and the swap path follow the homes; a hand-written list's reservation does
+not remove a card in this mode, its layers' experts live there.
+
+Measured (same box, `auto` without the probe, `Q36_DN_GPU=1`, 200 tokens):
+the join is gone (`take` 0.17 ms), but the pipeline stays behind the 3070
+alone -- 38.6 ms/token at a 28/12 split against 33.3 -- because lm_head and
+twelve layers now run on the slower card, and because the MoE phase does not
+fall below ~14 ms at 97-100 % residency: with eight experts on one card the
+group costs about 0.35 ms per layer whatever the hit rate (launch cost per
+expert, not bandwidth; with the experts split 4+4 it is 11.2 ms). Cold, two
+cards win (45.3 against 52.3 ms), since more experts are resident at once.
+So on two *equal* cards the index split remains the faster form; the layer
+split is for unequal cards and for the day the group is one launch.
+
 ## Measured (Threadripper 3945WX 12C, RTX 3070 8 GB + Quadro RTX 4000 8 GB, Qwen3.6-35B-A3B int4, 200-token decode)
 
 | | 1 GPU (8 GB) | 2 GPUs (16 GB) |

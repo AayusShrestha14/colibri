@@ -467,6 +467,7 @@ and the CPU/GPU execution split.
 | `Q36_MAXT` | conservative engine default | Lower the served/context capacity; it cannot raise the model's compiled safety ceiling. |
 | `COLI_VULKAN` | `0` | `VK=1` build: the dense trunk on the Vulkan device, and the routed experts on the shared expert tier (`COLI_VK_TIER*`, `COLI_VK_DENSE`, see [Vulkan](#vulkan-any-gpu-with-a-vulkan-12-driver)). With the tier on, the engine keeps the expert history `COLI_USAGE` (default `<snap>/.coli_usage`), saved at every run and serve turn end; it keeps none otherwise. |
 | `Q36_DN_GPU` | `0` (off) | CUDA expert tier: a decode token runs every DeltaNet layer whose in_proj and out_proj sit on one card end to end on that card (conv, recurrence, gated norm; state resident in VRAM). Measured on the 35B, 3070, trunk in VRAM: DeltaNet 16.2 -> 10.8 ms/token, the token 39.4 -> 33.3 ms. See [qwen36-cuda-tier.md](qwen36-cuda-tier.md#the-deltanet-layer-on-the-card-q36_dn_gpu1). |
+| `QT_HOME` | `expert` | CUDA expert tier on two or more cards: `layer` homes every expert of a layer on one card (layer ranges in proportion to the allowances, `QT_LAYER_SPLIT=<n>` layers on the first card), with the layer's trunk and, for the last layer, lm_head alongside -- a pipeline instead of a per-layer join. See [qwen36-cuda-tier.md](qwen36-cuda-tier.md#two-cards-as-a-pipeline-qt_homelayer). |
 
 ## Qwen3.8 engine (`qwen38`)
 
