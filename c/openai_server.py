@@ -3173,6 +3173,21 @@ class ToolSideband:
 def generation_options(body, limit):
     if body.get("n", 1) != 1:
         raise APIError(400, "Colibri currently supports `n=1` only.", "n", "unsupported_value")
+    best_of = body.get("best_of", 1)
+    if best_of not in (None, 1):
+        raise APIError(400, "Colibri currently supports `best_of` equal to 1 only.",
+                       "best_of", "unsupported_value")
+    logit_bias = body.get("logit_bias")
+    if logit_bias not in (None, {}):
+        raise APIError(400, "Colibri does not support a non-empty `logit_bias` yet.",
+                       "logit_bias", "unsupported_value")
+    if body.get("suffix") is not None:
+        raise APIError(400, "Colibri does not support `suffix` infill yet.",
+                       "suffix", "unsupported_parameter")
+    modalities = body.get("modalities")
+    if isinstance(modalities, list) and "audio" in modalities:
+        raise APIError(400, "Colibri does not support audio output via `modalities`.",
+                       "modalities", "unsupported_value")
     # `tools`/`functions` are handled by render_chat (declaration) + parse_tool_calls (output).
     # Validate tools/functions structure early so malformed input fails with a clear error.
     tools_raw = body.get("tools") or body.get("functions")

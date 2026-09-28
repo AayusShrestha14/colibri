@@ -1642,6 +1642,49 @@ class BaseWireContractTest(unittest.TestCase):
         self.assertEqual(frames, [b"SUBMIT 1 0 11 4 0 0.9\nComplete me\n"])
 
 
+class OpenAIHonestySetTest(unittest.TestCase):
+    def test_refuses_unsupported_result_shaping_fields(self):
+        cases = (
+            ({"best_of": 2}, "best_of", "unsupported_value"),
+            ({"logit_bias": {"42": 100}}, "logit_bias", "unsupported_value"),
+            ({"suffix": " after"}, "suffix", "unsupported_parameter"),
+            ({"modalities": ["audio"]}, "modalities", "unsupported_value"),
+        )
+        for fields, param, code in cases:
+            with self.subTest(param=param), self.assertRaises(APIError) as caught:
+                generation_options(fields, 16)
+            self.assertEqual(caught.exception.status, 400)
+            self.assertEqual(caught.exception.param, param)
+            self.assertEqual(caught.exception.code, code)
+            self.assertIn(f"`{param}`", caught.exception.message)
+
+    def test_accepts_noop_values(self):
+        generation_options({"best_of": 1, "logit_bias": {}, "suffix": None,
+                            "modalities": ["text"]}, 16)
+
+    def test_intentionally_ignored_fields_return_200_and_do_not_reach_engine(self):
+        base = {"model": "test-model", "prompt": "Complete me",
+                "temperature": 0, "max_tokens": 4}
+        ignored = {
+            "store": True,
+            "metadata": {"trace": "request-1"},
+            "service_tier": "default",
+            "user": "user-1",
+            "safety_identifier": "safe-1",
+            "parallel_tool_calls": True,
+            "prompt_cache_key": "cache-1",
+            "verbosity": "low",
+            "web_search_options": {},
+            "moderation": True,
+            "stream_options": {"include_obfuscation": True},
+        }
+        status_plain, _, frames_plain = _capture_frames(base)
+        status_ignored, _, frames_ignored = _capture_frames({**base, **ignored})
+        self.assertEqual(status_plain, 200)
+        self.assertEqual(status_ignored, 200)
+        self.assertEqual(frames_ignored, frames_plain)
+
+
 class SeedOptionTest(unittest.TestCase):
     """`generation_options()` accepts a `seed` field without raising."""
 
