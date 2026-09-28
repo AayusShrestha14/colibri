@@ -6990,6 +6990,8 @@ class DispatcherLogprobTailTest(unittest.TestCase):
         # is answered with a named error rather than having its connection dropped, which
         # is what an unhandled write error does. Written against this tree's own STOP write
         # so the pin survives the composition with the checked writer.
+        stop_tried = threading.Event()
+
         class DeadOnStop:
             """The engine's stdin: accepts the SUBMIT, refuses the STOP."""
             def __init__(self, process):
@@ -7001,6 +7003,7 @@ class DispatcherLogprobTailTest(unittest.TestCase):
                 # the same normalisation `FakeProcess.write` above does.
                 data = bytes(data)
                 if data.startswith(b"STOP"):
+                    stop_tried.set()
                     raise BrokenPipeError(32, "Broken pipe")
                 return self.process.real_write(data)
 
@@ -7012,7 +7015,12 @@ class DispatcherLogprobTailTest(unittest.TestCase):
             process.stdout.feed(b"DATA " + request_id + b" 2 -0.5 1 3\nok\n")
 
             def terminal():
-                time.sleep(0.15)
+                # DONE only once the STOP was tried, as `_faulted_turn` does. A fixed
+                # 0.15 s let a slow runner read DATA and DONE back to back before the
+                # idle poll wrote the STOP (macOS CI on dev 1f9a8523): the turn then
+                # ended on the recorded fault and no STOP was ever written. The timeout
+                # still ends the turn on a build that never writes it, which fails below.
+                stop_tried.wait(1.0)
                 process.stdout.feed(
                     b"DONE " + request_id + b" STAT 1 2.5 0 1.0 5 0\n")
 
