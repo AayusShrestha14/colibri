@@ -69,7 +69,11 @@ static int qwen36_max_ctx(void) {
 #include "expert_ffn.h"    /* routed experts: planar int4 kernel + layer runner */
 #include "idot.h"          /* integer dot kernels for the dense trunk (COLI_DENSE_IDOT, COLI_DENSE_BITS) */
 #include "qwen38_vision.h" /* the ViT: the same tower in Qwen3.5/3.6/3.8 (#1757) */
+#include "qwen36_qpack.h"  /* optional MLX-affine qpack routed-expert path */
 #include "affine_quant.h"  /* MLX affine dense triples in model.safetensors */
+#ifdef COLI_METAL
+#include "backend_metal.h" /* coli_metal_init: affine pipelines for the store */
+#endif
 #ifdef COLI_SEGMENT_ADAPTER
 #include "segment_runtime.h"
 #include "segment_adapters.h"
@@ -2779,8 +2783,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     memset(out, 0, (int64_t)S*D*sizeof(float));
     float *g = falloc(I), *u = falloc(I), *hh = falloc(D);
     float *sh = falloc(I), *shu = falloc(I), *shd = falloc(D);  /* shared expert scratch */
-    int use_qt = qt_ready();
-    int use_xf = !use_qt && xf_mode(m);
+    /* When a qpack container owns the routed experts, they run through
+     * the MLX-affine path (Metal on Apple, CPU reference elsewhere);
+     * neither the CUDA tier nor the expert_ffn kernel is consulted.
+     * Routing, shared expert, and the combine stay on the CPU below. */
+    int use_qq = qq_active();
+    int use_qt = !use_qq && qt_ready();
+    int use_xf = !use_qq && !use_qt && xf_mode(m);
     int *xidx = use_xf ? malloc(sizeof(int) * (size_t)S * K) : NULL;
     float *xval = use_xf ? falloc((int64_t)S * K) : NULL;
     for (int s = 0; s < S; s++) {
@@ -2842,7 +2851,20 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) freq_l[idx[kk]]++;
         }
         const float *xs = x + (int64_t)s*D;
-        if (use_xf) {
+        if (use_qq) {
+            /* A failed expert is fatal: once the container owns the routed
+             * experts there is no other weight source to fall back to, and a
+             * silently skipped expert would just be a wrong answer. */
+            for (int kk = 0; kk < K; kk++) {
+                if (idx[kk] < 0) continue;
+                if (!qq_expert_forward(layer, idx[kk], xs, val[kk],
+                                       out + (int64_t)s*D)) {
+                    fprintf(stderr, "qpack expert layer %d expert %d failed"
+                            " -- refusing\n", layer, idx[kk]);
+                    exit(1);
+                }
+            }
+        } else if (use_xf) {
             for (int kk = 0; kk < K; kk++) { xidx[s*K+kk] = idx[kk]; xval[s*K+kk] = val[kk]; }
         } else if (use_qt) {
             /* CUDA expert tier: run the resident experts as async groups on
@@ -4365,9 +4387,56 @@ int main(int argc, char **argv) {
      * (COLI_DENSE_I8=0 disables it) -- see load_tq/QW; model_init_range
      * already logged the count and freed bytes. */
 
+    /* QWEN36_QPACK=<dir> hands the routed experts to a Swiftlet qpack
+     * container through the MLX-affine path (Metal on Apple builds, CPU
+     * reference elsewhere).  A mismatched or unsupported container is a
+     * refusal, not a silent fallback to the snapshot experts. */
+    const char *qq_dir = getenv("QWEN36_QPACK");
+    if (qq_dir && *qq_dir) {
+        char qq_err[256];
+#ifdef COLI_METAL
+        /* Compile the Metal affine pipelines BEFORE the store opens.  The
+         * store dispatches through coli_metal_matmul_affine_slot, which is
+         * gated on coli_metal_affine_available() -- i.e. on pipelines that
+         * only coli_metal_init() compiles.  The parity gates call it in
+         * their own main; the ENGINE never did, so a METAL=1 build ran every
+         * real-model routed projection on the CPU affine reference while
+         * looking identical apart from qq_counts (measured: metal=0
+         * cpu=37440 on the first 35B smoke).  Not a refusal when
+         * unavailable: the CPU reference is the documented oracle arm, but
+         * it must be CHOSEN (QWEN36_QPACK_SYNC / qq_force_cpu) or loudly
+         * reported, never a silent default. */
+        if (coli_metal_init())
+            fprintf(stderr, "[qpack] Metal affine pipelines ready\n");
+        else
+            fprintf(stderr, "[qpack] Metal unavailable -- routed experts"
+                    " fall back to the CPU affine reference\n");
+#endif
+        /* QWEN36_QPACK_SLOTS=<n> bounds the refillable expert slot pool
+         * (0/unset = the default in qwen36_qpack.c, clamped to the container
+         * total either way). */
+        const char *qq_slots_env = getenv("QWEN36_QPACK_SLOTS");
+        if (qq_slots_env && *qq_slots_env)
+            qq_set_slot_count(atoi(qq_slots_env));
+        if (!qq_open(qq_dir, m.c.n_layers, m.c.n_experts, m.c.hidden,
+                     m.c.inter, qq_err, sizeof(qq_err))) {
+            fprintf(stderr, "[qpack] %s: %s\n", qq_dir, qq_err);
+            return 1;
+        }
+        atexit(qq_close);
+        {
+            int qq_slots = 0;
+            qq_slot_stats(&qq_slots, NULL, NULL);
+            fprintf(stderr, "[qpack] routed experts <- MLX affine container"
+                    " %s (%d bounded slots)\n", qq_dir, qq_slots);
+        }
+    }
+
     /* Optional CUDA VRAM expert tier (COLI_CUDA=1): hot experts live in
      * DEVICE_LOCAL memory across the configured GPUs, misses fall back to the
-     * CPU int8 path. See qwen36_tier.h. */
+     * CPU int8 path. See qwen36_tier.h. Skipped when the qpack container owns
+     * the routed experts: the tier would warmstart-load the snapshot experts
+     * moe() no longer computes. */
     /* Formato degli esperti dalla TAGLIA SU DISCO del primo, non da meta.ebits:
      * esiste un container i8 il cui meta dichiara ebits=4 (stesso motivo per cui
      * il loader piu' sopra guarda nbytes). Il tier ne ha bisogno prima di
@@ -4397,8 +4466,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[qwen36] mixed layout on disk but qwen36_meta.json has no expert_down_bits -- down scales assumed per row\n");
     /* Offer the dense trunk to the placer before the tier decides its budget:
      * sizes only, from the same dense-i8 entries the uploads below will use.
-     * No entry (dense-i8 off) means nothing to offer, and the CPU path stands. */
-    {
+     * No entry (dense-i8 off) means nothing to offer, and the CPU path stands.
+     * A qpack container owns routed execution outright, so it must not seed
+     * CUDA placement state for a tier that is deliberately skipped below. */
+    if (!qq_active()) {
         int O_qkv = m.c.dn_conv_dim, O_z = m.c.dn_vheads * m.c.dn_vdim;
         if (m.lm_head.q)
             qt_trunk_offer("lmhead", 0, (size_t)m.lm_head.I * m.lm_head.O + (size_t)m.lm_head.O * sizeof(float));
@@ -4411,7 +4482,7 @@ int main(int argc, char **argv) {
     }
     if (expert_mixed && getenv("COLI_CUDA") && getenv("COLI_CUDA")[0] == '1')
         fprintf(stderr, "[qwen36] COLI_CUDA=1 ignored: the VRAM expert tier does not take the mixed layout yet (one format per expert)\n");
-    if (!expert_mixed && m.c.n_experts > 0 &&
+    if (!qq_active() && !expert_mixed && m.c.n_experts > 0 &&
         qt_init(m.c.n_layers, m.c.n_experts, m.c.hidden, m.c.inter, cap, m.c.topk,
                 m.c.expert_gs, expert_is_int4)) {
         fprintf(stderr, "[gpu] MoE experts -> CUDA VRAM tier\n");
@@ -4551,6 +4622,22 @@ int main(int argc, char **argv) {
     if (g_ttft >= 0) fprintf(stderr, "TTFT: %.2f s (time to first token)\n", g_ttft);
     tm_report();
     qt_stats();
+    /* qpack dispatch evidence, mirroring what the parity gates assert: which
+     * path computed the routed projections (coli_metal_matmul_affine_slot
+     * returns 0 for CPU fallback by contract, and qq_counts is where that
+     * becomes visible) and how hard the bounded slot pool worked.  A run
+     * whose experts silently fell back to the CPU reference shows cpu != 0
+     * here instead of hiding it. */
+    if (qq_active()) {
+        uint64_t qmp = 0, qcp = 0, qev = 0, qfl = 0;
+        int qsl = 0;
+        qq_counts(&qmp, &qcp);
+        qq_slot_stats(&qsl, &qev, &qfl);
+        fprintf(stderr, "[qpack] projections: metal=%llu cpu=%llu"
+                " | slots=%d fills=%llu evictions=%llu\n",
+                (unsigned long long)qmp, (unsigned long long)qcp,
+                qsl, (unsigned long long)qfl, (unsigned long long)qev);
+    }
     fprintf(stderr, "\nPEAK RSS: %.2f GB\n", rss_gb());
     fprintf(stderr, "Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
            (unsigned long long)m.hits, (unsigned long long)m.miss);
