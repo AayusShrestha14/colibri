@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <time.h>
 #ifdef __linux__
 #include <unistd.h>
 #include <sys/syscall.h>
@@ -686,13 +687,54 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
     { const char *hm = getenv("QT_HOME");
       if(hm && !strcmp(hm, "layer") && G.ndev > 1 && nl <= QT_DN_MAX_LAYERS){
           G_home_layer = 1;
-          double tot = 0; for(int i = 0; i < G.ndev; i++) tot += (double)capacity[i];
+          /* Weight of a card = its allowance divided by the time it needs for a
+           * dense GEMV: a slower card takes fewer layers, or the token waits
+           * on it for every one of them (3070 + Quadro RTX 4000: 0.16 against
+           * 0.26 ms for 16 MB). Probed here with a 64 MB int8 matrix, ten
+           * GEMVs, best of three rounds; a backend that answers in no time
+           * (the fake) leaves the weights at the allowances. */
+          double w[QT_MAX_DEV], tprobe[QT_MAX_DEV]; int probed = 1;
+          { const int PI = 4096, PO = 16384;                 /* 64 MB int8 */
+            int8_t *pw = malloc((size_t)PI * PO); float *psc = malloc((size_t)PO * sizeof(float));
+            float *px = malloc((size_t)PI * sizeof(float)), *py = malloc((size_t)PO * sizeof(float));
+            if(pw && psc && px && py){
+                for(size_t i = 0; i < (size_t)PI * PO; i++) pw[i] = (int8_t)(i * 7 % 13) - 6;
+                for(int o = 0; o < PO; o++) psc[o] = 0.01f;
+                for(int i = 0; i < PI; i++) px[i] = (float)((i * 37) % 101) / 50.f - 1.f;
+                for(int i = 0; i < G.ndev; i++){
+                    ColiCudaTensor *pt = NULL; tprobe[i] = 0;
+                    if(!coli_cuda_matmul(&pt, py, px, pw, psc, 1, 1, PI, PO, G.dev[i], 0)){ probed = 0; break; }
+                    double best = 1e30;
+                    for(int r = 0; r < 3; r++){
+                        for(int j = 0; j < 3; j++) coli_cuda_matmul(&pt, py, px, NULL, NULL, 1, 1, PI, PO, G.dev[i], 0);
+                        struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+                        for(int j = 0; j < 10; j++) coli_cuda_matmul(&pt, py, px, NULL, NULL, 1, 1, PI, PO, G.dev[i], 0);
+                        clock_gettime(CLOCK_MONOTONIC, &t1);
+                        double dt = ((t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9) / 10;
+                        if(dt < best) best = dt;
+                    }
+                    tprobe[i] = best;
+                    coli_cuda_tensor_free(pt);
+                    if(best < 20e-6) probed = 0;               /* no real GEMV happened: keep the allowances */
+                }
+            } else probed = 0;
+            free(pw); free(psc); free(px); free(py); }
+          double tot = 0;
+          for(int i = 0; i < G.ndev; i++){ w[i] = (double)capacity[i] / (probed ? tprobe[i] : 1.0); tot += w[i]; }
           const char *sp = getenv("QT_LAYER_SPLIT"); int k = (sp && *sp) ? atoi(sp) : -1;
           for(int l = 0; l < nl; l++){
               int di = G.ndev - 1;
               if(k >= 0 && k <= nl && G.ndev == 2) di = l < k ? 0 : 1;
-              else { double f = (l + 0.5) / nl, acc = 0; for(int i = 0; i < G.ndev; i++){ acc += tot > 0 ? capacity[i] / tot : 1.0 / G.ndev; if(f < acc){ di = i; break; } } }
+              else { double f = (l + 0.5) / nl, acc = 0; for(int i = 0; i < G.ndev; i++){ acc += tot > 0 ? w[i] / tot : 1.0 / G.ndev; if(f < acc){ di = i; break; } } }
               G_layer_dev[l] = (uint8_t)di;
+          }
+          if(probed){
+              int slow = 0; for(int i = 1; i < G.ndev; i++) if(tprobe[i] > tprobe[slow]) slow = i;
+              int fast = 0; for(int i = 1; i < G.ndev; i++) if(tprobe[i] < tprobe[fast]) fast = i;
+              fprintf(stderr,"[qtier] homes: dense GEMV probe (64 MB int8):");
+              for(int i = 0; i < G.ndev; i++) fprintf(stderr," dev %d %.3f ms", G.dev[i], tprobe[i]*1e3);
+              if(slow != fast) fprintf(stderr," -> dev %d is %.0f %% slower per dense byte; every layer it holds pays that", G.dev[slow], (tprobe[slow]/tprobe[fast]-1)*100);
+              fprintf(stderr,"%s\n", k >= 0 ? " (QT_LAYER_SPLIT set: split taken from it)" : "");
           }
           for(int i = 0; i < G.ndev; i++){
               int lo = -1, hi = -1, n = 0;
