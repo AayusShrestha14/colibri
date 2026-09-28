@@ -25,10 +25,11 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            parse_arch_tool_calls, parse_k3_tool_calls, parse_qwen38_tool_calls,
                            read_engine_turn, render_chat, render_chat_for_arch,
                            render_chat_glm53, render_chat_inkling, render_chat_kimi,
-                           render_chat_olmoe,
+                           render_chat_olmoe, render_chat_qwen,
                            render_chat_qwen38, render_chat_v4, render_chat_dsv41,
                            _dsv4_tool_calls, serve,
                            resolve_generation_prompt, split_thinking_reply,
+                           detect_chat_flavor, qwen36_has_vision,
                            starts_in_reasoning,
                            stop_policy, tune_child_env)
 
@@ -196,6 +197,120 @@ class TemplateTest(unittest.TestCase):
             "M user 8\nContinue"
             "G 1\n",
         )
+
+    def test_qwen36_history_is_what_the_engine_was_fed(self):
+        """#1759: prefix reuse on qwen36 is all or nothing, because nothing rewinds the
+        DeltaNet state, so it engages only if the next turn's prompt begins with exactly
+        the text the engine read: the previous prompt plus what it generated. The
+        template's preserve_thinking gives a past turn the <think> block it was generated
+        after; its default strips the block, and the history diverges at the first
+        assistant turn of every conversation."""
+        first = [{"role": "user", "content": "Capital of France?"}]
+        follow = {"role": "user", "content": "And of Italy?"}
+
+        # Thinking off: the generation followed the pre-closed header.
+        fed = render_chat_qwen(first, enable_thinking=False) + "Paris."
+        history = first + [{"role": "assistant", "content": "Paris."}, follow]
+        self.assertTrue(render_chat_qwen(history, enable_thinking=False,
+                                         preserve_thinking=True).startswith(fed))
+        self.assertFalse(render_chat_qwen(history, enable_thinking=False).startswith(fed))
+
+        # Thinking on: the history matches only if the client sends the reasoning back,
+        # as reasoning_content or inside the content, the way the model wrote it.
+        fed = (render_chat_qwen(first, enable_thinking=True)
+               + "Easy one.\n</think>\n\nParis.")
+        for past in ({"role": "assistant", "content": "Paris.",
+                      "reasoning_content": "Easy one."},
+                     {"role": "assistant",
+                      "content": "<think>\nEasy one.\n</think>\n\nParis."}):
+            with self.subTest(past=past):
+                prompt = render_chat_qwen(first + [past, follow], enable_thinking=True,
+                                          preserve_thinking=True)
+                self.assertTrue(prompt.startswith(fed))
+                # Without preserve_thinking the block leaves the history either way.
+                self.assertIn("<|im_start|>assistant\nParis.<|im_end|>",
+                              render_chat_qwen(first + [past, follow], enable_thinking=True))
+
+    def test_qwen36_images_follow_the_container(self):
+        """#1757: a qwen36 container converted with its vision tower says so in
+        qwen36_meta.json, and only then does the gateway turn image parts into
+        patches for the engine; an older or text-only container keeps refusing them."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            self.assertFalse(qwen36_has_vision(d))
+            meta = Path(d) / "qwen36_meta.json"
+            meta.write_text(json.dumps({"num_experts": 0}), encoding="utf-8")
+            self.assertFalse(qwen36_has_vision(d))
+            meta.write_text(json.dumps({"vision": {"depth": 27}}), encoding="utf-8")
+            self.assertTrue(qwen36_has_vision(d))
+            meta.write_text("not json", encoding="utf-8")
+            self.assertFalse(qwen36_has_vision(d))
+        self.assertFalse(qwen36_has_vision(None))
+
+    def test_qwen38_images_arrive_as_data_uri_bytes(self):
+        """A data: URI reaches the preprocessor as bytes. Image.open read them as a
+        file name and every image request died with "embedded null byte" (500):
+        the preprocessor's own test hands it a PIL image, so only the gateway path
+        broke. Found running Qwen3.8-27B with its tower (#1757)."""
+        try:
+            import base64, io, tempfile
+            import numpy
+            from PIL import Image
+        except ImportError as missing:
+            self.skipTest(f"needs Pillow and numpy ({missing})")
+        from openai_server import expand_qwen38_images
+        buffer = io.BytesIO()
+        Image.fromarray((numpy.arange(64 * 96 * 3) % 251).astype("uint8").reshape(64, 96, 3)).save(buffer, "PNG")
+        uri = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "preprocessor_config.json").write_text(json.dumps(
+                {"patch_size": 16, "merge_size": 2, "temporal_patch_size": 2}), encoding="utf-8")
+            messages, images = expand_qwen38_images(
+                [{"role": "user", "content": [{"type": "text", "text": "what is this?"},
+                                              {"type": "image_url", "image_url": {"url": uri}}]}], d)
+        self.assertEqual(len(images), 1)
+        patches, grid_h, grid_w = images[0]
+        self.assertEqual(patches.shape[0], grid_h * grid_w)
+        self.assertIn("what is this?", messages[0]["content"])
+
+    def test_an_image_url_that_is_not_an_object_is_a_client_error(self):
+        """{"type": "image_url", "image_url": "data:..."} (or a number) made the image
+        expanders call .get("url") on a string, an AttributeError that do_POST answered
+        with 500 on GLM-5.3, Qwen3.8 and DeepSeek V4.1. It is the client's error: 400."""
+        from openai_server import expand_dsv41_images, expand_glm53_images, expand_qwen38_images
+        for expand in (expand_glm53_images, expand_qwen38_images, expand_dsv41_images):
+            for value in ("data:image/png;base64,AAAA", 5, ["x"]):
+                with self.subTest(expand=expand.__name__, value=value):
+                    with self.assertRaises(APIError) as caught:
+                        expand([{"role": "user", "content": [
+                            {"type": "text", "text": "what is this?"},
+                            {"type": "image_url", "image_url": value}]}], None)
+                    self.assertEqual(caught.exception.status, 400)
+                    self.assertIn("`image_url` must be an object", str(caught.exception))
+
+    def test_qwen38_template_on_the_qwen36_engine(self):
+        """#1757: Qwen3.8-27B is a dense model of Qwen3.5's architecture, so the qwen36
+        engine runs it, but it ships Qwen3.8's chat_template.jinja. The gateway renders
+        the template the checkpoint carries, not its engine family's."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            template = Path(d) / "chat_template.jinja"
+            template.write_text("{%- set resolved_reasoning_effort = "
+                                "reasoning_effort|default('xhigh') %}", encoding="utf-8")
+            self.assertEqual(detect_chat_flavor("qwen36", d), "qwen38")
+            self.assertIsNone(detect_chat_flavor("glm53", d))
+            template.write_text("{%- if enable_thinking is defined %}", encoding="utf-8")
+            self.assertIsNone(detect_chat_flavor("qwen36", d))
+            template.unlink()
+            self.assertIsNone(detect_chat_flavor("qwen36", d))
+        history = [{"role": "user", "content": "Capital of France?"}]
+        with patch("openai_server.ARCH", "qwen36"), patch("openai_server.CHAT_FLAVOR", "qwen38"):
+            for thinking in (True, False):
+                self.assertEqual(render_chat_for_arch(history, thinking, "xhigh"),
+                                 render_chat_qwen38(history, thinking, "xhigh"))
+        with patch("openai_server.ARCH", "qwen36"):
+            self.assertNotEqual(render_chat_for_arch(history, True, "xhigh"),
+                                render_chat_qwen38(history, True, "xhigh"))
 
     def test_kimi_renders_tool_declaration_and_choice(self):
         tools = [{"type": "function", "function": {
@@ -1527,6 +1642,49 @@ class BaseWireContractTest(unittest.TestCase):
         self.assertEqual(frames, [b"SUBMIT 1 0 11 4 0 0.9\nComplete me\n"])
 
 
+class OpenAIHonestySetTest(unittest.TestCase):
+    def test_refuses_unsupported_result_shaping_fields(self):
+        cases = (
+            ({"best_of": 2}, "best_of", "unsupported_value"),
+            ({"logit_bias": {"42": 100}}, "logit_bias", "unsupported_value"),
+            ({"suffix": " after"}, "suffix", "unsupported_parameter"),
+            ({"modalities": ["audio"]}, "modalities", "unsupported_value"),
+        )
+        for fields, param, code in cases:
+            with self.subTest(param=param), self.assertRaises(APIError) as caught:
+                generation_options(fields, 16)
+            self.assertEqual(caught.exception.status, 400)
+            self.assertEqual(caught.exception.param, param)
+            self.assertEqual(caught.exception.code, code)
+            self.assertIn(f"`{param}`", caught.exception.message)
+
+    def test_accepts_noop_values(self):
+        generation_options({"best_of": 1, "logit_bias": {}, "suffix": None,
+                            "modalities": ["text"]}, 16)
+
+    def test_intentionally_ignored_fields_return_200_and_do_not_reach_engine(self):
+        base = {"model": "test-model", "prompt": "Complete me",
+                "temperature": 0, "max_tokens": 4}
+        ignored = {
+            "store": True,
+            "metadata": {"trace": "request-1"},
+            "service_tier": "default",
+            "user": "user-1",
+            "safety_identifier": "safe-1",
+            "parallel_tool_calls": True,
+            "prompt_cache_key": "cache-1",
+            "verbosity": "low",
+            "web_search_options": {},
+            "moderation": True,
+            "stream_options": {"include_obfuscation": True},
+        }
+        status_plain, _, frames_plain = _capture_frames(base)
+        status_ignored, _, frames_ignored = _capture_frames({**base, **ignored})
+        self.assertEqual(status_plain, 200)
+        self.assertEqual(status_ignored, 200)
+        self.assertEqual(frames_ignored, frames_plain)
+
+
 class SeedOptionTest(unittest.TestCase):
     """`generation_options()` accepts a `seed` field without raising."""
 
@@ -2099,6 +2257,44 @@ class HTTPTest(unittest.TestCase):
         self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 400)
 
+    def test_qwen36_preserve_thinking_defaults_to_the_fed_history(self):
+        """#1759: with thinking off the past turn keeps the empty block it was generated
+        after, so a standard client's resent history matches the engine's state. With
+        thinking on the template default stays: a standard client does not send the
+        reasoning back, and an empty block would claim the model did not think. The
+        request key overrides either way."""
+        history = [{"role": "user", "content": "Capital of France?"},
+                   {"role": "assistant", "content": "Paris."},
+                   {"role": "user", "content": "And of Italy?"}]
+        kept = "<|im_start|>assistant\n<think>\n\n</think>\n\nParis.<|im_end|>"
+        bare = "<|im_start|>assistant\nParis.<|im_end|>"
+        cases = (({}, kept), ({"enable_thinking": True}, bare),
+                 ({"preserve_thinking": False}, bare),
+                 ({"enable_thinking": True, "preserve_thinking": True},
+                  "<|im_start|>assistant\n<think>\n\n</think>\n\nParis.<|im_end|>"))
+        with patch("openai_server.ARCH", "qwen36"):
+            for extra, expected in cases:
+                with self.subTest(extra=extra):
+                    with self.request("/v1/chat/completions", {
+                            "model": "test-model", "messages": history, **extra}) as response:
+                        self.assertEqual(response.status, 200)
+                    self.assertIn(expected, self.engine.calls[-1][0])
+            with self.assertRaises(HTTPError) as caught:
+                self.request("/v1/chat/completions", {
+                    "model": "test-model", "messages": history, "preserve_thinking": "yes"})
+            self.addCleanup(caught.exception.close)
+            self.assertEqual(caught.exception.code, 400)
+
+    def test_qwen38_template_defaults_to_xhigh_thinking_on_the_qwen36_engine(self):
+        """What the flavor changes over the wire: with no thinking field, a Qwen3.8
+        template reasons at xhigh by default, as the qwen38 family does."""
+        history = [{"role": "user", "content": "Capital of France?"}]
+        with patch("openai_server.ARCH", "qwen36"), patch("openai_server.CHAT_FLAVOR", "qwen38"):
+            with self.request("/v1/chat/completions", {
+                    "model": "test-model", "messages": history}) as response:
+                self.assertEqual(response.status, 200)
+        self.assertEqual(self.engine.calls[-1][0], render_chat_qwen38(history, True, "xhigh"))
+
     def test_a_well_formed_forced_tool_choice_still_runs(self):
         """The read above must not change the shape clients actually send."""
         with self.request("/v1/chat/completions", {
@@ -2177,6 +2373,70 @@ class HTTPTest(unittest.TestCase):
             self.assertEqual(response.status, 200)
             self.assertEqual(json.load(response)["object"], "chat.completion")
 
+    def test_a_past_tool_call_whose_function_is_not_an_object_is_a_client_error(self):
+        """A replayed tool call with `function: "search"` answered HTTP 500.
+
+        The fallback, Kimi and Qwen3.8 renderers already answer 400. GLM, GLM-5.3
+        and DeepSeek V4/V4.1 called .get() on the value, and the AttributeError
+        became do_POST's 500 "The colibri engine failed to process the request."
+        """
+        def history(function):
+            return {"model": "test-model", "messages": [
+                {"role": "user", "content": "run it"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "x", "type": "function", "function": function}]},
+                {"role": "tool", "tool_call_id": "x", "content": "done"},
+                {"role": "user", "content": "and now?"},
+            ]}
+        cases = [("search", "messages.1.tool_calls.0.function"),
+                 (["search"], "messages.1.tool_calls.0.function"),
+                 (5, "messages.1.tool_calls.0.function"),
+                 (None, "messages.1.tool_calls.0.function"),
+                 ({"name": 5, "arguments": "{}"}, "messages.1.tool_calls.0.function.name")]
+        for arch in ("glm", "glm53", "deepseek_v4", "deepseek_v41"):
+            for function, param in cases:
+                with self.subTest(arch=arch, function=function):
+                    with patch("openai_server.ARCH", arch):
+                        with self.assertRaises(HTTPError) as caught:
+                            self.request("/v1/chat/completions", history(function))
+                    self.addCleanup(caught.exception.close)
+                    self.assertEqual(caught.exception.code, 400)
+                    self.assertEqual(json.loads(caught.exception.read())["error"]["param"], param)
+            with self.subTest(arch=arch, function="well formed"):
+                with patch("openai_server.ARCH", arch):
+                    with self.request("/v1/chat/completions",
+                                      history({"name": "fn", "arguments": "{}"})) as response:
+                        self.assertEqual(response.status, 200)
+
+
+    def test_a_text_part_whose_text_is_not_a_string_is_a_client_error(self):
+        """{"type": "text", "text": 5} answered HTTP 500 on GLM-5.3, Qwen3.8 and V4.1.
+
+        The other renderers read content through content_text(), which already
+        answers 400. The image expanders of these three, and the GLM-5.3
+        renderer, join the text parts themselves, and "".join raised TypeError,
+        which do_POST turns into its catch-all 500.
+        """
+        def request(text):
+            return {"model": "test-model",
+                    "messages": [{"role": "user", "content": [
+                        {"type": "text", "text": "look at "},
+                        {"type": "text", "text": text}]}]}
+        for arch in ("glm53", "qwen38", "deepseek_v41"):
+            for text in (5, None, ["hi"], {"value": "hi"}):
+                with self.subTest(arch=arch, text=text):
+                    with patch("openai_server.ARCH", arch):
+                        with self.assertRaises(HTTPError) as caught:
+                            self.request("/v1/chat/completions", request(text))
+                    self.addCleanup(caught.exception.close)
+                    self.assertEqual(caught.exception.code, 400)
+                    self.assertEqual(json.loads(caught.exception.read())["error"]["param"],
+                                     "messages.0.content.1.text")
+            with self.subTest(arch=arch, text="well formed"):
+                with patch("openai_server.ARCH", arch):
+                    with self.request("/v1/chat/completions", request("this")) as response:
+                        self.assertEqual(response.status, 200)
+                self.assertIn("look at this", self.engine.calls[-1][0])
 
 class ClientHangupTest(unittest.TestCase):
     """A client that disconnects mid-response must not print a traceback.

@@ -75,6 +75,18 @@ sequences. The extension
 `enable_thinking: true` enables GLM-5.2's reasoning block; the standard
 `reasoning_effort` field also enables it unless set to `none`.
 
+On Qwen3.6 the extension `preserve_thinking` is the official template's kwarg of
+the same name: past assistant turns keep their `<think>` block, with the
+`reasoning_content` the client sends back, empty when it sends none. It
+defaults to `true` when thinking is off and to `false` when it is on. With
+thinking off, the empty block is the one each past turn was generated after,
+so a client that resends only `content` sends the history the engine already
+holds and the KV prefix is reused instead of prefilled again (#1759). With
+thinking on a standard client drops the reasoning, the history cannot match
+either way, and the template's default applies; a client that sends
+`reasoning_content` back can set `preserve_thinking: true` to get the reuse
+too. Both values render byte for byte like the official `chat_template.jinja`.
+
 The server serves one generation at a time: the model stays in one persistent
 process, so concurrent HTTP requests queue instead of loading duplicate model
 copies. Tool calling depends on the active engine; see the support matrix below.
@@ -83,6 +95,15 @@ than being silently ignored. `seed` is accepted and ignored (see below).
 Audio is accepted only by Inkling checkpoints with
 audio support. The default bind address is localhost; set `COLI_API_KEY` before
 exposing the server beyond the machine.
+
+The hosted-platform bookkeeping fields `store`, `metadata`, `service_tier`,
+`user`, `safety_identifier`, `parallel_tool_calls`, `prompt_cache_key`,
+`verbosity`, `web_search_options`, `moderation`, and
+`stream_options.include_obfuscation` are accepted and intentionally ignored:
+they have no local equivalent and do not affect generation. Unsupported
+result-shaping requests are refused explicitly: `best_of` values above 1, a
+non-empty `logit_bias`, `suffix` infill, and audio output requested through
+`modalities`.
 
 ### `seed`
 

@@ -763,6 +763,71 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
             "mode": "deep" if deep else "standard", "checks": checks, "plan": plan}
 
 
+def run_image_doctor(model, engine_path, available_memory=None):
+    """doctor for a text-to-image pipeline: the checks that apply to it.
+
+    There is no config.json, no expert cache and no KV state to place, so the
+    text checks would report failures that are not failures. What can be wrong
+    here is a missing component, a missing tokenizer, an engine that is not
+    built, or weights that do not fit in RAM even with the text encoder loaded
+    on demand."""
+    from image_engine import COMPONENTS, TOKENIZER_FILE, plan_image_model
+    model = Path(model).expanduser().resolve()
+    checks = []
+    readable = model.is_dir() and os.access(model, os.R_OK)
+    checks.append(_check("model.path", "pass" if readable else "fail",
+                         "model directory is readable" if readable else
+                         "model directory is missing or not readable", path=str(model)))
+    try:
+        resolved = resolve_model(model)
+        checks.append(_check("model.family", "pass",
+                             f"{resolved.descriptor.display_name} pipeline is registered",
+                             family_id=resolved.descriptor.id, model_type=resolved.model_type,
+                             descriptor=public_metadata(resolved.descriptor)))
+    except (FamilyConfigError, UnknownFamilyError) as error:
+        checks.append(_check("model.family", "fail", str(error)))
+    missing = [name for name in COMPONENTS if not (model / name).is_dir()]
+    checks.append(_check("model.components", "fail" if missing else "pass",
+                         "missing: " + ", ".join(f"{name}/" for name in missing) if missing
+                         else "text_encoder, transformer, vae, processor and scheduler present"))
+    tokenizer = model / TOKENIZER_FILE
+    checks.append(_check("model.tokenizer", "pass" if tokenizer.is_file() else "fail",
+                         f"{TOKENIZER_FILE} found" if tokenizer.is_file()
+                         else f"{TOKENIZER_FILE} is missing"))
+    engine = Path(engine_path)
+    engine_ok = engine.is_file() and (sys.platform == "win32" or os.access(engine, os.X_OK))
+    checks.append(_check("engine.binary", "pass" if engine_ok else "fail",
+                         "engine executable is ready" if engine_ok else "engine is not built",
+                         path=str(engine)))
+    available_memory = memory_available() if available_memory is None else available_memory
+    plan = None
+    try:
+        plan = plan_image_model(model, available_memory or None)
+        on_demand = plan["modes"]["text_encoder_on_demand"]
+        resident = plan["modes"]["resident"]
+        if not available_memory:
+            status, summary = "warn", "available RAM could not be measured"
+        elif resident.get("fits"):
+            status, summary = "pass", "all weights fit in RAM together"
+        elif on_demand.get("fits"):
+            status, summary = ("warn", "weights fit only with the text encoder loaded on demand")
+        else:
+            status, summary = "fail", "the weights do not fit in the available RAM"
+        checks.append(_check("memory.ram", status, summary, available_bytes=available_memory,
+                             resident_bytes=resident["peak_bytes"],
+                             on_demand_peak_bytes=on_demand["peak_bytes"]))
+        for warning in plan["warnings"]:
+            checks.append(_check("model.weights", "warn", warning))
+    except (OSError, ValueError, KeyError) as error:
+        checks.append(_check("model.weights", "fail", str(error)))
+    statuses = {item["status"] for item in checks}
+    status = "error" if "fail" in statuses else "warning" if "warn" in statuses else "ok"
+    # The image plan has its own shape; it rides in `image_plan` so a consumer
+    # of `plan` (the text placement report) never meets a document it cannot read.
+    return {"schema_version": 1, "status": status, "model": str(model), "mode": "standard",
+            "checks": checks, "plan": None, "image_plan": plan}
+
+
 def format_doctor(report):
     icons = {"pass": "ok", "warn": "warn", "fail": "fail", "skip": "skip"}
     # model is null in the JSON when none was given (#724); say that rather than "None"
@@ -771,6 +836,9 @@ def format_doctor(report):
         lines.append(f"[{icons[check['status']]:>4}] {check['id']:<18} {check['summary']}")
     if report["plan"]:
         lines.extend(["", format_plan(report["plan"])])
+    elif report.get("image_plan"):
+        from image_engine import format_image_plan
+        lines.extend(["", format_image_plan(report["image_plan"])])
     lines.extend(["", f"result {report['status']}"])
     return "\n".join(lines)
 
