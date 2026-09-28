@@ -2785,19 +2785,57 @@ def split_thinking_reply(text, enable_thinking=True, add_generation_prompt=True)
     return "".join(thinking), "".join(answer)
 
 
-def _anthropic_block_text(blocks, param):
-    """Text out of an Anthropic content array (tool_result content is the same shape)."""
+def _anthropic_image_part(block, where):
+    """An Anthropic `image` block as the OpenAI-shaped part expand_*_images() reads.
+
+    A base64 source becomes the same data: URI a client of /v1/chat/completions would
+    send, so both endpoints hand the expander one picture in one shape. A `url` source
+    is passed through as-is: the expander already refuses to fetch remote URLs, and
+    the Anthropic client must meet that refusal, not a second one."""
+    source = block.get("source")
+    if not isinstance(source, dict):
+        raise APIError(400, "`image` blocks require a `source` object.", f"{where}.source")
+    kind = source.get("type")
+    if kind == "base64":
+        media_type, data = source.get("media_type"), source.get("data")
+        if not isinstance(media_type, str) or not media_type:
+            raise APIError(400, "`image.source.media_type` is required for base64 sources.",
+                           f"{where}.source.media_type")
+        if not isinstance(data, str) or not data:
+            raise APIError(400, "`image.source.data` is required for base64 sources.",
+                           f"{where}.source.data")
+        return {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{data}"}}
+    if kind == "url":
+        url = source.get("url")
+        if not isinstance(url, str) or not url:
+            raise APIError(400, "`image.source.url` is required for url sources.",
+                           f"{where}.source.url")
+        return {"type": "image_url", "image_url": {"url": url}}
+    raise APIError(400, "`image.source.type` must be base64 or url.", f"{where}.source.type",
+                   "unsupported_content_type")
+
+
+def _anthropic_block_text(blocks, param, images=None):
+    """Text out of an Anthropic content array (tool_result content is the same shape).
+
+    With `images`, a list, `image` blocks are allowed and their OpenAI-shaped parts are
+    appended to it instead of raising: a tool_result can carry a picture (Claude Code's
+    Read on an image file does), and the caller decides which turn it rides on."""
     if isinstance(blocks, str):
         return blocks
     if not isinstance(blocks, list):
         raise APIError(400, "Content must be a string or an array of blocks.", param)
     parts = []
     for index, block in enumerate(blocks):
+        where = f"{param}.{index}"
+        if isinstance(block, dict) and block.get("type") == "image" and images is not None:
+            images.append(_anthropic_image_part(block, where))
+            continue
         if not isinstance(block, dict) or block.get("type") != "text":
             raise APIError(400, "Colibri currently supports text blocks only here.",
-                           f"{param}.{index}", "unsupported_content_type")
+                           where, "unsupported_content_type")
         if not isinstance(block.get("text"), str):
-            raise APIError(400, "Text blocks require a string `text` field.", f"{param}.{index}.text")
+            raise APIError(400, "Text blocks require a string `text` field.", f"{where}.text")
         parts.append(block["text"])
     return "".join(parts)
 
@@ -2834,7 +2872,10 @@ def anthropic_to_openai(body):
         if not isinstance(content, list):
             raise APIError(400, "Message content must be a string or an array of blocks.",
                            f"messages.{index}.content")
-        texts, reasoning, calls, results = [], [], [], []
+        # `parts` keeps the user's text and image blocks in the order the client put
+        # them; `carried` collects pictures found inside tool_result blocks, which
+        # ride the user turn that follows the tool turns (the tool role is text).
+        texts, parts, carried, reasoning, calls, results = [], [], [], [], [], []
         for j, block in enumerate(content):
             where = f"messages.{index}.content.{j}"
             if not isinstance(block, dict):
@@ -2844,6 +2885,12 @@ def anthropic_to_openai(body):
                 if not isinstance(block.get("text"), str):
                     raise APIError(400, "Text blocks require a string `text` field.", f"{where}.text")
                 texts.append(block["text"])
+                parts.append({"type": "text", "text": block["text"]})
+            elif kind == "image":
+                if role != "user":
+                    raise APIError(400, "`image` blocks are valid only in user messages.",
+                                   where, "unsupported_content_type")
+                parts.append(_anthropic_image_part(block, where))
             elif kind == "thinking":
                 if role != "assistant":
                     raise APIError(400, "`thinking` blocks are valid only in assistant messages.",
@@ -2869,13 +2916,19 @@ def anthropic_to_openai(body):
                               "function": {"name": name,
                                            "arguments": json.dumps(arguments, ensure_ascii=False)}})
             elif kind == "tool_result":
+                pictures = []
                 results.append({"role": "tool",
                                 "tool_call_id": block.get("tool_use_id") or "",
                                 "content": _anthropic_block_text(block.get("content", ""),
-                                                                 f"{where}.content")})
+                                                                 f"{where}.content", pictures)})
+                if pictures and role != "user":
+                    raise APIError(400, "`image` blocks are valid only in user messages.",
+                                   where, "unsupported_content_type")
+                carried.extend(pictures)
             else:
-                raise APIError(400, "Colibri supports `text`, `tool_use` and `tool_result` "
-                               "content blocks only.", f"{where}.type", "unsupported_content_type")
+                raise APIError(400, "Colibri supports `text`, `image`, `tool_use` and "
+                               "`tool_result` content blocks only.", f"{where}.type",
+                               "unsupported_content_type")
         # tool results precede the user's own text: they answer the previous assistant turn
         messages.extend(results)
         text = "".join(texts)
@@ -2887,6 +2940,11 @@ def anthropic_to_openai(body):
                 if calls:
                     entry["tool_calls"] = calls
                 messages.append(entry)
+        elif carried or any(part["type"] != "text" for part in parts):
+            # A picture is in this turn: the content stays a parts list, which is
+            # what expand_*_images() reads. Pictures out of tool results come first,
+            # right after the tool turns that produced them.
+            messages.append({"role": "user", "content": carried + parts})
         elif text or not results:
             messages.append({"role": "user", "content": text})
     return messages
@@ -5509,40 +5567,7 @@ class APIHandler(BaseHTTPRequestHandler):
         tools = body.get("tools") or body.get("functions") or None
         tool_choice = body.get("tool_choice")
         audio_clips = [] if ARCH == "inkling" else None
-        messages = body.get("messages")
-        # Le immagini diventano segnaposto PRIMA del rendering: il renderer
-        # tratta poi turni di solo testo, e il conto dei segnaposto e quello
-        # degli embedding non possono divergere.
-        image = None
-        if ARCH == "glm53":
-            messages, images = expand_glm53_images(
-                messages, getattr(self.server.engine, "model_dir", None))
-            if len(images) > 1:
-                raise APIError(400, "one image per request for now; the engine "
-                                    "holds a single pending image.", "messages")
-            image = images[0] if images else None
-        elif ARCH == "deepseek_v41":
-            ceiling = os.environ.get("V41_MAX_IMAGE_TOKENS")
-            messages, images = expand_dsv41_images(
-                messages, getattr(self.server.engine, "model_dir", None),
-                int(ceiling) if ceiling else None)
-            if len(images) > 1:
-                raise APIError(400, "one image per request for now; the engine "
-                                    "holds a single pending image.", "messages")
-            image = images[0] if images else None
-        elif ARCH == "qwen38" or (ARCH == "qwen36" and qwen36_has_vision(
-                getattr(self.server.engine, "model_dir", None))):
-            # Qwen3.5/3.6/3.8 share the tower and the preprocessor, so qwen36
-            # checkpoints converted with their tower take the same path (#1757).
-            ceiling = os.environ.get("Q38_MAX_IMAGE_TOKENS" if ARCH == "qwen38"
-                                     else "Q36_MAX_IMAGE_TOKENS")
-            messages, images = expand_qwen38_images(
-                messages, getattr(self.server.engine, "model_dir", None),
-                int(ceiling) if ceiling else None)
-            if len(images) > 1:
-                raise APIError(400, "one image per request for now; the engine "
-                                    "holds a single pending image.", "messages")
-            image = images[0] if images else None
+        messages, image = self.expand_images(body.get("messages"))
         add_generation_prompt = resolve_generation_prompt(messages, body)
         prompt = render_chat_for_arch(messages, enable_thinking, reasoning_effort,
                                       tools, tool_choice, audio_out=audio_clips,
@@ -5554,6 +5579,34 @@ class APIHandler(BaseHTTPRequestHandler):
                         audio=b"".join(audio_clips) if audio_clips else None,
                         image=image)
 
+    def expand_images(self, messages):
+        """(messages with placeholders, the one image or None) for this engine's family.
+
+        Le immagini diventano segnaposto PRIMA del rendering: il renderer tratta
+        poi turni di solo testo, e il conto dei segnaposto e quello degli
+        embedding non possono divergere. Both chat endpoints come through here,
+        so a picture is one thing whichever API delivered it."""
+        model_dir = getattr(self.server.engine, "model_dir", None)
+        if ARCH == "glm53":
+            messages, images = expand_glm53_images(messages, model_dir)
+        elif ARCH == "deepseek_v41":
+            ceiling = os.environ.get("V41_MAX_IMAGE_TOKENS")
+            messages, images = expand_dsv41_images(messages, model_dir,
+                                                   int(ceiling) if ceiling else None)
+        elif ARCH == "qwen38" or (ARCH == "qwen36" and qwen36_has_vision(model_dir)):
+            # Qwen3.5/3.6/3.8 share the tower and the preprocessor, so qwen36
+            # checkpoints converted with their tower take the same path (#1757).
+            ceiling = os.environ.get("Q38_MAX_IMAGE_TOKENS" if ARCH == "qwen38"
+                                     else "Q36_MAX_IMAGE_TOKENS")
+            messages, images = expand_qwen38_images(messages, model_dir,
+                                                    int(ceiling) if ceiling else None)
+        else:
+            return messages, None
+        if len(images) > 1:
+            raise APIError(400, "one image per request for now; the engine "
+                                "holds a single pending image.", "messages")
+        return messages, images[0] if images else None
+
     # ---- Anthropic /v1/messages (#343) ----------------------------------------------------
     ANTHROPIC_STOP = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
 
@@ -5563,7 +5616,7 @@ class APIHandler(BaseHTTPRequestHandler):
             if body.get(unsupported) not in (None, [], ""):
                 raise APIError(400, f"Colibri does not support `{unsupported}` ({why}) yet.",
                                unsupported, "unsupported_value")
-        messages = anthropic_to_openai(body)
+        messages, image = self.expand_images(anthropic_to_openai(body))
         tools, tool_choice = anthropic_tools(body)
         thinking = body.get("thinking")
         if thinking is not None and not isinstance(thinking, dict):
@@ -5596,10 +5649,10 @@ class APIHandler(BaseHTTPRequestHandler):
                                       add_generation_prompt=add_generation_prompt,
                                       preserve_thinking=not enable_thinking)
         self.anthropic_generation(translated, prompt, request_id, tools, enable_thinking,
-                                  add_generation_prompt)
+                                  add_generation_prompt, image)
 
     def anthropic_generation(self, body, prompt, request_id, tools, enable_thinking,
-                             add_generation_prompt=True):
+                             add_generation_prompt=True, image=None):
         maximum, temperature, top_p, grammar, _stop_sequences = generation_options(
             body, self.server.max_tokens)
         # Same policy as /v1/chat/completions: `body` is the translated OpenAI-shaped
@@ -5668,7 +5721,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 stats = self.server.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
                     self.client_disconnected, grammar=grammar, stopped=generation_stopped,
-                    **({"on_tool": sideband.feed} if sideband.enabled else {}))
+                    **({"on_tool": sideband.feed} if sideband.enabled else {}),
+                    **({"image": image} if image is not None else {}))
                 stop_filter.finish()
                 sideband.finish()
                 content, stop_reason = blocks_and_stop("".join(output), stats,
@@ -5812,7 +5866,8 @@ class APIHandler(BaseHTTPRequestHandler):
             stats = self.server.generate(
                 prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
                 lambda: not connected[0], grammar=grammar, stopped=generation_stopped,
-                **({"on_tool": sideband.feed} if sideband.enabled else {}))
+                **({"on_tool": sideband.feed} if sideband.enabled else {}),
+                **({"image": image} if image is not None else {}))
             stop_filter.finish()
             sideband.finish()
             if split:
