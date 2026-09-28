@@ -452,6 +452,92 @@ def main() -> int:
               f"  da sessione pulita: {clean!r}")
         return 1
 
+    # --- CANCEL durante il prefill ---
+    #
+    # Il CANCEL si guarda anche fra un pezzo di prefill e l'altro: prima un
+    # client che se ne andava a meta' di un prompt lungo lasciava il motore a
+    # macinarlo fino in fondo per nessuno. Il motore si ferma a un confine di
+    # pezzo, risponde CANCELLED senza DATA, e tiene quello che ha fatto: un
+    # nuovo tentativo dello stesso prompt ne e' un'estensione stretta e lo
+    # riusa, con la stessa risposta di una sessione pulita.
+    #
+    # Deterministico, non una corsa: il turno 29 mette in cache i primi 10
+    # token, e il CANCEL del turno 30 parte nella stessa scrittura del SUBMIT,
+    # quindi la guardata prima del primo pezzo lo trova gia' li'.
+    long_prompt = prompt + "abcdefghijklmnopqrstuvwxyz0123"
+    chunked = {"GLM53_PREFILL_CHUNK": "1"}
+    halted = engine(binary, arguments.fixture, chunked)
+    try:
+        handshake(halted)
+        submit(halted, 29, long_prompt[:10], max_tokens=1)
+        _, done29, _ = collect(halted, 29)
+        if not done29.startswith("DONE 29 "):
+            print(f"FAIL: turno che prepara la cache -> {done29!r}")
+            return 1
+        body = long_prompt.encode()
+        halted.stdin.write(f"SUBMIT 30 0 {len(body)} 4 0.0 1.0\n".encode() + body
+                           + b"\nCANCEL 30\n")
+        halted.stdin.flush()
+        prefill_data, done30, _ = collect(halted, 30)
+        if done30 != "ERROR 30 CANCELLED" or prefill_data:
+            print(f"FAIL: CANCEL durante il prefill -> {done30!r} con "
+                  f"{len(prefill_data)} byte di DATA, atteso ERROR 30 CANCELLED "
+                  f"senza DATA")
+            return 1
+        notes = open(NOTES, "r", errors="replace").read().splitlines()
+        halted_line = [line.split() for line in notes if line.startswith("CANCEL 30 ")]
+        if halted_line != [["CANCEL", "30", str(len(body)), "0", "10"]]:
+            print(f"FAIL: CANCEL durante il prefill doveva fermarsi ai 10 token "
+                  f"gia' in cache su {len(body)}: {halted_line!r}")
+            return 1
+        submit(halted, 31, long_prompt, max_tokens=4)
+        retried, done31, _ = collect(halted, 31)
+        if not done31.startswith("DONE 31 "):
+            print(f"FAIL: nuovo tentativo dopo il CANCEL -> {done31!r}")
+            return 1
+        if reuse_line(31)[2:4] != ["10", str(len(body))] or reuse_line(31)[-1] != "extend":
+            print(f"FAIL: il nuovo tentativo doveva riusare i 10 token del prefill "
+                  f"interrotto: {reuse_line(31)!r}")
+            return 1
+        halted.stdin.close()
+        halted.wait(timeout=60)
+    finally:
+        if halted.poll() is None:
+            halted.kill()
+    clean_engine = engine(binary, arguments.fixture, chunked)
+    try:
+        handshake(clean_engine)
+        # Lo stesso CANCEL su uno slot vuoto: si ferma prima di macinare
+        # qualsiasi cosa, e la storia che resta ha zero token. Il motore deve
+        # rispondere CANCELLED e poi servire il turno dopo da freddo.
+        clean_engine.stdin.write(f"SUBMIT 33 0 {len(body)} 4 0.0 1.0\n".encode()
+                                 + body + b"\nCANCEL 33\n")
+        clean_engine.stdin.flush()
+        _, done33, _ = collect(clean_engine, 33)
+        empty_line = [line.split() for line in
+                      open(NOTES, "r", errors="replace").read().splitlines()
+                      if line.startswith("CANCEL 33 ")]
+        if done33 != "ERROR 33 CANCELLED" or \
+                empty_line != [["CANCEL", "33", str(len(body)), "0", "0"]]:
+            print(f"FAIL: CANCEL prima del primo pezzo su uno slot vuoto -> "
+                  f"{done33!r}, {empty_line!r}")
+            return 1
+        submit(clean_engine, 32, long_prompt, max_tokens=4)
+        from_clean, done32, _ = collect(clean_engine, 32)
+        clean_engine.stdin.close()
+        clean_engine.wait(timeout=60)
+    finally:
+        if clean_engine.poll() is None:
+            clean_engine.kill()
+    if reuse_line(32)[-1:] != ["cold"]:
+        print(f"FAIL: dopo un CANCEL a zero token il turno doveva partire da "
+              f"freddo: {reuse_line(32)!r}")
+        return 1
+    if not done32.startswith("DONE 32 ") or retried != from_clean:
+        print(f"FAIL: dopo un prefill interrotto la risposta cambia\n"
+              f"  riusando: {retried!r}\n  da pulito: {from_clean!r} ({done32!r})")
+        return 1
+
     # La CLI stampa la risposta e poi un a capo; quello che conta e' che i byte
     # della risposta siano gli stessi.
     from_cli = cli_answer(binary, arguments.fixture, prompt, tokens)
@@ -466,6 +552,8 @@ def main() -> int:
           f"al secondo turno con la stessa risposta di una sessione pulita, "
           f"CANCEL onorato a meta' turno dopo {emitted_before} token su {budget}, "
           f"STOP chiuso col DONE dopo {emitted_stop} token su {stop_budget}, "
+          f"CANCEL durante il prefill fermo a 10 token su {len(body)} e riusato "
+          f"dal nuovo tentativo, "
           f"SUBMIT a slot occupato rifiutato con SLOT_BUSY, "
           f"{emitted_eof} token portati a termine con la pipa gia' chiusa")
     return 0

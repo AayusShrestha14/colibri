@@ -516,7 +516,7 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 	test_edge_adapters_registration test_edge_adapters_real \
 	test_xdna_execution test_xdna_failure \
 	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41 test_st_f16_bf16_simd_sse41 test_qwen38_tier_engine \
-	test_e8x4g64_loader \
+	test_e8x4g64_loader test_qwenimage_vae \
 	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
@@ -961,10 +961,10 @@ cuda-dsv4-dg-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h dsv4.def $(DEEPGEMM_S
 dsv4-cuda-loader-test: tests/test_dsv4_decode_cuda.c backend_loader_dsv4.c backend_cuda_dsv4.h
 	$(CC) $(CFLAGS) tests/test_dsv4_decode_cuda.c backend_loader_dsv4.c -o dsv4_decode_loader_test$(EXE)
 	./dsv4_decode_loader_test$(EXE)
-backend_metal.o: backend_metal.mm backend_metal.h
+backend_metal.o: backend_metal.mm backend_metal.h affine_quant.h
 	$(METALXX) -c backend_metal.mm -o $@
 
-metal-test: tests/test_backend_metal.mm backend_metal.mm backend_metal.h
+metal-test: tests/test_backend_metal.mm backend_metal.mm backend_metal.h affine_quant.h
 	$(METALXX) tests/test_backend_metal.mm backend_metal.mm -framework Metal -framework Foundation -o backend_metal_test
 	./backend_metal_test
 
@@ -991,9 +991,18 @@ glm53-metal-check: backend_metal.o tests/test_glm53_clamped_metal.c tests/test_g
 
 # Standalone large-batch GEMM correctness sweep — reproduces the long-context prefill
 # corruption in seconds (no model). OMP-parallel CPU reference.
-gemm-test: tests/test_gemm_largebatch.mm backend_metal.mm backend_metal.h
+gemm-test: tests/test_gemm_largebatch.mm backend_metal.mm backend_metal.h affine_quant.h
 	$(METALXX) $(OMPC) tests/test_gemm_largebatch.mm backend_metal.mm $(OMPL) -framework Metal -framework Foundation -o gemm_largebatch_test
 	./gemm_largebatch_test
+
+# Apple gate: qwen36 routed experts through the MLX affine path, Metal vs
+# the CPU reference -- one-layer MoE parity plus end-to-end logit parity on
+# the tiny hybrid stack. Needs QWEN36_QPACK_FIXTURE=<dir> pointing at a real
+# swiftlet-repack output of tiny-model-q4; without it the binary skips with a
+# distinct marker instead of pretending to pass.
+qwen36-metal-test: tests/test_qwen36_qpack_metal.c qwen36.c qwen36_qpack.c qwen36_qpack.h qpack.c qpack.h affine_quant.h qwen36_tier.h st.h json.h compat.h backend_metal.o
+	$(CC) $(CFLAGS) -DCOLI_METAL -DQWEN36_QPACK tests/test_qwen36_qpack_metal.c qwen36_qpack.c qpack.c backend_metal.o -o qwen36_qpack_metal_test -framework Metal -framework Foundation -lc++ $(LDFLAGS)
+	./qwen36_qpack_metal_test
 
 # fmt=6 (E8/IQ3) encoder for tools/convert_fp8_to_int4.py. OPTIONAL: iq3_pack.py
 # falls back to its numpy path when the library is absent, producing the same
@@ -1193,10 +1202,32 @@ ifneq ($(EXE),)
 .PHONY: qwen36
 qwen36: qwen36$(EXE)
 endif
+# Apple METAL=1 engine builds also compile the qpack MLX-affine routed-
+# expert path (activated at runtime by QWEN36_QPACK=<container dir>); other
+# builds keep the inline stubs in qwen36_qpack.h and change nothing.
+QWEN36_QPACK_SRC =
+ifeq ($(METAL),1)
+QWEN36_QPACK_SRC = qwen36_qpack.c qpack.c
+QWEN36_CFLAGS  += -DQWEN36_QPACK
+endif
 # Rebuild when CUDA_DLL changes; otherwise an existing CPU-only executable can
 # be reported as up to date despite selecting the Windows CUDA DLL tier.
-qwen36$(EXE): qwen36.c qwen38_vision.h sse41_kernels.h decode_batch.h serve_poll.h cli_args.h qwen36_tier.h expert_ffn.h idot.h st.h json.h compat.h omp_tune.h kv_prefix.h pin_pool.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h gsgemv.h qgemv.h $(QWEN36_TIER_SRC) $(CUDA_OBJ) .build-config
-	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
+qwen36$(EXE): qwen36.c affine_quant.h backend_metal.h qwen36_qpack.h qwen38_vision.h sse41_kernels.h decode_batch.h serve_poll.h cli_args.h qwen36_tier.h expert_ffn.h idot.h st.h json.h compat.h omp_tune.h kv_prefix.h pin_pool.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h gsgemv.h qgemv.h $(QWEN36_TIER_SRC) $(QWEN36_QPACK_SRC) $(CUDA_OBJ) $(METAL_OBJ) .build-config
+	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_SRC) $(QWEN36_QPACK_SRC) $(CUDA_OBJ) $(METAL_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
+
+# Qwen-Image-2.1 text-to-image (docs/qwen-image.md). It reads the diffusers
+# checkpoint as it is: no conversion step. qi_gemm.h is its one matrix kernel.
+ifneq ($(EXE),)
+.PHONY: qwenimage
+qwenimage: qwenimage$(EXE)
+endif
+qwenimage$(EXE): qwenimage.c qi_gemm.h qwenimage_vae.h qwenimage_preview.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h tok_unicode_deepseek.h qwen38_nfc.h qwen38_nfc_tables.h serve_poll.h compat.h .build-config
+	$(CC) $(CFLAGS) qwenimage.c -o qwenimage$(EXE) $(LDFLAGS)
+
+# In make check: every format and ragged edges against the naive product, and
+# the int8 x int8 VNNI path against the exact integer sum.
+tests/test_qi_gemm$(EXE): tests/test_qi_gemm.c qi_gemm.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # DeepSeek V4.1 Flash: one file, like every other portable engine. The fp4 experts
 # stream from the official checkpoint and quant.h's mxfp4 kernel reads them as they
@@ -1274,7 +1305,22 @@ tests/test_qwen36_cache_route$(EXE): tests/test_qwen36_cache_route.c gsgemv.h qg
 tests/test_qwen36_dense_batch$(EXE): tests/test_qwen36_dense_batch.c gsgemv.h qgemv.h sse41_kernels.h qwen36.c qwen38_vision.h expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
+# CPU gate: the qpack MLX-affine routed-expert glue (qwen36_qpack.c)
+# against the portable affine reference, on a synthesized container -- no
+# GPU, every platform. The Apple parity twin (Metal vs CPU reference on a
+# real Swiftlet-generated fixture) is the qwen36-metal-test target.
+tests/test_qwen36_qpack$(EXE): tests/test_qwen36_qpack.c qwen36.c gsgemv.h qgemv.h sse41_kernels.h qwen38_vision.h expert_ffn.h qwen36_qpack.c qwen36_qpack.h qpack.c qpack.h affine_quant.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(METAL_OBJ)
+	$(CC) $(QWEN36_CFLAGS) -DQWEN36_QPACK $< qwen36_qpack.c qpack.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(METAL_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
 tests/test_qwen36_json_escape$(EXE): tests/test_qwen36_json_escape.c gsgemv.h qgemv.h sse41_kernels.h qwen36.c qwen38_vision.h expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+# Dense-bridge gate: qwen36's loader against an MLX affine
+# model.safetensors (the dense half of a Swiftlet qpack container) --
+# `language_model.` name resolution, U32 triple indexing, checked Q4/Q8
+# expansion, refusals.  With argv it doubles as the round-trip harness for
+# tests/test_make_qwen36_qpack_snap.py.
+tests/test_qwen36_dense_affine$(EXE): tests/test_qwen36_dense_affine.c qwen36.c affine_quant.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 # Both tokenizer.json merge spellings ("a b" strings and ["a","b"] pairs)
@@ -1353,6 +1399,9 @@ portable:
 iobench$(EXE): iobench.c compat.h
 	$(CC) $(CFLAGS) iobench.c -o iobench$(EXE) $(LDFLAGS)
 
+qpack-inspect$(EXE): qpack_inspect.c qpack.c qpack.h affine_quant.h json.h compat.h
+	$(CC) $(CFLAGS) qpack_inspect.c qpack.c -o qpack-inspect$(EXE) $(LDFLAGS)
+
 tests/test_serve_sentinel$(EXE): tests/test_serve_sentinel.c compat.h serve_codec.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -1364,8 +1413,8 @@ tests/test_ue8m0$(EXE): tests/test_ue8m0.c st.h json.h compat.h
 
 # Compiles the engine with -DCOLI_XDNA so the QT side pointer, its reset helper
 # and the expert-slot wiring are exercised as the engine actually builds them.
-tests/test_xdna_qt_state$(EXE): tests/test_xdna_qt_state.c colibri.c backend_xdna.c backend_xdna.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) -DCOLI_XDNA $< backend_xdna.c -o $@ $(LDFLAGS)
+tests/test_xdna_qt_state$(EXE): tests/test_xdna_qt_state.c colibri.c backend_xdna.c backend_xdna.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_XDNA $< backend_xdna.c $(VK_OBJ) -o $@ $(LDFLAGS)
 tests/test_xdna_prepared_state$(EXE): tests/test_xdna_prepared_state.c backend_xdna.c backend_xdna.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -1391,8 +1440,8 @@ tests/test_xdna_execution$(EXE): tests/test_xdna_execution.c backend_xdna.c back
 # Failure/fallback owner. Needs BOTH the engine (matmul_qt is the fallback
 # target it verifies against) and the synthetic ABI-2 helpers, which is why it
 # is a separate owner from test_xdna_execution.
-tests/test_xdna_failure$(EXE): tests/test_xdna_failure.c colibri.c backend_xdna.c backend_xdna.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(XDNA_FAKE_HELPERS)
-	$(CC) $(CFLAGS) -DCOLI_XDNA $< backend_xdna.c -o $@ $(LDFLAGS)
+tests/test_xdna_failure$(EXE): tests/test_xdna_failure.c colibri.c backend_xdna.c backend_xdna.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(XDNA_FAKE_HELPERS) $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_XDNA $< backend_xdna.c $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # NOT a test gate -- intentionally absent from TEST_BINS (its name does not match
 # the tests/test_*$(EXE) pattern the gate list is derived from). It needs a real
@@ -1403,8 +1452,8 @@ tests/test_xdna_failure$(EXE): tests/test_xdna_failure.c colibri.c backend_xdna.
 #
 # M-list defaults to 1,32,64 (the M64 bucket); pass 65,130,256 to qualify
 # the M256 bucket through the same owner.
-tests/xdna_physical_probe$(EXE): tests/xdna_physical_probe.c colibri.c backend_xdna.c backend_xdna.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) -DCOLI_XDNA $< backend_xdna.c -o $@ $(LDFLAGS)
+tests/xdna_physical_probe$(EXE): tests/xdna_physical_probe.c colibri.c backend_xdna.c backend_xdna.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_XDNA $< backend_xdna.c $(VK_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_json$(EXE): tests/test_json.c json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -1458,6 +1507,15 @@ tests/test_qwen38_vision$(EXE): tests/test_qwen38_vision.c qwen38_vision.h st.h 
 qwen38-vision-check: tests/test_qwen38_vision$(EXE)
 	$(PYTHON) tools/make_qwen38_vision_tiny.py --out ./qwen38_vision_tiny
 	./tests/test_qwen38_vision$(EXE) ./qwen38_vision_tiny
+
+# Qwen-Image-2.1 VAE decoder against diffusers. The fixture needs torch and
+# diffusers (tools/make_qwenimage_vae_tiny.py OUTDIR, about 6 MB); the test itself
+# is plain C: make test_qwenimage_vae && tests/test_qwenimage_vae OUTDIR
+tests/test_qwenimage_vae$(EXE): tests/test_qwenimage_vae.c qwenimage_vae.h qi_gemm.h st.h json.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+.PHONY: test_qwenimage_vae
+test_qwenimage_vae: tests/test_qwenimage_vae$(EXE)
 
 # Il percorso completo: frame IMAGE, torre, sostituzione degli embedding,
 # generazione. Prova che due immagini diverse danno risposte diverse, che e'
@@ -1555,14 +1613,14 @@ tests/test_grammar_cache$(EXE): tests/test_grammar_cache.c sse41_kernels.h colib
 # agreement check against the plain logprob_target the sampling path uses
 # on rows a float subtraction cannot mis-round, and a double-precision
 # check against a second double computation on rows that do.
-tests/test_logprob_status$(EXE): tests/test_logprob_status.c colibri.c sse41_kernels.h exact_dot.h oracle.h sample.h evidence_digest.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_logprob_status$(EXE): tests/test_logprob_status.c colibri.c sse41_kernels.h exact_dot.h oracle.h sample.h evidence_digest.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # The ablation mode's manifest loader, evidence writer and dispatch contract.
 # The adapter build bypasses only the model computation, so the parser/writer
 # path is exercised for real with no model and no weights.
-tests/test_ablate_mode$(EXE): tests/test_ablate_mode.c colibri.c sse41_kernels.h exact_dot.h oracle.h sample.h evidence_digest.h abl.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_ablate_mode$(EXE): tests/test_ablate_mode.c colibri.c sse41_kernels.h exact_dot.h oracle.h sample.h evidence_digest.h abl.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # Standalone: drives a faithful miniature of moe()'s routing+accumulate and links
 # the SAME abl.h the engine links -- no model/weights needed (the ablation-logic gate).
@@ -1663,8 +1721,8 @@ tests/test_topp$(EXE): tests/test_topp.c sse41_kernels.h colibri.c oracle.h st.h
 
 # bench_topp is a microbenchmark (old qsort vs new heap partial-select, #335), NOT a test
 # gate -- intentionally absent from TEST_BINS. Build on demand: make tests/bench_topp
-tests/bench_topp$(EXE): tests/bench_topp.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/bench_topp$(EXE): tests/bench_topp.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_sample_nan$(EXE): tests/test_sample_nan.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
@@ -1761,6 +1819,19 @@ tests/test_expert_store_ops$(EXE): tests/test_expert_store_ops.c expert_store.h 
 
 tests/test_native_quant$(EXE): tests/test_native_quant.c sse41_kernels.h deepseek_v4.c native_quant.h tensor.h quant.h fp8_format.h idot.h
 	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_NATIVE_QUANT deepseek_v4.c $< -o $@ $(LDFLAGS)
+
+# Portable MLX affine Q4/Q8 format contract and CPU oracle.  This stays
+# separate from QT fmt=4, whose signed-int4 scale-only layout is incompatible.
+tests/test_affine_quant$(EXE): tests/test_affine_quant.c affine_quant.h backend_metal.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_qpack$(EXE): tests/test_qpack.c qpack.c qpack.h affine_quant.h json.h compat.h
+	$(CC) $(CFLAGS) tests/test_qpack.c qpack.c -o $@ $(LDFLAGS)
+
+# Loader-side expansion oracle for the same MLX affine contract: nibble/byte
+# order, scalar decodings, parity against coli_affine_matmul_ref, refusals.
+tests/test_affine_dequant$(EXE): tests/test_affine_dequant.c affine_quant.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_edge_runtime$(EXE): tests/test_edge_runtime.c edge_runtime.c edge_runtime.h
 	$(CC) $(CFLAGS) tests/test_edge_runtime.c edge_runtime.c -o $@ $(LDFLAGS)
@@ -2183,13 +2254,13 @@ tests/test_ssd_probe$(EXE): tests/test_ssd_probe.c sse41_kernels.h colibri.c ora
 
 # bench_dsa_select is a microbenchmark (old qsort vs new quickselect partial-select, #356),
 # NOT a test gate -- intentionally absent from TEST_BINS. Build on demand: make tests/bench_dsa_select
-tests/bench_dsa_select$(EXE): tests/bench_dsa_select.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/bench_dsa_select$(EXE): tests/bench_dsa_select.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # bench_router_select is a microbenchmark (duplicate-prefix scan vs marked-score scan),
 # not a test gate. Build on demand: make tests/bench_router_select.
-tests/bench_router_select$(EXE): tests/bench_router_select.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/bench_router_select$(EXE): tests/bench_router_select.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # bench_indexer_allocations: microbenchmark (DeepSeek V4 indexer malloc vs persistent arena scratch), NOT a test gate.
 # Build on demand: make tests/bench_indexer_allocations
@@ -2198,24 +2269,24 @@ tests/bench_indexer_allocations$(EXE): tests/bench_indexer_allocations.c
 
 # bench_idot: microbenchmark (single-acc vs independent-acc AVX-VNNI idot), NOT a test gate.
 # Build on demand on an AVX-VNNI CPU: make tests/bench_idot ARCH=native
-tests/bench_idot$(EXE): tests/bench_idot.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/bench_idot$(EXE): tests/bench_idot.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # bench_i4p_gidot: microbenchmark (per-row vs multi-row/AMX K1b grouped planar IDOT), NOT a test gate.
 # Build on demand: make tests/bench_i4p_gidot ARCH=native
-tests/bench_i4p_gidot$(EXE): tests/bench_i4p_gidot.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/bench_i4p_gidot$(EXE): tests/bench_i4p_gidot.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # bench_gemv_stream: microbenchmark (decode-regime GEMV bandwidth vs the read ceiling;
 # frozen-baseline + deinterleaved-x candidate A/B), NOT a test gate.
 # Build on demand: make tests/bench_gemv_stream ARCH=native
-tests/bench_gemv_stream$(EXE): tests/bench_gemv_stream.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/bench_gemv_stream$(EXE): tests/bench_gemv_stream.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # bench_mla_simd: microbenchmark (scalar vs AVX2/NEON MLA-absorb reductions, #442),
 # NOT a test gate. Build on demand: make tests/bench_mla_simd
-tests/bench_mla_simd$(EXE): tests/bench_mla_simd.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/bench_mla_simd$(EXE): tests/bench_mla_simd.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_uring$(EXE): tests/test_uring.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
@@ -2285,8 +2356,8 @@ tests/test_shard_kvb_refuse$(EXE): tests/test_shard_kvb_refuse.c colibri.c st.h 
 # exists so it also compiles under the suite's own $(CFLAGS) rather than only
 # under the driver's hand-copied flag list, and so a warning regression in it
 # fails the normal build.
-tests/test_e8x4g64_loader$(EXE): tests/test_e8x4g64_loader.c st.h quant.h fp8_format.h compat.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_e8x4g64_loader$(EXE): tests/test_e8x4g64_loader.c st.h quant.h fp8_format.h compat.h $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # Reachable build-only entry point for the harness above: `make check` never
 # calls this (it stays out of TEST_BINS/test-c, per TEST_EXCLUDE), so this adds
@@ -2377,7 +2448,7 @@ check:
 	$(MAKE) portable
 	$(MAKE) test
 
-install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) qwen38$(EXE) deepseek_v41$(EXE) \
+install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) qwen38$(EXE) deepseek_v41$(EXE) qwenimage$(EXE) \
 	$(if $(filter 1,$(COLI_V4_SUPPORTED)),deepseek-v4,)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
@@ -2390,12 +2461,14 @@ install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen3
 	$(INSTALL) -m 755 olmoe$(EXE) $(DESTDIR)$(LIBEXECDIR)/olmoe$(EXE)
 	$(INSTALL) -m 755 qwen36$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwen36$(EXE)
 	$(INSTALL) -m 755 qwen38$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwen38$(EXE)
+	$(INSTALL) -m 755 qwenimage$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwenimage$(EXE)
 	$(INSTALL) -m 755 deepseek_v41$(EXE) $(DESTDIR)$(LIBEXECDIR)/deepseek_v41$(EXE)
 	@if [ -f deepseek_v4$(EXE) ]; then \
 	  $(INSTALL) -m 755 deepseek_v4$(EXE) $(DESTDIR)$(LIBEXECDIR)/deepseek_v4$(EXE); \
 	fi
 	$(INSTALL) -m 644 family_registry.py resource_plan.py doctor.py autotune.py \
-		openai_server.py cluster.py v4_dsml.py v41_dsml.py version.py $(DESTDIR)$(LIBEXECDIR)/
+		openai_server.py cluster.py v4_dsml.py v41_dsml.py version.py \
+		image_engine.py term_image.py $(DESTDIR)$(LIBEXECDIR)/
 	$(INSTALL) -m 644 tools/*.py $(DESTDIR)$(LIBEXECDIR)/tools/
 	@# The dashboard is an optional build artifact (cd web && npm run build), so install
 	@# it only when it exists. It goes NEXT TO openai_server.py, which probes ./web/dist.
