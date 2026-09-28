@@ -64,6 +64,8 @@ typedef struct {
     int deepseek;        /* 1 = DeepSeek V4 / V4.1: three chained Splits (digit groups, CJK
                           * runs, then a regex of its own) -- not cl100k, see
                           * pretok_chunk_deepseek */
+    int ndig1;           /* 1 = digits split one at a time: Qwen's \p{N} where cl100k has
+                          * \p{N}{1,3}; the rest of the cl100k pretokenizer is the same */
     int rankbpe;         /* 1 = no merges list (tiktoken-derived vocab): merge the adjacent
                           * pair whose CONCATENATION has the lowest vocab id — exactly
                           * tiktoken's byte_pair_encode, no recovered merges to diverge */
@@ -237,6 +239,7 @@ static void tok_load(Tok *T, const char *path){
             jval *rx=pat?json_get(pat,"Regex"):NULL;
             if(rx&&rx->t==J_STR&&strstr(rx->str,"\\p{Lu}")) T->o200k=1;
             if(rx&&rx->t==J_STR&&strstr(rx->str,"\\p{Han}")) T->kimi=1;
+            if(rx&&rx->t==J_STR&&strstr(rx->str,"|\\p{N}|")) T->ndig1=1;
             /* DeepSeek's third Split: ASCII punctuation takes the ASCII letters after
              * it, and marks join letter runs -- no other family writes either */
             if(rx&&rx->t==J_STR&&strstr(rx->str,"][A-Za-z]+|")&&strstr(rx->str,"[\\p{L}\\p{M}]+"))
@@ -313,8 +316,8 @@ static void pretok_chunk(Tok *T, const unsigned char *p, int a, int b, int *out,
                 if(is_L(cp[j])){ while(j<n && is_L(cp[j])) j++; i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
             }
         }
-        /* 3) \p{N}{1,3} */
-        if(is_N(c)){ int j=i,k=0; while(j<n && is_N(cp[j]) && k<3){ j++; k++; } i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
+        /* 3) \p{N}{1,3}, or \p{N} alone for Qwen (ndig1) */
+        if(is_N(c)){ int j=i,k=0,kmax=T->ndig1?1:3; while(j<n && is_N(cp[j]) && k<kmax){ j++; k++; } i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
         /* 4) ' ?[^\s\p{L}\p{N}]+[\r\n]*' */
         {
             int j=i;

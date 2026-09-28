@@ -150,6 +150,15 @@ class FamilyDescriptor:
     # la geometria lo rende visibile. 0 = nessun riferimento dichiarato, il
     # banner stampa display_scale come sempre.
     reference_experts: int = 0
+    # "text" for the chat engines, "image" for a text-to-image pipeline. An
+    # image family has no KV cache, no experts and no chat template: coli
+    # routes it to the image REPL, the image planner and POST
+    # /v1/images/generations, and every text-only invariant (context variable,
+    # segment conformance, tuning) is scoped to modality "text".
+    modality: str = "text"
+    # Where the tokenizer lives, relative to the model directory. A diffusers
+    # pipeline keeps it in processor/, not at the root.
+    tokenizer_file: str = "tokenizer.json"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1456,6 +1465,42 @@ FAMILIES = (
         # coli chat, coli serve and coli web already use.
         has_cli_adapter=False,
     ),
+    FamilyDescriptor(
+        id="qwen_image",
+        # A diffusers pipeline has no config.json at its root: the family is
+        # read from model_index.json's _class_name (see resolve_model), which
+        # is what this entry holds, normalized like every model_type.
+        model_types=("qwenimage21pipeline",),
+        display_name="Qwen-Image-2.1",
+        display_scale="",
+        engine_artifact="qwenimage",
+        engine_aliases=(),
+        engine_group="qwenimage",
+        internal_arch="qwenimage",
+        build_target="qwenimage",
+        process_names=("qwenimage",),
+        default_model_id="qwen-image-2.1-colibri",
+        cli_adapter="qwen_image",
+        gateway_adapter="qwen_image",
+        planner_id="qwen_image",
+        planner_geometry=None,
+        planner_unsupported_reason=(
+            "an image model has no KV cache and no experts; coli plan sizes its "
+            "text encoder, DiT and VAE instead (image_engine.plan_image_model)"),
+        expert_inventory=lambda _name, _size, _config, _dtype=None: (),
+        config_section="root",
+        # One image at a time, and no context or output-token budget: the
+        # limits exist because every descriptor has them. No context variable
+        # either (empty): the launcher refuses --ctx for this modality rather
+        # than inventing a knob the engine does not read.
+        limits=FamilyLimits(1, 1, 1, 1, 1, 0, ""),
+        capabilities=FamilyCapabilities(False, False, False, False),
+        has_gateway_adapter=True,
+        has_cli_adapter=True,
+        supports_accelerator=False,
+        modality="image",
+        tokenizer_file="processor/tokenizer.json",
+    ),
 )
 
 
@@ -1478,7 +1523,9 @@ def _build_registry(families):
                 not isinstance(family.has_gateway_adapter, bool) or
                 not isinstance(family.has_cli_adapter, bool) or
                 not isinstance(family.tune_prompt_template, str) or
-                "{prompt}" not in family.tune_prompt_template):
+                "{prompt}" not in family.tune_prompt_template or
+                family.modality not in ("text", "image") or
+                not isinstance(family.tokenizer_file, str) or not family.tokenizer_file):
             raise RegistryError(f"incomplete family descriptor: {family.id}")
         try:
             family.tune_prompt_template.format(prompt="test", prompt_len=4)
@@ -1543,11 +1590,30 @@ def family_by_id(family_id):
 def family_for_config(config):
     if not isinstance(config, dict):
         raise FamilyConfigError("config.json is not a JSON object")
+    if "model_type" not in config and isinstance(config.get("_class_name"), str):
+        # A diffusers model_index.json: the pipeline class is its model type.
+        return family_for_index(config)
     model_type = _normalize_model_type(config.get("model_type"))
     try:
         return _BY_TYPE[model_type]
     except KeyError as error:
         raise UnknownFamilyError(f"unsupported model_type: {model_type}") from error
+
+
+def family_for_index(index):
+    """The family of a diffusers pipeline, from its model_index.json."""
+    if not isinstance(index, dict):
+        raise FamilyConfigError(f"{MODEL_INDEX} is not a JSON object")
+    name = index.get("_class_name")
+    if not isinstance(name, str) or not name.strip():
+        raise FamilyConfigError(f"{MODEL_INDEX} has no non-empty string _class_name")
+    try:
+        family = _BY_TYPE[_normalize_model_type(name)]
+    except KeyError as error:
+        raise UnknownFamilyError(f"unsupported diffusers pipeline: {name}") from error
+    if family.modality != "image":
+        raise UnknownFamilyError(f"unsupported diffusers pipeline: {name}")
+    return family
 
 
 def tuning_replay_prompt(family, prompt):
@@ -1556,9 +1622,26 @@ def tuning_replay_prompt(family, prompt):
     return family.tune_prompt_template.format(prompt=prompt, prompt_len=len(prompt))
 
 
+MODEL_INDEX = "model_index.json"
+
+
 def resolve_model(model_dir):
     model = Path(model_dir).expanduser().resolve()
     path = model / "config.json"
+    if not path.is_file() and (model / MODEL_INDEX).is_file():
+        # A diffusers pipeline (Qwen-Image): the root carries model_index.json
+        # and each component keeps its own config.json in its own directory.
+        # config.json wins when both exist, so a text checkpoint that happens
+        # to ship an index is never read as an image model.
+        try:
+            index = json.loads((model / MODEL_INDEX).read_text(encoding="utf-8"))
+        except OSError as error:
+            raise FamilyConfigError(f"cannot read {MODEL_INDEX}: {model}") from error
+        except json.JSONDecodeError as error:
+            raise FamilyConfigError(f"invalid {MODEL_INDEX}: {error}") from error
+        family = family_for_index(index)
+        return ResolvedFamily(family, _normalize_model_type(index["_class_name"]),
+                              index, index, str(model))
     try:
         config = json.loads(path.read_text(encoding="utf-8"))
     except OSError as error:
@@ -1566,7 +1649,8 @@ def resolve_model(model_dir):
             f"cannot read config.json: {model}\n"
             "  coli picks the engine from config.json, so nothing runs without it. Copy the\n"
             "  checkpoint's config.json (with tokenizer.json and model.safetensors.index.json)\n"
-            "  from the model repo next to the shards.") from error
+            "  from the model repo next to the shards. An image model (a diffusers pipeline)\n"
+            "  carries model_index.json instead.") from error
     except json.JSONDecodeError as error:
         raise FamilyConfigError(f"invalid config.json: {error}") from error
     family = family_for_config(config)
@@ -1712,6 +1796,8 @@ def public_metadata(family):
         "gateway_adapter": family.gateway_adapter,
         "planner_id": family.planner_id,
         "supports_accelerator": family.supports_accelerator,
+        "modality": family.modality,
+        "tokenizer_file": family.tokenizer_file,
         "limits": {
             "default_context": family.limits.default_context,
             "max_context": family.limits.max_context,

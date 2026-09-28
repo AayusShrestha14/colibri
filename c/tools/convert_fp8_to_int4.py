@@ -66,6 +66,8 @@ OTHER_FAMILY_PATHS = {
     "deepseek_v4":     "DeepSeek V4: see docs/deepseek-v4.md, section Download",
     "deepseek_v41":    "DeepSeek V4.1: no conversion needed -- its experts already ship fp4 and its dense fp8; run tools/prepare_dsv41.py once, see docs/deepseek-v41.md",
     "deepseek_v41_text": "DeepSeek V4.1: no conversion needed -- see docs/deepseek-v41.md",
+    "qwenimage21pipeline": "Qwen-Image-2.1 is NOT converted: the image engine reads the "
+                           "diffusers checkpoint as downloaded; see docs/qwen-image.md",
 }
 
 

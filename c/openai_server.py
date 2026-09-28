@@ -22,6 +22,7 @@ import uuid
 
 import v4_dsml                      # vendored DeepSeek V4 DSML reference primitives
 import v41_dsml                     # ...and V4.1's, whose tag names differ by a space
+import image_engine                 # the qwenimage serve protocol, PNG and request rules
 from family_registry import (FamilyConfigError, UnknownFamilyError, family_by_id,
                              family_ids, resolve_model)
 from family_registry import default_model_id as registry_default_model_id
@@ -3960,6 +3961,21 @@ def model_object(model_id, created):
     return {"id": model_id, "object": "model", "created": created, "owned_by": "colibri"}
 
 
+def is_image_engine(engine):
+    """True when the server fronts a text-to-image engine rather than a chat one.
+    Decided by the engine object, not by the ARCH global, so a server built in a
+    test (or embedded) with an ImageEngine behaves as one."""
+    return getattr(engine, "modality", "text") == "image"
+
+
+# The endpoints that only make sense for a chat model, refused with a pointer
+# when the model draws images instead.
+TEXT_ENDPOINTS = ("/v1/chat/completions", "/v1/completions", "/v1/messages", "/v1/brio",
+                  "/v1/systemone")
+IMAGE_OPTION_KEYS = ("default_width", "default_height", "default_steps", "min_side",
+                     "max_side", "multiple")
+
+
 def _positive_env(name, default):
     try:
         value = int(os.environ.get(name, "") or default)
@@ -4013,6 +4029,17 @@ class APIServer(ThreadingHTTPServer):
         self._conn_live = 0
         self._conn_by_ip = {}
         self._conn_owner = {}
+
+    def model_entry(self):
+        """The /v1/models object. An image model says so, and carries the size
+        rules its engine announced, so a client can build a valid request
+        without trial and error."""
+        entry = model_object(self.model_id, self.created)
+        if is_image_engine(self.engine):
+            info = getattr(self.engine, "info", None) or {}
+            entry["capabilities"] = ["image_generation"]
+            entry["image"] = {key: info.get(key) for key in IMAGE_OPTION_KEYS}
+        return entry
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, *args, **kwargs):
         started = time.monotonic()
@@ -4402,6 +4429,9 @@ class APIHandler(BaseHTTPRequestHandler):
                     if tiers: payload["tiers"] = tiers
                     hwinfo = getattr(self.server.engine, "hwinfo", None) if self.server.engine else None
                     if hwinfo: payload["hwinfo"] = hwinfo
+                    if is_image_engine(self.server.engine):
+                        payload["capabilities"] = ["image_generation"]
+                        payload["image"] = dict(getattr(self.server.engine, "info", None) or {})
                 self.send_json(200, payload, request_id)
                 return
             if path == "/experts":
@@ -4432,10 +4462,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 return
             self.require_auth()
             if path == "/v1/models":
-                self.send_json(200, {"object": "list", "data": [model_object(
-                    self.server.model_id, self.server.created)]}, request_id)
+                self.send_json(200, {"object": "list", "data": [self.server.model_entry()]},
+                               request_id)
             elif path.startswith("/v1/models/") and unquote(path[11:]) == self.server.model_id:
-                self.send_json(200, model_object(self.server.model_id, self.server.created), request_id)
+                self.send_json(200, self.server.model_entry(), request_id)
             else:
                 raise APIError(404, "Not found.", None, "not_found")
         except APIError as error:
@@ -4465,7 +4495,13 @@ class APIHandler(BaseHTTPRequestHandler):
             # served model answers whatever name was asked for.
             if path != "/v1/systemone":
                 self.check_model(body)
-            if path == "/v1/chat/completions":
+            if is_image_engine(self.server.engine) and path in TEXT_ENDPOINTS:
+                raise APIError(400, f"`{self.server.model_id}` is an image generation model and "
+                                    "does not chat: POST /v1/images/generations instead.",
+                               "model", "unsupported_endpoint")
+            if path == "/v1/images/generations":
+                self.image_generation(body, request_id)
+            elif path == "/v1/chat/completions":
                 self.chat_completion(body, request_id)
             elif path == "/v1/completions":
                 self.completion(body, request_id)
@@ -4908,6 +4944,184 @@ class APIHandler(BaseHTTPRequestHandler):
                  "usage": {"input_tokens": result["usage"]["prompt_tokens"],
                            "output_tokens": result["usage"]["read_tokens"]}}
         self.send_json(200, reply, request_id, result.get("_headers"))
+
+    # ------------------------------------------------------------- images
+    #
+    # POST /v1/images/generations, the OpenAI shape plus a `colibri` block with
+    # what was actually drawn (the seed above all: without it an image cannot be
+    # reproduced). One image at a time through the same scheduler as chat, so
+    # the queue, its limits and /metrics mean the same thing for both.
+    def image_generation(self, body, request_id):
+        engine = self.server.engine
+        if not is_image_engine(engine):
+            raise APIError(400, f"`{self.server.model_id}` does not generate images: it is a "
+                                "chat model (POST /v1/chat/completions).",
+                           "model", "unsupported_endpoint")
+        try:
+            request = image_engine.image_request(body, engine.info)
+        except image_engine.ImageRequestError as error:
+            raise APIError(400, str(error), error.param, "invalid_value")
+        stream = body.get("stream", False)
+        if not isinstance(stream, bool):
+            raise APIError(400, "`stream` must be a boolean.", "stream")
+        partial_images = body.get("partial_images")
+        if partial_images is not None and (isinstance(partial_images, bool) or
+                                           not isinstance(partial_images, int) or
+                                           not 0 <= partial_images <= 16):
+            raise APIError(400, "`partial_images` must be an integer between 0 and 16.",
+                           "partial_images")
+        created = int(time.time())
+        with contextlib.ExitStack() as stack:
+            try:
+                queue_wait, _slot = stack.enter_context(
+                    self.server.scheduler.admit(self.client_disconnected))
+            except APIError as error:
+                if error.status == 429:
+                    # The contract's word for "busy past the queue" is 503: an
+                    # image takes minutes, and a client that retries after a
+                    # second, as 429 invites, only refills the queue.
+                    raise APIError(503, error.message, None, error.code, "server_error",
+                                   error.headers) from None
+                raise
+            if not engine.alive:
+                raise APIError(503, f"The image engine is not running ({engine.dead or 'exited'}).",
+                               None, "engine_unavailable", "server_error")
+            queue_headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000))}
+            if stream:
+                self._image_stream(engine, request, request_id, created, queue_headers,
+                                   partial_images)
+                return
+            try:
+                result = engine.generate(request["prompt"], request["width"], request["height"],
+                                         request["steps"], request["seed"], preview=False,
+                                         cancelled=self.client_disconnected)
+            except image_engine.ImageCancelled:
+                raise ClientCancelled() from None
+            except image_engine.ImageEngineError as error:
+                raise APIError(500, f"The image engine failed: {error}", None, "engine_error",
+                               "server_error") from None
+            self.send_json(200, self._image_payload(result, created), request_id, queue_headers)
+
+    @staticmethod
+    def _image_payload(result, created):
+        import base64
+        png = image_engine.encode_png(result["width"], result["height"], result["rgba"], 4)
+        return {"created": created,
+                "data": [{"b64_json": base64.b64encode(png).decode("ascii"),
+                          "revised_prompt": None}],
+                "colibri": {"width": result["width"], "height": result["height"],
+                            "seed": result["seed"], "steps": result["steps"],
+                            "timings": result["timings"]}}
+
+    def _image_stream(self, engine, request, request_id, created, queue_headers,
+                      partial_images):
+        """SSE: progress, optional partial images, completed, [DONE].
+
+        The 200 is committed on the engine's first frame, not before: an engine
+        that refuses the request outright still answers with a real HTTP error
+        instead of an error event inside a stream that already said OK."""
+        import base64
+        lock = threading.Lock()
+        state = {"started": False, "connected": True, "last": time.monotonic(), "partials": 0}
+
+        def start():
+            if state["started"]:
+                return
+            state["started"] = True
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Connection", "close")
+            self.close_connection = True
+            self.send_header("x-request-id", request_id)
+            for name, value in queue_headers.items():
+                self.send_header(name, value)
+            self.send_cors_headers()
+            try:
+                self.end_headers()
+            except OSError:
+                # The client left between admission and the first frame: count
+                # it as gone, so the generation is cancelled like any hang-up
+                # instead of this exception abandoning it mid-image.
+                state["connected"] = False
+
+        def write(data):
+            with lock:
+                if not state["connected"]:
+                    return
+                try:
+                    self.wfile.write(data)
+                    self.wfile.flush()
+                    state["last"] = time.monotonic()
+                except OSError:
+                    state["connected"] = False
+
+        def event(name, data):
+            start()
+            write(f"event: {name}\ndata: "
+                  f"{json.dumps(data, ensure_ascii=False, separators=(',', ':'))}\n\n".encode())
+
+        def cancelled():
+            return not state["connected"] or self.client_disconnected()
+
+        def on_progress(frame):
+            event("image_generation.progress",
+                  {key: frame.get(key) for key in ("stage", "step", "steps", "elapsed")})
+
+        def on_preview(frame, pixels):
+            limit = partial_images
+            if limit is not None:
+                # Spread a requested number of partial images over the run
+                # instead of spending them on the first steps.
+                steps = max(1, int(frame.get("steps") or request["steps"]))
+                due = (state["partials"] + 1) * steps / (limit + 1)
+                if state["partials"] >= limit or int(frame.get("step") or 0) < due:
+                    return
+            channels = frame.get("channels", 3)
+            try:
+                png = image_engine.encode_png(frame["width"], frame["height"], pixels, channels)
+            except (KeyError, TypeError, ValueError) as error:
+                sys.stderr.write(f"[api] {request_id}: unusable PREVIEW frame ({error})\n")
+                return
+            event("image_generation.partial_image",
+                  {"b64_json": base64.b64encode(png).decode("ascii"),
+                   "partial_image_index": state["partials"]})
+            state["partials"] += 1
+
+        def on_idle():
+            # SSE comments keep proxies and idle timers from closing a stream
+            # that is legitimately silent through a long denoising step.
+            if state["started"] and time.monotonic() - state["last"] >= 10:
+                write(b": keepalive\n\n")
+
+        try:
+            result = engine.generate(request["prompt"], request["width"], request["height"],
+                                     request["steps"], request["seed"],
+                                     preview=partial_images != 0, on_progress=on_progress,
+                                     on_preview=on_preview, cancelled=cancelled,
+                                     on_idle=on_idle)
+        except image_engine.ImageCancelled:
+            if not state["started"]:
+                raise ClientCancelled() from None
+            # Once the 200 is out, every ending is an event: a client still
+            # listening (the web UI) is told the image will not come, then the
+            # stream closes the way every stream closes.
+            event("error", {"error": {"message": "cancelled", "type": "cancelled",
+                                      "param": None, "code": "cancelled"}})
+            write(b"data: [DONE]\n\n")
+            raise ClientCancelled() from None       # counted as cancelled, not completed
+        except image_engine.ImageEngineError as error:
+            if not state["started"]:
+                raise APIError(500, f"The image engine failed: {error}", None, "engine_error",
+                               "server_error") from None
+            event("error", {"error": {"message": f"The image engine failed: {error}",
+                                      "type": "server_error", "param": None,
+                                      "code": "engine_error"}})
+            write(b"data: [DONE]\n\n")
+            return
+        event("image_generation.completed", self._image_payload(result, created))
+        write(b"data: [DONE]\n\n")
 
     def _fail(self, error, request_id):
         """Report an error, unless the response is already on the wire. Once a streaming 200
@@ -5696,7 +5910,18 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
         if kv_slots > family.limits.max_kv_slots:
             raise ValueError(f"{family.id} engine supports at most "
                              f"{family.limits.max_kv_slots} KV slot(s)")
-        runtime = Engine(engine,model,cap,max_tokens,env,kv_slots,family)
+        if family.modality == "image":
+            # Its own process class: the image engine speaks a line-and-JSON
+            # protocol with binary frames, not the text engines' byte stream.
+            runtime = image_engine.ImageEngine(engine, model, env=env)
+            # Same lifetime rule as the text engines on Windows: a job object
+            # takes the engine down with this server, however the server ends.
+            runtime._win_job = _win_kill_on_close_job(getattr(runtime.process, "pid", None))
+            print(f"[image] {model_id}: default {runtime.info['default_width']}x"
+                  f"{runtime.info['default_height']}, {runtime.info['default_steps']} steps",
+                  file=sys.stderr)
+        else:
+            runtime = Engine(engine,model,cap,max_tokens,env,kv_slots,family)
         server.engine = runtime
         print(f"OpenAI-compatible API listening on http://{host}:{port}/v1", file=sys.stderr)
         signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
