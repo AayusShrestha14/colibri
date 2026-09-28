@@ -155,6 +155,14 @@ static void test_nan_propagation(void){
  * bit-identical to the scalar kernel, token by token.  Odd O/I/S cover the
  * zero-padded row tile, the clamped token lanes and the 64-token chunk edge;
  * one NaN byte checks the propagation policy survives the tile decode. */
+/* full 23-bit-mantissa x in [1,2): e4m3 (4-bit mantissa) x such a value needs
+ * 27 bits, so w*x is NOT exactly representable and a fused multiply-add chain
+ * (vfmaq / fmaf / fmas) rounds differently from an unfused mul-then-add chain.
+ * The old rndf() inputs (20-bit mantissa) made every product exact, which is
+ * why this test could not see fused-vs-unfused divergence (SVE fadda review). */
+static float rndf_mant(void){ rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+    uint32_t u = (uint32_t)rng; union { uint32_t b; float f; } v;
+    v.b = 0x3F800000u | (u & 0x7FFFFFu); return v.f; }
 static void run_batch_exact(int S, int I, int O){
     uint8_t *q8=malloc((size_t)O*I);
     int64_t nblk=fp8_nblk(O)*fp8_nblk(I);
@@ -163,7 +171,7 @@ static void run_batch_exact(int S, int I, int O){
     for(int64_t i=0;i<(int64_t)O*I;i++) q8[i]=rndbyte_nonan();
     q8[(int64_t)(O-1)*I + I/2] = 0x7F;
     for(int64_t b=0;b<nblk;b++) bscale[b]=rndf();
-    for(int64_t i=0;i<(int64_t)S*I;i++) x[i]=rndf();
+    for(int64_t i=0;i<(int64_t)S*I;i++) x[i]=rndf_mant();
     matmul_fp8(y, x, q8, bscale, S, I, O);
     matmul_fp8_scalar(y1, x, q8, bscale, S, I, O);
     int same=1;

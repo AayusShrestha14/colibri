@@ -599,10 +599,20 @@ static void matmul_fp8_scalar(float *y, const float *x, const uint8_t *q8, const
                 float acc0=0,acc1=0,acc2=0,acc3=0;
                 for(int i=base;i<base+blen;i++){
                     float xv=xs[i];
+#if defined(__aarch64__)
+                    /* SVE review: explicit fma pins the chain FUSED regardless of
+                       -ffp-contract or the auto-vectoriser (gcc on SVE lowers a
+                       plain acc += w*x to unfused fadda and diverges from vfmaq). */
+                    acc0 = __builtin_fmaf(e4m3_decode(w0[i]),xv,acc0);
+                    acc1 = __builtin_fmaf(e4m3_decode(w1[i]),xv,acc1);
+                    acc2 = __builtin_fmaf(e4m3_decode(w2[i]),xv,acc2);
+                    acc3 = __builtin_fmaf(e4m3_decode(w3[i]),xv,acc3);
+#else
                     acc0 += e4m3_decode(w0[i])*xv;
                     acc1 += e4m3_decode(w1[i])*xv;
                     acc2 += e4m3_decode(w2[i])*xv;
                     acc3 += e4m3_decode(w3[i])*xv;
+#endif
                 }
                 a0 += (double)acc0*scl0[bi];
                 a1 += (double)acc1*scl1[bi];
@@ -633,7 +643,12 @@ static void matmul_fp8_scalar(float *y, const float *x, const uint8_t *q8, const
             for(int64_t bi=0; bi*FP8_BLOCK<I; bi++){
                 int base=(int)(bi*FP8_BLOCK); int blen=FP8_BLOCK; if(base+blen>I) blen=I-base;
                 float sc=scl[bi]; float acc=0;
+#if defined(__aarch64__)
+                /* see the SVE note in the clang arm above */
+                for(int i=base;i<base+blen;i++) acc = __builtin_fmaf(e4m3_decode(w[i]),xs[i],acc);
+#else
                 for(int i=base;i<base+blen;i++) acc += e4m3_decode(w[i])*xs[i];
+#endif
                 a += (double)acc*sc;
             }
             y[(int64_t)s*O+o]=(float)a;
