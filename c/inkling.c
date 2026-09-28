@@ -187,19 +187,7 @@ static float siluf(float x) { return x / (1.f + expf(-x)); }
  * cumulato p. 0 = spento (default): tutti i topk, calcolo invariato. */
 static float g_topp = 0.f;
 
-/* y[S,O] = x[S,I] @ W^T, W row-major [O,I] */
-static void matmul(float *y, const float *x, const float *W, int S, int I, int O) {
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
-        const float *w = W + (int64_t)o * I;
-        for (int s = 0; s < S; s++) {
-            const float *xs = x + (int64_t)s * I;
-            float acc = 0.f;
-            for (int i = 0; i < I; i++) acc += xs[i] * w[i];
-            y[(int64_t)s * O + o] = acc;
-        }
-    }
-}
+#include "matmul_f32.h"   /* y[S,O] = x[S,I] @ W^T, W [O,I] f32 row-major */
 
 #if defined(__AVX512BF16__) && defined(__AVX512F__)
 #include <immintrin.h>
