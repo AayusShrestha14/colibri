@@ -18,12 +18,15 @@ The same front ends as the text models reach it:
   <img src="media/qwen-image-web.png" width="820" alt="the web UI: the prompt, and the image colibri generated for it, with size, steps, seed and time">
 </p>
 <p align="center">
-  <img src="media/qwen-image-tui.png" width="820" alt="coli chat: the same prompt and seed, the image drawn inside the terminal with half blocks, then saved as a PNG">
+  <img src="media/qwen-image-tui.png" width="820" alt="coli chat: the same prompt and seed, the image drawn inside the terminal at full resolution (sixel), then saved as a PNG">
 </p>
 
 Both pictures come from the real checkpoint on an 8-core CPU server, same
 prompt and seed: the web UI above, `coli chat` attached to the same server
-below (half blocks, the mode that works in every terminal).
+below, as a sixel terminal shows it (the screenshot is xterm.js, the terminal
+of VS Code, fed the session's own bytes; Windows Terminal 1.22 and later, foot,
+WezTerm and kitty show the same picture). Terminals without graphics get half
+blocks, two pixels per character.
 
 ## Download
 
@@ -77,7 +80,7 @@ coli chat --model ~/Models/Qwen-Image-2.1
 ```
 
 <p align="center">
-  <img src="media/qwen-image-tui-preview.png" width="720" alt="coli chat while the image is forming: the live preview redrawn in the terminal, denoising step 3 of 8">
+  <img src="media/qwen-image-tui-preview.png" width="720" alt="coli chat while the image is forming: the live preview, smoothly enlarged, redrawn in place at denoising step 5 of 8">
 </p>
 
 Every line you type is a prompt. While the engine works, a status line shows
