@@ -1831,7 +1831,7 @@ __global__ void dn_conv_kernel(const float *__restrict__ qkv, float *__restrict_
 
 __device__ static double dn_block_sum(double v, double *sh) {
     /* blockDim <= 1024; warp shuffle then one pass over warps */
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+    for (int o = 16; o > 0; o >>= 1) v += f8_shfl_down(v, o);   /* CUDA: __shfl_down_sync, HIP: __shfl_down (backend_gpu_compat) */
     int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
     __syncthreads();
     if (lane == 0) sh[wid] = v;
