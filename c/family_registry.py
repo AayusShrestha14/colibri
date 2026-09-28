@@ -31,6 +31,11 @@ class FamilyCapabilities:
     grammar_payload: bool
     audio_payload: bool
     thinking: bool
+    # The gateway has a placeholder expansion for this family's pictures. Whether
+    # the checkpoint being served loaded its tower is the engine's word (the CAPS
+    # handshake line, openai_server.Engine.vision), never this bit's: a glm53
+    # export can carry vision_config and no model.visual.* tensors.
+    image: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1147,7 +1152,7 @@ FAMILIES = (
         # share COMMON_CAP, which says otherwise -- the flag is descriptive
         # (it only feeds the capability dict) so nothing broke, but a client
         # reading it programmatically was told the opposite of the truth.
-        capabilities=FamilyCapabilities(True, False, False, True),
+        capabilities=FamilyCapabilities(True, False, False, True, image=True),
         has_gateway_adapter=True,
         has_cli_adapter=True,
         # Dal chat_template.jinja del checkpoint: nessun a capo, e <think>
@@ -1343,7 +1348,7 @@ FAMILIES = (
         expert_inventory=_individual_expert_inventory(_GLM_EXPERT),
         config_section="text_config",
         limits=FamilyLimits(8192, 262144, 1024, 8192, 1, 8, "Q36_MAXT"),
-        capabilities=FamilyCapabilities(False, False, False, True),
+        capabilities=FamilyCapabilities(False, False, False, True, image=True),
         has_gateway_adapter=True,
         # coli run stays unwired on purpose: cmd_run dispatches per arch after
         # this gate, and without a qwen36 branch the engine would inherit GLM's
@@ -1376,7 +1381,7 @@ FAMILIES = (
         fixed_resident_inventory=_qwen38_fixed_resident_inventory,
         config_section="text_config",
         limits=FamilyLimits(8192, 262144, 1024, 8192, 1, 1, "Q38_MAXT"),
-        capabilities=FamilyCapabilities(True, False, False, True),
+        capabilities=FamilyCapabilities(True, False, False, True, image=True),
         has_gateway_adapter=True,
         # Like Qwen3.6, direct `coli run` is intentionally not exposed until
         # an engine-specific CLI prompt path exists; chat/serve use the gateway.
@@ -1455,7 +1460,7 @@ FAMILIES = (
         # tools yes (DSML, see v41_dsml.py), grammars no: the engine reads the six-field
         # SUBMIT header and has no constrained decoder, so a grammar has to be refused
         # at the gateway rather than desync the wire.
-        capabilities=FamilyCapabilities(True, False, False, True),
+        capabilities=FamilyCapabilities(True, False, False, True, image=True),
         has_gateway_adapter=True,
         # coli run stays unwired, for the reason qwen36 gives above and one more:
         # cmd_run dispatches per arch after this gate, and with no deepseek_v41
@@ -1812,5 +1817,6 @@ def public_metadata(family):
             "grammar_payload": family.capabilities.grammar_payload,
             "audio_payload": family.capabilities.audio_payload,
             "thinking": family.capabilities.thinking,
+            "image": family.capabilities.image,
         },
     }

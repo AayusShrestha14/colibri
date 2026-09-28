@@ -2403,6 +2403,17 @@ def qwen36_has_vision(model_dir):
     return isinstance(meta, dict) and isinstance(meta.get("vision"), dict)
 
 
+def has_image_parts(messages):
+    """Whether any message carries a picture part (the shapes expand_*_images() read)."""
+    for message in messages if isinstance(messages, list) else ():
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list) and any(
+                isinstance(part, dict) and part.get("type") in ("image_url", "input_image")
+                for part in content):
+            return True
+    return False
+
+
 def expand_glm53_images(messages, model_dir):
     """Sostituisce le parti immagine coi loro segnaposto e ne estrae le patch.
 
@@ -4192,7 +4203,7 @@ def _engine_extension_args(engine_k):
     return {"logprobs": engine_k, "gbytes_before_ext": True}
 
 
-def read_engine_turn(stream, sentinel, on_bytes):
+def read_engine_turn(stream, sentinel, on_bytes, caps=None):
     pending = b""
     while True:
         byte = stream.read(1)
@@ -4208,7 +4219,16 @@ def read_engine_turn(stream, sentinel, on_bytes):
             on_bytes(pending[:-len(sentinel)])
             pending = pending[-len(sentinel):]
 
-    fields = stream.readline().decode("utf-8", "replace").strip().split()
+    # CAPS key=value ... between READY and STAT: what the engine loaded (a vision
+    # tower or not), said BEFORE the status line so a server knows the modalities
+    # it serves before it takes its first request. Engines that predate the line
+    # say nothing, and `caps` stays as the caller left it.
+    while True:
+        fields = stream.readline().decode("utf-8", "replace").strip().split()
+        if fields[:1] != ["CAPS"]:
+            break
+        if caps is not None:
+            caps.update(entry.partition("=")[::2] for entry in fields[1:] if "=" in entry)
     if len(fields) < 5 or fields[0] != "STAT":
         raise RuntimeError(f"invalid engine status: {' '.join(fields)}")
     return {
@@ -4514,7 +4534,11 @@ class Engine:
         self.hits_seq = 0                      # latest "TIERS" snapshot from the engine
         self.profile = collections.deque(maxlen=PROFILE_TURNS)  # per-turn phase timings
         self.profile_seq = 0
-        read_engine_turn(self.process.stdout, READY, lambda _: None)
+        self.caps = {}                         # the engine's CAPS handshake line, key=value
+        read_engine_turn(self.process.stdout, READY, lambda _: None, self.caps)
+        # True/False when the engine said whether it loaded a vision tower; None when
+        # it said nothing (an engine that predates CAPS, or a family without a tower).
+        self.vision = {"1": True, "0": False}.get(self.caps.get("vision"))
         self.dispatcher = threading.Thread(target=self._dispatch_stdout,
                                            name="colibri-stdout", daemon=True)
         self.dispatcher.start()
@@ -5167,11 +5191,25 @@ class APIServer(ThreadingHTTPServer):
         rules its engine announced, so a client can build a valid request
         without trial and error."""
         entry = model_object(self.model_id, self.created)
+        entry["input_modalities"] = self.input_modalities()
         if is_image_engine(self.engine):
             info = getattr(self.engine, "info", None) or {}
             entry["capabilities"] = ["image_generation"]
             entry["image"] = {key: info.get(key) for key in IMAGE_OPTION_KEYS}
         return entry
+
+    def input_modalities(self):
+        """What a request to this server may carry: text, plus image when BOTH the
+        family has a placeholder expansion and the engine said it loaded its tower.
+        The family alone is not the truth (a glm53 export can declare vision_config
+        and ship no model.visual.* tensors, and the engine then serves text), and
+        the engine alone is not either (a tower the gateway cannot feed is no
+        modality). An engine that announced nothing is text: the card under-claims
+        rather than promising a picture nobody checked."""
+        modalities = ["text"]
+        if family_by_id(ARCH).capabilities.image and getattr(self.engine, "vision", None) is True:
+            modalities.append("image")
+        return modalities
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, *args, **kwargs):
         started = time.monotonic()
@@ -5556,6 +5594,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 if self._is_authed():
                     payload["scheduler"] = self.server.scheduler.snapshot()
                     payload["kv_slots"] = self.server.kv_slots
+                    payload["input_modalities"] = self.server.input_modalities()
                     payload["continue_assistant"] = os.environ.get("COLI_CONTINUE_ASSISTANT", "1") != "0" and ARCH in CONTINUATION_FAMILIES
                     tiers = getattr(self.server.engine, "tiers", None) if self.server.engine else None
                     if tiers: payload["tiers"] = tiers
@@ -6712,6 +6751,15 @@ class APIHandler(BaseHTTPRequestHandler):
         embedding non possono divergere. Both chat endpoints come through here,
         so a picture is one thing whichever API delivered it."""
         model_dir = getattr(self.server.engine, "model_dir", None)
+        if getattr(self.server.engine, "vision", None) is False and has_image_parts(messages):
+            # The engine said at its handshake that it loaded no tower. Refuse here,
+            # by name, before the picture is preprocessed and before the engine
+            # answers it with a bare BAD_REQUEST (a 500 the client cannot act on).
+            raise APIError(400, "this engine loaded no vision tower: the checkpoint declares "
+                                "one in its config but its weights are not in the container, "
+                                "so images cannot be served. Reconvert the checkpoint with its "
+                                "vision weights, or send text only.",
+                           "messages", "unsupported_content_type")
         if ARCH == "glm53":
             messages, images = expand_glm53_images(messages, model_dir)
         elif ARCH == "deepseek_v41":
@@ -7103,6 +7151,13 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
         else:
             runtime = Engine(engine,model,cap,max_tokens,env,kv_slots,family)
         server.engine = runtime
+        if family.modality != "image":
+            # Said once at start-up, so a checkpoint that declares a tower it does
+            # not carry is visible in the log and not only in a client's 400.
+            print(f"[gateway] input modalities: {', '.join(server.input_modalities())}"
+                  + (" (the engine loaded no vision tower; a picture gets a 400)"
+                     if family.capabilities.image and runtime.vision is False else ""),
+                  file=sys.stderr)
         print(f"OpenAI-compatible API listening on http://{host}:{port}/v1", file=sys.stderr)
         signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
         # On Windows SIGTERM is never delivered (os.kill is TerminateProcess);

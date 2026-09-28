@@ -2299,7 +2299,14 @@ static void vision_load(GModel *m) {
     const Cfg *c = &m->c;
     m->has_vision = 0;
     if (c->vis_layers <= 0) return;
-    if (!st_find(&m->S, "model.visual.patch_embed.proj.weight")) return;
+    if (!st_find(&m->S, "model.visual.patch_embed.proj.weight")) {
+        /* La config annuncia una torre che il checkpoint non porta: si serve
+         * solo testo, e lo si dice qui e al gateway (CAPS vision=0), invece di
+         * lasciarlo scoprire a chi manda una foto. */
+        fprintf(stderr, "vision_config present but model.visual.* tensors absent: "
+                        "serving text only, images will be refused\n");
+        return;
+    }
     const char *V = "model.visual.";
 
     m->vision.config = (ColiVisionConfig){
@@ -3682,6 +3689,9 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
     setvbuf(stdin, NULL, _IONBF, 0);
     slots_init(m);
     serve_line("\x01\x01READY\x01\x01\n");
+    /* Fra READY e STAT: il gateway lo legge nella stretta di mano, quindi sa
+     * che modalita' serve prima della prima richiesta (docs/serve_protocol.md). */
+    serve_line("CAPS vision=%d\n", m->has_vision ? 1 : 0);
     serve_line("STAT 0 0.00 0.0 %.1f\n", rss_gb());
     /* La griglia va DOPO READY: il lettore di boot del server scarta tutto
      * fino al sentinel, e colibri.c fa lo stesso (READY, STAT, poi EMAP). */

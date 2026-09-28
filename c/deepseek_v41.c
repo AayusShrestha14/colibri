@@ -3537,7 +3537,10 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
     coli_serve_stdio_init();
     int eos_ids[8];
     int n_eos = serve_eos(m, snap, eos_ids, 8);
-    coli_serve_write_ready(stdout, rss_gb());
+    /* CAPS between READY and STAT: the gateway reads it in the handshake, so it
+     * knows the served modalities before the first request. m->vision is NULL
+     * for a text-only container and for a VL config whose tower is missing. */
+    coli_serve_write_ready_caps(stdout, rss_gb(), m->vision ? "vision=1" : "vision=0");
     serve_emap(m);
     float *logits = xmalloc((size_t)c->vocab * sizeof(float), "logits");
     /* tok_encode stops at its output capacity: one extra id distinguishes

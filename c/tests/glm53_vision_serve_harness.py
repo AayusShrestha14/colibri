@@ -111,7 +111,12 @@ def main() -> int:
         if "READY" not in read_line(process.stdout):
             print("FAIL: nessun READY")
             return 1
-        read_line(process.stdout)                       # STAT
+        line = read_line(process.stdout)                # CAPS vision=<0|1>, then STAT
+        while line.startswith("CAPS "):
+            line = read_line(process.stdout)
+        if not line.startswith("STAT "):
+            print(f"FAIL: dopo READY {line!r}, atteso STAT")
+            return 1
         first = ask(process, 1, prompt, images[0])
         second = ask(process, 2, prompt, images[1])
         process.stdin.close()

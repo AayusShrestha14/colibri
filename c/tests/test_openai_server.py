@@ -1495,6 +1495,19 @@ class ProtocolTest(unittest.TestCase):
         self.assertEqual(stats["prompt_tokens"], 7)
         self.assertTrue(stats["length_limited"])
 
+    def test_reads_caps_between_ready_and_stat(self):
+        # A vision engine says what it loaded BEFORE its status line, so the gateway
+        # knows the served modalities before it answers its first request. An engine
+        # that says nothing leaves the dict empty and the status parse untouched.
+        caps = {}
+        stream = io.BytesIO(READY + b"CAPS vision=1 other=x\nSTAT 0 0 0 0\n")
+        stats = read_engine_turn(stream, READY, lambda _: None, caps)
+        self.assertEqual(caps, {"vision": "1", "other": "x"})
+        self.assertEqual(stats["completion_tokens"], 0)
+        caps = {}
+        read_engine_turn(io.BytesIO(READY + b"STAT 0 0 0 0\n"), READY, lambda _: None, caps)
+        self.assertEqual(caps, {})
+
     def test_rejects_invalid_kv_pool_before_engine_start(self):
         with self.assertRaisesRegex(ValueError, "kv_slots"):
             serve("/missing", kv_slots=0)
@@ -7206,6 +7219,100 @@ class DispatcherLogprobTailTest(unittest.TestCase):
         self.assertEqual(echoes[0]["bytes"], b"h")
         self.assertTrue(math.isnan(echoes[0]["lp"]))
         self.assertEqual(echoes[0]["topk"], [])
+
+
+class EngineCapsTest(unittest.TestCase):
+    def test_engine_learns_its_vision_tower_from_the_handshake(self):
+        # CAPS vision=<0|1> sits between READY and STAT; an engine that predates the
+        # line (or has no tower to speak of) leaves the flag unknown, not False.
+        for line, expected in ((b"CAPS vision=1\n", True), (b"CAPS vision=0\n", False),
+                               (b"", None)):
+            with self.subTest(line=line):
+                process = FakeProcess(lambda _process, _frame: None)
+                process.stdout = BlockingStream(READY + line + b"STAT 0 0 0 0\n")
+                with patch("openai_server.ARCH", "glm53"), \
+                     patch("openai_server.subprocess.Popen", return_value=process):
+                    engine = Engine("glm53", "model")
+                try:
+                    self.assertIs(engine.vision, expected)
+                finally:
+                    engine.close()
+
+
+class ServedModalityTest(unittest.TestCase):
+    """What /v1/models says it accepts is what the engine loaded. The tower is a
+    property of the checkpoint (a glm53 export can carry vision_config and no
+    model.visual.* tensors), not of the family, so the card follows the engine's
+    handshake, and a picture sent to an engine that announced no tower is refused
+    by name at the gateway instead of dying in the engine as a bare BAD_REQUEST."""
+
+    def serve(self, vision):
+        engine = FakeEngine()
+        if vision is not None:
+            engine.vision = vision
+        server = APIServer(("127.0.0.1", 0), engine, "test-model", "secret", 16, kv_slots=1)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def stop():
+            server.scheduler.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+        self.addCleanup(stop)
+        return engine, f"http://127.0.0.1:{server.server_port}"
+
+    def request(self, base, path, body=None):
+        headers = {"Authorization": "Bearer secret"}
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode()
+            headers["Content-Type"] = "application/json"
+        return urlopen(Request(base + path, data=data, headers=headers), timeout=2)
+
+    def test_card_and_health_report_the_live_tower(self):
+        with patch("openai_server.ARCH", "glm53"):
+            for vision, expected in ((True, ["text", "image"]), (False, ["text"]),
+                                     (None, ["text"])):
+                with self.subTest(vision=vision):
+                    _engine, base = self.serve(vision)
+                    with self.request(base, "/v1/models") as response:
+                        card = json.load(response)["data"][0]
+                    self.assertEqual(card["input_modalities"], expected)
+                    with self.request(base, "/v1/models/test-model") as response:
+                        self.assertEqual(json.load(response)["input_modalities"], expected)
+                    with self.request(base, "/health") as response:
+                        self.assertEqual(json.load(response)["input_modalities"], expected)
+
+    def test_a_family_without_an_image_path_never_claims_images(self):
+        # Even an engine that announces a tower is text-only to its clients when
+        # the gateway has no placeholder expansion for the family.
+        with patch("openai_server.ARCH", "glm"):
+            _engine, base = self.serve(True)
+            with self.request(base, "/v1/models") as response:
+                self.assertEqual(json.load(response)["data"][0]["input_modalities"], ["text"])
+
+    def test_tower_less_engine_refuses_a_picture_by_name(self):
+        picture = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+        with patch("openai_server.ARCH", "glm53"):
+            engine, base = self.serve(False)
+            with self.assertRaises(HTTPError) as caught:
+                self.request(base, "/v1/chat/completions", {
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": [
+                        {"type": "text", "text": "what is this?"}, picture]}]})
+            self.addCleanup(caught.exception.close)
+            self.assertEqual(caught.exception.code, 400)
+            error = json.load(caught.exception)["error"]
+            self.assertIn("vision tower", error["message"])
+            self.assertEqual(error["param"], "messages")
+            self.assertEqual(engine.calls, [])            # refused before the engine
+            # the same engine still serves text
+            with self.request(base, "/v1/chat/completions", {
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "hello"}]}) as response:
+                self.assertEqual(response.status, 200)
+            self.assertEqual(len(engine.calls), 1)
 
 
 if __name__ == "__main__":
