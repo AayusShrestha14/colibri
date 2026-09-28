@@ -3483,11 +3483,20 @@ static void trunk_offer_dense(Model *m){
         size_t bq = qdw_bytes(&l->q), bk = qdw_bytes(&l->k), bv = qdw_bytes(&l->v), bo = qdw_bytes(&l->o);
         if (bq && bk && bv && bo) qt_trunk_offer("attnproj", i, bq + bk + bv + bo);
     }
-    for (int i = 0; i < c->n_layers; i++) {
-        Layer *l = &m->L[i];
-        size_t bg = qdw_bytes(&l->sh_g), bu = qdw_bytes(&l->sh_u), bd = qdw_bytes(&l->sh_d);
-        if (bg && bu && bd) qt_trunk_offer("shexp", i, bg + bu + bd);
-    }
+    /* The shared expert is offered only on request (Q36_OFFER_SHEXP=1). On the
+     * card it is 120 synchronous small GEMVs per token that sit between
+     * qt_issue and qt_take, where on the CPU it hides behind the expert group:
+     * measured on the 35B, 3070, shared 3.7-4.0 ms/token on the CPU against
+     * 6.3 on the same card and 11-12.7 with layers on a slower second card
+     * (docs/qwen36-cuda-tier.md). A hand-written COLI_PLACE naming shexp is
+     * still obeyed when the offer is made. */
+    { const char *so = getenv("Q36_OFFER_SHEXP");
+      if (so && *so == '1')
+        for (int i = 0; i < c->n_layers; i++) {
+            Layer *l = &m->L[i];
+            size_t bg = qdw_bytes(&l->sh_g), bu = qdw_bytes(&l->sh_u), bd = qdw_bytes(&l->sh_d);
+            if (bg && bu && bd) qt_trunk_offer("shexp", i, bg + bu + bd);
+        } }
 }
 /* After qt_init decided: upload what was placed, keep the handles in the
  * Layer. Every matrix falls back on its own, so a failed upload costs one
