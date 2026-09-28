@@ -2280,6 +2280,14 @@ tests/bench_i4p_gidot$(EXE): tests/bench_i4p_gidot.c sse41_kernels.h colibri.c o
 tests/bench_gemv_stream$(EXE): tests/bench_gemv_stream.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
+# bench_matmul_f32: microbenchmark (pre-#442 scalar vs row-blocked fmaf f32 matmul at
+# router shapes), NOT a test gate. Build on demand: make tests/bench_matmul_f32
+tests/bench_matmul_f32$(EXE): tests/bench_matmul_f32.c quant.h idot.h sse41_kernels.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_matmul_f32$(EXE): tests/test_matmul_f32.c quant.h idot.h sse41_kernels.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 # bench_mla_simd: microbenchmark (scalar vs AVX2/NEON MLA-absorb reductions, #442),
 # NOT a test gate. Build on demand: make tests/bench_mla_simd
 tests/bench_mla_simd$(EXE): tests/bench_mla_simd.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
