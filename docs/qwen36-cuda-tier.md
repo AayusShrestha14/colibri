@@ -93,7 +93,7 @@ on Qwen3.6-35B-A3B (hidden 2048, 30 DeltaNet and 10 attention layers):
 | `dnproj` | DeltaNet in_proj qkv ++ z, fused | 25.2 MB | 755 MB |
 | `dnout` | DeltaNet out_proj | 8.4 MB | 252 MB |
 | `attnproj` | attention q, k, v, o (one item, four matrices) | 27.3 MB | 273 MB |
-| `shexp` | the shared expert's gate, up, down | 3.1 MB | 126 MB |
+| `shexp` | the shared expert's gate, up, down (offered only with `Q36_OFFER_SHEXP=1`, see below) | 3.1 MB | 126 MB |
 
 Offer order is the placement priority once the budget runs short: `lmhead`,
 then `dnproj`, `dnout`, `attnproj`, `shexp`, each in layer order, so a partial
@@ -264,6 +264,18 @@ ms -- the expert groups are bound by GPU time and by the slower card's
 `COLI_GPUS` card even when a hand-written list reserves some of them for the
 trunk (the default hands a reserved card's experts back to the others, #1361).
 
+### The shared expert stays on the CPU by default
+
+`shexp` on the card is 120 synchronous small GEMVs per token that sit between
+`qt_issue` and `qt_take`, where on the CPU the shared expert hides behind the
+expert group. Measured on the 35B with the DeltaNet layer on the card: shared
+3.7-4.0 ms/token on the CPU against 6.3 on the same 3070, and 11-12.7 ms when
+a slower second card holds some of the layers; the token went 33.3 -> 31.8 ms
+on one card and 38.6 -> 33.6 ms as a two-card pipeline once `shexp` left the
+card. The engine therefore offers `shexp` to the placer only with
+`Q36_OFFER_SHEXP=1`; a hand-written `COLI_PLACE` naming it is obeyed when the
+offer is made.
+
 ### Two cards as a pipeline (`QT_HOME=layer`)
 
 By default expert `eid` is homed on device `eid % n_gpus` in *every* layer,
@@ -278,16 +290,13 @@ the rest on the other, like llama.cpp's layer split. Budgets, warmstart, LFRU
 and the swap path follow the homes; a hand-written list's reservation does
 not remove a card in this mode, its layers' experts live there.
 
-Measured (same box, `auto` without the probe, `Q36_DN_GPU=1`, 200 tokens):
-the join is gone (`take` 0.17 ms), but the pipeline stays behind the 3070
-alone -- 38.6 ms/token at a 28/12 split against 33.3 -- because lm_head and
-twelve layers now run on the slower card, and because the MoE phase does not
-fall below ~14 ms at 97-100 % residency: with eight experts on one card the
-group costs about 0.35 ms per layer whatever the hit rate (launch cost per
-expert, not bandwidth; with the experts split 4+4 it is 11.2 ms). Cold, two
-cards win (45.3 against 52.3 ms), since more experts are resident at once.
-So on two *equal* cards the index split remains the faster form; the layer
-split is for unequal cards and for the day the group is one launch.
+Measured (same box, `Q36_DN_GPU=1`, shared expert on the CPU, 200 tokens):
+the join is gone (`take` 5.2 -> 0.17 ms) and the MoE phase falls from 12.4-13.4
+to 9.4 ms at 99.7 % residency, but the pipeline ends level with the 3070 alone
+-- 33.6 ms/token at a 28/12 split against 31.8-33.1 -- because lm_head (+2.8
+ms) and twelve DeltaNet layers (+1.6 ms) now run on the slower card. Two equal
+cards would keep the MoE gain without that price. Cold, two cards win either
+way (45.3 against 52.3 ms), since more experts are resident at once.
 
 ## Measured (Threadripper 3945WX 12C, RTX 3070 8 GB + Quadro RTX 4000 8 GB, Qwen3.6-35B-A3B int4, 200-token decode)
 
