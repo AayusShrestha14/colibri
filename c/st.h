@@ -33,7 +33,7 @@ typedef struct {
     int     fd;
     int64_t off;       /* offset assoluto del dato dentro al file */
     int64_t nbytes;
-    int     dtype;     /* 0=BF16 1=F16 2=F32 3=U8/I8 4=F8_E4M3 5=F8_E8M0 6=I64 */
+    int     dtype;     /* 0=BF16 1=F16 2=F32 3=U8/I8 4=F8_E4M3 5=F8_E8M0 6=I64 7=U32/I32 */
     int64_t numel;
     int     rank;
     int64_t shape[ST_MAX_RANK];
@@ -95,8 +95,11 @@ static int st_dtype_code(const char *s) {
         !strcmp(s, "float8_e4m3fn")) return 4;
     if (!strcmp(s, "F8_E8M0") || !strcmp(s, "F8_E8M0FNU")) return 5;
     if (!strcmp(s, "I64") || !strcmp(s, "U64")) return 6;
-    /* I32/U32: token ids in reference dumps (tools/make_qwenimage_tiny.py). Same
-     * rule as the fp8 codes above: a new number, read raw, refused by the float readers. */
+    /* I32/U32: token ids in reference dumps (tools/make_qwenimage_tiny.py), and
+     * the packed U32 words of MLX affine-quantized checkpoints (Swiftlet qpack
+     * containers included; qwen36's dense affine loader reads them through
+     * st_read_raw after validating the packed geometry). Same rule as the fp8
+     * codes above: a new number, read raw, refused by the float readers. */
     if (!strcmp(s, "I32") || !strcmp(s, "U32")) return 7;
     fprintf(stderr, "unsupported dtype: %s\n", s); exit(1);
 }
