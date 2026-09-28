@@ -273,6 +273,21 @@ class TemplateTest(unittest.TestCase):
         self.assertEqual(patches.shape[0], grid_h * grid_w)
         self.assertIn("what is this?", messages[0]["content"])
 
+    def test_an_image_url_that_is_not_an_object_is_a_client_error(self):
+        """{"type": "image_url", "image_url": "data:..."} (or a number) made the image
+        expanders call .get("url") on a string, an AttributeError that do_POST answered
+        with 500 on GLM-5.3, Qwen3.8 and DeepSeek V4.1. It is the client's error: 400."""
+        from openai_server import expand_dsv41_images, expand_glm53_images, expand_qwen38_images
+        for expand in (expand_glm53_images, expand_qwen38_images, expand_dsv41_images):
+            for value in ("data:image/png;base64,AAAA", 5, ["x"]):
+                with self.subTest(expand=expand.__name__, value=value):
+                    with self.assertRaises(APIError) as caught:
+                        expand([{"role": "user", "content": [
+                            {"type": "text", "text": "what is this?"},
+                            {"type": "image_url", "image_url": value}]}], None)
+                    self.assertEqual(caught.exception.status, 400)
+                    self.assertIn("`image_url` must be an object", str(caught.exception))
+
     def test_qwen38_template_on_the_qwen36_engine(self):
         """#1757: Qwen3.8-27B is a dense model of Qwen3.5's architecture, so the qwen36
         engine runs it, but it ships Qwen3.8's chat_template.jinja. The gateway renders

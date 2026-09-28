@@ -1974,6 +1974,21 @@ GLM53_IMAGE_OPEN, GLM53_IMAGE, GLM53_IMAGE_CLOSE = (
     "<|begin_of_image|>", "<|image|>", "<|end_of_image|>")
 
 
+def _image_part_url(part, kind):
+    """The URL an image content part names. An `image_url` part carries an object,
+    `{"url": ...}`, and an `input_image` part the URL itself. `.get("url")` on an
+    `image_url` that was a string or a number raised AttributeError, which do_POST
+    answers with 500; that is the client's error, so it is a 400 here."""
+    value = part.get("image_url")
+    if kind != "image_url":
+        return value or part.get("url")
+    if value is None:
+        return None                       # _image_bytes_from_url answers the missing url
+    if not isinstance(value, dict):
+        raise APIError(400, "`image_url` must be an object with a `url`.", "messages")
+    return value.get("url")
+
+
 def _image_bytes_from_url(url):
     """data: URI, file:// o percorso sul disco -> i byte dell'immagine.
 
@@ -2082,8 +2097,7 @@ def expand_qwen38_images(messages, model_dir, max_tokens=None):
             if kind == "text":
                 pieces.append(_text_part(part, index, position))
             elif kind in ("image_url", "input_image"):
-                url = (part.get("image_url") or {}).get("url") if kind == "image_url" \
-                      else part.get("image_url") or part.get("url")
+                url = _image_part_url(part, kind)
                 data = _image_bytes_from_url(url)
                 patches, grid_h, grid_w = _preprocess_qwen38_image(
                     data, model_dir, max_tokens)
@@ -2130,8 +2144,7 @@ def expand_glm53_images(messages, model_dir):
             if kind == "text":
                 pieces.append(_text_part(part, index, position))
             elif kind in ("image_url", "input_image"):
-                url = (part.get("image_url") or {}).get("url") if kind == "image_url" \
-                      else part.get("image_url") or part.get("url")
+                url = _image_part_url(part, kind)
                 data = _image_bytes_from_url(url)
                 patches, grid_h, grid_w = _preprocess_image(data, model_dir)
                 tokens = (grid_h // 2) * (grid_w // 2)
@@ -2168,8 +2181,7 @@ def expand_dsv41_images(messages, model_dir, max_tokens=None):
             if kind == "text":
                 pieces.append(_text_part(part, index, position))
             elif kind in ("image_url", "input_image"):
-                url = (part.get("image_url") or {}).get("url") if kind == "image_url" \
-                      else part.get("image_url") or part.get("url")
+                url = _image_part_url(part, kind)
                 data = _image_bytes_from_url(url)
                 patches, grid_h, grid_w, llm_h, llm_w = _preprocess_dsv41_image(
                     data, model_dir, max_tokens)
