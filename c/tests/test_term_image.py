@@ -284,5 +284,24 @@ class RenderDispatchTest(unittest.TestCase):
             ti.render(pixels, 64, 32, 4, "hologram", env={}, stream=Tty())
 
 
+
+class UpscaleSmoothTest(unittest.TestCase):
+    """The TUI enlarges the engine's one-pixel-per-token previews with this, so
+    they look like a picture forming and not like a mosaic of squares."""
+
+    def test_flat_colour_stays_exact(self):
+        big = ti.upscale_smooth(bytes([10, 200, 30]) * 4, 2, 2, 3, 16, 12)
+        self.assertEqual(big, bytes([10, 200, 30]) * (16 * 12))
+
+    def test_corners_kept_and_middle_interpolated(self):
+        # a black-to-white ramp, 2 pixels wide, enlarged 8x
+        small = bytes([0, 0, 0, 255, 255, 255])
+        big = ti.upscale_smooth(small, 2, 1, 3, 16, 1)
+        row = [big[i * 3] for i in range(16)]
+        self.assertEqual(row[0], 0)
+        self.assertEqual(row[-1], 255)
+        self.assertEqual(row, sorted(row))                 # monotone, no steps back
+        self.assertGreater(len(set(row)), 8)               # a ramp, not two blocks
+
 if __name__ == "__main__":
     unittest.main()

@@ -2146,8 +2146,15 @@ class ImageProgress:
     FRAMES = Spinner.FRAMES
     STAGES = {"encode": "encoding the prompt", "denoise": "denoising", "decode": "decoding"}
 
-    def __init__(self, stream, seed, steps, previews=True):
+    def __init__(self, stream, seed, steps, previews=True, protocol="blocks"):
         self.out = stream
+        # With sixel the preview is drawn as a picture, smoothly enlarged, in an
+        # area reserved once: the cursor is saved at its top (DECSC) and every
+        # step is drawn over the last one from there. kitty and iTerm2 place
+        # images by their own rules, so they keep the half blocks for previews
+        # (the finished picture is full resolution in every graphics protocol).
+        self.protocol = protocol
+        self.area = 0
         self.live = bool(stream) and (stream.isatty() or os.environ.get("COLI_COLOR") == "1")
         self.previews = previews and self.live
         self.seed, self.steps = seed, steps
@@ -2197,6 +2204,9 @@ class ImageProgress:
         if not self.previews or not width or not height:
             return
         import term_image
+        if self.protocol == "sixel":
+            self._preview_sixel(term_image, width, height, channels, pixels)
+            return
         try:
             text = term_image.render_blocks(pixels, width, height, channels,
                                             max_columns=min(64, term_w() - 6), max_rows=16,
@@ -2207,6 +2217,31 @@ class ImageProgress:
             self.out.write(f"\r\033[{self.rows}A" if self.rows else "\r\033[K")
             self.out.write(text)
             self.rows = text.count("\n")
+            self._draw()
+
+    def _preview_sixel(self, term_image, width, height, channels, pixels):
+        columns, rows, cell_w, cell_h = term_image.terminal_geometry(self.out)
+        w_px = max(64, min(512, (columns - 6) * cell_w))
+        h_px = round(height * w_px / width)
+        cap = max(4, min(18, rows - 8)) * cell_h
+        if h_px > cap:
+            h_px, w_px = cap, max(64, round(width * cap / height))
+        try:
+            big = term_image.upscale_smooth(pixels, width, height, channels, w_px, h_px)
+            text = term_image.render_sixel(big, w_px, h_px, channels, w_px, h_px, "  ")
+        except (ValueError, IndexError):
+            return
+        # rows the picture covers, with a margin for a terminal whose real cells
+        # are smaller than the ones it reported (or than the 8x16 guess)
+        lines = -(-h_px // max(8, cell_h - 2)) + 1
+        with self.lock:
+            if not self.area:
+                # reserve the lines now, so the terminal scrolls here and never
+                # under a saved cursor
+                self.out.write("\r\033[K" + "\n" * lines + f"\033[{lines}A\r\0337")
+                self.area = lines
+            self.out.write("\0338" + text)
+            self.out.write(f"\0338\033[{self.area}B")
             self._draw()
 
     def interrupted(self):
@@ -2223,10 +2258,13 @@ class ImageProgress:
         if self.live:
             with self.lock:
                 self.out.write("\r\033[K")
-                if self.rows:
+                if self.area:
+                    self.out.write("\0338\033[J")          # the preview area, image and all
+                elif self.rows:
                     self.out.write(f"\033[{self.rows}A\r\033[J")
                 self.out.flush()
             self.rows = 0
+            self.area = 0
 
 def image_settings(a, info):
     """Size, steps and seed for the first image: the flags when given, the
@@ -2257,7 +2295,7 @@ def generate_image(backend, prompt, settings, protocol, out=None, stream=None, l
     stream = stream or sys.stdout
     seed = settings["seed"] if settings["seed"] is not None else random_seed()
     previews = protocol != "none" and os.environ.get("COLI_IMAGE_PREVIEW", "1") != "0"
-    progress = ImageProgress(stream, seed, settings["steps"], previews)
+    progress = ImageProgress(stream, seed, settings["steps"], previews, protocol)
     progress.start()
     t0 = time.time()
     try:

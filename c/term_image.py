@@ -250,6 +250,35 @@ def resize(pixels, width, height, channels, new_width, new_height):
     return bytes(out)
 
 
+def upscale_smooth(pixels, width, height, channels, new_width, new_height):
+    """Bilinear enlargement. The engine's previews carry one pixel per latent
+    token (48x32 for a 768x512 picture): enlarged with resize() they come out as
+    visible squares, and a preview is meant to look like a picture forming, as
+    the web UI shows it (smoothly scaled and blurred), not like a mosaic."""
+    new_width, new_height = max(1, new_width), max(1, new_height)
+    out = bytearray(new_width * new_height * channels)
+    columns = []
+    for x in range(new_width):
+        fx = min(max((x + 0.5) * width / new_width - 0.5, 0.0), width - 1.0)
+        x0 = int(fx)
+        x1 = min(width - 1, x0 + 1)
+        columns.append((x0 * channels, x1 * channels, fx - x0))
+    o = 0
+    for y in range(new_height):
+        fy = min(max((y + 0.5) * height / new_height - 0.5, 0.0), height - 1.0)
+        y0 = int(fy)
+        u = fy - y0
+        r0 = y0 * width * channels
+        r1 = min(height - 1, y0 + 1) * width * channels
+        for a0, a1, t in columns:
+            for c in range(channels):
+                top = pixels[r0 + a0 + c] + (pixels[r0 + a1 + c] - pixels[r0 + a0 + c]) * t
+                bottom = pixels[r1 + a0 + c] + (pixels[r1 + a1 + c] - pixels[r1 + a0 + c]) * t
+                out[o] = int(top + (bottom - top) * u + 0.5)
+                o += 1
+    return bytes(out)
+
+
 def flatten(pixels, width, height, channels, checker=8):
     """RGB for renderers that have no alpha: transparent areas over a grey
     checkerboard, the convention that reads as "transparent" at a glance."""
