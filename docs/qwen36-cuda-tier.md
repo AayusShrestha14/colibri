@@ -245,7 +245,8 @@ tokens, trunk in VRAM, `COLI_TIMERS=1`):
 |---|---|---|
 | DeltaNet ms/token | 16.2 | **10.8** |
 | token ms | 39.4 / 39.3 | **33.9 / 33.3** |
-| tok/s (engine line, TTFT included) | 21.2 / 21.3 | **24.1 / 24.4** |
+| decode tok/s | 25.4 | **30.0** |
+| tok/s as the engine prints it (TTFT included) | 21.2 / 21.3 | **24.1 / 24.4** |
 | VRAM hit rate | 82 % | 82 % |
 | layers on the card | 0 | 30 |
 
@@ -294,8 +295,10 @@ not remove a card in this mode, its layers' experts live there.
 Measured (same box, `Q36_DN_GPU=1`, shared expert on the CPU, 200 tokens):
 the join is gone (`take` 5.2 -> 0.17 ms) and the MoE phase falls from 12.4-13.4
 to 9.4 ms at 99.7 % residency, but the pipeline ends level with the 3070 alone
--- 33.6 ms/token at a 28/12 split against 31.8-33.1 -- because lm_head (+2.8
-ms) and twelve DeltaNet layers (+1.6 ms) now run on the slower card. Two equal
+-- 33.6 ms/token (29.8 tok/s) at a 28/12 split against 31.8-33.1 ms (30.2-31.4
+tok/s) -- because lm_head (+2.8 ms) and twelve DeltaNet layers (+1.6 ms) now run
+on the slower card. The startup probe measures that card 154 % slower per dense
+byte and chooses 28/12 by itself; under `auto` that is 36.0 ms (27.8 tok/s). Two equal
 cards would keep the MoE gain without that price. Cold, two cards win either
 way (45.3 against 52.3 ms), since more experts are resident at once. For the
 record, Ollama 0.34.4 on the same pair shows the same shape: 38.1 tok/s on the
