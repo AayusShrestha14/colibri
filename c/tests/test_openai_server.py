@@ -3624,6 +3624,66 @@ class UnclosedToolCallTest(unittest.TestCase):
         self.assertEqual(content, "Done.")
 
 
+class StrictGLMToolCallTest(unittest.TestCase):
+    """Opt-in calls must be complete before a client can execute them."""
+
+    CALL = ("<tool_call>lookup_order<arg_key>order_id</arg_key>"
+            "<arg_value>00123</arg_value></tool_call>")
+
+    def test_complete_call_preserves_declared_string(self):
+        content, calls = openai_server.parse_glm_tool_calls_strict("Checking. " + self.CALL,
+                                                                   ORDER_TOOL)
+        self.assertEqual(content, "Checking.")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"order_id": "00123"})
+
+    def test_incomplete_duplicate_undeclared_and_invalid_calls_fail_closed(self):
+        bad = (self.CALL[:-len("</tool_call>")],
+               self.CALL.replace("</tool_call>",
+                                 "<arg_key>order_id</arg_key><arg_value>other</arg_value></tool_call>"),
+               self.CALL.replace("lookup_order", "other_function"),
+               self.CALL.replace("</tool_call>",
+                                 "<arg_key>qty</arg_key><arg_value>many</arg_value></tool_call>"),
+               self.CALL.replace("order_id", "other_key"),
+               "<tool_call>lookup_order</tool_call>")
+        for reply in bad:
+            with self.subTest(reply=reply), self.assertRaises(APIError) as caught:
+                openai_server.parse_glm_tool_calls_strict(reply, ORDER_TOOL)
+            self.assertEqual(caught.exception.code, "invalid_model_tool_call")
+
+    def test_http_refuses_length_limited_tool_and_unsupported_stream_before_dispatch(self):
+        engine = ScriptedEngine(chunks=(self.CALL,), length_limited=True)
+        base = _spawn_test_server(self, engine)
+        body = {"model": "test-model", "messages": [{"role": "user", "content": "order?"}],
+                "tools": ORDER_TOOL, "strict_tool_calls": True}
+        with patch.object(openai_server, "ARCH", "glm"):
+            status, error = _error_body(self, lambda: _post_chat(base, body))
+            self.assertEqual((status, error["code"]), (502, "invalid_model_tool_call"))
+            self.assertEqual(len(engine.calls), 1)
+            status, error = _error_body(self, lambda: _post_chat(base, {**body, "stream": True}))
+            self.assertEqual((status, error["code"]), (400, "unsupported_parameter"))
+            self.assertEqual(len(engine.calls), 1)
+            status, error = _error_body(self, lambda: _post_chat(base, {**body,
+                                                 "strict_tool_calls": "true"}))
+            self.assertEqual((status, error["param"]), (400, "strict_tool_calls"))
+            self.assertEqual(len(engine.calls), 1)
+            status, error = _error_body(self, lambda: _post_chat(base, {**body, "tools": []}))
+            self.assertEqual((status, error["param"]), (400, "strict_tool_calls"))
+            self.assertEqual(len(engine.calls), 1)
+
+    def test_http_complete_call_finishes_with_tool_calls(self):
+        engine = ScriptedEngine(chunks=(self.CALL,))
+        base = _spawn_test_server(self, engine)
+        body = {"model": "test-model", "messages": [{"role": "user", "content": "order?"}],
+                "tools": ORDER_TOOL, "strict_tool_calls": True}
+        with patch.object(openai_server, "ARCH", "glm"):
+            with _post_chat(base, body) as response:
+                result = json.load(response)
+        choice = result["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        self.assertEqual(json.loads(choice["message"]["tool_calls"][0]["function"]["arguments"]),
+                         {"order_id": "00123"})
+
+
 class ToolChoiceTest(unittest.TestCase):
     def test_none_does_not_offer_the_tools(self):
         prompt = render_chat([{"role": "user", "content": "hi"}], tools=ORDER_TOOL,
