@@ -5765,13 +5765,21 @@ class APIHandler(BaseHTTPRequestHandler):
             # La conversazione in corso FA da stato: e' quello che la TUI manda
             # quando si scrive /brio a meta chat.
             parts = []
-            for message in messages:
+            for message_index, message in enumerate(messages):
                 if not isinstance(message, dict):
                     raise APIError(400, "Every message must be an object.", "messages")
                 content = message.get("content")
                 if isinstance(content, list):
-                    content = "".join(piece.get("text", "") for piece in content
-                                      if isinstance(piece, dict))
+                    text_parts = []
+                    for part_index, piece in enumerate(content):
+                        if not isinstance(piece, dict):
+                            continue
+                        text = piece.get("text", "")
+                        if not isinstance(text, str):
+                            raise APIError(400, "Text content parts require a string `text` field.",
+                                           f"messages.{message_index}.content.{part_index}.text")
+                        text_parts.append(text)
+                    content = "".join(text_parts)
                 if content:
                     parts.append(f"{message.get('role', 'user')}: {content}")
             state = "\n".join(parts)
