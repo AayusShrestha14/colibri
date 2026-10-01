@@ -7015,6 +7015,13 @@ class APIHandler(BaseHTTPRequestHandler):
         if not isinstance(stream, bool):
             raise APIError(400, "`stream` must be a boolean.", "stream")
         message_id = "msg_" + uuid.uuid4().hex[:24]
+        # GLM-5.3 opens <think> in the prompt even with thinking off (#1278), so its reply
+        # starts with reasoning either way. Split it off so the answer never carries the
+        # reasoning or a literal </think>, but only return it as a thinking block when the
+        # client asked for thinking: the real API never sends one otherwise, and clients
+        # read the answer from content[0].
+        split_reasoning = enable_thinking or starts_in_reasoning(enable_thinking,
+                                                                 add_generation_prompt)
 
         def blocks_and_stop(text, stats, tool_reply=None):
             """Split a finished reply into Anthropic content blocks + stop_reason."""
@@ -7022,7 +7029,7 @@ class APIHandler(BaseHTTPRequestHandler):
             reasoning = ""
             if ARCH == "inkling":
                 text, reasoning = split_inkling(text)
-            elif enable_thinking:
+            elif split_reasoning:
                 reasoning, text = split_thinking_reply(text, enable_thinking,
                                                        add_generation_prompt)
             if enable_thinking:
@@ -7169,6 +7176,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     state["buf"] = state["buf"][flush:]
 
             def emit_thinking(chunk):
+                if not enable_thinking:
+                    return                       # reasoning the client did not ask for
                 send_event("content_block_delta", {"type": "content_block_delta", "index": 0,
                     "delta": {"type": "thinking_delta", "thinking": chunk}})
 
