@@ -283,20 +283,7 @@ static float g_temp = 0.7f;   /* TEMP env overrides */
 static float g_nuc  = 0.95f;  /* NUCLEUS env overrides */
 #include "sample.h"
 
-/* y[S,O] = x[S,I] @ W^T,  W e' [O,I] row-major */
-static void matmul(float *y, const float *x, const float *W, int S, int I, int O) {
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
-        const float *w = W + (int64_t)o * I;
-        for (int s = 0; s < S; s++) {
-            const float *xs = x + (int64_t)s * I;
-            float acc = 0.f;
-            #pragma omp simd reduction(+:acc)
-            for (int i = 0; i < I; i++) acc += xs[i] * w[i];
-            y[(int64_t)s * O + o] = acc;
-        }
-    }
-}
+#include "matmul_f32.h"   /* y[S,O] = x[S,I] @ W^T, W [O,I] f32 row-major */
 
 /* y[1,O] = x[1,I] @ W^T con W quantizzato: q[O,I] int8 + scala per riga.
  * W[o,i] ~= q[o,i]*scale[o]  ->  y[o] = scale[o] * sum_i x[i]*q[o,i].
