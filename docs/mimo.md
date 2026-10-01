@@ -121,7 +121,10 @@ move with that.
 
 Through the gateway: a tool call comes back as `get_weather({"city": "Roma", "days": 3})`
 with the integer typed as declared, and asked what is written in a picture made by
-colibri's Qwen-Image the model answers with its text, word for word.
+colibri's Qwen-Image the model answers with its text, word for word. The same in
+`coli web` and `coli chat`:
+
+![MiMo-V2.6 Flash in coli web, reading a picture made by Qwen-Image](media/mimo-web.png)
 
 ## Environment
 
