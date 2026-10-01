@@ -716,6 +716,65 @@ def parse_tool_calls(reply, tools=None):
     return content, calls
 
 
+def parse_glm_tool_calls_strict(reply, tools):
+    """Parse complete GLM calls against declared schemas, without recovery or salvage.
+
+    A client can opt into this when executing a malformed call would be worse than
+    receiving a named model-output error. The default parser remains permissive.
+    """
+    def invalid(reason):
+        raise APIError(502, "Invalid GLM tool call: " + reason, code="invalid_model_tool_call",
+                       error_type="server_error")
+
+    declared = {_tool_function(tool).get("name"): _tool_function(tool).get("parameters") or {}
+                for tool in tools}
+    calls = []
+    boxes = list(_BOX_RE.finditer(reply))
+    outside = _BOX_RE.sub("", reply)
+    if re.search(r"</?tool_call|</?arg_(?:key|value)", outside):
+        invalid("incomplete or stray tool marker")
+    for box in boxes:
+        inner = box.group(1)
+        name_match = _NAME_RE.match(inner)
+        if not name_match or name_match.group(1) not in declared:
+            invalid("undeclared function")
+        name = name_match.group(1)
+        params = declared[name]
+        properties = params.get("properties") or {}
+        args = {}
+        cursor = name_match.end()
+        while inner[cursor:].strip():
+            prefix = len(inner[cursor:]) - len(inner[cursor:].lstrip())
+            cursor += prefix
+            match = _ARG_RE.match(inner, cursor)
+            if not match:
+                invalid("malformed argument syntax")
+            key, value = match.groups()
+            if key not in properties or key in args or re.search(r"</?arg_(?:key|value)|</?tool_call", value):
+                invalid("unknown, duplicate, or malformed argument")
+            spec = properties[key] if isinstance(properties[key], dict) else {}
+            declared_type = spec.get("type")
+            if isinstance(declared_type, list):
+                declared_type = next((item for item in declared_type if item != "null"), None)
+            parsed = _coerce_arg(value, declared_type)
+            valid = (declared_type in (None, "string") or
+                     (declared_type == "integer" and type(parsed) is int) or
+                     (declared_type == "number" and type(parsed) in (int, float)) or
+                     (declared_type == "boolean" and type(parsed) is bool) or
+                     (declared_type == "array" and isinstance(parsed, list)) or
+                     (declared_type == "object" and isinstance(parsed, dict)))
+            if not valid:
+                invalid("argument does not match its declared type")
+            args[key] = parsed
+            cursor = match.end()
+        if any(key not in args for key in params.get("required") or []):
+            invalid("missing required argument")
+        calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+                      "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+    content, _box_map, _content_map = _tool_call_content_spans(reply, None, False)
+    return content, calls
+
+
 def parse_tool_calls_spans(reply, tools=None):
     """parse_tool_calls plus the tool-call stage's maps."""
     return _parse_tool_calls(reply, tools, True)
@@ -6596,7 +6655,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 # describe the string it produces. It reads nothing the tail writes.
                 content, calls, content_spans = None, [], None
                 if chat and tools:
-                    if engine_k:
+                    if body.get("strict_tool_calls") and ARCH == "glm":
+                        if stats["length_limited"] and BOX_START in text:
+                            raise APIError(502, "GLM tool call ended at the generation limit.",
+                                           code="invalid_model_tool_call", error_type="server_error")
+                        content, calls = parse_glm_tool_calls_strict(text, tools)
+                    elif engine_k:
                         content, calls, _box_spans, tool_spans = parse_arch_tool_calls_spans(
                             text, tools, sideband.reply())
                     else:
@@ -6867,6 +6931,18 @@ class APIHandler(BaseHTTPRequestHandler):
                 "total_tokens": prompt + completion}
 
     def chat_completion(self, body, request_id):
+        strict_tools = body.get("strict_tool_calls", False)
+        if not isinstance(strict_tools, bool):
+            raise APIError(400, "`strict_tool_calls` must be a boolean.", "strict_tool_calls")
+        if strict_tools and ARCH != "glm":
+            raise APIError(400, "`strict_tool_calls` currently supports GLM only.",
+                           "strict_tool_calls", "unsupported_parameter")
+        if strict_tools and body.get("stream") is True:
+            raise APIError(400, "`strict_tool_calls` requires `stream: false`.",
+                           "stream", "unsupported_parameter")
+        if strict_tools and body.get("logprobs"):
+            raise APIError(400, "`strict_tool_calls` does not support `logprobs` yet.",
+                           "logprobs", "unsupported_parameter")
         reasoning_effort = body.get("reasoning_effort")
         efforts = (None, "none", "minimal", "low", "medium", "high", "xhigh")
         if reasoning_effort not in efforts:
@@ -6910,6 +6986,17 @@ class APIHandler(BaseHTTPRequestHandler):
         validate_tools(body)
         tools = body.get("tools") or body.get("functions") or None
         tool_choice = body.get("tool_choice")
+        if strict_tools and (not isinstance(tools, list) or not tools or tool_choice == "none"):
+            raise APIError(400, "`strict_tool_calls` requires active `tools`.",
+                           "strict_tool_calls", "unsupported_parameter")
+        if strict_tools:
+            for index, tool in enumerate(tools):
+                params = _tool_function(tool).get("parameters") or {}
+                if (not isinstance(params, dict) or
+                        not isinstance(params.get("properties", {}), dict) or
+                        not isinstance(params.get("required", []), list)):
+                    raise APIError(400, "Strict tool schemas need object `parameters`, "
+                                   "object `properties` and array `required`.", f"tools.{index}")
         audio_clips = [] if ARCH == "inkling" else None
         messages = body.get("messages")
         if not isinstance(messages, list) or not messages:
