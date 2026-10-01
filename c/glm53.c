@@ -2967,6 +2967,9 @@ static int sample_token(const float *logits, int vocab) {
  * Se il prompt nuovo non estende quello vecchio, la sessione si rifa'. */
 #define GLM53_MAX_SLOTS 16
 
+/* la ricorrenza KDA di uno scatto: stato e finestra di ogni strato lineare */
+typedef struct { float **state, **window; int n_layers; } Glm53PinState;
+
 typedef struct {
     GSession *session;
     int *tokens;                          /* la sequenza che lo slot tiene */
@@ -2979,10 +2982,26 @@ typedef struct {
      * posizioni non esistono piu e gli scatti non valgono niente. */
     ColiPinPool pins;
     GSession *pin_session;
+    /* Dove riprendere il turno appena finito, se il prossimo prompt e' la
+     * sua storia esatta (un Continue dopo una disconnessione) o la sua storia
+     * senza gli spazi finali (lo stesso Continue, dopo che il gateway ha
+     * tolto gli spazi in coda). Valgono solo per il turno subito dopo: ogni
+     * turno li decide, li azzera, e li riscrive alla fine.
+     *
+     * tail_logit: la riga che predice la posizione `filled`, cioe' lo stato
+     * finale della sessione. Senza, un prompt uguale alla cache non avrebbe
+     * niente da macinare e quindi nessun logit, e si rifarebbe da capo.
+     *
+     * blank: lo stato KDA com'era prima del primo token di spazi dell'ultima
+     * corsa generata, con la riga che quel token l'ha scelto. E' il solo
+     * riavvolgimento che serve: il gateway toglie gli spazi in coda a un turno
+     * da continuare, quindi il Continue arriva corto di quella corsa. */
+    float *tail_logit;
+    int tail_len;
+    Glm53PinState *blank;
+    float *blank_logit;
+    int blank_len;
 } KVSlot;
-
-/* la ricorrenza KDA di uno scatto: stato e finestra di ogni strato lineare */
-typedef struct { float **state, **window; int n_layers; } Glm53PinState;
 
 static KVSlot g_slots[GLM53_MAX_SLOTS];
 static int g_n_slots = 0;
@@ -3093,11 +3112,57 @@ static int slot_pin_restore(const GModel *m, KVSlot *slot, const int *tokens, in
     return 0;
 }
 
+/* Lo stato KDA della sessione, dentro o fuori da uno scatto. Il buffer si
+ * alloca la prima volta e poi si riusa (~149 MiB), 34 strati lineari da
+ * 64x128x128 piu' la finestra della convoluzione. */
+static int glm53_state_capture(const GModel *m, Glm53PinState **into, const GSession *s) {
+    const Cfg *c = &m->c;
+    const size_t ns = (size_t)c->kda_heads * c->kda_hd * c->kda_hd;
+    const size_t nw = (size_t)3 * c->kda_proj * c->conv_k;
+    Glm53PinState *st = *into;
+    if (!st) {
+        st = (Glm53PinState *)calloc(1, sizeof(*st));
+        if (!st) return 0;
+        st->n_layers = c->n_layers;
+        st->state  = (float **)calloc((size_t)c->n_layers, sizeof(float *));
+        st->window = (float **)calloc((size_t)c->n_layers, sizeof(float *));
+        if (!st->state || !st->window) { glm53_pin_state_free(st); return 0; }
+        for (int i = 0; i < c->n_layers; i++) {
+            if (c->is_full[i] || !s->layer[i].kda_state) continue;
+            st->state[i]  = (float *)malloc(ns * sizeof(float));
+            st->window[i] = (float *)malloc(nw * sizeof(float));
+            if (!st->state[i] || !st->window[i]) { glm53_pin_state_free(st); return 0; }
+        }
+        *into = st;
+    }
+    for (int i = 0; i < c->n_layers; i++) {
+        if (c->is_full[i] || !s->layer[i].kda_state || !st->state[i]) continue;
+        memcpy(st->state[i],  s->layer[i].kda_state,  ns * sizeof(float));
+        memcpy(st->window[i], s->layer[i].kda_window, nw * sizeof(float));
+    }
+    return 1;
+}
+
+static void glm53_state_restore(const GModel *m, const Glm53PinState *st, GSession *s) {
+    const Cfg *c = &m->c;
+    const size_t ns = (size_t)c->kda_heads * c->kda_hd * c->kda_hd;
+    const size_t nw = (size_t)3 * c->kda_proj * c->conv_k;
+    for (int i = 0; i < c->n_layers; i++) {
+        if (c->is_full[i] || !s->layer[i].kda_state || !st->state[i]) continue;
+        memcpy(s->layer[i].kda_state,  st->state[i],  ns * sizeof(float));
+        memcpy(s->layer[i].kda_window, st->window[i], nw * sizeof(float));
+    }
+}
+
 static void slot_reset(const GModel *m, KVSlot *slot) {
     slot_pin_drop(m, slot);
     if (slot->session) session_close(m, slot->session);
     slot->session = NULL;
     slot->n = 0;
+    free(slot->tail_logit);
+    slot->tail_logit = NULL;
+    slot->tail_len = 0;
+    slot->blank_len = 0;          /* il buffer resta: si riusa alla prossima corsa */
 }
 
 /* Quanti token iniziali lo slot ha gia' in cache e puo' tenere. */
@@ -3442,11 +3507,35 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
                     : total <= cached && common == total ? (total == cached ? "equal" : "shorter")
                     : common < cached                    ? "diverged"
                     :                                      "extend";
+    /* Riprendere il turno appena finito senza macinare niente: il prompt e'
+     * la sua storia esatta (tail) o la sua storia fino all'inizio dell'ultima
+     * corsa di spazi (blank). Tutti e due valgono solo col turno subito
+     * prima, e il controllo sugli id e' contro la storia dello slot, cioe'
+     * contro quello che le righe tengono davvero. Non con un'immagine (gli
+     * id non la descrivono) e non con logprobs: la lettura ECHO vuole
+     * macinare le posizioni che riporta. Si decide prima della fotografia,
+     * che cambierebbe lo stato sotto. */
+    float *resume = NULL;
+    const int plain = !(g_pending.patches && g_pending.id == q->id) && q->logprobs == 0;
+    if (plain && cached > 0 && common == total) {
+        if (total == cached && slot->tail_logit && slot->tail_len == cached) {
+            resume = slot->tail_logit;
+            slot->tail_logit = NULL;
+        } else if (slot->blank && slot->blank_len == total && total < cached &&
+                   (resume = malloc((size_t)m->c.vocab * sizeof(float)))) {
+            memcpy(resume, slot->blank_logit, (size_t)m->c.vocab * sizeof(float));
+            glm53_state_restore(m, slot->blank, slot->session);
+            slot->session->filled = total;
+        }
+        if (resume) shared = total;
+    }
+    slot->tail_len = 0;
+    slot->blank_len = 0;
     /* La fotografia si prova sempre, non solo quando il riuso in avanti
      * fallisce: se lo stato vivo e gia il prompt condiviso, il riuso normale
      * scatterebbe lo stesso ma il primo token fresco resterebbe senza
      * predittore, e quindi senza logprob, proprio quello che serve. */
-    int pinned = slot_pin_restore(m, slot, sequence, total);
+    int pinned = resume ? 0 : slot_pin_restore(m, slot, sequence, total);
     if (pinned > 0) { shared = pinned; why = "pin"; }
     if (shared <= 0) {
         slot_reset(m, slot);
@@ -3489,7 +3578,8 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     }
     int rows = 1, ctl = SERVE_CTL_NONE, input_eof = 0;
     PrefillWatch watch = { q->id, &ctl, &input_eof };
-    float *logits = forward_prefill(m, slot->session, sequence + shared,
+    float *logits = resume ? resume
+                  : forward_prefill(m, slot->session, sequence + shared,
                                     total - shared, vision, n_vision, 0,
                                     prefill_should_halt, &watch);
     g_echo_k = 0; g_echo_id = 0;   /* la lettura riguarda il prefill, non la decodifica */
@@ -3506,6 +3596,14 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     else if (q->pin)
         fprintf(stderr, "[PIN] stato fotografato a %d token\n", total);
     GSession *session = slot->session;
+    /* GLM53_REWIND=1 accende lo scatto della corsa di spazi, che costa un
+     * buffer grande quanto lo stato KDA (~149 MiB, fuori da GLM53_EXPERT_GB)
+     * e una sua copia per ogni corsa, non per ogni token. Spento di
+     * default: lo pagherebbe ogni risposta, anche di chi non fa mai Continue. */
+    const char *rewind_setting = getenv("GLM53_REWIND");
+    const int keep_blank = q->logprobs == 0 && n_vision == 0 &&
+                           rewind_setting && atoi(rewind_setting);
+    int in_blank = 0;
     for (int step = 0; step < budget; step++) {
         /* #1332: una guardata a stdin per token. Il costo e' una select con
          * timeout zero; il guadagno e' che il gateway smette di aspettare un
@@ -3535,8 +3633,9 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         char lptail[1024]; lptail[0] = 0;
         if (q->logprobs > 0)
             coli_logprob_tail(lptail, sizeof lptail, row, m->c.vocab, next, q->logprobs);
-        free(logits);
-        logits = NULL;
+        /* `logits` resta finche' non ne arriva uno nuovo: a ogni uscita dal
+         * ciclo descrive la posizione `filled`, ed e' quello che il turno dopo
+         * riprende se il suo prompt e' questa storia esatta. */
         if (is_stop(next)) break;
         sequence[total++] = next;
         emitted++;
@@ -3545,11 +3644,42 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         if (q->logprobs > 0) serve_data_lp(q->id, piece, written, lptail);
         else serve_data(q->id, piece, written);
         if (step + 1 == budget) { limited = 1; break; }
-        logits = forward_span(m, session, &next, 1, NULL, 0);
+        /* Il primo token di soli spazi di una corsa: lo stato di adesso e la
+         * riga che l'ha scelto sono dove un Continue riprende se il gateway
+         * gli toglie la corsa in coda. Solo spazi ASCII: quello che
+         * str.rstrip() toglie in piu' (spazi Unicode, o spazi dentro un token
+         * con del testo) ritokenizza diverso e si rifa' da capo lo stesso. */
+        int blank = written > 0;
+        for (int i = 0; i < written && blank; i++)
+            blank = piece[i] == ' ' || piece[i] == '\n' || piece[i] == '\t' ||
+                    piece[i] == '\r' || piece[i] == '\v' || piece[i] == '\f';
+        if (keep_blank && blank && !in_blank) {
+            if (!slot->blank_logit)
+                slot->blank_logit = malloc((size_t)m->c.vocab * sizeof(float));
+            if (slot->blank_logit && glm53_state_capture(m, &slot->blank, session)) {
+                memcpy(slot->blank_logit, row, (size_t)m->c.vocab * sizeof(float));
+                slot->blank_len = session->filled;
+            }
+        }
+        in_blank = blank;
+        float *fed = forward_span(m, session, &next, 1, NULL, 0);
+        free(logits);
+        logits = fed;
         rows = 1;
     }
-    free(logits);
     free(vision);
+    /* Il turno dopo riprende da qui se il suo prompt e' questa storia esatta.
+     * Dopo un prefill interrotto `logits` e' NULL e non c'e' niente da
+     * riprendere: il nuovo tentativo estende quello che e' stato macinato.
+     * Non dopo un turno con un'immagine: il controllo del turno dopo e' sugli
+     * id, e gli id dei segnaposto non dicono quale immagine ha fatto queste
+     * righe. Una richiesta senza IMAGE e con gli stessi id riprenderebbe da
+     * embedding che non ha mandato. */
+    free(slot->tail_logit);
+    slot->tail_logit = n_vision == 0 ? logits : NULL;
+    slot->tail_len = slot->tail_logit ? session->filled : 0;
+    if (!slot->tail_logit) free(logits);
+    logits = NULL;
     /* La sessione resta allo slot per il turno dopo, con la sequenza che ha
      * davvero macinato: prompt piu' quello che ha generato. */
     slot_remember(slot, sequence, total);
