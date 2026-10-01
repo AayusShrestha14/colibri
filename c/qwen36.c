@@ -4175,6 +4175,9 @@ static void serve_loop(Model *m){
     coli_serve_binary_mode();
     setvbuf(stdin,NULL,_IONBF,0);
     fputs("\x01\x01READY\x01\x01\n",stdout);
+    /* fra READY e STAT: il gateway lo legge nella stretta di mano, quindi sa che
+     * modalita' serve prima della prima richiesta (docs/serve_protocol.md) */
+    printf("CAPS vision=%d\n",m->vis_ready?1:0);
     printf("STAT 0 0.00 0.0 %.2f\n",rss_gb());
     fflush(stdout);
     emap_emit(m);          /* dopo READY e STAT: il boot reader legge STAT dopo il sentinel */

@@ -72,6 +72,8 @@ def handshake(process):
     if "READY" not in ready:
         raise AssertionError(f"prima riga {ready!r}, atteso il sentinello READY")
     stat = read_line(process.stdout)
+    while stat.startswith("CAPS "):        # CAPS vision=<0|1> sits between READY and STAT
+        stat = read_line(process.stdout)
     if not stat.startswith("STAT "):
         raise AssertionError(f"seconda riga {stat!r}, atteso STAT")
 
