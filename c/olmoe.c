@@ -46,6 +46,7 @@
 #include "kv_prefix.h"
 #include "pin_pool.h"                       /* piu scatti annidati */   /* riuso del prefisso tra turni (shared) */
 #include "serve_codec.h"
+#include "serve_budget.h"
 #ifdef COLI_SEGMENT_ADAPTER
 #include "segment_runtime.h"
 #include "segment_adapters.h"
@@ -132,6 +133,7 @@ typedef struct {
 } Model;
 
 static pthread_mutex_t g_pilot_mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_pilot_cv = PTHREAD_COND_INITIALIZER; /* broadcast on every publish */
 static struct { int l, e; } pilot_q[4096];
 static volatile unsigned pilot_r = 0, pilot_w = 0;
 static Model *pilot_m = NULL;
@@ -193,6 +195,28 @@ static void cache_publish(Model *m, int layer, Slot *s, int eid) {
     s->eid = eid;
     if (lc->slot_by_expert && eid >= 0 && eid < m->c.n_experts)
         lc->slot_by_expert[eid] = (int)(s - lc->slots);
+}
+
+/* A slot being read keeps the index entry of the expert it is loading, marked
+ * -(eid+2) as in colibri.c's ecache_reserve: lookups still miss and eviction
+ * still skips it (eid < 0), but a second loader of the same expert can see the
+ * read in flight instead of starting another one into another slot. */
+static void cache_reserve(Model *m, int layer, Slot *s, int eid) {
+    LCache *lc = &m->cache[layer];
+    cache_hide(m, layer, s);
+    s->eid = -(eid + 2);
+    if (lc->slot_by_expert && eid >= 0 && eid < m->c.n_experts)
+        lc->slot_by_expert[eid] = (int)(s - lc->slots);
+}
+
+/* Caller holds g_pilot_mx. */
+static int slot_in_flight(Model *m, int layer, int eid) {
+    if (layer < 0 || layer >= m->c.n_layers || eid < 0 ||
+        eid >= m->c.n_experts) return 0;
+    LCache *lc = &m->cache[layer];
+    if (!lc->slot_by_expert) return 0;
+    int i = lc->slot_by_expert[eid];
+    return i >= 0 && i < lc->n && lc->slots[i].eid == -(eid + 2);
 }
 
 static void ensure_pilot_worker_started(Model *m) {
@@ -269,20 +293,7 @@ static float g_temp = 0.7f;   /* TEMP env overrides */
 static float g_nuc  = 0.95f;  /* NUCLEUS env overrides */
 #include "sample.h"
 
-/* y[S,O] = x[S,I] @ W^T,  W e' [O,I] row-major */
-static void matmul(float *y, const float *x, const float *W, int S, int I, int O) {
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
-        const float *w = W + (int64_t)o * I;
-        for (int s = 0; s < S; s++) {
-            const float *xs = x + (int64_t)s * I;
-            float acc = 0.f;
-            #pragma omp simd reduction(+:acc)
-            for (int i = 0; i < I; i++) acc += xs[i] * w[i];
-            y[(int64_t)s * O + o] = acc;
-        }
-    }
-}
+#include "matmul_f32.h"   /* y[S,O] = x[S,I] @ W^T, W [O,I] f32 row-major */
 
 /* y[1,O] = x[1,I] @ W^T con W quantizzato: q[O,I] int8 + scala per riga.
  * W[o,i] ~= q[o,i]*scale[o]  ->  y[o] = scale[o] * sum_i x[i]*q[o,i].
@@ -679,7 +690,16 @@ static void slot_ensure_allocated(Model *m, Slot *s) {
     s->pinned = 0;
 }
 
+#ifdef COLI_CACHE_INDEX_TEST
+/* Model-free tests stand in for the disk read, so they can hold a load open
+ * and count how many times each expert is read. */
+static void (*g_test_expert_load)(Model *m, int layer, int eid, Slot *s);
+#endif
+
 static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
+#ifdef COLI_CACHE_INDEX_TEST
+    if (g_test_expert_load) { g_test_expert_load(m, layer, eid, s); return; }
+#endif
     char nm[256], qsnm[256];
     snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.merged_weight", layer, eid);
     snprintf(qsnm, sizeof(qsnm), "model.layers.%d.mlp.experts.%d.qs", layer, eid);
@@ -726,6 +746,13 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     pthread_mutex_lock(&g_pilot_mx);
     ehit_mark(m, layer, eid);          /* under the lock: the routing loop is parallel */
     Slot *hit = slot_indexed(m, layer, eid);
+    /* The prefetcher usually reads the next layer's experts while this one
+     * computes, so a routed expert is often already on its way: wait for that
+     * read to publish rather than read the same bytes again into another slot. */
+    while (!hit && slot_in_flight(m, layer, eid)) {
+        pthread_cond_wait(&g_pilot_cv, &g_pilot_mx);
+        hit = slot_indexed(m, layer, eid);
+    }
     if (hit) {
         m->hits++; hit->used = ++m->clock; *out = hit;
         if (m->last_access) m->last_access[layer * m->c.n_experts + eid] = m->clock;
@@ -772,7 +799,7 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
         s = &lc->slots[lru];
         s->pinned = 0;
     }
-    cache_hide(m, layer, s);
+    cache_reserve(m, layer, s, eid);
     s->used = ++m->clock;
     pthread_mutex_unlock(&g_pilot_mx);
 
@@ -784,6 +811,7 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     s->used = ++m->clock;
     if (m->last_access) m->last_access[layer * c->n_experts + eid] = m->clock;
     *out = s;
+    pthread_cond_broadcast(&g_pilot_cv);
     pthread_mutex_unlock(&g_pilot_mx);
 }
 
@@ -1143,7 +1171,7 @@ static void pilot_realload(Model *m, int layer, int eid) {
         pthread_mutex_unlock(&g_pilot_mx);
         return;
     }
-    if (slot_indexed(m, layer, eid)) {
+    if (slot_indexed(m, layer, eid) || slot_in_flight(m, layer, eid)) {
         m->is_queued[layer * c->n_experts + eid] = 0;
         pthread_mutex_unlock(&g_pilot_mx);
         return;
@@ -1180,7 +1208,7 @@ static void pilot_realload(Model *m, int layer, int eid) {
 
         s = &lc->slots[lru]; s->pinned = 0;
     }
-    cache_hide(m, layer, s); s->used = ++m->clock;
+    cache_reserve(m, layer, s, eid); s->used = ++m->clock;
     pthread_mutex_unlock(&g_pilot_mx);
 
     load_expert_merged(m, layer, eid, s);
@@ -1191,6 +1219,7 @@ static void pilot_realload(Model *m, int layer, int eid) {
     s->used = ++m->clock;
     if (m->last_access) m->last_access[layer * c->n_experts + eid] = m->clock;
     m->is_queued[layer * c->n_experts + eid] = 0;
+    pthread_cond_broadcast(&g_pilot_cv);
     pthread_mutex_unlock(&g_pilot_mx);
 }
 
@@ -1588,7 +1617,8 @@ static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
     int *ids = malloc((size_t)cap * sizeof(int));
     int np = tok_encode(T, q->payload, q->plen, ids, cap);
     if (np <= 0) { coli_serve_write_error(stdout, q->id, "empty prompt"); free(ids); return 0; }
-    if (np + q->max_tok > ctx_cap) {
+    int budget = coli_serve_budget(np, q->max_tok, ctx_cap, q->logprobs > 0);
+    if (budget < 0) {
         char message[128];
         /* The frame the gateway turns into a 400 context_length_exceeded
          * (#506, #1381). Free text here reached the client as a 500. */
@@ -1596,6 +1626,12 @@ static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
                  "CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d",
                  np, q->max_tok, ctx_cap);
         coli_serve_write_error(stdout, q->id, message); free(ids); return 0;
+    }
+    if (budget < q->max_tok) {
+        fprintf(stderr, "[serve] max_tokens %d clamped to %d (context %d - prompt %d); "
+                        "raise CTX for longer answers\n",
+                q->max_tok, budget, ctx_cap, np);
+        q->max_tok = budget;
     }
     g_temp = q->temp; g_nuc = q->top_p;
     /* A chat client resends the whole transcript every turn. If this prompt

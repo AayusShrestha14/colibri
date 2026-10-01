@@ -10,8 +10,8 @@ from pathlib import Path
 
 from family_registry import (FamilyConfigError, PlannerUnsupportedError, UnknownFamilyError,
                              public_metadata, resolve_model)
-from resource_plan import (GB, SSD_PROBE_PENDING, build_plan, discover_gpus, format_plan,
-                           memory_available)
+from resource_plan import (GB, SSD_PROBE_PENDING, CgroupError, build_plan, discover_gpus,
+                           format_plan, memory_available)
 
 SAFETENSORS_MAX_HEADER = 512 << 20
 MODEL_INDEX_MAX_BYTES = SAFETENSORS_MAX_HEADER
@@ -457,6 +457,26 @@ def deep_container_report(model, mirror_dir=None):
     }
 
 
+def windows_backend_dll(image):
+    """Which GPU backend DLL a Windows host compiled in, or None if CPU-only.
+
+    backend_loader.c bakes exactly one basename: coli_hip.dll under COLI_HIP_DLL
+    and coli_cuda.dll otherwise. That string is the build marker. The GLM/Qwen
+    banner "[CUDA] mode: routed experts" is only printed by those two engines;
+    a Kimi K3 CUDA_DLL host links the same loader and prints [K3-CUDA] instead.
+    DeepSeek V4 has its own pair and is not this function's job.
+    """
+    if not image or b"[DSV4 CUDA]" in image:
+        return None
+    if b"coli_hip.dll" in image:
+        return "coli_hip.dll"
+    if b"coli_cuda.dll" in image:
+        return "coli_cuda.dll"
+    if b"[CUDA] mode: routed experts" in image or b"[K3-CUDA]" in image:
+        return "coli_cuda.dll"
+    return None
+
+
 def cuda_linkage(engine_path):
     """Return CUDA linkage state without loading the executable or CUDA runtime."""
     engine = Path(engine_path)
@@ -484,17 +504,11 @@ def cuda_linkage(engine_path):
     if sys.platform == "win32":
         # Windows DLL-split builds never link the GPU runtime directly: the host
         # LoadLibrary's its backend at runtime (backend_loader.c), so there's no
-        # import-table entry for ldd/dumpbin to see. Detect the GPU build via a
-        # marker string baked into the engine's #ifdef COLI_CUDA block, then
-        # require the backend artifact to sit next to the executable.
-        #
-        # WHICH artifact is not a guess. backend_loader.c compiles exactly one
-        # basename into the host -- COLI_BACKEND_DLL is "coli_hip.dll" under
-        # COLI_HIP_DLL and "coli_cuda.dll" otherwise -- so the binary states
-        # what it will load and we check for that. Asking for coli_cuda.dll
-        # unconditionally failed a working HIP host (a hard error, not a
-        # warning), and accepting either name would have passed a HIP host that
-        # only had a stray CUDA backend beside it.
+        # import-table entry for ldd/dumpbin to see. Detect the GPU build from
+        # the backend basename compiled into the host, then require that file
+        # next to the executable. Asking for coli_cuda.dll unconditionally
+        # failed a working HIP host (a hard error, not a warning), and requiring
+        # the GLM routed-experts banner missed every Kimi K3 CUDA_DLL build.
         try:
             image = engine.read_bytes()
         except OSError:
@@ -506,10 +520,7 @@ def cuda_linkage(engine_path):
             present = any((engine.parent / name).is_file()
                           for name in ("coli_cuda_dsv4_dg.dll", "coli_cuda_dsv4.dll"))
             return {"linked": present, "missing": not present}
-        if b"[CUDA] mode: routed experts" not in image:
-            return {"linked": False, "missing": False}
-        expected = next((name for name in ("coli_hip.dll", "coli_cuda.dll")
-                         if name.encode() in image), None)
+        expected = windows_backend_dll(image)
         if expected is None:
             return {"linked": False, "missing": False}
         dll_present = (engine.parent / expected).is_file()
@@ -611,7 +622,6 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
     else:
         checks.append(_check("engine.binary", "fail", "engine is not built", path=str(engine)))
 
-    available_memory = memory_available() if available_memory is None else available_memory
     detected_gpus = discover_gpus() if gpus is None else list(gpus)
     linkage = cuda_linkage(engine) if linkage is None else linkage
     selected_gpus = detected_gpus
@@ -651,6 +661,9 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         plan = build_plan(model, ram_gb, context, plan_gpu_indices, plan_vram_gb,
                           available_memory=available_memory, available_disk=available_disk,
                           gpus=plan_gpus, kv_slots=kv_slots)
+        # build_plan() owns the single memory probe -- min(host MemAvailable,
+        # finite cgroup headroom); 0 means nothing could measure it (T15).
+        available_memory = plan["memory"]["available_bytes"]
         model_info = plan["model"]
         checks.append(_check("model.shards", "pass", "safetensors headers are valid",
                              shards=model_info["shards"], model_bytes=model_info["model_bytes"]))
@@ -701,6 +714,15 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         checks.append(_check("placement.plan", "skip", str(error)))
         checks.append(_check("storage.ssd_probe", "skip",
                              "probe surfacing requires a family planner"))
+    except CgroupError as error:
+        # A present but malformed, incomplete or unreadable cgroup/procfs input
+        # is a refusal with a reason, not "could not be measured" (T15 A1).
+        checks.append(_check("model.shards", "skip", "shard summary requires an admissible memory budget"))
+        checks.append(_check("storage.disk", "skip", "storage check requires an admissible memory budget"))
+        checks.append(_check("memory.ram", "fail", str(error)))
+        checks.append(_check("placement.plan", "skip", "placement requires an admissible memory budget"))
+        checks.append(_check("storage.ssd_probe", "skip",
+                             "probe surfacing requires an admissible memory budget"))
     except (OSError, ValueError, KeyError, TypeError) as error:
         checks.append(_check("model.shards", "fail", str(error)))
         checks.append(_check("storage.disk", "skip", "storage check requires a valid model"))
@@ -752,6 +774,71 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
             "mode": "deep" if deep else "standard", "checks": checks, "plan": plan}
 
 
+def run_image_doctor(model, engine_path, available_memory=None):
+    """doctor for a text-to-image pipeline: the checks that apply to it.
+
+    There is no config.json, no expert cache and no KV state to place, so the
+    text checks would report failures that are not failures. What can be wrong
+    here is a missing component, a missing tokenizer, an engine that is not
+    built, or weights that do not fit in RAM even with the text encoder loaded
+    on demand."""
+    from image_engine import COMPONENTS, TOKENIZER_FILE, plan_image_model
+    model = Path(model).expanduser().resolve()
+    checks = []
+    readable = model.is_dir() and os.access(model, os.R_OK)
+    checks.append(_check("model.path", "pass" if readable else "fail",
+                         "model directory is readable" if readable else
+                         "model directory is missing or not readable", path=str(model)))
+    try:
+        resolved = resolve_model(model)
+        checks.append(_check("model.family", "pass",
+                             f"{resolved.descriptor.display_name} pipeline is registered",
+                             family_id=resolved.descriptor.id, model_type=resolved.model_type,
+                             descriptor=public_metadata(resolved.descriptor)))
+    except (FamilyConfigError, UnknownFamilyError) as error:
+        checks.append(_check("model.family", "fail", str(error)))
+    missing = [name for name in COMPONENTS if not (model / name).is_dir()]
+    checks.append(_check("model.components", "fail" if missing else "pass",
+                         "missing: " + ", ".join(f"{name}/" for name in missing) if missing
+                         else "text_encoder, transformer, vae, processor and scheduler present"))
+    tokenizer = model / TOKENIZER_FILE
+    checks.append(_check("model.tokenizer", "pass" if tokenizer.is_file() else "fail",
+                         f"{TOKENIZER_FILE} found" if tokenizer.is_file()
+                         else f"{TOKENIZER_FILE} is missing"))
+    engine = Path(engine_path)
+    engine_ok = engine.is_file() and (sys.platform == "win32" or os.access(engine, os.X_OK))
+    checks.append(_check("engine.binary", "pass" if engine_ok else "fail",
+                         "engine executable is ready" if engine_ok else "engine is not built",
+                         path=str(engine)))
+    available_memory = memory_available() if available_memory is None else available_memory
+    plan = None
+    try:
+        plan = plan_image_model(model, available_memory or None)
+        on_demand = plan["modes"]["text_encoder_on_demand"]
+        resident = plan["modes"]["resident"]
+        if not available_memory:
+            status, summary = "warn", "available RAM could not be measured"
+        elif resident.get("fits"):
+            status, summary = "pass", "all weights fit in RAM together"
+        elif on_demand.get("fits"):
+            status, summary = ("warn", "weights fit only with the text encoder loaded on demand")
+        else:
+            status, summary = "fail", "the weights do not fit in the available RAM"
+        checks.append(_check("memory.ram", status, summary, available_bytes=available_memory,
+                             resident_bytes=resident["peak_bytes"],
+                             on_demand_peak_bytes=on_demand["peak_bytes"]))
+        for warning in plan["warnings"]:
+            checks.append(_check("model.weights", "warn", warning))
+    except (OSError, ValueError, KeyError) as error:
+        checks.append(_check("model.weights", "fail", str(error)))
+    statuses = {item["status"] for item in checks}
+    status = "error" if "fail" in statuses else "warning" if "warn" in statuses else "ok"
+    # The image plan has its own shape; it rides in `image_plan` so a consumer
+    # of `plan` (the text placement report) never meets a document it cannot read.
+    return {"schema_version": 1, "status": status, "model": str(model), "mode": "standard",
+            "checks": checks, "plan": None, "image_plan": plan}
+
+
 def format_doctor(report):
     icons = {"pass": "ok", "warn": "warn", "fail": "fail", "skip": "skip"}
     # model is null in the JSON when none was given (#724); say that rather than "None"
@@ -760,6 +847,9 @@ def format_doctor(report):
         lines.append(f"[{icons[check['status']]:>4}] {check['id']:<18} {check['summary']}")
     if report["plan"]:
         lines.extend(["", format_plan(report["plan"])])
+    elif report.get("image_plan"):
+        from image_engine import format_image_plan
+        lines.extend(["", format_image_plan(report["image_plan"])])
     lines.extend(["", f"result {report['status']}"])
     return "\n".join(lines)
 

@@ -41,6 +41,11 @@ family registry (`qwen3_5_moe` / `qwen3_5_moe_text` — an exact match, so other
 Qwen architectures are not claimed by this engine), picks it, and drives it over the serve protocol — `coli web` and
 `coli serve` (OpenAI-compatible API) work the same way.
 
+Tool calling is supported through the HTTP gateway using Qwen3.6's native
+`<tool_call>` / `<tool_response>` protocol. The gateway translates between
+the native format and the supported API tool representations; see the
+[per-engine API matrix](api.md#tool-calling-support).
+
 Direct invocation without the gateway:
 
 ```sh
@@ -104,6 +109,52 @@ overlap, not this kernel. `tests/test_expert_ffn` holds the numerics.
 keeps its own path: it uploads the pair-layout int4 and computes misses from
 the int8 copy.
 
+## The dense trunk: integer dot products
+
+Every dense GEMV of a token, the DeltaNet in and out projections, the
+attention q/k/v/o, the shared expert and lm_head, used to multiply int8
+weights by f32 activations: each weight byte converted to f32 and fed to an
+FMA, eight weights per instruction. On a 16-core AVX-512 host lm_head
+(248320 x 2048 int8, 508 MB) ran at 29 GB/s on a memory bus that does 80:
+the kernel was the limit, and the dense part of the token is 1.9 GB of int8
+on the 35B, three times what the routed experts read.
+
+Since 1.12.1 the activation is quantized to int8 once per call (one scale,
+amax/127, the same contract the expert integer kernels use) and the products
+are integer: 32 weights per instruction on AVX2, 64 on AVX-512 VNNI, exact
+int32 sums scaled once per output. The routed experts take the same path for
+their activations. Measured on Qwen3.6-35B-A3B, 8 threads, 300 decoded
+tokens, every expert resident, perplexity on 4 x 512 tokens of English text:
+
+| | tok/s | ms/token: DeltaNet proj / out, attention, lm_head, expert compute | perplexity |
+|---|---|---|---|
+| f32 activations (1.12.0) | 6.71 | 21.9 / 8.6, 9.5, 12.6, 22.7 | 13.79 |
+| int8 activations, dense trunk (`COLI_DENSE_IDOT=1`) | 7.35 | 17.4 / 6.3, 7.7, 10.2, 22.7 | 13.92 (+1.0%) |
+| int8 activations, routed experts (`QWEN_EXPERT_ACT=i8`) | 7.20 | 21.9 / 8.6, 9.5, 12.6, 15.9 | 13.80 (+0.1%) |
+| both (the 1.12.1 default) | **8.23** (+22.6%) | 17.2 / 6.3, 7.5, 10.1, 15.6 | 13.97 (+1.3%) |
+
+Both are the default; `COLI_DENSE_IDOT=0` and `QWEN_EXPERT_ACT=f32`
+restore the f32 kernels, which stay bit-identical to their references.
+
+**int4 for the trunk is opt-in, per component.** `COLI_DENSE_BITS=4` stores
+the dense matrices as int4 in blocks of 64 with one scale per block (the
+planar layout of the grouped expert kernel) and halves the bytes the token
+reads, but the parts of the trunk pay 4 bits very differently, so
+`COLI_DENSE_INT4` picks which ones take it:
+
+| int4 on | tok/s | perplexity |
+|---|---|---|
+| nothing (int8) | 7.35 | 13.92 |
+| `lmhead` | 8.15 (lm_head 10.1 to 8.4 ms; the total is within noise of the cache warming) | 14.13 (+2.4% vs f32) |
+| `lmhead,dnproj,dnout` | | 14.56 (+5.6%) |
+| `lmhead,dnproj,dnout,shexp` | | 14.94 (+8.3%) |
+| everything (`attn` included) | 8.09 | 15.17 (+10%) |
+
+A least-squares refinement of the block scale was tried and changes nothing
+(15.16 against 15.17): the loss is the matrices' sensitivity, not the
+quantizer. If you take one, take `lmhead`: 254 MB less per token for the
+smallest cost.
+
 ## Cache-aware routing (`CACHE_ROUTE`, off by default)
 
 The residual misses above are the lever's target. `CACHE_ROUTE=1` ports the
@@ -133,15 +184,29 @@ per-row quantization error concentrates the same way. The gs64 container costs
 ~1.7 GB more on disk and a few percent on cold-start; warm decode speed is the
 same or slightly better.
 
+**Mixed: int8 `down`, int4 gate/up.** `convert_qwen36.py --ebits 4 --gs 64
+--down-bits 8` (`--down-gs` for grouped down scales, 0 = per row) writes one
+slab per expert with `down_proj` in int8 and gate/up as above -- 5.7 bits per
+weight against gs64's 4.5. It is the knob that produced the #1370 numbers on
+wikitext-2 (16 x 512 tokens): gs64 7.325, mixed 7.281, all experts int8 7.153,
+Ollama's Q4_K_M 7.147 -- `down` alone recovers a quarter of the gap to int8,
+the rest sits in gate/up, and at equal bits Q4_K_M's asymmetric quantizer is
+ahead. Keep it as a measurement tool and a middle step for boxes with RAM to
+spare; it is not the answer to the gap. The engine tells the layout apart by
+size and reads each matrix in its own format on the CPU path; the CUDA VRAM
+tier takes one format per expert and refuses a mixed container with a line
+(`COLI_CUDA=1 ignored`), so such a container runs CPU-only for now.
+
 ## Which checkpoints, and what the banner calls them
 
-Two Qwen checkpoints declare `model_type: qwen3_5_moe_text` and resolve to
-this engine:
+Three Qwen checkpoints resolve to this engine: two MoE ones that declare
+`model_type: qwen3_5_moe_text`, and a dense one that declares `qwen3_5`:
 
 | checkpoint | layers | experts | hidden | banner |
 |---|---|---|---|---|
 | Qwen/Qwen3.6-35B-A3B | 40 (10 attention) | 256, top-8 | 2048 | `Qwen3.6-35B-A3B · 35B MoE` |
 | Qwen/Qwen3.8-2.4T-A95B | 92 (23 attention) | 512, top-10 | 8192 | `Qwen3.8-2.4T-A95B · 2.4T MoE` |
+| Qwen/Qwen3.8-27B | 64 (16 attention) | none: one MLP of 17408 per layer | 5120 | `Qwen3.8-27B · 27B` |
 
 The registry names a checkpoint by its geometry (`display_variants` on the
 `qwen36` descriptor), so the banner says what is on disk. A config that
@@ -157,6 +222,77 @@ is hold the experts: the warmstart keeps every expert in RAM by design (see
 `--ram` below), which is ~1.4 TB of int4 for 2.4T. Serving it needs the
 disk-streaming design, not this one. The conversion and the geometry checks
 are in place so that work starts from a verified shape, not from a guess.
+
+### The dense 27B
+
+Qwen3.8-27B (#1757) is `Qwen3_5ForConditionalGeneration`: the same Gated
+DeltaNet + gated attention layers, with one SwiGLU MLP per layer and no
+router. The engine loads that MLP as the shared expert, ungated, and routes
+nothing; the converter writes `num_experts: 0` and the MLP width into
+`qwen36_meta.json`. It ships Qwen3.8's `chat_template.jinja`, not Qwen3.6's
+(the same file the qwen38 renderer is pinned to): the converter copies it
+into the container, and the gateway recognises it and renders with the
+Qwen3.8 rules (reasoning on by default at `xhigh`, the XML tool-call form,
+history that keeps its thinking) while the engine stays qwen36. The API model
+id is `qwen3.8-27b-colibri`.
+
+```bash
+python3 tools/convert_qwen36.py --model <Qwen3.8-27B download> --out q27_c
+./coli chat --model q27_c --gpu none
+```
+
+The container keeps the weights in f16 (51 GB) and the engine quantizes
+them while loading. Every weight is read for every token, so speed is set by
+memory bandwidth, not by the disk. Measured on a 16-thread CPU server
+(8 OpenMP threads), perplexity over 1000 tokens of human-written text:
+
+| dense weights | RSS | scoring | perplexity, English | perplexity, Italian |
+|---|---|---|---|---|
+| int8 (default) | 29.1 GB | 2.25 tok/s | 4.85 | 11.19 |
+| `COLI_DENSE_BITS=4 COLI_DENSE_INT4=shexp,lmhead` | 21.6 GB | 3.15 tok/s | 4.94 (+1.8%) | 11.69 (+4.5%) |
+| `COLI_DENSE_BITS=4` (everything) | 18.8 GB | 3.72 tok/s | 5.02 (+3.5%) | 12.15 (+8.6%) |
+
+Through the gateway (`coli serve`), greedy decode ran at 2.1 tok/s in int8 and
+3.45 tok/s with everything in int4, after a load of 73 and 114 s; the answers
+to the same English, Italian and Turkish questions were the same but for a word.
+
+The MLP is 17 of the 27 billion parameters, so int4 on the MLP and the LM head
+keeps most of the saving at half the loss. With a matrix in int4 the engine
+no longer keeps its int8 copy (`COLI_DENSE_KEEP_I8=1` does); that is what
+brings the full int4 run from 42.4 to 18.8 GB.
+
+#### Images
+
+Qwen3.8-27B reads images. Its vision tower is the ViT of the whole family
+(27 blocks, hidden 1152, patch 16, 2x2 merge; only the output width follows
+the text model), so the engine runs it through the same `qwen38_vision.h`
+the qwen38 engine uses, now split across OpenMP threads. The converter copies
+it into `model-vision.safetensors` and writes its shape into
+`qwen36_meta.json`, together with `preprocessor_config.json`.
+
+What is specific to this family is where the image sits in the rope. The
+attention layers use interleaved M-RoPE (`mrope_section` [11, 11, 10]): an
+image token at merged (row, col) is rotated by (start, start + row,
+start + col), the text after the image resumes at start + max(rows, cols),
+and every later position carries that offset (HF's `rope_deltas`). The
+engine follows `Qwen3_5Model.get_rope_index` exactly; with plain 1D
+positions the tiny oracle below loses 10 of 16 tokens.
+
+An image reaches it the way it reaches the other vision engines: a path in
+a `coli chat` message, an attachment in `coli web`, or an `image_url` part
+on `/v1/chat/completions`. One image per request. `Q36_MAX_IMAGE_TOKENS`
+caps the tokens an image costs (the preprocessor's own ceiling is far above
+what a CPU prefill wants); the image is shrunk, not cropped.
+
+`tools/make_qwen36_vl_tiny.py` builds a toy `Qwen3_5ForConditionalGeneration`
+and a reference from transformers with one 4 x 8-patch image; the engine
+matches it token for token, and `tests/test_qwen36_vision_serve.py` holds the
+IMAGE frame path to the same tokens. Qwen3.6-35B carries the same tower, so a
+35B container converted with this converter gets images too; only the 27B has
+been run with real pictures.
+
+Not yet: the CUDA tier (a dense checkpoint runs on the CPU), the MTP head
+(skipped by the converter), video, and an int4 container on disk.
 
 ### The converter's tensor contract
 

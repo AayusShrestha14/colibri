@@ -10,9 +10,11 @@ from unittest import mock
 
 from resource_plan import (
     GB,
+    CgroupFormatError,
     analyze_model,
     build_plan,
     cpu_socket_count,
+    discover_gpus,
     environment_for_plan,
     format_plan,
     memory_available,
@@ -112,6 +114,28 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertFalse(any("jointly constrained" in warning
                              for warning in plan["warnings"]))
 
+    def test_macos_discovers_metal_gpu_without_cuda_or_rocm_probes(self):
+        output = json.dumps({"SPDisplaysDataType": [{
+            "_name": "Apple M1 Pro",
+            "sppci_model": "Apple M1 Pro",
+            "spdisplays_mtlgpufamilysupport": "spdisplays_metal4",
+        }]})
+        result = subprocess.CompletedProcess(args=[], returncode=0,
+                                             stdout=output, stderr="")
+        with mock.patch.object(sys, "platform", "darwin"), \
+             mock.patch("resource_plan.subprocess.run", return_value=result) as run:
+            devices = discover_gpus()
+        self.assertEqual(devices, [{"index": 0, "name": "Apple M1 Pro",
+                                    "total_bytes": 0, "free_bytes": None,
+                                    "unified_memory": True, "backend": "metal"}])
+        self.assertEqual(run.call_args.args[0],
+                         ["system_profiler", "SPDisplaysDataType", "-json"])
+        plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
+                  available_disk=1, gpus=devices, physical_cpus=8,
+                  cpu_sockets=1)
+        self.assertIn("Metal  0:Apple M1 Pro · unified memory",
+                  format_plan(plan))
+
     def test_glm53_auto_tune_does_not_emit_generic_inert_knobs(self):
         from resource_plan import _auto_tune
 
@@ -146,6 +170,30 @@ class ResourcePlanTest(unittest.TestCase):
                 with self.subTest(engine_group=group, case=case[:2]):
                     self.assertEqual(_auto_tune(*case, False, engine_group=group), {})
 
+    def test_v41_gateway_sizes_cap_from_ram_without_auto_tier(self):
+        from openai_server import cap_for_arch
+
+        (self.model / "config.json").write_text(json.dumps({
+            "model_type": "deepseek_v41", "num_hidden_layers": 2,
+            "n_routed_experts": 128, "hidden_size": 128, "head_dim": 64,
+            "window_size": 8, "index_head_dim": 32, "hc_mult": 4,
+            "compress_ratios": [0, 2], "kv_source_layers": [1],
+        }))
+        write_shard(self.model / "model.safetensors", [
+            ("embed.weight", GB),
+            *[(f"layers.{layer}.ffn.experts.{expert}.w1.weight", 16 * 1024**2)
+              for layer in range(2) for expert in range(128)],
+        ])
+        with mock.patch("resource_plan.memory_available", return_value=16 * GB):
+            small = cap_for_arch("deepseek_v41", None, {"RAM_GB": "8"}, self.model)
+            large = cap_for_arch("deepseek_v41", None, {"RAM_GB": "12"}, self.model)
+            automatic = cap_for_arch("deepseek_v41", None, {}, self.model)
+        self.assertGreater(small, 8)
+        self.assertGreater(large, small)
+        self.assertEqual(large, 128)
+        self.assertEqual(automatic, 128)
+        self.assertEqual(cap_for_arch("deepseek_v41", 4, {"RAM_GB": "12"}, self.model), 4)
+
     def test_sibling_plan_advises_no_colibri_knob(self):
         other = tempfile.TemporaryDirectory()
         self.addCleanup(other.cleanup)
@@ -172,6 +220,200 @@ class ResourcePlanTest(unittest.TestCase):
         env = environment_for_plan(plan, {})
         for key in ("DRAFT", "PIPE", "COLI_CUDA_PIPE", "COLI_NUMA", "PIN_GB"):
             self.assertNotIn(key, env)
+
+    def _kimi_model(self):
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        model = Path(other.name)
+        (model / "config.json").write_text(json.dumps({
+            "model_type": "kimi_k3",
+            "hidden_size": 64,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "q_lora_rank": 8,
+            "kv_lora_rank": 8,
+            "qk_nope_head_dim": 8,
+            "qk_rope_head_dim": 4,
+            "v_head_dim": 8,
+            "num_experts": 2,
+            "linear_attn_config": {
+                "num_heads": 2,
+                "head_dim": 8,
+                "kda_layers": [1],
+            },
+        }))
+        write_shard(model / "model.safetensors", [
+            ("model.embed_tokens.weight", 100),
+            ("model.layers.0.block_sparse_moe.experts.0.w1.weight", 80),
+            ("model.layers.0.block_sparse_moe.experts.1.w1.weight", 80),
+            ("model.layers.1.block_sparse_moe.experts.0.w1.weight", 80),
+            ("model.layers.1.block_sparse_moe.experts.1.w1.weight", 80),
+        ])
+        return model
+
+    def _qwen_dense_model(self, num_experts=None):
+        """Qwen3.8-27B's shape at toy size (#1757): the qwen3_5 architecture with one
+        dense MLP per layer and no expert count in the config."""
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        model = Path(other.name)
+        text = {
+            "model_type": "qwen3_5_text", "num_hidden_layers": 4, "hidden_size": 32,
+            "intermediate_size": 64, "num_key_value_heads": 1, "head_dim": 8,
+            "linear_num_key_heads": 2, "linear_key_head_dim": 8,
+            "linear_num_value_heads": 4, "linear_value_head_dim": 8,
+            "linear_conv_kernel_dim": 4,
+            "layer_types": ["linear_attention"] * 3 + ["full_attention"],
+        }
+        if num_experts is not None:
+            text["num_experts"] = num_experts
+        (model / "config.json").write_text(json.dumps(
+            {"model_type": "qwen3_5", "text_config": text}))
+        write_shard(model / "model.safetensors", [
+            ("model.language_model.embed_tokens.weight", 100),
+            ("model.language_model.layers.0.mlp.gate_proj.weight", 80),
+            ("model.language_model.layers.0.mlp.up_proj.weight", 80),
+            ("model.language_model.layers.0.mlp.down_proj.weight", 80),
+        ])
+        return model
+
+    def test_dense_qwen_model_keeps_every_weight_resident(self):
+        plan = build_plan(self._qwen_dense_model(), context=32, available_memory=32 * GB,
+                          available_disk=100 * GB, gpus=[])
+        self.assertEqual(plan["model"]["family_id"], "qwen36")
+        self.assertEqual(plan["model"]["configured_experts"], 0)
+        self.assertEqual(plan["tiers"]["ram"]["cache_slots_per_layer"], 1)
+        self.assertIn("dense model", plan["expected_bottleneck"])
+        self.assertFalse([w for w in plan["warnings"] if "expert slot" in w])
+        self.assertEqual([d["target"] for d in plan["decisions"]], ["RAM"])
+
+    def test_zero_experts_declared_is_still_a_broken_config(self):
+        with self.assertRaisesRegex(ValueError, "num_experts|expert count is zero"):
+            build_plan(self._qwen_dense_model(num_experts=0), context=32,
+                       available_memory=32 * GB, available_disk=100 * GB, gpus=[])
+
+    def _glm53_model(self):
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        model = Path(other.name)
+        (model / "config.json").write_text(json.dumps({
+            "model_type": "glm5_next",
+            "text_config": {
+                "num_hidden_layers": 2,
+                "n_routed_experts": 2,
+                "hidden_size": 32,
+                "num_attention_heads": 4,
+                "q_lora_rank": 8,
+                "kv_lora_rank": 8,
+                "qk_nope_head_dim": 8,
+                "v_head_dim": 8,
+                "index_head_dim": 8,
+                "hc_mult": 2,
+                "layer_types": ["linear", "full"],
+                "linear_attn_config": {
+                    "num_heads": 2,
+                    "head_dim": 8,
+                    "short_conv_kernel_size": 2,
+                },
+            },
+        }))
+        write_shard(model / "model.safetensors", [
+            ("model.language_model.embed_tokens.weight", 100),
+            ("model.language_model.layers.1.mlp.experts.0.gate_proj.weight", 80),
+            ("model.language_model.layers.1.mlp.experts.1.gate_proj.weight", 80),
+        ])
+        return model
+
+    def test_kimi_plan_exports_the_expert_cache_knob_the_engine_reads(self):
+        """Kimi K3 sizes the expert LRU from K3_EXPERT_GB (default 8 GB).
+        RAM_GB is only a ceiling, and main() never takes argv as a cap, so
+        --auto-tier that set RAM_GB and COLI_PLAN_CAP left the 8 GB default
+        in place on a machine whose plan had hundreds of GB of warm experts."""
+        plan = build_plan(self._kimi_model(), context=32, available_memory=32 * GB,
+                          available_disk=1, gpus=[], cpu_sockets=1)
+        cache = plan["tiers"]["ram"]["expert_cache_bytes"]
+        self.assertGreater(cache, 0)
+        expected = f"{cache / GB:.3f}"
+        self.assertIn("K3_EXPERT_GB", plan["tune"])
+        self.assertEqual(plan["tune"]["K3_EXPERT_GB"]["value"], expected)
+        self.assertNotIn("GLM53_EXPERT_GB", plan["tune"])
+        self.assertIn("K3_EXPERT_GB=", format_plan(plan))
+        env = environment_for_plan(plan, {})
+        self.assertIn("K3_EXPERT_GB", env)
+        self.assertEqual(env["K3_EXPERT_GB"], expected)
+        kept = environment_for_plan(plan, {"K3_EXPERT_GB": "3.5"})
+        self.assertEqual(kept["K3_EXPERT_GB"], "3.5")
+
+    def test_glm53_plan_exports_the_expert_cache_knob_the_engine_reads(self):
+        """glm53.c reads GLM53_EXPERT_GB, not RAM_GB. --auto-tier exported
+        RAM_GB (inert) and relied on COLI_PLAN_CAP as argv, which a direct
+        engine launch never sees."""
+        plan = build_plan(self._glm53_model(), context=32, available_memory=32 * GB,
+                          available_disk=1, gpus=[], cpu_sockets=1)
+        cache = plan["tiers"]["ram"]["expert_cache_bytes"]
+        self.assertGreater(cache, 0)
+        expected = f"{cache / GB:.3f}"
+        self.assertIn("GLM53_EXPERT_GB", plan["tune"])
+        self.assertEqual(plan["tune"]["GLM53_EXPERT_GB"]["value"], expected)
+        self.assertNotIn("K3_EXPERT_GB", plan["tune"])
+        env = environment_for_plan(plan, {})
+        self.assertIn("GLM53_EXPERT_GB", env)
+        self.assertEqual(env["GLM53_EXPERT_GB"], expected)
+        self.assertNotIn("K3_EXPERT_GB", env)
+    def test_auto_ram_keeps_reserve_below_small_finite_headroom(self):
+        # T15: detecting a 2 GB cgroup budget and later inflating it to the
+        # planner's historical 8 GB floor is still over-admission. Preserve the
+        # ordinary 12% reserve and never export more RAM than the finite value.
+        with mock.patch("resource_plan.memory_available", return_value=2 * GB):
+            plan = build_plan(self.model, available_disk=1, gpus=[])
+        ram = plan["tiers"]["ram"]
+        self.assertEqual(plan["memory"]["available_bytes"], 2 * GB)
+        self.assertEqual(ram["budget_bytes"], int(2 * GB * 0.88))
+        self.assertLessEqual(ram["budget_bytes"], ram["available_bytes"])
+        self.assertEqual(environment_for_plan(plan)["RAM_GB"], "1.760")
+
+    def test_auto_ram_never_exceeds_finite_headroom_on_unified_memory(self):
+        gpu = {"index": 0, "name": "NVIDIA GB10", "total_bytes": 130 * GB,
+               "free_bytes": 128 * GB, "unified_memory": True}
+        with mock.patch("resource_plan.memory_available", return_value=2 * GB):
+            plan = build_plan(self.model, available_disk=1, gpus=[gpu])
+        ram = plan["tiers"]["ram"]
+        self.assertTrue(plan["memory"]["unified"])
+        self.assertEqual(ram["budget_bytes"], int(2 * GB * 0.88))
+        self.assertLessEqual(ram["budget_bytes"], ram["available_bytes"])
+
+    def test_auto_ram_rejects_known_zero_headroom(self):
+        # current >= limit is authoritative exhaustion, not the old
+        # unavailable-probe sentinel. Never turn it into an 8 GB launch --
+        # whether the zero was probed or handed in explicitly.
+        with mock.patch("resource_plan.memory_available", return_value=0), \
+             self.assertRaisesRegex(ValueError, "memory budget is exhausted"):
+            build_plan(self.model, available_disk=1, gpus=[])
+        with self.assertRaisesRegex(ValueError, "memory budget is exhausted"):
+            build_plan(self.model, available_memory=0, available_disk=1, gpus=[])
+
+    def test_auto_ram_retains_legacy_fallback_only_when_probe_is_unknown(self):
+        # None is the tri-state's "nothing could measure it": the historical
+        # 8 GB fallback and the historical 0 in the report, never a refusal.
+        with mock.patch("resource_plan.memory_available", return_value=None):
+            plan = build_plan(self.model, available_disk=1, gpus=[])
+        self.assertEqual(plan["tiers"]["ram"]["budget_bytes"], 8 * GB)
+        self.assertEqual(plan["memory"]["available_bytes"], 0)
+
+    def test_malformed_cgroup_input_is_a_typed_refusal_not_a_fallback(self):
+        # A present but malformed controller reaches the caller with its
+        # reason; it is a ValueError, so existing handlers still catch it.
+        error = CgroupFormatError("malformed cgroup memory limit: /sys/fs/cgroup/memory.max")
+        with mock.patch("resource_plan.memory_available", side_effect=error), \
+             self.assertRaises(CgroupFormatError) as context:
+            build_plan(self.model, available_disk=1, gpus=[])
+        self.assertIsInstance(context.exception, ValueError)
+        self.assertIn("memory.max", str(context.exception))
+
+    def test_explicit_small_ram_budget_is_not_silently_inflated(self):
+        plan = build_plan(self.model, ram_gb=2, available_memory=16 * GB,
+                          available_disk=1, gpus=[])
+        self.assertEqual(plan["tiers"]["ram"]["budget_bytes"], 2 * GB)
 
     def test_cpu_socket_count_is_positive(self):
         self.assertGreaterEqual(cpu_socket_count(), 1)

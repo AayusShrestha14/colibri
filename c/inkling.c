@@ -43,6 +43,7 @@
 #include "kv_prefix.h"
 #include "pin_pool.h"                          /* KV prefix reuse (shared) */                          /* shared routing telemetry (#700) */
 #include "serve_codec.h"
+#include "serve_budget.h"
 #ifdef COLI_SEGMENT_ADAPTER
 #include "segment_runtime.h"
 #include "segment_adapters.h"
@@ -186,19 +187,7 @@ static float siluf(float x) { return x / (1.f + expf(-x)); }
  * cumulato p. 0 = spento (default): tutti i topk, calcolo invariato. */
 static float g_topp = 0.f;
 
-/* y[S,O] = x[S,I] @ W^T, W row-major [O,I] */
-static void matmul(float *y, const float *x, const float *W, int S, int I, int O) {
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
-        const float *w = W + (int64_t)o * I;
-        for (int s = 0; s < S; s++) {
-            const float *xs = x + (int64_t)s * I;
-            float acc = 0.f;
-            for (int i = 0; i < I; i++) acc += xs[i] * w[i];
-            y[(int64_t)s * O + o] = acc;
-        }
-    }
-}
+#include "matmul_f32.h"   /* y[S,O] = x[S,I] @ W^T, W [O,I] f32 row-major */
 
 #if defined(__AVX512BF16__) && defined(__AVX512F__)
 #include <immintrin.h>
@@ -718,6 +707,17 @@ static void load_cfg(Cfg *c, const char *snap) {
 }
 
 /* ---------- weight loading ---------- */
+/* The embedding norm has two names. The converter and every container written with
+ * transformers up to 5.17 call it model.embed_norm.weight; transformers 5.18 saves
+ * the same tensor as model.embed_tokens.embed_norm.weight. Read by the old name
+ * only, a checkpoint saved by 5.18 loaded with no embedding norm at all -- no
+ * error, and every answer wrong (the tiny oracle: 1 of 36 positions). */
+static const char *embed_norm_name(shards *S) {
+    if (st_has(S, "model.embed_norm.weight")) return "model.embed_norm.weight";
+    if (st_has(S, "model.embed_tokens.embed_norm.weight")) return "model.embed_tokens.embed_norm.weight";
+    return NULL;
+}
+
 static float *load_t(Model *m, const char *name) {
     int64_t n = st_numel(&m->S, name);
     if (n < 0) { fprintf(stderr, "missing %s\n", name); exit(1); }
@@ -951,7 +951,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
 #endif
     if (load_boundaries) {
         m->embed      = load_w(m, "model.embed_tokens.weight", 0);
-        m->embed_norm = st_has(&m->S,"model.embed_norm.weight") ? load_t(m,"model.embed_norm.weight") : NULL;
+        { const char *en = embed_norm_name(&m->S); m->embed_norm = en ? load_t(m, en) : NULL; }
         m->final_norm = load_t(m, "model.norm.weight");
         m->lm_head    = load_w(m, "lm_head.weight", 1);
     }
@@ -1121,24 +1121,18 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
 }
 
 static double mem_avail_bytes(void) {
-#if defined(__linux__)
-    FILE *f = fopen("/proc/meminfo", "r");
-    if (!f) return 0;
-    char ln[256]; double kb = 0;
-    while (fgets(ln, sizeof(ln), f)) if (sscanf(ln, "MemAvailable: %lf", &kb) == 1) break;
-    fclose(f);
-    return kb * 1024.0;
-#elif defined(__APPLE__)
-    /* free + inactive + purgeable ~ Linux MemAvailable. Without this the auto
-     * cap fell back to 16 experts/layer on a 128 GB Mac. */
-    vm_size_t page = 0; host_page_size(mach_host_self(), &page);
-    vm_statistics64_data_t vs; mach_msg_type_number_t n = HOST_VM_INFO64_COUNT;
-    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vs, &n) != KERN_SUCCESS)
-        return 0;
-    return (double)(vs.free_count + vs.inactive_count + vs.purgeable_count) * page;
-#else
+    /* Shared probe: Linux MemAvailable, macOS free+inactive+purgeable,
+     * Windows ullAvailPhys/commit. The #else here used to return 0, so
+     * Windows auto-cap was always 16 experts/layer and never warned. */
+    double gb = compat_mem_available_gb();
+    if (gb > 0.0) return gb * 1e9;
+    static int noted = 0;
+    if (!noted) {
+        noted = 1;
+        fprintf(stderr, "[inkling] could not measure available RAM on this platform; "
+                        "auto cache falls back to 16 experts/layer. Pass --cap to set it.\n");
+    }
     return 0;
-#endif
 }
 
 /* ---------- routed-expert slots: serial bookkeeping, parallel fills ---------- */
@@ -2198,15 +2192,20 @@ static void apply_rep_penalty(float *logit, int n, const int *hist, int nhist, f
     }
 }
 
-/* reject a prompt that would overrun the served KV bound (CTX_MAX, default 8192).
- * The refusal is the frame the gateway turns into a 400 context_length_exceeded
- * (#506, #1381); free text here reached the client as a 500. One request is
- * served at a time, so the returned buffer is only read before the next call. */
+/* Refuse only a prompt that does not fit the served KV bound (CTX_MAX,
+ * default 8192). max_tokens is a ceiling: coli chat's interactive default
+ * (16384) used to 400 every turn because 2 + 16384 > 8192. The refusal is
+ * the frame the gateway turns into a 400 context_length_exceeded (#506,
+ * #1381); free text here reached the client as a 500. One request is served
+ * at a time, so the returned buffer is only read before the next call. */
+static int ink_ctx_max(void) {
+    const char *cm = getenv("CTX_MAX");
+    return cm ? atoi(cm) : 8192;
+}
 static const char *prompt_reject(int np, int want) {
     static char message[96];
-    const char *cm = getenv("CTX_MAX");
-    int ctx_max = cm ? atoi(cm) : 8192;
-    if (np + want <= ctx_max) return NULL;
+    int ctx_max = ink_ctx_max();
+    if (coli_serve_budget(np, want, ctx_max, 0) >= 0) return NULL;
     snprintf(message, sizeof(message),
              "CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d",
              np, want, ctx_max);
@@ -2323,8 +2322,19 @@ static int serve_one(Model *m, Tok *T, SReq *q) {
     int *ids = malloc((size_t)cap * sizeof(int));
     int np = tok_encode(T, q->payload, q->plen, ids, cap);
     if (np <= 0) { coli_serve_write_error(stdout,q->id,"empty prompt"); free(ids); return 0; }
-    const char *bad = prompt_reject(np, q->max_tok);
-    if (bad) { coli_serve_write_error(stdout,q->id,bad); free(ids); return 0; }
+    int ctx_max = ink_ctx_max();
+    int budget = coli_serve_budget(np, q->max_tok, ctx_max, q->logprobs > 0);
+    if (budget < 0) {
+        const char *bad = prompt_reject(np, q->max_tok);
+        coli_serve_write_error(stdout,q->id,bad ? bad : "CONTEXT_EXCEEDED");
+        free(ids); return 0;
+    }
+    if (budget < q->max_tok) {
+        fprintf(stderr, "[serve] max_tokens %d clamped to %d (context %d - prompt %d); "
+                        "raise CTX_MAX for longer answers\n",
+                q->max_tok, budget, ctx_max, np);
+        q->max_tok = budget;
+    }
     /* audio: every <|audio|> placeholder must have exactly one DMel frame */
     int naud = q->alen / m->c.mel_bins;
     if (q->alen % m->c.mel_bins != 0 || audio_tok_count(m, ids, np) != naud) {
@@ -2482,6 +2492,25 @@ static void serve_hwinfo(Model *m) {
             if (sscanf(ln, "MemTotal: %lf", &v) == 1) rt = v/1e6;
             if (sscanf(ln, "MemAvailable: %lf", &v) == 1) ra = v/1e6;
         } fclose(mi); }
+    if (rt <= 0.0 || ra <= 0.0) {
+        double t2 = 0, a2 = 0;
+        compat_meminfo_gb(&t2, &a2);
+        if (rt <= 0.0) rt = t2;
+        if (ra <= 0.0) ra = a2;
+    }
+#ifdef _WIN32
+    if (cores <= 0) {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        cores = (int)si.dwNumberOfProcessors;
+    }
+#endif
+#ifdef __APPLE__
+    if (!cpu[0]) {
+        size_t sl = sizeof(cpu);
+        if (sysctlbyname("machdep.cpu.brand_string", cpu, &sl, NULL, 0)) cpu[0] = 0;
+    }
+#endif
     int ngpu = 0; double vram = 0;
     const char *gpu = "";
 #ifdef COLI_CUDA
@@ -3239,8 +3268,8 @@ static int inkling_edge_engine_open(
         model->has_q = model->Sq.n > 0;
     }
     model->embed = load_w(model, "model.embed_tokens.weight", 0);
-    model->embed_norm = st_has(&model->S, "model.embed_norm.weight")
-        ? load_t(model, "model.embed_norm.weight") : NULL;
+    const char *embed_norm = embed_norm_name(&model->S);
+    model->embed_norm = embed_norm ? load_t(model, embed_norm) : NULL;
     model->final_norm = load_t(model, "model.norm.weight");
     model->lm_head = load_w(model, "lm_head.weight", 1);
     char tokenizer_path[4096];
