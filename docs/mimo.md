@@ -77,9 +77,12 @@ real template by `tests/test_mimo_chat_template.py`): ChatML with no newline aft
 `<|im_end|>`, every assistant turn carrying its `<think>` block, tools in their own
 system turn, calls written inline as
 `<tool_call><function=NAME><parameter=KEY>VALUE</parameter></function></tool_call>`,
-tool results as a `tool` turn. Thinking is on unless the request turns it off
-(`enable_thinking: false`, or `reasoning_effort: "none"`), as in the template; with
-thinking on the cue ends in `<think>`, the token the model writes first.
+tool results as a `tool` turn. Through the API, thinking is on unless the request
+turns it off (`enable_thinking: false`, or `reasoning_effort: "none"`), as in the
+template; with thinking on the cue ends in `<think>`, the token the model writes
+first. `coli chat` starts with thinking off, because at about 1 tok/s the template's
+default reasoning is minutes of tokens before the answer; `coli chat --think` turns it
+on (the web has its own reasoning toggle).
 
 ## Correctness
 

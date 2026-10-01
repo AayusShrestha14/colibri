@@ -5726,6 +5726,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 # past a bare 200 to an unauthenticated probe. (#SEC-8)
                 payload = {"status": "ok"}
                 if self._is_authed():
+                    payload["arch"] = ARCH            # which family answers: coli chat reads it
                     payload["scheduler"] = self.server.scheduler.snapshot()
                     payload["kv_slots"] = self.server.kv_slots
                     payload["continue_assistant"] = os.environ.get("COLI_CONTINUE_ASSISTANT", "1") != "0" and ARCH in CONTINUATION_FAMILIES
