@@ -2841,6 +2841,23 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 m->route.agree_hit += (uint64_t)K; m->route.agree_tot += (uint64_t)K; m->route.kl_n++;
             }
         }
+        /* SEC: an all-NaN router row (a corrupt tile, an fp overflow) leaves best at
+         * -1 above -- NaN > bv is false for every expert -- and route_select pads
+         * with -1 when fewer than K experts rank. Every consumer below takes the id
+         * as an index and a file offset: expert_get() went looking for experts.-1.
+         * Same degradation as rt_router_pick in route_trace.h, which this engine
+         * does not include: the slot's own index, in range because topk <=
+         * n_experts is a config check, at weight 0 so the slot adds nothing. */
+        for (int kk = 0; kk < K; kk++) {
+            if (idx[kk] >= 0) continue;
+            static int warned;
+            if (!warned) {
+                warned = 1;
+                fprintf(stderr, "[router] non-finite logits at layer %d, or fewer than top-k "
+                                "experts eligible: selection degraded\n", layer);
+            }
+            idx[kk] = kk; val[kk] = 0.f;
+        }
         if (m->resident_collecting) {
             for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) m->seen[(int64_t)layer * E + idx[kk]] = 1;
         }
