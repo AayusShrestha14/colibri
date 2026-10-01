@@ -1144,7 +1144,8 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *dir) {
     coli_serve_stdio_init();
     int eos[8];
     int n_eos = coli_load_stop_ids(dir, eos, 8, NULL);
-    coli_serve_write_ready(stdout, rss_gb());
+    /* CAPS: the gateway offers pictures only when the tower actually loaded */
+    coli_serve_write_ready_caps(stdout, rss_gb(), g_vision ? "vision=1" : "vision=0");
     serve_emap(m);
     float *logits = xmalloc((size_t)c->vocab * sizeof(float), "logits");
     int *ids = xmalloc(((size_t)m->ctx + 1) * sizeof(int), "prompt ids");

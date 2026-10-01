@@ -1562,7 +1562,7 @@ FAMILIES = (
         limits=FamilyLimits(8192, 1048576, 1024, 16384, 1, 16, "CTX"),
         # tools (the XML call form, parse_mimo_tool_calls), thinking (on by default,
         # as the template has it); no grammars, no audio in or out
-        capabilities=FamilyCapabilities(True, False, False, True),
+        capabilities=FamilyCapabilities(True, False, False, True, image=True),
         has_gateway_adapter=True,
         # the engine is driven through the gateway (SERVE); coli run has no mimo
         # branch and would fall through to GLM's binary, as for deepseek_v41
