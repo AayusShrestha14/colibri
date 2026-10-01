@@ -3568,12 +3568,13 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     else if (q->pin)
         fprintf(stderr, "[PIN] stato fotografato a %d token\n", total);
     GSession *session = slot->session;
-    /* GLM53_REWIND=0 spegne lo scatto della corsa di spazi, che costa un
-     * buffer grande quanto lo stato KDA (~149 MiB) e una sua copia per ogni
-     * corsa, non per ogni token. */
+    /* GLM53_REWIND=1 accende lo scatto della corsa di spazi, che costa un
+     * buffer grande quanto lo stato KDA (~149 MiB, fuori da GLM53_EXPERT_GB)
+     * e una sua copia per ogni corsa, non per ogni token. Spento di
+     * default: lo pagherebbe ogni risposta, anche di chi non fa mai Continue. */
     const char *rewind_setting = getenv("GLM53_REWIND");
     const int keep_blank = q->logprobs == 0 && n_vision == 0 &&
-                           !(rewind_setting && !strcmp(rewind_setting, "0"));
+                           rewind_setting && atoi(rewind_setting);
     int in_blank = 0;
     for (int step = 0; step < budget; step++) {
         /* #1332: una guardata a stdin per token. Il costo e' una select con

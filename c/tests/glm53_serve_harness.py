@@ -532,7 +532,7 @@ def main() -> int:
     blank_prompt, kept, k = found
     trimmed = blank_prompt + b"".join(kept)
     for fed, first in ((1, 40), (2, 44)):
-        rewound = engine(binary, arguments.fixture)
+        rewound = engine(binary, arguments.fixture, {"GLM53_REWIND": "1"})
         try:
             handshake(rewound)
             submit_bytes(rewound, first, blank_prompt, max_tokens=k + fed + 1)
@@ -559,8 +559,9 @@ def main() -> int:
             print(f"FAIL: riavvolto di {fed} spazi, il Continue risponde "
                   f"{from_rewind!r} e un motore appena partito no")
             return 1
-    # Lo stesso con GLM53_REWIND=0: niente scatto, prefill da capo.
-    unwound = engine(binary, arguments.fixture, {"GLM53_REWIND": "0"})
+    # Lo stesso senza GLM53_REWIND, cioe' il default: niente scatto, prefill
+    # da capo.
+    unwound = engine(binary, arguments.fixture)
     try:
         handshake(unwound)
         submit_bytes(unwound, 42, blank_prompt, max_tokens=k + 2)
@@ -573,7 +574,7 @@ def main() -> int:
         if unwound.poll() is None:
             unwound.kill()
     if reuse_line(43)[2] != "0":
-        print(f"FAIL: con GLM53_REWIND=0 il Continue non doveva riusare: "
+        print(f"FAIL: senza GLM53_REWIND il Continue non doveva riusare: "
               f"{reuse_line(43)!r}")
         return 1
 
