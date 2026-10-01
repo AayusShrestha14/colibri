@@ -111,16 +111,33 @@ The ViT's 252 output rows for that picture differ from Xiaomi's by at most 3.7e-
 
 ## Measured
 
-A first measurement, not a benchmark: the machine (Ryzen 7 PRO 8700GE, 8 cores, 64 GB,
-NVMe RAID) was running two other jobs on about 13 of its 16 threads, and the numbers
-move with that.
+Ryzen 7 PRO 8700GE (8 cores, 16 threads), 64 GB DDR5, NVMe RAID, Linux, with nothing
+else running. MiMo-V2.6-Flash, the CLI from a cold expert cache, greedy, a 33-token
+chat prompt (thinking off) and 128 generated tokens:
 
-| Flash, 32 cached experts per layer, dense as released | |
-|---|---|
-| resident | 30 GB (dense 10 GB, expert cache up to 19 GB) |
-| 24-token prompt from a cold cache | 21.8 s |
-| decode, 4 threads | 0.89 tok/s |
-| expert reads | 5.8 GB/s, about 1.7 GB per token while the cache warms |
+```sh
+./mimo /models/mimo-v2.6-flash --cap N --ngen 128 \
+  --prompt $'<|im_start|>user\nScrivi un racconto lungo e dettagliato su un colibri che attraversa il Mediterraneo.<|im_end|><|im_start|>assistant\n<think></think>'
+```
+
+| experts cached per layer | dense weights | threads | decode | last 64 tokens | resident | expert reads |
+|---|---|---|---|---|---|---|
+| 32 | as released (exact) | 8 | 2.34 tok/s | 2.33 tok/s | 30.1 GB | 264 GB |
+| 32 | as released (exact) | 16 | 2.31 tok/s | 2.30 tok/s | 30.1 GB | 264 GB |
+| 64 | as released (exact) | 8 | 2.95 tok/s | 2.94 tok/s | 49.8 GB | 167 GB |
+| 64 | as released, `MIMO_IDOT=1` | 8 | 2.95 tok/s | 2.96 tok/s | 49.8 GB | 166 GB |
+| 64 | int8 (`MIMO_DENSE_BITS=8`) | 8 | 3.37 tok/s | 3.39 tok/s | 47.5 GB | 166 GB |
+
+- Loading takes about 5 s, and the 33-token prompt from a cold cache 10 to 11 s.
+- Expert reads run at 9.8 to 10 GB/s with `O_DIRECT`.
+- With 64 experts cached and dense weights as released, the 54 s of a run split into
+  expert reads 17 s, expert matmuls 15.5 s, attention with its qkv and output
+  projections 18 s, and the rest (dense MLP, router, head) 4 s.
+- 16 threads give nothing over the 8 physical cores; the engine picks 8 when
+  `OMP_NUM_THREADS` is unset.
+- Two runs of the 16-thread configuration agreed within 1%.
+- int8 dense weights are not exact: the tokens part from the exact run within the
+  first sentence, and the story that follows reads just as well.
 
 Through the gateway: a tool call comes back as `get_weather({"city": "Roma", "days": 3})`
 with the integer typed as declared, and asked what is written in a picture made by
@@ -134,7 +151,7 @@ colibri's Qwen-Image the model answers with its text, word for word. The same in
 | Variable | Default | Effect |
 |---|---|---|
 | `MIMO_DENSE_BITS` | 0 | 0: dense weights as released (FP8, BF16), exact. 8: int8 per row, less RAM, not exact. 32: f32, the oracle's configuration. |
-| `MIMO_IDOT` | 0 | 1: int8 activations for the expert matmuls (faster, not exact). |
+| `MIMO_IDOT` | 0 | 1: int8 activations for the expert matmuls (not exact; no faster in the measurement above). |
 | `MIMO_DIRECT` | 1 | 0: buffered expert reads instead of `O_DIRECT`. |
 | `MIMO_READ_THREADS` | 8 | Parallel expert reads per layer. |
 | `MIMO_CHUNK` | 64 | Prompt tokens per prefill block. |
