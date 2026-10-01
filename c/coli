@@ -1651,6 +1651,13 @@ def chat_command(message):
     e deve poter distinguere "comando sbagliato" da "testo che comincia con /"."""
     if not message or message[0] not in "/:":
         return None, None
+    # A picture's path is not a command. A file dragged into the terminal pastes
+    # "/home/me/photo.png" at the start of the line, and that line is a question
+    # about the picture; read as a command it got "comando sconosciuto" and the
+    # picture never left the prompt.
+    # The first word decides: "/save /tmp/x.png" is still the /save command.
+    if IMAGE_PATH.fullmatch(message.split()[0]):
+        return None, None
     head, _, rest = message[1:].partition(" ")
     return head.strip().lower(), rest.strip()
 
