@@ -966,6 +966,8 @@ def _parse_arch_tool_calls(reply, tools, tool_reply, track_spans):
         return parse_k3_tool_calls(reply, tools) + (None, None)  # pre-#1147 engines
     if chat_flavor() in ("qwen36", "qwen38"):
         return parse_qwen_tool_calls(reply, tools) + (None, None)
+    if ARCH == "mimo":
+        return parse_mimo_tool_calls(reply, tools) + (None, None)
     return _parse_tool_calls(reply, tools, track_spans)
 
 
@@ -1938,6 +1940,172 @@ def parse_qwen_tool_calls(reply, tools=None):
 parse_qwen38_tool_calls = parse_qwen_tool_calls
 
 
+# ---- MiMo-V2.6 (Xiaomi) -------------------------------------------------------------------
+# ChatML without a newline after <|im_end|>, every assistant turn carrying its <think> block
+# (empty or not), tools declared in their own system turn, calls written INLINE
+# (<tool_call><function=N><parameter=K>V</parameter></function></tool_call>, no newlines) and
+# tool results as a plain `tool` turn. All of it from the release's chat_template.jinja
+# (XiaomiMiMo/MiMo-V2.6-Flash-MOPD); tests/test_mimo_chat_template.py renders that template
+# with jinja2 and compares byte for byte.
+
+MIMO_TOOLS_HEAD = "You are provided with the following tools:\n\n<tools>"
+
+
+def _mimo_tools(tools):
+    """render_tools(): each tool object as JSON, key order kept (transformers' tojson)."""
+    return (MIMO_TOOLS_HEAD
+            + "".join("\n" + json.dumps(tool, ensure_ascii=False) for tool in tools)
+            + "\n</tools>")
+
+
+def _mimo_value(value):
+    """render_value(): a string as-is, anything else as JSON."""
+    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+
+
+def _mimo_tool_calls(calls, index):
+    out = []
+    for position, call in enumerate(calls):
+        where = f"messages.{index}.tool_calls.{position}"
+        if not isinstance(call, dict):
+            raise APIError(400, "Each tool call must be an object.", where)
+        fn = call.get("function", call.get("custom", call))
+        if not isinstance(fn, dict) or not isinstance(fn.get("name"), str) or not fn["name"]:
+            raise APIError(400, "A tool call needs a `function.name`.", f"{where}.function")
+        out.append(f"<tool_call><function={fn['name']}>")
+        if isinstance(fn.get("input"), str):
+            out.append(fn["input"])
+        else:
+            args = fn.get("arguments")
+            # An OpenAI client sends the arguments back as a JSON string. The template
+            # would print that string raw, a shape the model never writes; read as the
+            # object it is, the call comes back in the <parameter=...> form the model
+            # produced, which is also what keeps the resent history on the KV prefix.
+            if isinstance(args, str) and args.strip():
+                try:
+                    args = json.loads(args)
+                except (TypeError, ValueError):
+                    raise APIError(400, "`function.arguments` must be a JSON object.",
+                                   f"{where}.function.arguments")
+            if isinstance(args, dict):
+                for key, value in args.items():
+                    out.append(f"<parameter={key}>{_mimo_value(value)}</parameter>")
+            elif args not in (None, "", {}):
+                raise APIError(400, "`function.arguments` must be a JSON object.",
+                               f"{where}.function.arguments")
+        out.append("</function></tool_call>")
+    return "".join(out)
+
+
+def render_chat_mimo(messages, enable_thinking=True, reasoning_effort=None, tools=None,
+                     tool_choice=None, add_generation_prompt=True):
+    """MiMo-V2.6's chat template.
+
+    One deliberate addition: with thinking on, the generation cue ends in `<think>`. The
+    template leaves that token to the model, and the model writes it first on every turn
+    it was trained on (each assistant turn of the template opens with it); putting it in
+    the prompt is what lets the reasoning split start inside the reasoning, where the
+    model is. With thinking off the template's own `<think></think>` closes it.
+
+    add_generation_prompt=False continues a trailing assistant turn: its past-turn render
+    minus the closing <|im_end|>, and no cue."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if tool_choice in ("none",):
+        tools = None
+    if tools is not None and not isinstance(tools, list):
+        raise APIError(400, "`tools` must be an array.", "tools")
+    parts = []
+    if tools:
+        parts.append(f"<|im_start|>system\n{_mimo_tools(tools)}<|im_end|>")
+    last = len(messages) - 1
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role == "developer":
+            role = "system"
+        if role not in ("system", "user", "assistant", "tool"):
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        raw = message.get("content")
+        body = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        if role == "assistant":
+            reasoning = message.get("reasoning_content")
+            if reasoning is not None and not isinstance(reasoning, str):
+                raise APIError(400, "`reasoning_content` must be a string.",
+                               f"messages.{index}.reasoning_content")
+            turn = f"<|im_start|>assistant\n<think>{reasoning or ''}</think>{body}"
+            calls = message.get("tool_calls")
+            if calls:
+                if not isinstance(calls, list):
+                    raise APIError(400, "`tool_calls` must be an array.",
+                                   f"messages.{index}.tool_calls")
+                turn += _mimo_tool_calls(calls, index)
+            if not add_generation_prompt and index == last:
+                parts.append(turn)            # the open turn: no terminator, no cue
+                return "".join(parts)
+            parts.append(turn + "<|im_end|>")
+            continue
+        parts.append(f"<|im_start|>{role}\n{body}<|im_end|>")
+    if add_generation_prompt:
+        parts.append("<|im_start|>assistant\n")
+        parts.append("<think>" if enable_thinking else "<think></think>")
+    return "".join(parts)
+
+
+MIMO_CALL_RE = re.compile(
+    r"<tool_call>\s*<function=([^>\n]+)>(.*?)</function>\s*</tool_call>", re.S)
+MIMO_PARAM_RE = re.compile(r"<parameter=([^>\n]+)>(.*?)</parameter>", re.S)
+
+
+def parse_mimo_tool_calls(reply, tools=None):
+    """MiMo's calls back into OpenAI `tool_calls`.
+
+    Parameters are inline (`<parameter=K>V</parameter>`); a value that arrives on its own
+    lines, Qwen-style, loses exactly one newline on each side. Types come from the declared
+    schema as for Qwen: a string parameter stays text, anything else is read as JSON. A
+    body with no parameter tags but a JSON object in it is the template's other spelling
+    (`arguments` as a string) and is taken as the arguments."""
+    schema = {}
+    for tool in (tools or []):
+        fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+        name = fn.get("name")
+        params = (fn.get("parameters") or {}).get("properties") or {}
+        if isinstance(name, str) and name and isinstance(params, dict):
+            schema[name] = params
+
+    def make_call(name, body):
+        args = {}
+        found = MIMO_PARAM_RE.findall(body)
+        for key, raw in found:
+            key = key.strip()
+            if raw.startswith("\n"):
+                raw = raw[1:]
+            if raw.endswith("\n"):
+                raw = raw[:-1]
+            declared = (schema.get(name) or {}).get(key) or {}
+            kind = declared.get("type") if isinstance(declared, dict) else None
+            args[key] = _coerce_arg(raw, kind if isinstance(kind, str) else None) \
+                if kind not in (None, "string") else raw
+        if not found and body.strip():
+            try:
+                parsed = json.loads(body)
+                if isinstance(parsed, dict):
+                    args = parsed
+            except (TypeError, ValueError):
+                pass
+        return {"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
+                "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}
+
+    text = reply or ""
+    calls = [make_call(m.group(1).strip(), m.group(2)) for m in MIMO_CALL_RE.finditer(text)]
+    if not calls and tools and ("<tool_call>" in text or "<function=" in text):
+        sys.stderr.write("[api] mimo tool markers present but no call parsed -- "
+                         "possibly truncated or mangled output\n")
+        sys.stderr.flush()
+    return MIMO_CALL_RE.sub("", text).strip(), calls
+
+
 def render_chat_qwen38(messages, enable_thinking=True, reasoning_effort=None, tools=None,
                        tool_choice=None, add_generation_prompt=True):
     """Text-only Qwen3.8 chat-template subset with native reasoning hints.
@@ -2904,7 +3072,7 @@ def render_chat_dsv41(messages, enable_thinking=False, reasoning_effort=None, to
 # on by default, and a family without its open-turn shape yet must not start rejecting requests
 # nobody opted into. Each renderer adds itself here in the same commit that derives its shape.
 CONTINUATION_FAMILIES = {"glm53", "qwen38", "qwen36", "glm", "olmoe", "deepseek_v4", "inkling",
-                         "kimi", "deepseek_v41"}
+                         "kimi", "deepseek_v41", "mimo"}
 
 
 def resolve_generation_prompt(messages, body):
@@ -3016,6 +3184,9 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
     if ARCH == "deepseek_v41":
         return render_chat_dsv41(messages, enable_thinking, reasoning_effort, tools,
                                  tool_choice, add_generation_prompt)
+    if ARCH == "mimo":
+        return render_chat_mimo(messages, enable_thinking, reasoning_effort, tools,
+                                tool_choice, add_generation_prompt)
     return render_chat(messages, enable_thinking, reasoning_effort, tools, tool_choice)
 
 
@@ -4265,8 +4436,8 @@ def cap_for_arch(arch, cap, env=None, model=None):
             planned = 0
         if planned >= 1:
             return planned
-    if arch == "deepseek_v41" and model is not None:
-        # V4.1 only reads its argv cap, not RAM_GB. Without --auto-tier the
+    if arch in ("deepseek_v41", "mimo") and model is not None:
+        # V4.1 and MiMo only read their argv cap, not RAM_GB. Without --auto-tier the
         # legacy eight slots silently discarded both --ram and RAM_GB (#1666).
         from resource_plan import build_plan
         settings = env if env is not None else os.environ
@@ -4277,9 +4448,10 @@ def cap_for_arch(arch, cap, env=None, model=None):
                           gpu_indices=[])
         slots = plan["tiers"]["ram"]["cache_slots_per_layer"]
         if slots < 1:
-            raise ValueError("DeepSeek V4.1 RAM budget cannot hold one expert slot per layer")
-        print(f"[v41] RAM plan: {slots} expert cache slots/layer; --cap overrides",
-              file=sys.stderr)
+            raise ValueError(f"{family_by_id(arch).display_name} RAM budget cannot hold one "
+                             f"expert slot per layer")
+        print(f"[{'v41' if arch == 'deepseek_v41' else arch}] RAM plan: {slots} expert cache "
+              f"slots/layer; --cap overrides", file=sys.stderr)
         return slots
     return family_by_id(arch).limits.implicit_cap
 
@@ -5554,6 +5726,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 # past a bare 200 to an unauthenticated probe. (#SEC-8)
                 payload = {"status": "ok"}
                 if self._is_authed():
+                    payload["arch"] = ARCH            # which family answers: coli chat reads it
                     payload["scheduler"] = self.server.scheduler.snapshot()
                     payload["kv_slots"] = self.server.kv_slots
                     payload["continue_assistant"] = os.environ.get("COLI_CONTINUE_ASSISTANT", "1") != "0" and ARCH in CONTINUATION_FAMILIES
@@ -6666,7 +6839,8 @@ class APIHandler(BaseHTTPRequestHandler):
             # preserve the older opt-in default for the other families.
             if chat_flavor() == "qwen38":
                 reasoning_effort = "xhigh"
-            elif os.environ.get("COLI_THINK", "0") == "1":
+            elif ARCH == "mimo" or os.environ.get("COLI_THINK", "0") == "1":
+                # MiMo-V2.6's template thinks unless told not to (enable_thinking false)
                 reasoning_effort = "high"
         enable_thinking = body.get("enable_thinking", reasoning_effort not in (None, "none"))
         if not isinstance(enable_thinking, bool):
@@ -6718,6 +6892,12 @@ class APIHandler(BaseHTTPRequestHandler):
             ceiling = os.environ.get("V41_MAX_IMAGE_TOKENS")
             messages, images = expand_dsv41_images(messages, model_dir,
                                                    int(ceiling) if ceiling else None)
+        elif ARCH == "mimo":
+            # MiMo-V2.6's ViT reads the Qwen2-VL processor's patches, with the same
+            # placeholders: the Qwen expander serves it unchanged.
+            ceiling = os.environ.get("MIMO_MAX_IMAGE_TOKENS")
+            messages, images = expand_qwen38_images(messages, model_dir,
+                                                    int(ceiling) if ceiling else None)
         elif ARCH == "qwen38" or (ARCH == "qwen36" and qwen36_has_vision(model_dir)):
             # Qwen3.5/3.6/3.8 share the tower and the preprocessor, so qwen36
             # checkpoints converted with their tower take the same path (#1757).
@@ -6748,7 +6928,7 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "`thinking` must be an object.", "thinking")
         enable_thinking = bool(thinking and thinking.get("type") == "enabled")
         if not enable_thinking and thinking is None:
-            if chat_flavor() == "qwen38":
+            if chat_flavor() == "qwen38" or ARCH == "mimo":
                 enable_thinking = True
             elif os.environ.get("COLI_THINK", "0") == "1":
                 enable_thinking = True

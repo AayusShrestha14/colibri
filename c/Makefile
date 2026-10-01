@@ -1236,6 +1236,28 @@ deepseek_v41$(EXE): deepseek_v41.c sse41_kernels.h cli_args.h st.h json.h tok.h 
 	sparse_attn.h hyper_connections.h serve_codec.h serve_poll.h .build-config
 	$(CC) $(CFLAGS) deepseek_v41.c -o deepseek_v41$(EXE) $(LDFLAGS)
 
+# Xiaomi MiMo-V2.6 (Flash 309B, Pro 1.02T): one file plus its ViT header, reading the
+# release as it is -- MXFP4 experts streamed per layer, FP8/BF16 dense resident.
+ifneq ($(EXE),)
+.PHONY: mimo
+mimo: mimo$(EXE)
+endif
+mimo$(EXE): mimo.c mimo_vision.h sse41_kernels.h cli_args.h compat.h json.h st.h quant.h idot.h fp8_format.h \
+	omp_tune.h kv_prefix.h tok.h tok_unicode.h tok_unicode_o200k.h tok_unicode_deepseek.h serve_codec.h \
+	decode_batch.h serve_poll.h stop_ids.h .build-config
+	$(CC) $(CFLAGS) mimo.c -o mimo$(EXE) $(LDFLAGS)
+
+# Tiny MiMo fixture + vendor oracle, the Kimi K3 pattern: the generator is numpy (and
+# Pillow for the test picture) and deterministic; ref.json is committed and comes from
+# Xiaomi's own modeling code (tools/make_mimo_ref.py, maintainer-run, SHA-256-pinned),
+# so CI needs neither torch nor network. The fixture carries the vision tower too.
+.PHONY: mimo-tiny-generate mimo-tiny-check
+mimo-tiny-generate:
+	$(PYTHON) tools/make_mimo_tiny.py --output ./mimo_tiny --force --vision
+
+mimo-tiny-check: mimo-tiny-generate mimo$(EXE)
+	$(PYTHON) tests/mimo_tiny_harness.py --binary ./mimo$(EXE) --fixture ./mimo_tiny
+
 # Qwen3.8-Flash-Next text-only sibling. qwen38.c owns the direct checkpoint
 # loader and SERVE=1 protocol. With CUDA=1 it links the same expert tier as
 # qwen36 (fp8 streaming mode: hot experts get VRAM copies, the RAM LRU stays);
@@ -2453,7 +2475,7 @@ check:
 	$(MAKE) portable
 	$(MAKE) test
 
-install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) qwen38$(EXE) deepseek_v41$(EXE) qwenimage$(EXE) \
+install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) qwen38$(EXE) deepseek_v41$(EXE) mimo$(EXE) qwenimage$(EXE) \
 	$(if $(filter 1,$(COLI_V4_SUPPORTED)),deepseek-v4,)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
@@ -2468,6 +2490,7 @@ install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen3
 	$(INSTALL) -m 755 qwen38$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwen38$(EXE)
 	$(INSTALL) -m 755 qwenimage$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwenimage$(EXE)
 	$(INSTALL) -m 755 deepseek_v41$(EXE) $(DESTDIR)$(LIBEXECDIR)/deepseek_v41$(EXE)
+	$(INSTALL) -m 755 mimo$(EXE) $(DESTDIR)$(LIBEXECDIR)/mimo$(EXE)
 	@if [ -f deepseek_v4$(EXE) ]; then \
 	  $(INSTALL) -m 755 deepseek_v4$(EXE) $(DESTDIR)$(LIBEXECDIR)/deepseek_v4$(EXE); \
 	fi

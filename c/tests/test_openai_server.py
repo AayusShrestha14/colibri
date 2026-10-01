@@ -2786,6 +2786,8 @@ class HTTPTest(unittest.TestCase):
         with self.request("/health") as response:
             health = json.load(response)
             scheduler = health["scheduler"]
+        # the family, for coli chat's per-family defaults (authed probes only)
+        self.assertEqual(health["arch"], openai_server.ARCH)
         self.assertEqual(scheduler["max_queue"], 8)
         self.assertIn("queued", scheduler)
         self.assertEqual(health["kv_slots"], 2)
