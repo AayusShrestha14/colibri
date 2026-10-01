@@ -233,7 +233,11 @@ static double mem_available_gb(void) {
     double total = 0, avail = 0;
     compat_meminfo_gb(&total, &avail);
     static int warned = 0;
-    if (avail <= 0.0 || (total > 0.0 && avail < total * 0.02)) {
+    if (avail <= 0.0
+#ifdef __APPLE__
+        || (total > 0.0 && avail < total * 0.02)
+#endif
+    ) {
         if (!warned) {
             warned = 1;
             if (total > 0.0) {
