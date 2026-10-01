@@ -3982,6 +3982,23 @@ def _json_float(value):
     return value if math.isfinite(value) else None
 
 
+def _keepalive_choice(chat, visible):
+    """The streamed keepalive's single choice, in the endpoint's own chunk shape.
+
+    A chat chunk (`chat.completion.chunk`) carries a `delta`; a legacy
+    `/v1/completions` chunk (`text_completion`) carries `text`, never `delta`.
+    Emitting a `delta` on the completions stream produces a chunk with no `text`,
+    which a strict client (the OpenAI SDK models `CompletionChoice.text` as
+    required) rejects. Chat has a side channel for the diagnostic marker
+    (reasoning_content, off the visible answer); completions does not, so its
+    keepalive stays an empty `text` — a "." there would land in the completion —
+    and still resets the client's idle timer."""
+    if chat:
+        return {"index": 0, "delta": {"reasoning_content": "." if visible else ""},
+                "logprobs": None, "finish_reason": None}
+    return {"index": 0, "text": "", "logprobs": None, "finish_reason": None}
+
+
 def _order_echo_records(prompt_records):
     """Place each prompt-echo record at its own wire `pos` index rather than trusting the
     order the frames arrived in, and return `(payload bytes, record)` pairs -- the same
@@ -6666,10 +6683,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 # cold prefill. COLI_VISIBLE_KEEPALIVE=1 restores the old visible "." for
                 # diagnosing whether keepalives are being delivered at all.
                 visible = os.environ.get("COLI_VISIBLE_KEEPALIVE") == "1"
-                ping = [{"index": 0,
-                         "delta": ({"reasoning_content": "." if visible else ""} if chat
-                                   else {"content": ""}),
-                         "logprobs": None, "finish_reason": None}]
+                ping = [_keepalive_choice(chat, visible)]
                 while not ka_stop.wait(1.0):
                     if not connected:
                         return

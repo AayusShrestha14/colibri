@@ -38,6 +38,7 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            parse_tool_calls_spans, parse_arch_tool_calls_spans,
                            THINK_OPEN, THINK_CLOSE,
                            _compose_span_maps, _cut_span_map, _project_span,
+                           _keepalive_choice,
                            stop_policy, tune_child_env)
 
 
@@ -885,6 +886,22 @@ class TemplateTest(unittest.TestCase):
         for value in ("", [], [""], ["1", "2", "3", "4", "5"], 7, ["ok", 7]):
             with self.subTest(value=value), self.assertRaises(APIError):
                 generation_options({"stop": value}, 8)
+
+    def test_keepalive_choice_matches_the_endpoint_chunk_shape(self):
+        # Chat chunks carry a `delta`; the diagnostic marker rides reasoning_content,
+        # off the visible answer.
+        chat = _keepalive_choice(True, False)
+        self.assertEqual(chat["delta"], {"reasoning_content": ""})
+        self.assertNotIn("text", chat)
+        self.assertEqual(_keepalive_choice(True, True)["delta"],
+                         {"reasoning_content": "."})
+        # Legacy /v1/completions chunks carry `text`, never `delta`, or a strict
+        # client (OpenAI SDK: CompletionChoice.text is required) rejects the ping.
+        # No side channel, so the marker never appears: a "." would land in the text.
+        for visible in (False, True):
+            comp = _keepalive_choice(False, visible)
+            self.assertEqual(comp["text"], "")
+            self.assertNotIn("delta", comp)
 
     def test_glm_chat_defaults_role_stops_without_changing_other_policies(self):
         with patch("openai_server.ARCH", "glm"):
