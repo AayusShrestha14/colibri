@@ -1032,6 +1032,8 @@ class FamilyRegistryTest(unittest.TestCase):
             # V4.1 ships its chat encoding as a Python module (encoding/encoding.py),
             # not a jinja template, so the replay prompt stays the bare text like V4.
             "deepseek_v41": "hello {world}",
+            # MiMo-V2.6: render_chat_mimo's cue with thinking on (its template's default)
+            "mimo": "<|im_start|>user\nhello {world}<|im_end|><|im_start|>assistant\n<think>",
             # An image model has no chat template and nothing to tune; the
             # template is the identity and `coli tune` refuses the modality.
             "qwen_image": "hello {world}",
