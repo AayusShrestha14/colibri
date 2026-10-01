@@ -264,6 +264,15 @@ offered tools to the named one, some keep the full list and name the tool in
 prose instead, and some (Qwen3.6, Qwen3.8) do neither. Read the rendered prompt
 rather than assuming the request was honoured.
 
+For GLM calls that will execute tools, an OpenAI chat request may set
+`"strict_tool_calls": true`. This opt-in accepts only complete `<​tool_call>`
+blocks whose function and arguments match the declared tool schema. It returns
+HTTP 502 with code `invalid_model_tool_call` for incomplete, duplicate, unknown,
+or invalid arguments and for a tool call cut off by the generation limit. It
+never recovers or salvages a malformed call. The default recovery behavior is
+unchanged. Strict mode currently requires `stream: false` and does not support
+`logprobs`; these combinations receive HTTP 400 before generation.
+
 When a reverse proxy or MagicDNS hostname preserves a public `Host` header,
 trust that exact hostname with repeatable `--allowed-host` options. The
 comma-separated `COLI_ALLOWED_HOSTS` environment variable is equivalent:
