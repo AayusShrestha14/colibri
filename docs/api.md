@@ -236,6 +236,7 @@ Known limitations, current build:
 | DeepSeek V4 | yes | yes | native DSML tool-call blocks |
 | Inkling | no | no | active tool declarations/choices return HTTP 400 |
 | Kimi K3 | yes | yes | native XTML `tools`/`call`/`argument` blocks (#1143) |
+| MiMo-V2.6 | yes | yes | native `<tools>` / `<tool_call>` blocks |
 | Qwen3.6 | yes | yes | native `<tool_call>`/`<tool_response>` blocks, the same XML-ish form as Qwen3.8 |
 | Qwen3.8-Flash-Next | yes | yes | native `<tool_call>`/`<tool_response>` blocks |
 | OLMoE | no | no | active tool declarations/choices return HTTP 400 |
