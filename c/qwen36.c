@@ -5293,6 +5293,7 @@ static int qwen36_segment_engine_open(
         &engine->model, (int)options->layer_begin) ? 4 : 8;
     free(engine->model.DN_rec); free(engine->model.DN_conv); free(engine->model.dn_dev_fresh); free(engine->model.dn_host_stale);
     engine->model.DN_rec = NULL; engine->model.DN_conv = NULL;
+    engine->model.dn_dev_fresh = NULL; engine->model.dn_host_stale = NULL;   /* a segment run re-reads them (deltanet) and teardown frees again */
     engine->model.max_t = (int)options->context_tokens;
     engine->model.kv_cap = (int)options->context_tokens;
     engine->model.attn_sc_thr = 1;

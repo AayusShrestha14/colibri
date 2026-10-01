@@ -790,7 +790,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
         } else if(ed==QT_PLACE_ALL){
             /* experts=all: every COLI_GPUS card keeps its experts, reserved or
              * not -- the form for "trunk on the fast card, experts on both" */
-            fprintf(stderr,"[place] experts=all -> Experten auf allen %d Karten, auch den reservierten\n",G.ndev);
+            fprintf(stderr,"[place] experts=all: the experts stay on all %d cards, the reserved ones included\n",G.ndev);
         } else if(ed!=QT_PLACE_CPU){
             int present=0; for(int i=0;i<G.ndev;i++) if(G.dev[i]==ed) present=1;
             if(present){
