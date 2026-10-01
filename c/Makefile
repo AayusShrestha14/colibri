@@ -2407,7 +2407,7 @@ tests/test_qwen36_tier_int8_engine$(EXE): tests/test_qwen36_tier_int8_engine.c q
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # The DeltaNet layer on the GPU (Q36_DN_GPU=1): outputs and state against the CPU path, fake backend.
-tests/test_qwen36_dn_gpu$(EXE): tests/test_qwen36_dn_gpu.c gsgemv.h qgemv.h sse41_kernels.h tests/qwen36_fake_cuda.h qwen36.c qwen38_vision.h expert_ffn.h qwen36_tier.c qwen36_tier.h backend_cuda.h cli_args.h st.h json.h compat.h
+tests/test_qwen36_dn_gpu$(EXE): tests/test_qwen36_dn_gpu.c qwen36.c qwen36_tier.c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
 # dnout / attnproj / shexp offered, placed and served from VRAM (fake backend).
