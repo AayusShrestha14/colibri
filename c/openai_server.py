@@ -3738,26 +3738,11 @@ class ToolSideband:
     def reply(self):
         return "".join(self.parts) if self.seen else None
 
-def generation_options(body, limit):
-    if body.get("n", 1) != 1:
-        raise APIError(400, "Colibri currently supports `n=1` only.", "n", "unsupported_value")
-    best_of = body.get("best_of", 1)
-    if best_of not in (None, 1):
-        raise APIError(400, "Colibri currently supports `best_of` equal to 1 only.",
-                       "best_of", "unsupported_value")
-    logit_bias = body.get("logit_bias")
-    if logit_bias not in (None, {}):
-        raise APIError(400, "Colibri does not support a non-empty `logit_bias` yet.",
-                       "logit_bias", "unsupported_value")
-    if body.get("suffix") is not None:
-        raise APIError(400, "Colibri does not support `suffix` infill yet.",
-                       "suffix", "unsupported_parameter")
-    modalities = body.get("modalities")
-    if isinstance(modalities, list) and "audio" in modalities:
-        raise APIError(400, "Colibri does not support audio output via `modalities`.",
-                       "modalities", "unsupported_value")
-    # `tools`/`functions` are handled by render_chat (declaration) + parse_tool_calls (output).
-    # Validate tools/functions structure early so malformed input fails with a clear error.
+def validate_tools(body):
+    """Refuse a malformed `tools`/`functions` with a 400 naming the field. The chat renderers
+    iterate the list and parse_tool_calls reads each schema's `properties` and `required`, so
+    this has to run before either: chat_completion() calls it ahead of rendering, and
+    generation_options() calls it again for every other path."""
     tools_raw = body.get("tools") or body.get("functions")
     if tools_raw is not None:
         if not isinstance(tools_raw, list):
@@ -3778,6 +3763,40 @@ def generation_options(body, limit):
             if not isinstance(fn["name"], str):
                 raise APIError(400, f"Tool `name` must be a string at index {idx}.",
                                f"tools.{idx}.function.name", "invalid_value")
+            params = fn.get("parameters")
+            if params is None:
+                continue
+            if not isinstance(params, dict):
+                raise APIError(400, f"Tool `parameters` must be an object at index {idx}.",
+                               f"tools.{idx}.function.parameters", "invalid_value")
+            if params.get("properties") is not None and not isinstance(params["properties"], dict):
+                raise APIError(400, f"Tool `parameters.properties` must be an object at index {idx}.",
+                               f"tools.{idx}.function.parameters.properties", "invalid_value")
+            if params.get("required") is not None and not isinstance(params["required"], list):
+                raise APIError(400, f"Tool `parameters.required` must be an array at index {idx}.",
+                               f"tools.{idx}.function.parameters.required", "invalid_value")
+
+
+def generation_options(body, limit):
+    if body.get("n", 1) != 1:
+        raise APIError(400, "Colibri currently supports `n=1` only.", "n", "unsupported_value")
+    best_of = body.get("best_of", 1)
+    if best_of not in (None, 1):
+        raise APIError(400, "Colibri currently supports `best_of` equal to 1 only.",
+                       "best_of", "unsupported_value")
+    logit_bias = body.get("logit_bias")
+    if logit_bias not in (None, {}):
+        raise APIError(400, "Colibri does not support a non-empty `logit_bias` yet.",
+                       "logit_bias", "unsupported_value")
+    if body.get("suffix") is not None:
+        raise APIError(400, "Colibri does not support `suffix` infill yet.",
+                       "suffix", "unsupported_parameter")
+    modalities = body.get("modalities")
+    if isinstance(modalities, list) and "audio" in modalities:
+        raise APIError(400, "Colibri does not support audio output via `modalities`.",
+                       "modalities", "unsupported_value")
+    # `tools`/`functions` are handled by render_chat (declaration) + parse_tool_calls (output).
+    validate_tools(body)
     choice = body.get("tool_choice")
     if choice is not None:
         if isinstance(choice, str):
@@ -6871,10 +6890,17 @@ class APIHandler(BaseHTTPRequestHandler):
         preserve_thinking = body.get("preserve_thinking", not enable_thinking)
         if not isinstance(preserve_thinking, bool):
             raise APIError(400, "`preserve_thinking` must be a boolean.", "preserve_thinking")
+        # The request's shape is checked before the image expanders and the renderer read it.
+        # generation() validates `tools` too, but only after rendering, and a renderer handed a
+        # `tools` of 5 or a `messages` of null raises TypeError, which do_POST answers with 500.
+        validate_tools(body)
         tools = body.get("tools") or body.get("functions") or None
         tool_choice = body.get("tool_choice")
         audio_clips = [] if ARCH == "inkling" else None
-        messages, image = self.expand_images(body.get("messages"))
+        messages = body.get("messages")
+        if not isinstance(messages, list) or not messages:
+            raise APIError(400, "`messages` must be a non-empty array.", "messages")
+        messages, image = self.expand_images(messages)
         add_generation_prompt = resolve_generation_prompt(messages, body)
         prompt = render_chat_for_arch(messages, enable_thinking, reasoning_effort,
                                       tools, tool_choice, audio_out=audio_clips,

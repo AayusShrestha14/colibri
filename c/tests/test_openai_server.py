@@ -2747,6 +2747,43 @@ class HTTPTest(unittest.TestCase):
         self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 401)
 
+    def test_a_malformed_tools_or_messages_is_a_client_error_on_every_family(self):
+        """`tools: 5` or `messages: null` answered HTTP 500 on most families.
+
+        generation_options() validates `tools`, but chat_completion() renders the prompt (and
+        runs the image expanders) before it calls generation(), and those iterate `tools` and
+        `messages` without checking them, so the TypeError reached do_POST's catch-all. A
+        `parameters` that is not an object got past every check and failed in
+        parse_tool_calls() after the whole generation had run.
+        """
+        import family_registry
+
+        cases = [
+            ({"tools": 5}, "tools"),
+            ({"tools": True}, "tools"),
+            ({"tools": [{"type": "function", "function": {"name": "f", "parameters": "x"}}]},
+             "tools.0.function.parameters"),
+            ({"tools": [{"type": "function", "function": {
+                "name": "f", "parameters": {"type": "object", "properties": "x"}}}]},
+             "tools.0.function.parameters.properties"),
+            ({"tools": [{"type": "function", "function": {
+                "name": "f", "parameters": {"type": "object", "required": "a"}}}]},
+             "tools.0.function.parameters.required"),
+            ({"messages": None}, "messages"),
+            ({"messages": 5}, "messages"),
+        ]
+        for arch in family_registry.family_ids():
+            for extra, param in cases:
+                with self.subTest(arch=arch, param=param, value=next(iter(extra.values()))):
+                    body = {"model": "test-model",
+                            "messages": [{"role": "user", "content": "hi"}], **extra}
+                    with patch("openai_server.ARCH", arch):
+                        with self.assertRaises(HTTPError) as caught:
+                            self.request("/v1/chat/completions", body)
+                    self.addCleanup(caught.exception.close)
+                    self.assertEqual(caught.exception.code, 400)
+                    self.assertEqual(json.loads(caught.exception.read())["error"]["param"], param)
+
     def test_metrics_counts_http_engine_failure_without_success(self):
         before = self.server.scheduler.snapshot()
         with patch.object(self.engine, "generate", side_effect=RuntimeError("injected failure")):
