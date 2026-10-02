@@ -707,7 +707,15 @@ def main():
     print(f"[meta] {out / 'qwen36_meta.json'}")
 
     # ---- README ----
-    if not args.no_readme:
+    if not args.no_readme and plain_qwen3:
+        lines = ["---", "tags:", "  - colibri", "  - qwen3_moe", "  - moe",
+                 "library_name: colibri", "---", "",
+                 "colibri container for a Qwen3 MoE checkpoint (qwen3_moe, e.g. Qwen3-Coder-30B-A3B):",
+                 f"{len(all_idx)} attention layers, no DeltaNet and no shared expert, routed experts",
+                 f"at {args.ebits} bits" + (f" with a scale per {args.gs} inputs." if args.gs else " with a scale per row."),
+                 "", "Engine: https://github.com/JustVugg/colibri (c/qwen36.c, docs/qwen36.md)"]
+        (out / "README.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    elif not args.no_readme:
         lines = ["---", "tags:", "  - colibri", "  - qwen3.6", "  - qwen3.6-35b-a3b", "  - moe",
                  "library_name: colibri", "---", "",
                  "colibri container for Qwen3.6-35B-A3B (Phase 2: all layers, incl. Gated DeltaNet).",
@@ -738,7 +746,8 @@ def main():
         pass
 
     print(f"\nDone. Container at: {out}")
-    print(f"All {len(all_idx)} layers stored (incl. Gated DeltaNet). n_active={len(all_idx)}.")
+    n_linear = sum(kind == "linear_attention" for kind in layer_types)
+    print(f"All {len(all_idx)} layers stored ({n_linear} Gated DeltaNet). n_active={len(all_idx)}.")
     print(f"Run (engine):  SNAP={out} ./qwen36 16 {args.ebits} ref_qwen36.json")
 
 
