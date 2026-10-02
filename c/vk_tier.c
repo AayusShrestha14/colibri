@@ -44,7 +44,7 @@ static struct {
     int max_resident, resident, queued, rate, uma;
     VSlot *s;
     uint32_t tick, decay_at;          /* tokens seen (rows of the forward's first layer) */
-    int last_layer, first_layer, promos;
+    int last_layer, first_layer, promos, promo_cap;
     /* uploader */
     pthread_t th; int th_on, stop;
     pthread_mutex_t mx; pthread_cond_t cv, cv_room;
@@ -346,7 +346,7 @@ static int pick_victim(uint64_t hs) {
  * blocks of rows, or rows one by one, is the same forward). The tick counts tokens:
  * the rows of the forward's first layer, every block of them. */
 static void new_forward(void) {
-    T.promos = 0;
+    T.promos = 0; T.promo_cap = 0;
     if (T.tick >= T.decay_at) {
         size_t n = (size_t)T.c.layers * T.c.experts;
         for (size_t i = 0; i < n; i++) T.s[i].heat = tier_decay_value(T.s[i].heat);
@@ -362,7 +362,7 @@ void vkt_note(int layer, int eid, const VktExpertSrc *src) {
     if (!T.on || !src || layer < 0 || layer >= T.c.layers || eid < 0 || eid >= T.c.experts) return;
     VSlot *v = slot(layer, eid);
     if (v->state != VS_NONE || !src->g || !src->u || !src->d) return;
-    if (T.promos >= T.rate) { T.rated++; return; }
+    if (T.promos >= T.promo_cap) { T.rated++; return; }
     int victim = -1;
     if (T.resident + T.queued >= T.max_resident) {
         if (!v->heat) return;
@@ -485,7 +485,11 @@ int vkt_issue(int layer, const float *x, int S, int K, const int *idx, uint8_t *
         return 0;
     }
     if (layer < T.last_layer) { T.first_layer = layer; new_forward(); }
-    if (layer == T.first_layer) T.tick += (uint32_t)S;
+    if (layer == T.first_layer) {   /* COLI_VK_TIER_RATE promotions per token of the forward */
+        T.tick += (uint32_t)S;
+        long cap = (long)T.promo_cap + (long)T.rate * S;
+        T.promo_cap = cap > (1 << 30) ? 1 << 30 : (int)cap;
+    }
     T.last_layer = layer;
     quiesce();
     int E = T.c.experts, H = T.c.hidden, n = S * K;
@@ -725,7 +729,7 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     if (T.gu_gs) fprintf(stderr, " gs %d", T.gu_gs);
     fprintf(stderr, ", down fmt %d", T.dn_fmt);
     if (T.dn_gs) fprintf(stderr, " gs %d", T.dn_gs);
-    fprintf(stderr, "), %s, %s queue, up to %d promotions per forward%s\n",
+    fprintf(stderr, "), %s, %s queue, up to %d promotions per token%s\n",
             T.uma ? (cap && *cap ? "shared RAM (COLI_VK_TIER_GB)" : "shared RAM: a quarter of what the expert cache leaves")
                   : "device memory", coli_vk_xb_queue_shared() ? "shared" : "own", T.rate,
             T.balance ? ", balanced against the CPU" : "");
