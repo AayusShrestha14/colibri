@@ -74,6 +74,10 @@ static int qwen36_max_ctx(void) {
 #ifdef COLI_METAL
 #include "backend_metal.h" /* coli_metal_init: affine pipelines for the store */
 #endif
+#ifdef COLI_VULKAN
+#include "backend_vulkan.h" /* COLI_VULKAN=1: the resident dense trunk on a Vulkan device */
+static int g_vk_ready = 0;
+#endif
 #ifdef COLI_SEGMENT_ADAPTER
 #include "segment_runtime.h"
 #include "segment_adapters.h"
@@ -727,9 +731,17 @@ typedef struct {
 /* q/sc: int8 rows with one scale per row (the classic copy, what the VRAM
  * tier uploads). q4/sg: the same matrix as int4 planar blocks of 64 with one
  * scale per group (COLI_DENSE_BITS=4), the layout the K1b grouped kernel
- * reads; ng = I/64 groups per row. */
-typedef struct { const float *w; int8_t *q; float *sc; int I, O; uint8_t *q4; float *sg; int ng; } QW;
+ * reads; ng = I/64 groups per row.
+ * vk/vk_off: the Vulkan device copy (COLI_VULKAN=1) of whichever of q4, q or w
+ * matmul_d reads, uploaded at the first matmul_d and kept; vk_off = the upload
+ * failed once, this matrix stays on the CPU. Both stay zero without VK=1. */
+typedef struct { const float *w; int8_t *q; float *sc; int I, O; uint8_t *q4; float *sg; int ng;
+                 void *vk; int vk_off; } QW;
 static void qw_free(QW *w) {
+#ifdef COLI_VULKAN
+    if (w->vk) coli_vk_tensor_free((ColiVkTensor *)w->vk);
+    w->vk = NULL; w->vk_off = 0;
+#endif
     free((void*)w->w); free(w->q); free(w->sc); free(w->q4); free(w->sg);
     w->w = NULL; w->q = NULL; w->sc = NULL; w->q4 = NULL; w->sg = NULL; w->ng = 0;
 }
@@ -1294,9 +1306,76 @@ static void qw_quantize(const float *W, int I, int O, const char *tag, QW *out) 
         } else { free(q4); free(sg); }
     }
 }
+#ifdef COLI_VULKAN
+/* COLI_VULKAN=1: a resident dense matrix answers from the Vulkan device, with
+ * the weights the CPU would read, in the order matmul_d picks them: the int4
+ * copy when there is one, else the int8 rows (fmt 1, one scale per row), else
+ * the f32 matrix (fmt 10, COLI_DENSE_I8=0: the reference path). The planar
+ * int4 blocks are not the shader's layout (fmt 4: low nibble = even column),
+ * so they are repacked once at upload, nibble for nibble: the same codes v+8
+ * and the same per-64 scales, nothing requantized. For the quantized copies
+ * only the activation differs from the CPU's default: it stays f32 on the
+ * device, where the integer dot rounds it to int8 (COLI_DENSE_IDOT=0 is the
+ * CPU arm with the same arithmetic); the f32 matrix differs from the CPU only
+ * in the order of the sums. The device copy lives in w->vk from the first
+ * call; a failed upload sets vk_off and the matrix stays on the CPU.
+ * The backend has one command buffer: never from a parallel region. */
+static void vk_q4_planar_to_fmt4(const QW *w, uint8_t *dst) {
+    const int I = w->I, rb = I / 2, ng = I / 64;
+    for (int o = 0; o < w->O; o++) {
+        const uint8_t *src = w->q4 + (size_t)o * rb;
+        uint8_t *row = dst + (size_t)o * rb;
+        for (int g = 0; g < ng; g++)
+            for (int p = 0; p < 32; p++) {
+                int lo = 2 * p, hi = 2 * p + 1;   /* columns g*64+lo, g*64+hi */
+                uint8_t a = lo < 32 ? (src[g * 32 + lo] & 15) : (src[g * 32 + lo - 32] >> 4);
+                uint8_t b = hi < 32 ? (src[g * 32 + hi] & 15) : (src[g * 32 + hi - 32] >> 4);
+                row[g * 32 + p] = (uint8_t)(a | (b << 4));
+            }
+    }
+}
+static unsigned g_vk_placed[3];   /* uploads by format: int8 rows, int4, f32 */
+static int vk_dense_matmul(float *y, const float *x, const QW *w, int S, int I, int O) {
+#ifdef _OPENMP
+    if (omp_in_parallel()) return 0;
+#endif
+    if (w->vk_off || w->I != I || w->O != O || S < 1 || S > 65535) return 0;
+    QW *mw = (QW *)w;   /* vk is a cache in a matrix the forward pass treats as read-only */
+    ColiVkTensor **t = (ColiVkTensor **)&mw->vk;
+    int fmt = w->q4 ? 4 : w->q ? 1 : 10, gs = w->q4 ? 64 : 0;
+    const void *wq = w->q4 ? (const void *)w->q4 : w->q ? (const void *)w->q : (const void *)w->w;
+    const float *sc = w->q4 ? w->sg : w->q ? w->sc : NULL;   /* fmt 10: no scales */
+    if (!wq) return 0;
+    if (!*t) {
+        int ok;
+        if (w->q4) {
+            uint8_t *packed = malloc((size_t)O * (I / 2));
+            if (packed) vk_q4_planar_to_fmt4(w, packed);
+            ok = packed && coli_vk_tensor_ensure(t, packed, sc, fmt, I, O, gs);
+            free(packed);
+        } else ok = coli_vk_tensor_ensure(t, wq, sc, fmt, I, O, gs);
+        if (!ok) { mw->vk_off = 1; return 0; }
+        g_vk_placed[fmt == 1 ? 0 : fmt == 4 ? 1 : 2]++;
+    }
+    return coli_vk_matmul(t, y, x, wq, sc, fmt, S, I, O, gs);
+}
+/* One line at the end of a run or a serve turn: how many matmuls the device
+ * really answered, so a test can tell a used path from an initialised one. */
+static void vk_report(void) {
+    if (!g_vk_ready) return;
+    size_t bytes = 0, tensors = 0;
+    coli_vk_mem_info(&bytes, &tensors);
+    fprintf(stderr, "[VK] qwen36: %llu matmuls on the GPU (%zu matrices resident, %.1f MiB; placed int8 %u, int4 %u, f32 %u)\n",
+            coli_vk_matmul_calls(), tensors, bytes / 1048576.0,
+            g_vk_placed[0], g_vk_placed[1], g_vk_placed[2]);
+}
+#endif
 static void matmul_d(float *y, const float *x, const QW *w, int S, int I, int O){
 #ifdef COLI_QWEN_BATCH_TEST
     g_qwen_matmul_d_calls++;
+#endif
+#ifdef COLI_VULKAN
+    if (g_vk_ready && (w->q || w->q4 || w->w) && vk_dense_matmul(y, x, w, S, I, O)) return;
 #endif
     if (w->q || w->q4) {
         if (w->q4 || dense_idot_on()) {
@@ -1733,6 +1812,7 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
     float *p = load_t_n(m, name, (int64_t)I * O);
     out->w = p; out->q = NULL; out->sc = NULL; out->I = I; out->O = O;
     out->q4 = NULL; out->sg = NULL; out->ng = 0;
+    out->vk = NULL; out->vk_off = 0;
     if (!quantize || !dense_i8_on()) return;
     qw_quantize(p, I, O, tag, out);
     if (getenv("COLI_KEEP_F32")) out->w = p; else { free(p); out->w = NULL; }
@@ -4174,6 +4254,9 @@ static void serve_one(Model *m, ServeReq *q){
     printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n",q->id,gen,
            dt>0?gen/dt:0.0,0.0,rss_gb(),np,limited);
     fflush(stdout);
+#ifdef COLI_VULKAN
+    vk_report();   /* stderr: the wire protocol on stdout is untouched */
+#endif
 }
 
 static void serve_loop(Model *m){
@@ -4374,6 +4457,11 @@ int main(int argc, char **argv) {
     g_expert_gs = m.c.expert_gs;
     if (g_expert_gs) fprintf(stderr, "[qwen36] group-scaled experts: gs=%d\n", g_expert_gs);
     fprintf(stderr, "resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
+#ifdef COLI_VULKAN
+    /* After the weights: the dense matrices upload at their first matmul_d.
+     * No device (or COLI_VULKAN unset) leaves g_vk_ready 0, the CPU path. */
+    g_vk_ready = coli_vk_init_env("qwen36");
+#endif
     if (ref_image && ref_image->t == J_OBJ) {
         jval *gh = json_get(ref_image, "grid_h"), *gw = json_get(ref_image, "grid_w");
         jval *pv = json_get(ref_image, "patches");
@@ -4574,6 +4662,9 @@ int main(int argc, char **argv) {
                (unsigned long long)m.hits, (unsigned long long)m.miss);
         route_footer(stdout, &m);
         printf("Speed: %.2f tok/s (%.1fs for %d tokens) | PEAK RSS: %.2f GB\n", scored/dt, dt, scored, rss_gb());
+#ifdef COLI_VULKAN
+        vk_report();
+#endif
         free(buf); free(arena); return 0;
     }
 
@@ -4656,6 +4747,9 @@ int main(int argc, char **argv) {
            (unsigned long long)m.hits, (unsigned long long)m.miss);
     route_footer(stderr, &m);
     fprintf(stderr, "Speed: %.2f tok/s (%.1fs for %d tokens)\n", n_new/dt, dt, n_new);
+#ifdef COLI_VULKAN
+    vk_report();
+#endif
     free(buf); free(arena);
     /* Oracle mode is a gate, not a report: a mismatch must fail the caller.
      * inkling.c does the same (`return (match == ngen) ? 0 : 1;`) and its CI

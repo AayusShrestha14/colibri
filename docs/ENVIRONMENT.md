@@ -214,7 +214,7 @@ Per-drive byte counts are reported in a `MIRROR:` stats line. Combine with `DIRE
 
 | Variable | Default | Effect |
 |---|---|---|
-| `COLI_VULKAN` | off | Enable the Vulkan backend. Requires a `make VK=1` build; fails at startup (no silent fallback) if libvulkan or the compiled shaders are missing. |
+| `COLI_VULKAN` | off | Enable the Vulkan backend. Requires a `make VK=1` build. The GLM engine fails at startup (no silent fallback) if libvulkan or the compiled shaders are missing. The other engines (qwen36, qwen38, inkling, olmoe, deepseek_v41, deepseek_v4, mimo, qwenimage) print one line and run on the CPU. What each one puts on the device: [vulkan.md](vulkan.md#the-other-engines). |
 | `COLI_VK_DEV` | unset | Select the primary Vulkan physical-device enumeration index. Without it, the backend prefers a discrete GPU, then integrated/virtual devices. |
 | `COLI_VK_SHADERS` | auto | Path to the compiled `qmatmul.spv` **or** the directory holding the `.spv` set; the other shaders are found next to it. Unset: `shaders/` next to the binary, then CWD-relative `shaders/qmatmul.spv`. |
 | `COLI_VK_EXPERTS` | `320` | Pinned VRAM expert tier size: top-N experts by `.coli_usage` heat uploaded once at startup and served from VRAM with no RAM slot or disk read. `0` disables the tier (experts stay on the CPU path). ~19 MB VRAM per int4 expert. |
@@ -512,6 +512,8 @@ Read **only** by `c/mimo.c` (and `MIMO_MAX_IMAGE_TOKENS` by the gateway). See [m
 | `MIMO_TRACE` | unset | MiMo, oracle: dump the residual after every sublayer of the first block. |
 | `MIMO_DIRS` | unset | MiMo: extra directories holding shards. |
 | `MIMO_STATS` | unset | MiMo: report the vision tower's time per picture. |
+| `COLI_VULKAN` | `0` | MiMo, `VK=1` build: the dense matrices of the trunk and of the vision tower run on the GPU in their `MIMO_DENSE_BITS` form (FP8 and BF16, int8 or f32). The router stays on the CPU. |
+| `MIMO_VK_EXPERTS` | `0` | MiMo, with `COLI_VULKAN=1`: keep up to this many routed experts (MXFP4) on the GPU once they have run from the RAM cache; never evicted, capped by the device's memory budget. |
 
 ## OLMoE engine (`olmoe`)
 
