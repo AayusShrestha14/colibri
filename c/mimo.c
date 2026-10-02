@@ -1032,10 +1032,15 @@ static void moe(Model *m, int li, const float *xn, int n, float *out) {
      * up of every expert, then down of every expert -- split in row blocks, instead
      * of three OpenMP regions per expert (a thousand a token on Flash, and every
      * barrier costs a scheduling round on a busy machine). The kernel inside a
-     * task is the same matmul_mxfp4 on the same rows, so the numbers do not move. */
+     * task is the same matmul_mxfp4 on the same rows, so the numbers do not move.
+     *
+     * Every (row, choice) pair has its own slot in the buffers below, across all
+     * the groups of the block, so the weighted sum can wait for the last group
+     * and run row by row in that row's own routing order. */
     int cap = m->cache[li].cap;
     int *row = xmalloc((size_t)n * K * sizeof(int), "expert rows index");
     float *rw = xmalloc((size_t)n * K * sizeof(float), "expert row weights");
+    int *pair = xmalloc((size_t)n * K * sizeof(int), "expert pair of a choice");
     int *first = xmalloc((size_t)(cap + 1) * sizeof(int), "expert row offsets");
     float *xg = xmalloc((size_t)n * K * H * sizeof(float), "expert inputs");
     float *g = xmalloc((size_t)n * K * MI * sizeof(float), "expert gate");
@@ -1045,20 +1050,25 @@ static void moe(Model *m, int li, const float *xn, int n, float *out) {
         = m->idot ? matmul_mxfp4_i8 : matmul_mxfp4;
     const int BLOCK_ROWS = 256;
     Slot *slots[4096];
+    int total = 0;                   /* pairs placed so far, over every group */
     for (int b = 0; b < nu; b += cap) {
         int nb = nu - b < cap ? nu - b : cap;
         experts_ensure(m, li, uni + b, nb, slots);
         double t0 = now_s();
-        int total = 0;
+        int from = total;
         for (int j = 0; j < nb; j++) {
             int e = uni[b + j];
             first[j] = total;
             for (int t = 0; t < n; t++)
                 for (int q = 0; q < K; q++)
-                    if (sel[(size_t)t * K + q] == e) { row[total] = t; rw[total] = wt[(size_t)t * K + q]; total++; }
+                    if (sel[(size_t)t * K + q] == e) {
+                        row[total] = t; rw[total] = wt[(size_t)t * K + q];
+                        pair[(size_t)t * K + q] = total;
+                        total++;
+                    }
         }
         first[nb] = total;
-        for (int i = 0; i < total; i++) memcpy(xg + (size_t)i * H, xn + (size_t)row[i] * H, (size_t)H * sizeof(float));
+        for (int i = from; i < total; i++) memcpy(xg + (size_t)i * H, xn + (size_t)row[i] * H, (size_t)H * sizeof(float));
         int up_blocks = (MI + BLOCK_ROWS - 1) / BLOCK_ROWS, down_blocks = (H + BLOCK_ROWS - 1) / BLOCK_ROWS;
         int rb_mi = MI / 2, gb_mi = MI / 32, rb_h = H / 2, gb_h = H / 32;
 #ifdef COLI_VULKAN
@@ -1088,7 +1098,7 @@ static void moe(Model *m, int li, const float *xn, int n, float *out) {
                 memcpy(dst + (size_t)i * MI + o0, scratch + (size_t)i * rows, (size_t)rows * sizeof(float));
             if (scratch != tmp) free(scratch);
         }
-        for (size_t i = 0; i < (size_t)total * MI; i++) g[i] = silu(g[i]) * u[i];
+        for (size_t i = (size_t)from * MI; i < (size_t)total * MI; i++) g[i] = silu(g[i]) * u[i];
 #ifdef COLI_VULKAN
         vk_experts_down(m, li, uni + b, nb, first, g, y, vk_gu, vk_dn);
 #endif
@@ -1111,16 +1121,27 @@ static void moe(Model *m, int li, const float *xn, int n, float *out) {
                 memcpy(dst + (size_t)i * H + o0, scratch + (size_t)i * rows, (size_t)rows * sizeof(float));
             if (scratch != tmp) free(scratch);
         }
-        /* the weighted sum, expert by expert in the order they were chosen */
-        for (int j = 0; j < nb; j++)
-            for (int i = first[j]; i < first[j + 1]; i++) {
-                float *o = out + (size_t)row[i] * H;
-                const float *yy = y + (size_t)i * H;
-                for (int d = 0; d < H; d++) o[d] += rw[i] * yy[d];
-            }
         m->t_expert += now_s() - t0;
     }
-    free(first);
+    /* The weighted sum, row by row, each row's experts in the order ITS router
+     * chose them. A row's sum used to follow the block's first-use order, which
+     * depends on the rows that happen to share the block: the same position
+     * came out with different low bits in a 64-row prefill block and in a
+     * one-row resume, so a prompt resumed from a prefix was not the prompt
+     * computed cold. Now a row is a function of its own inputs and nothing else,
+     * whatever the block boundaries. One row (a decode step) adds in the same
+     * order as before: its first-use order IS its routing order. */
+    double t1 = now_s();
+    for (int t = 0; t < n; t++) {
+        float *o = out + (size_t)t * H;
+        for (int q = 0; q < K; q++) {
+            int i = pair[(size_t)t * K + q];
+            const float *yy = y + (size_t)i * H;
+            for (int d = 0; d < H; d++) o[d] += rw[i] * yy[d];
+        }
+    }
+    m->t_expert += now_s() - t1;
+    free(first); free(pair);
     free(xg); free(g); free(u); free(y); free(row); free(rw); free(uni); free(sel); free(wt);
 }
 
