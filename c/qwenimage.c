@@ -50,8 +50,8 @@
 #endif
 #endif
 #ifdef COLI_VULKAN
-/* VK=1 and COLI_VULKAN=1: the DiT's int8 matrices run on the GPU, all the
- * image tokens of a product in one call. One command buffer: main thread only. */
+/* VK=1 and COLI_VULKAN=1: the DiT's matrices run on the GPU, all the image
+ * tokens of a product in one call. One command buffer: main thread only. */
 #include "backend_vulkan.h"
 static int g_vk_ready, g_vk_tried;
 #endif
@@ -165,19 +165,23 @@ static float *vec_load(shards *S, const char *name, int n){
     st_read_f32_cap(S, name, v, n, 1);
     return v;
 }
-/* Y[M][N] = X . W^T on the GPU, for every row of X in one call. The shader's
- * fmt 1 is QI_I8 as it is stored (int8 [N][K], one f32 scale per row), and the
- * activations stay f32, so the result is the CPU's f32-activation product up to
- * summation order. COLI_IMG_ACT8 is a CPU kernel: a matrix the GPU takes does
- * not quantize its activations. 0 when the product stays on the CPU. */
+/* Y[M][N] = X . W^T on the GPU, for every row of X in one call. Each storage
+ * format is one of the shader's as it is stored: QI_I8 is fmt 1 (int8 [N][K],
+ * one f32 scale per row), QI_BF16 fmt 11, QI_F32 fmt 10. The activations stay
+ * f32, so the result is the CPU's f32-activation product up to summation
+ * order. COLI_IMG_ACT8 is a CPU kernel: a matrix the GPU takes does not
+ * quantize its activations. 0 when the product stays on the CPU. */
 static int qi_vk_linear(float *y, const float *x, int M, const Lin *l){
 #ifdef COLI_VULKAN
-    if (!g_vk_ready || !l->gpu || l->vk_off || l->m.fmt != QI_I8 || l->m.ld || M < 1) return 0;
+    if (!g_vk_ready || !l->gpu || l->vk_off || l->m.ld || M < 1) return 0;
 #ifdef _OPENMP
     if (omp_in_parallel()) return 0;
 #endif
+    int fmt = l->m.fmt == QI_I8 ? 1 : l->m.fmt == QI_BF16 ? 11 : l->m.fmt == QI_F32 ? 10 : -1;
+    if (fmt < 0) return 0;
     Lin *dev = (Lin *)l;    /* the device copy is a cache inside a read-only matrix */
-    if (coli_vk_matmul((ColiVkTensor **)&dev->vk, y, x, l->m.w, l->m.sc, 1, M, l->m.K, l->m.N, 0)) return 1;
+    if (coli_vk_matmul((ColiVkTensor **)&dev->vk, y, x, l->m.w, fmt == 1 ? l->m.sc : NULL, fmt,
+                       M, l->m.K, l->m.N, 0)) return 1;
     if (!dev->vk) dev->vk_off = 1;
 #endif
     (void)y; (void)x; (void)M; (void)l;
@@ -544,7 +548,8 @@ static void dit_load(Dit *d, const char *model){
                  lin_bytes(&B->gate) + lin_bytes(&B->proj) + lin_bytes(&B->out);
     }
     st_destroy(&S);
-    d->mod.gpu = d->txt1.gpu = d->txt2.gpu = 1;
+    d->img_in.gpu = d->t1.gpu = d->t2.gpu = d->mod.gpu = d->norm_out.gpu = d->proj_out.gpu = 1;
+    d->txt1.gpu = d->txt2.gpu = 1;
     d->loaded = 1;
     fprintf(stderr, "[qwenimage] transformer: %d blocks, %.2f GB resident, %.1f s\n",
             d->layers, (bytes + lin_bytes(&d->mod) + lin_bytes(&d->txt1) + lin_bytes(&d->txt2)) / 1e9,
@@ -568,9 +573,9 @@ static void dit_temb(Dit *d, float t, float *temb){
         e[i] = cosf(a); e[half + i] = sinf(a);
     }
     float *h = fmalloc(d->dim);
-    qi_gemm(h, e, 1, &d->t1.m, NULL);
+    if (!qi_vk_linear(h, e, 1, &d->t1)) qi_gemm(h, e, 1, &d->t1.m, NULL);
     for (int i = 0; i < d->dim; i++) h[i] = silu(h[i]);
-    qi_gemm(temb, h, 1, &d->t2.m, NULL);
+    if (!qi_vk_linear(temb, h, 1, &d->t2)) qi_gemm(temb, h, 1, &d->t2.m, NULL);
     free(h);
 }
 /* mod[4*dim] = [scale1 | gate1 | scale2 | gate2], outs[dim] = the final norm's scale */
@@ -579,7 +584,7 @@ static void dit_modulation(Dit *d, float t, float *mod, float *outs){
     dit_temb(d, t, temb);
     for (int i = 0; i < d->dim; i++) s[i] = silu(temb[i]);
     if (!qi_vk_linear(mod, s, 1, &d->mod)) qi_gemm(mod, s, 1, &d->mod.m, NULL);
-    qi_gemm(outs, s, 1, &d->norm_out.m, NULL);
+    if (!qi_vk_linear(outs, s, 1, &d->norm_out)) qi_gemm(outs, s, 1, &d->norm_out.m, NULL);
     free(temb); free(s);
 }
 

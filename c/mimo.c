@@ -65,10 +65,11 @@
 #include <immintrin.h>
 #endif
 #ifdef COLI_VULKAN
-/* VK=1 and COLI_VULKAN=1: the int8 dense matrices (MIMO_DENSE_BITS=8) run on
- * the GPU, and with MIMO_VK_EXPERTS=N up to N routed experts are kept there as
- * MXFP4. Everything else, and every matrix whose upload fails, stays on the
- * CPU path below. The backend has one command buffer: main thread only. */
+/* VK=1 and COLI_VULKAN=1: the dense matrices of the trunk and of the vision
+ * tower run on the GPU in whatever form MIMO_DENSE_BITS gave them (FP8, BF16,
+ * int8 or f32), and with MIMO_VK_EXPERTS=N up to N routed experts are kept
+ * there as MXFP4. The router, and every matrix whose upload fails, stays on
+ * the CPU path below. The backend has one command buffer: main thread only. */
 #include "backend_vulkan.h"
 static int g_vk_ready;
 #endif
@@ -257,7 +258,7 @@ typedef struct {
     int fmt, O, I, nblk;
     void *w;           /* f32 / bf16 / e4m3 / int8 */
     float *s;          /* FP8: [O][nblk]; I8: [O] */
-    void *vk;          /* COLI_VULKAN: the device copy of an I8 matrix, uploaded at start-up */
+    void *vk;          /* COLI_VULKAN: the device copy, uploaded at start-up */
     int vk_off;        /* its upload failed: this matrix stays on the CPU */
 } DW;
 
@@ -314,9 +315,15 @@ static void matmul_fp8_rows(float *y, const float *x, const uint8_t *q8, const f
 }
 
 #ifdef COLI_VULKAN
-/* The shader's fmt 1 is this layout exactly: int8 [O, I] and one f32 scale per
- * row, applied after the row's sum, as matmul_q does. FP8 and BF16 have no
- * shader format and stay on the CPU. */
+/* Each form is one of the shader's formats as it is stored, so nothing is
+ * converted on the way up:
+ *   DW_F32   fmt 10, f32 [O, I], no scales
+ *   DW_BF16  fmt 11, bf16 [O, I] (the low half of a word is the even column)
+ *   DW_FP8   fmt 12, e4m3 [O, I] with the per-(row, 128-column block) scales
+ *            rs[O][nblk] that dw_load_fp8 expanded: a group size of 128
+ *   DW_I8    fmt 1, int8 [O, I] and one f32 scale per row after the sum
+ * Every one is f32 weights times f32 activations, as on the CPU; what differs
+ * is the order of the sums (the CPU's FP8 kernel adds its blocks in double). */
 static int vk_main_thread(void) {
 #ifdef _OPENMP
     return !omp_in_parallel();
@@ -325,12 +332,32 @@ static int vk_main_thread(void) {
 #endif
 }
 
+static int dw_vk_fmt(const DW *d, int *gs, const float **sc) {
+    *gs = 0; *sc = NULL;
+    switch (d->fmt) {
+    case DW_F32:  return 10;
+    case DW_BF16: return 11;
+    case DW_FP8:  *gs = 128; *sc = d->s; return 12;
+    case DW_I8:   *sc = d->s; return 1;
+    }
+    return -1;
+}
+
+static int dw_upload(DW *d) {
+    int gs; const float *sc;
+    int fmt = dw_vk_fmt(d, &gs, &sc);
+    if (d->vk || d->vk_off || !d->w) return d->vk != NULL;
+    if (fmt < 0 || !coli_vk_tensor_ensure((ColiVkTensor **)&d->vk, d->w, sc, fmt, d->I, d->O, gs)) d->vk_off = 1;
+    return d->vk != NULL;
+}
+
 static int dw_matmul_vk(float *y, const float *x, int S, const DW *d) {
-    if (!g_vk_ready || d->fmt != DW_I8 || d->vk_off || !vk_main_thread()) return 0;
+    if (!g_vk_ready || d->vk_off || !vk_main_thread()) return 0;
     DW *dev = (DW *)d;     /* the device copy is a cache inside a read-only matrix */
-    if (coli_vk_matmul((ColiVkTensor **)&dev->vk, y, x, d->w, d->s, 1, S, d->I, d->O, 0)) return 1;
-    if (!dev->vk) dev->vk_off = 1;
-    return 0;
+    if (!dw_upload(dev)) return 0;
+    int gs; const float *sc;
+    int fmt = dw_vk_fmt(d, &gs, &sc);
+    return coli_vk_matmul((ColiVkTensor **)&dev->vk, y, x, d->w, sc, fmt, S, d->I, d->O, gs);
 }
 #endif
 
@@ -880,24 +907,6 @@ static int g_vkx_full;               /* an upload failed or the budget is reache
 static long g_vkx_resident;
 static unsigned long long g_vkx_calls;
 
-/* The dense int8 matrices go up first, at start-up, so the experts take only
- * what they leave; one that does not fit stays on the CPU. */
-static void vk_dense_upload(Model *m) {
-    DW *all[5 * MIMO_MAX_LAYERS + 1];
-    int n = 0;
-    for (int li = 0; li < m->c.n_layers; li++) {
-        Layer *l = &m->L[li];
-        all[n++] = &l->qkv; all[n++] = &l->o;
-        if (!m->c.moe[li]) { all[n++] = &l->gate; all[n++] = &l->up; all[n++] = &l->down; }
-    }
-    all[n++] = &m->head;
-    for (int k = 0; k < n; k++) {
-        DW *d = all[k];
-        if (d->fmt == DW_I8 && !d->vk &&
-            !coli_vk_tensor_ensure((ColiVkTensor **)&d->vk, d->w, d->s, 1, d->I, d->O, 0)) d->vk_off = 1;
-    }
-}
-
 /* the device's own budget, when it reports one, with half a GB left over */
 static int vk_budget_full(void) {
     double used = 0, budget = 0;
@@ -1199,6 +1208,29 @@ static void prefill(Model *m, const int *ids, int n, float *logits, float *all_l
 typedef struct Vision Vision;
 static Vision *g_vision;
 #include "mimo_vision.h"
+
+#ifdef COLI_VULKAN
+/* The dense matrices go up first, at start-up, the trunk before the tower, so
+ * the experts take only what they leave; one that does not fit stays on the
+ * CPU. Returns how many went up. */
+static int vk_dense_upload(Model *m) {
+    int n = 0;
+    for (int li = 0; li < m->c.n_layers; li++) {
+        Layer *l = &m->L[li];
+        n += dw_upload(&l->qkv) + dw_upload(&l->o);
+        if (!m->c.moe[li]) n += dw_upload(&l->gate) + dw_upload(&l->up) + dw_upload(&l->down);
+    }
+    n += dw_upload(&m->head);
+    if (g_vision) {
+        Vision *v = g_vision;
+        n += dw_upload(&v->embed) + dw_upload(&v->fc1) + dw_upload(&v->fc2);
+        for (int i = 0; i < v->depth; i++)
+            n += dw_upload(&v->b[i].qkv) + dw_upload(&v->b[i].proj) + dw_upload(&v->b[i].gate) +
+                 dw_upload(&v->b[i].up) + dw_upload(&v->b[i].down);
+    }
+    return n;
+}
+#endif
 
 /* --------------------------------------------------------------- sampling ---- */
 
@@ -1510,7 +1542,12 @@ int main(int argc, char **argv) {
 #ifdef COLI_VULKAN
     /* after the weights, so a missing device costs one line and nothing else */
     g_vk_ready = coli_vk_init_env("mimo");
-    if (g_vk_ready) vk_dense_upload(m);
+    if (g_vk_ready) {
+        int up = vk_dense_upload(m);
+        size_t used = 0, count = 0;
+        coli_vk_mem_info(&used, &count);
+        fprintf(stderr, "[VK] mimo: %d dense matrices on the GPU (%.2f GB)\n", up, used / 1e9);
+    }
     int vk_experts = env_int("MIMO_VK_EXPERTS", 0);
     if (g_vk_ready && vk_experts > 0) {
         g_vkx = xcalloc((size_t)c->n_layers * c->n_experts, sizeof(VkExpert), "GPU experts");
