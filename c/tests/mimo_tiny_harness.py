@@ -145,7 +145,17 @@ def logits_bytes(binary, fixture, ids, env, image=None):
 
 def check_block_invariance(binary, fixture, reference):
     """A row is a function of its own inputs, never of the rows that share its
-    prefill block: the logits must be the same BYTES for every block size."""
+    prefill block: the logits must be the same BYTES for every block size.
+
+    A CPU property. With COLI_VULKAN=1 the device takes a block of two or more
+    rows through the tiled GEMM and a single row through the GEMV (#1834), and
+    the two sum in different orders, so the bytes depend on the block size by
+    design; tests/vulkan_engines.sh checks the device against the CPU's tokens
+    instead."""
+    vk = os.environ.get("COLI_VULKAN", "")
+    if vk and vk != "0":
+        print("skip block invariance: COLI_VULKAN=1 (GEMM for blocks, GEMV for one row)")
+        return
     variants = {"blocks of 3": {"MIMO_CHUNK": "3"},
                 "one token at a time": {"MIMO_CHUNK": "1"},
                 "cache 4 (evicts at every layer)": {"MIMO_CAP": "4"}}
