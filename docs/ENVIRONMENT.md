@@ -14,14 +14,14 @@ what follows, but the sister engines read their own:
 |---|---|---|
 | `colibri` | `c/colibri.c` | everything below except the three sections named for another engine |
 | `glm53` | `c/glm53.c` | the `GLM53_*` family and `COLI_MAP_EXPERTS`: see [GLM-5.3-Flash engine](#glm-53-flash-engine-glm53) |
-| `kimi_k3` | `c/kimi_k3.c` | the `K3_*` family — see [Kimi K3 engine](#kimi-k3-engine-kimi_k3) |
+| `kimi_k3` | `c/kimi_k3.c` | the `K3_*` family, and the Vulkan expert tier's `COLI_VK_TIER*` — see [Kimi K3 engine](#kimi-k3-engine-kimi_k3) |
 | `inkling` | `c/inkling.c` | `INK_*`, plus `CTX_MAX`, `PIN_N`, `REP_PEN`, `GPU_DEV`, `NOGPU` — see [Inkling engine](#inkling-engine-inkling) |
 | `qwen36` | `c/qwen36.c` | `QWEN_*`, `Q36_*`, its dense/CUDA-tier controls, the `CACHE_ROUTE` family (VRAM tier over RAM cache), and the Vulkan expert tier's `COLI_VK_TIER*` — see [Qwen3.6 engine](#qwen36-engine-qwen36) |
 | `qwen38` | `c/qwen38.c` | `Q38_MAXT`, `Q38_EOS`, `Q38_NATIVE_FP8`, `Q38_NATIVE_BF16`, `Q38_EXPERT_INT4`, `Q38_MTP`, `Q38_PREFILL_BATCH`, `Q38_TRUNK_CPU_INT8`, `Q38_FP8_KERNEL`, `COLI_TIMERS`, the Vulkan expert tier's `COLI_VK_TIER*` — see [Qwen3.8 engine](#qwen38-engine-qwen38) |
 | `olmoe` | `c/olmoe.c` | `HOT`, `WIDE`, `SMOOTH`, `CONF_LIMIT`, `MAX_NEW`, `CHAT`, `EXPERT_DROP`, `WARMUP` — see [OLMoE engine](#olmoe-engine-olmoe) |
 | `deepseek_v4` | `c/deepseek_v4.c` | `CTX`, the `V4_*` / `DSV4_*` families and the two `COLI_CUDA_*_BATCH` gates — see [DeepSeek V4 engine](#deepseek-v4-engine-deepseek_v4); note that the CUDA section below describes `colibri.c` knobs (`COLI_CUDA`, `CUDA_DENSE`, ...) which the V4 engine does not read — its GPU switch is `DSV4_CUDA` |
 | `deepseek_v41` | `c/deepseek_v41.c` | the `V41_*` family: see [DeepSeek V4.1 engine](#deepseek-v41-engine-deepseek_v41) |
-| `mimo` | `c/mimo.c` | the `MIMO_*` family: see [MiMo-V2.6 engine](#mimo-v26-engine-mimo) |
+| `mimo` | `c/mimo.c` | the `MIMO_*` family, and the Vulkan expert tier's `COLI_VK_TIER*`: see [MiMo-V2.6 engine](#mimo-v26-engine-mimo) |
 
 Setting an `INK_*` variable while running `colibri` does nothing, and vice
 versa; nothing warns you about it. A few variables are genuinely shared because
@@ -214,7 +214,7 @@ Per-drive byte counts are reported in a `MIRROR:` stats line. Combine with `DIRE
 
 | Variable | Default | Effect |
 |---|---|---|
-| `COLI_VULKAN` | off | Enable the Vulkan backend. Requires a `make VK=1` build. The GLM engine fails at startup (no silent fallback) if libvulkan or the compiled shaders are missing. The other engines (qwen36, qwen38, inkling, olmoe, deepseek_v41, deepseek_v4, mimo, qwenimage) print one line and run on the CPU. What each one puts on the device: [vulkan.md](vulkan.md#the-other-engines). |
+| `COLI_VULKAN` | off | Enable the Vulkan backend. Requires a `make VK=1` build. The GLM engine fails at startup (no silent fallback) if libvulkan or the compiled shaders are missing. The other engines (qwen36, qwen38, inkling, olmoe, deepseek_v41, deepseek_v4, kimi_k3, mimo, qwenimage) print one line and run on the CPU. What each one puts on the device: [vulkan.md](vulkan.md#the-other-engines). |
 | `COLI_VK_DEV` | unset | Select the primary Vulkan physical-device enumeration index. Without it, the backend prefers a discrete GPU, then integrated/virtual devices. |
 | `COLI_VK_SHADERS` | auto | Path to the compiled `qmatmul.spv` **or** the directory holding the `.spv` set; the other shaders are found next to it. Unset: `shaders/` next to the binary, then CWD-relative `shaders/qmatmul.spv`. |
 | `COLI_VK_EXPERTS` | `320` | Pinned VRAM expert tier size: top-N experts by `.coli_usage` heat uploaded once at startup and served from VRAM with no RAM slot or disk read. `0` disables the tier (experts stay on the CPU path). ~19 MB VRAM per int4 expert. |
@@ -229,7 +229,7 @@ Per-drive byte counts are reported in a `MIRROR:` stats line. Combine with `DIRE
 | `COLI_VK_GEMM_TILE` | measured | `bm,bn,bk,tm,tn[,pf]`: one tile for every width of the fp32 GEMM instead of the measured pair. Tuning only (`COLI_VK_TEST_GEMM_BENCH`). |
 | `COLI_VK_COOP_TILE` | measured | `bm,bn,wm,wn,bk`: one tile for every width of the cooperative-matrix GEMM. Tuning only. |
 
-### The routed-expert tier (`vk_tier.c`; qwen36, qwen38)
+### The routed-expert tier (`vk_tier.c`; qwen36, qwen38, kimi_k3, mimo)
 
 With `COLI_VULKAN=1` the engines on the shared tier keep a cache of routed experts on the device that adapts while you chat, and compute the resident ones of each layer step while the CPU computes the rest. See [vulkan.md](vulkan.md#the-routed-expert-tier-vk_tierc). With the CUDA expert tier also on, CUDA wins and this tier stays off.
 
@@ -244,7 +244,7 @@ With `COLI_VULKAN=1` the engines on the shared tier keep a cache of routed exper
 | `COLI_VK_TIER_BALANCE` | on | `0`: the device takes every resident expert of a step. On, when a join keeps waiting for the device, the step's resident experts the CPU also holds in RAM go back to the CPU beyond the device's share, which moves with every join (down when the CPU waited more than a tenth of its own time, up when the device finished before 80% of it). |
 | `COLI_VK_TIER_GEMM_ROWS` | `16` | Rows from which an expert of a step takes the tiled GEMM (prefill) instead of the per-row GEMV; `0` never. Below it a row's bits do not depend on how many rows share the dispatch. |
 | `COLI_VK_TIER_QUEUE` | a second queue | `0`: the tier's batches share the main queue with the dense matmuls (they then serialize). Unset: a second queue of the main family, else a compute-only family's (RADV), else shared (Lavapipe). |
-| `COLI_VK_DENSE` | on; off on a device sharing the CPU's RAM while the tier is on | Where the dense (non-expert) matrices of qwen36, qwen38, inkling, olmoe, mimo, deepseek_v41, deepseek_v4 and qwenimage run. `0`: on the CPU (with the tier on, the device takes the routed experts only); `1`: on the device whatever the device. Unset: on the device, except on an integrated GPU or a CPU device (Lavapipe) while the engine runs the expert tier (today qwen36 and qwen38), where they stay on the CPU: there the dense matmuls cost more than the tier gains (measured on a Radeon 780M). The `[VK] <engine>: device ready, dense matrices on the ...` line says which and why. The GLM engine reads it through the same rule with its own default, off (see above). |
+| `COLI_VK_DENSE` | on; off on a device sharing the CPU's RAM while the tier is on | Where the dense (non-expert) matrices of qwen36, qwen38, inkling, olmoe, mimo, deepseek_v41, deepseek_v4 and qwenimage run. `0`: on the CPU (with the tier on, the device takes the routed experts only); `1`: on the device whatever the device. Unset: on the device, except on an integrated GPU or a CPU device (Lavapipe) while the engine runs the expert tier (today qwen36, qwen38, kimi_k3 and mimo), where they stay on the CPU: there the dense matmuls cost more than the tier gains (measured on a Radeon 780M). The `[VK] <engine>: device ready, dense matrices on the ...` line says which and why. The GLM engine reads it through the same rule with its own default, off (see above). |
 
 ### Second Vulkan device (opt-in)
 
@@ -411,9 +411,10 @@ Read **only** by `c/kimi_k3.c`. The K3 engine has its own loader, cache and quan
 | `K3_DIRS` | unset | Extra shard directories (`;`/`,`-separated) for a multi-drive split, as `COLI_MODEL_DIRS` is for `colibri`. |
 | `K3_TOPP` | `0` (off) | Prune routed experts to this cumulative gate weight. A quality lever — A/B it against `K3_LOGITS`. |
 | `K3_THINK` | `1` (on) | Emit a reasoning block. `=0` disables. |
-| `K3_VK` | `1` (on where built) | Vulkan expert tier. `=0` forces CPU-only. |
-| `K3_VK_GB` | `0` (driver budget) | VRAM cap (GB) for the K3 Vulkan expert tier. |
-| `K3_VK_UP` | `8` | Expert uploads allowed per step while filling the VRAM tier. |
+| `COLI_VULKAN` | `0` | `VK=1` build: the routed experts on the shared expert tier (`COLI_VK_TIER*`, see [Vulkan](#vulkan-any-gpu-with-a-vulkan-12-driver)), as the checkpoint's MXFP4 with SiTU-GLU on the device, warm-started from the expert history `COLI_USAGE`; the shared experts' matrices on the device where `COLI_VK_DENSE` puts the dense matrices. The tier's experts match `K3_IDOT=0` (the CPU's default kernel rounds activations to int8). With `K3_CUDA=1` too, CUDA wins and the Vulkan tier stays off. |
+| `K3_VK` | unset (follow `COLI_VULKAN`) | The switch of the engine's tier before the shared one, kept as an alias: `1` opens the device as `COLI_VULKAN=1` does; `0` keeps it closed whatever `COLI_VULKAN` says. Before the shared tier a `VK=1` build opened the device without being asked (`1` was the default); it now waits for one of the two. |
+| `K3_VK_GB` | unset | Alias: read as `COLI_VK_TIER_GB` (the routed experts' budget, GiB) when that is unset. |
+| `K3_VK_UP` | unset | Alias: a number is read as `COLI_VK_TIER_RATE` (promotions per token) when that is unset. `auto` (and `K3_VK_FILL_FRAC`) is accepted and does nothing: the shared tier uploads on a thread of its own and never holds a step. |
 | `K3_PREFIX_LOG` | unset | Log the KV-prefix reuse decision either way, with the reason when it is "no" — "it did not get faster" is otherwise indistinguishable from "reuse is off". |
 | `K3_CHAT_IDS` | unset | Print the chat-template token ids for the built prompt, then continue. |
 | `K3_TRACE` | unset | Write a routing trace to `K3_TRACE=<file>`. |
@@ -543,8 +544,8 @@ Read **only** by `c/mimo.c` (and `MIMO_MAX_IMAGE_TOKENS` by the gateway). See [m
 | `MIMO_TRACE` | unset | MiMo, oracle: dump the residual after every sublayer of the first block. |
 | `MIMO_DIRS` | unset | MiMo: extra directories holding shards. |
 | `MIMO_STATS` | unset | MiMo: report the vision tower's time per picture. |
-| `COLI_VULKAN` | `0` | MiMo, `VK=1` build: the dense matrices of the trunk and of the vision tower run on the GPU in their `MIMO_DENSE_BITS` form (FP8 and BF16, int8 or f32). The router stays on the CPU. |
-| `MIMO_VK_EXPERTS` | `0` | MiMo, with `COLI_VULKAN=1`: keep up to this many routed experts (MXFP4) on the GPU once they have run from the RAM cache; never evicted, capped by the device's memory budget. |
+| `COLI_VULKAN` | `0` | MiMo, `VK=1` build: the routed experts on the shared expert tier (`COLI_VK_TIER*`, see [Vulkan](#vulkan-any-gpu-with-a-vulkan-12-driver)) as the release's MXFP4, and the dense matrices of the trunk and of the vision tower on the device where `COLI_VK_DENSE` puts them, in their `MIMO_DENSE_BITS` form (FP8 and BF16, int8 or f32). The router stays on the CPU. MiMo keeps no expert history: the tier fills as experts pass by. |
+| `MIMO_VK_EXPERTS` | unset | MiMo, with `COLI_VULKAN=1`: the switch of the engine's own tier before the shared one, kept as an alias. `0` keeps the routed experts on the CPU (no tier); `N` sizes the shared tier's budget at N experts (`COLI_VK_TIER_GB`, which wins when set); the tier then evicts as the routing moves, where the old one stopped at N and never let go. Unset: the shared tier with its own budget. |
 
 ## OLMoE engine (`olmoe`)
 
