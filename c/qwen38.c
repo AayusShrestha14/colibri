@@ -6,7 +6,8 @@
  * (PLE), and every layer has a 512-way sparse MoE plus a shared expert.
  *
  * Resident tensors are loaded from the official multimodal checkpoint's text
- * namespace.  Vision and MTP tensors are indexed but never read.  Official
+ * namespace.  The MTP head's tensors are read only under Q38_MTP=1, which
+ * turns on speculative decoding with it (qwen38_core.h).  Official
  * block-FP8 experts remain native in a bounded per-layer LRU; the 51B-parameter
  * PLE table remains on disk and only its sixteen 160-byte rows/token are read.
  *
@@ -925,13 +926,14 @@ static void emit_openai_result(const int *out, int np, int n_new, int stream){
 #include "edge_adapter_internal.h"
 #endif
 
-/* Qwen3.8 routes every transformer layer and has no MTP row. Keep the
+/* Qwen3.8 routes every transformer layer; the MTP row (index c.layers) is
+ * kept only when the head is attached and routes too. Keep the
  * process-global route_trace owner in the CLI/serve model only; segment
  * adapters can coexist in one process and intentionally leave telemetry
  * detached, just like the other range-native engines. */
 static void q38_telemetry_init(const char *snap, const Model *m) {
     rt_init("qwen38", m->c.layers, m->c.experts);
-    rt_drop_row(m->c.layers);
+    if (!m->mtp) rt_drop_row(m->c.layers);
     const char *up = getenv("COLI_USAGE");
     if (up && *up) snprintf(g_q38_usage, sizeof g_q38_usage, "%s", up);
     else snprintf(g_q38_usage, sizeof g_q38_usage, "%s/.coli_usage", snap);
@@ -969,6 +971,38 @@ static void q38_validate_ids(const Cfg *c, const int *ids, int count,
     }
 }
 
+/* A decode run's speculation: drafting when the MTP head is attached, in the
+ * mode Q38_MTP_FORCE names (tests: reject, accept, mixed; qwen38_core.h). */
+static Q38Spec q38_spec_begin(const Model *m) {
+    Q38Spec sp; memset(&sp, 0, sizeof sp);
+    sp.on = m->mtp;
+    const char *force = getenv("Q38_MTP_FORCE");
+    if (force && *force) {
+        if (!strcmp(force, "reject")) sp.force = 'r';
+        else if (!strcmp(force, "accept")) sp.force = 'a';
+        else if (!strcmp(force, "mixed")) sp.force = 'm';
+        else { fprintf(stderr, "Q38_MTP_FORCE must be reject, accept or mixed\n"); exit(1); }
+    }
+    return sp;
+}
+
+/* Acceptance and tokens per forward, colibri.c's speculation line: a run's
+ * at the end, a serve turn's after its DONE (stderr, never the wire). Tokens
+ * are the decode tokens fed after the prompt, forwards the ones that fed them. */
+static void q38_spec_report(const Model *m, const Q38Spec *sp, const char *scope) {
+    if (!m->mtp) return;
+    fprintf(stderr, "[qwen38 MTP] %s: %.2f tokens/forward (%llu forwards per %llu tokens) | "
+                    "acceptance %.1f%% (%llu/%llu drafts) | wiring %c%s%s\n", scope,
+            sp->forwards ? (double)sp->tokens / sp->forwards : 0.0,
+            (unsigned long long)sp->forwards, (unsigned long long)sp->tokens,
+            sp->drafts ? 100.0 * sp->accepted / sp->drafts : 0.0,
+            (unsigned long long)sp->accepted, (unsigned long long)sp->drafts, m->mtp_wiring,
+            sp->force ? ", Q38_MTP_FORCE=" : "",
+            sp->force == 'r' ? "reject" : sp->force == 'a' ? "accept" : sp->force == 'm' ? "mixed" : "");
+}
+
+static Q38Spec g_q38_run_spec;   /* generate()'s, reported by main() */
+
 static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     Cfg *c = &m->c;
     /* Same ceiling serve_one() enforces. Past max_position_embeddings the RoPE
@@ -982,6 +1016,8 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     for (int i = 0; i < np; i++) out[i] = prompt[i];
     float *logit = step(m, prompt, np, 0);
     q38_tm_snapshot_prefill(m);        /* COLI_TIMERS: decode bank starts here */
+    Q38Spec *sp = &g_q38_run_spec;
+    *sp = q38_spec_begin(m);           /* Q38_MTP=1: the head drafts, every token still the argmax below */
     int len = np;
     for (int s = 0; s < n_new; s++) {
         int best = 0; float bv = logit[0];
@@ -999,9 +1035,9 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
             free(logit); out[len++] = best; break;
         }
         free(logit); out[len++] = best;
-        int one = best;
-        logit = step(m, &one, 1, len - 1);
+        logit = q38_spec_step(m, sp, best, len - 1, n_new - 1 - s);
     }
+    q38_spec_end(m, sp);
 }
 
 static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out) {
@@ -1305,6 +1341,10 @@ typedef struct {
     float *ple_conv;
     int64_t ple_history[2];
     int ple_history_len;
+    /* the MTP head where the prompt left it: its settled rows and the
+     * streams still waiting for their next token (Model.mtp_*) */
+    float *mtp_pend;
+    int mtp_len, mtp_pend_n, mtp_pend_tok;
 } Q38PrefixCache;
 
 static Q38PrefixCache g_q38_prefix;
@@ -1319,7 +1359,26 @@ static Q38PrefixCache g_q38_prefix;
 static int q38_prefix_geometry(const Model *m,size_t *rec_cells,
                                size_t *conv_cells,size_t *ple_cells);
 static ColiPinPool g_q38_pins;
-typedef struct { float **rec, **conv, *ple; int64_t ple_hist[2]; int ple_len; int n_layers; } Q38PinState;
+typedef struct { float **rec, **conv, *ple; int64_t ple_hist[2]; int ple_len; int n_layers;
+                 float *mtp_pend; int mtp_len, mtp_pend_n, mtp_pend_tok; } Q38PinState;
+
+/* The MTP head's place in the sequence travels with every snapshot of the
+ * recurrent state: its KV rows below mtp_len stay valid wherever the
+ * model's rows do (the head only writes a row together with the row
+ * after it), and the pending streams are what lets the next prompt's
+ * first token reach it. */
+static void q38_mtp_state_copy(Model *m, float *pend, int *len, int *pend_n,
+                               int *pend_tok, int to_state){
+    if(!m->mtp||!pend) return;
+    size_t bytes=(size_t)2*m->c.hc_width*sizeof(float);
+    if(to_state){
+        memcpy(pend,m->mtp_pend,bytes);
+        *len=m->mtp_len; *pend_n=m->mtp_pend_n; *pend_tok=m->mtp_pend_tok;
+    } else {
+        memcpy(m->mtp_pend,pend,bytes);
+        m->mtp_len=*len; m->mtp_pend_n=*pend_n; m->mtp_pend_tok=*pend_tok;
+    }
+}
 
 static void q38_pin_state_free(void *v){
     Q38PinState *st = (Q38PinState *)v;
@@ -1328,7 +1387,7 @@ static void q38_pin_state_free(void *v){
         if (st->rec)  free(st->rec[i]);
         if (st->conv) free(st->conv[i]);
     }
-    free(st->rec); free(st->conv); free(st->ple); free(st);
+    free(st->rec); free(st->conv); free(st->ple); free(st->mtp_pend); free(st);
 }
 
 /* Copia la ricorrenza DeltaNet (piu le righe PLE) fra motore e scatto. */
@@ -1356,6 +1415,10 @@ static int q38_pin_state_copy(Model *m, Q38PinState **slot, int to_state){
             st->ple = (float*)malloc(ple * sizeof(float));
             if (!st->ple){ q38_pin_state_free(st); return 0; }
         }
+        if (m->mtp){
+            st->mtp_pend = (float*)malloc((size_t)2 * c->hc_width * sizeof(float));
+            if (!st->mtp_pend){ q38_pin_state_free(st); return 0; }
+        }
         *slot = st;
     }
     for (int i = 0; i < c->layers; i++){
@@ -1379,6 +1442,7 @@ static int q38_pin_state_copy(Model *m, Q38PinState **slot, int to_state){
             memcpy(m->ple_history, st->ple_hist, sizeof(st->ple_hist));
         }
     }
+    q38_mtp_state_copy(m, st->mtp_pend, &st->mtp_len, &st->mtp_pend_n, &st->mtp_pend_tok, to_state);
     return 1;
 }
 
@@ -1412,7 +1476,7 @@ static void q38_prefix_cache_dispose(Q38PrefixCache *cache){
     if(!cache)return;
     if(cache->dn_rec)for(int i=0;i<cache->layers;i++)free(cache->dn_rec[i]);
     if(cache->dn_conv)for(int i=0;i<cache->layers;i++)free(cache->dn_conv[i]);
-    free(cache->dn_rec);free(cache->dn_conv);free(cache->ple_conv);
+    free(cache->dn_rec);free(cache->dn_conv);free(cache->ple_conv);free(cache->mtp_pend);
     free(cache->ids);free(cache->logits);memset(cache,0,sizeof(*cache));
 }
 
@@ -1431,6 +1495,10 @@ static int q38_prefix_cache_layout(Model *m){
         g_q38_prefix.layers=m->c.layers;g_q38_prefix.vocab=m->c.vocab;
         g_q38_prefix.rec_cells=rec;g_q38_prefix.conv_cells=conv;
         g_q38_prefix.ple_cells=ple;
+    }
+    if(m->mtp&&!g_q38_prefix.mtp_pend){
+        g_q38_prefix.mtp_pend=(float*)malloc((size_t)2*m->c.hc_width*sizeof(float));
+        if(!g_q38_prefix.mtp_pend){q38_prefix_cache_dispose(&g_q38_prefix);return 0;}
     }
     if(g_q38_prefix.dn_rec&&g_q38_prefix.dn_conv&&g_q38_prefix.logits&&
        (!ple||g_q38_prefix.ple_conv))return 1;
@@ -1495,6 +1563,8 @@ static void q38_prefix_copy_state(Model *m,int to_cache){
             memcpy(m->ple_history,g_q38_prefix.ple_history,sizeof(g_q38_prefix.ple_history));
         }
     }
+    q38_mtp_state_copy(m,g_q38_prefix.mtp_pend,&g_q38_prefix.mtp_len,&g_q38_prefix.mtp_pend_n,
+                       &g_q38_prefix.mtp_pend_tok,to_cache);
 }
 
 static int q38_prefix_cache_save(Model *m,const int *ids,int len,const float *logits,
@@ -1724,6 +1794,9 @@ static int serve_one(Model *m, ServeReq *q){
         fprintf(stderr,"[qwen38 prefix] request=%s reused=%d/%d\n",q->id,reuse,np);
     int gen=0, limited=1, cancelled=0, stopped=0, input_eof=0;
     int eos_ids[4];int n_eos=serve_eos_ids(eos_ids,4,m->c.eos_id,m->c.vocab);
+    /* Q38_MTP=1: the head drafts and a verify forward checks it; every token
+     * is still sampled from the exact logits below, greedy or not. */
+    Q38Spec spec=q38_spec_begin(m);
     double first_token_at=0.0,last_token_at=0.0;
     unsigned char sbuf[16]; int sbn=0;
     for(int s=0;s<q->max_tok;s++){
@@ -1767,8 +1840,9 @@ static int serve_one(Model *m, ServeReq *q){
          * is restored on the next request, so stepping here would only run a
          * full discarded decode pass. */
         if(s == q->max_tok - 1) break;
-        lo = step(m, &tk, 1, np+s);
+        lo = q38_spec_step(m, &spec, tk, np+s, q->max_tok-1-s);
     }
+    q38_spec_end(m, &spec);
     /* I vettori dell'immagine valgono per QUESTO turno soltanto: lasciarli
      * agganciati farebbe rispondere la richiesta successiva sulla foto
      * precedente, e la mappa e' per posizione assoluta, quindi combacerebbe
@@ -1798,6 +1872,7 @@ static int serve_one(Model *m, ServeReq *q){
     fflush(stdout);
     serve_hits(m);
     q38_tm_report_bank(&timers,"request");
+    {char scope[96];snprintf(scope,sizeof scope,"turn %s",q->id);q38_spec_report(m,&spec,scope);}
     return input_eof?-1:0;
 }
 
@@ -1956,6 +2031,7 @@ int main(int argc, char **argv) {
 
     Model m; model_init(&m, snap, cap, bits);
     q38_expert_int4_attach(&m, snap);   /* <snap>/experts-int4g64/ when present (Q38_EXPERT_INT4) */
+    q38_mtp_attach(&m, cap);            /* Q38_MTP=1: the checkpoint's MTP head drafts (qwen38_core.h) */
     q38_tier_start(&m, cap);   /* COLI_CUDA=1: hot experts stream to VRAM (qwen36_tier.c) */
     q38_trunk_cpu_int8(&m);    /* the trunk's int8 rows on the CPU, BF16 released (Q38_TRUNK_CPU_INT8=0 keeps BF16) */
     q38_expert_report(&m, cap);         /* expert format, bytes per expert, what the cache costs */
@@ -1966,6 +2042,11 @@ int main(int argc, char **argv) {
 #endif
     if(is_ref)ref_logits=read_reference_logits(ref_root,m.c.vocab);
     g_capture_last_logit=ref_logits!=NULL||getenv("DUMP")!=NULL;
+    if(is_ref){g_q38_mtp_oracle=full;g_q38_mtp_oracle_n=nfull;}   /* Q38_MTP_FORCE=accept|mixed */
+    if(m.mtp&&getenv("Q38_MTP_DUMP")&&*getenv("Q38_MTP_DUMP")){
+        g_q38_mtp_dump=fopen(getenv("Q38_MTP_DUMP"),"wb");
+        if(!g_q38_mtp_dump){perror(getenv("Q38_MTP_DUMP"));return 1;}
+    }
     q38_telemetry_init(snap, &m);
     fprintf(stderr, "resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
 
@@ -2066,6 +2147,8 @@ int main(int argc, char **argv) {
     }
     double tot = m.hits + m.miss;
     if (g_ttft >= 0) fprintf(stderr, "TTFT: %.2f s (time to first token)\n", g_ttft);
+    q38_spec_report(&m, &g_q38_run_spec, "run");
+    if (g_q38_mtp_dump) { fclose(g_q38_mtp_dump); g_q38_mtp_dump = NULL; }
     tm_report(&m);
     fprintf(stderr, "\nPEAK RSS: %.2f GB\n", rss_gb());
     qt_stats();   /* VRAM tier hits/misses/swaps, if on */
