@@ -211,7 +211,8 @@ size_t vkt_expert_bytes(int H, int F, VktFmt gu, VktFmt dn) {
         int fmt = k < 2 ? gf : df, gs = k < 2 ? gg : dg, I = k < 2 ? H : F, O = k < 2 ? F : H;
         size_t rows = (coli_vk_tensor_row_bytes(fmt, I) + 3) / 4 * 4 * (size_t)O;
         size_t sc = coli_vk_tensor_scale_count(fmt, I, O, gs) * 4;
-        b += (rows + 255) / 256 * 256 + (sc + 255) / 256 * 256 + 512;   /* two ranges, aligned, with slack */
+        size_t a = coli_vk_buffer_alignment();   /* two ranges, each aligned */
+        b += (rows + a - 1) / a * a + (sc + a - 1) / a * a;
     }
     return b;
 }

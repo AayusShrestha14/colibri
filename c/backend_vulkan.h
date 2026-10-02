@@ -158,6 +158,7 @@ void coli_vk_tier_pool_limit(size_t bytes);
 int    coli_vk_tier_tensor(ColiVkTensor **t, int fmt, int I, int O, int gs,
                            uint8_t **rows, size_t *stride, float **scales);
 size_t coli_vk_tensor_row_bytes(int fmt, int I);
+size_t coli_vk_buffer_alignment(void);   /* where a weight range may start (bytes) */
 size_t coli_vk_tensor_scale_count(int fmt, int I, int O, int gs);
 
 /* ---- async expert batch (the routed-expert tier) ------------------------------

@@ -138,6 +138,7 @@ static struct {
      * main queue after all, and its timestamp bits; device limits its batches respect */
     VkQueue tqueue; uint32_t tq_fam, tq_idx, tq_ts; int tq_shared;
     size_t ssbo_align, ssbo_range; float ts_period;
+    size_t buf_align;            /* what a storage buffer's memory requirements align to */
     uint32_t memtype_dev;        /* DEVICE_LOCAL, for scratch only the device touches */
     char spv_path[1024];         /* the main shader, its siblings are found beside it */
 } G;
@@ -623,6 +624,16 @@ int coli_vk_init(const char *spv_path) {
         G.ssbo_align = (size_t)pp.limits.minStorageBufferOffsetAlignment;
         G.ssbo_range = (size_t)pp.limits.maxStorageBufferRange;
         G.ts_period = pp.limits.timestampPeriod;
+        /* a weight range starts at this alignment (D3D12 behind Dozen: 64 KiB) */
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 4096,
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+        VkBuffer probe;
+        G.buf_align = 256;
+        if (vkCreateBuffer(G.dev, &bi, NULL, &probe) == VK_SUCCESS) {
+            VkMemoryRequirements req; vkGetBufferMemoryRequirements(G.dev, probe, &req);
+            if (req.alignment > G.buf_align) G.buf_align = (size_t)req.alignment;
+            vkDestroyBuffer(G.dev, probe, NULL);
+        }
     }
     if (G.has_prio || G.has_budget)
         fprintf(stderr, "[VK] VRAM pressure-proofing: memory_priority %s, memory_budget %s\n",
@@ -2568,6 +2579,7 @@ int coli_vk_tier_tensor(ColiVkTensor **t, int fmt, int I, int O, int gs,
     return 1;
 }
 size_t coli_vk_tensor_row_bytes(int fmt, int I) { return cpu_row_bytes(fmt, I); }
+size_t coli_vk_buffer_alignment(void) { return G.buf_align ? G.buf_align : 256; }
 size_t coli_vk_tensor_scale_count(int fmt, int I, int O, int gs) { return scale_floats(fmt, I, O, gs); }
 
 void coli_vk_shutdown(void) {
@@ -3310,18 +3322,20 @@ static int run_xbatch(int fmt, int dfmt, int gs, int D, int I, int act, float li
 static int run_tier_pool(void) {
     int bad = 0, D = XB.D, I = XB.I;
     size_t one = 0;
-    {   /* how many bytes one expert takes, measured in the dense pool (same rules) */
-        ColiVkPoolStats a, b; ColiVkTensor *m[3]; void *w, *sc;
-        coli_vk_pool_stats(0, &a);
-        m[0] = tensor_alloc(&g_wpool, 4, D, I, 64, &w, &sc); m[1] = tensor_alloc(&g_wpool, 4, D, I, 64, &w, &sc);
-        m[2] = tensor_alloc(&g_wpool, 4, I, D, 64, &w, &sc);
-        coli_vk_pool_stats(0, &b);
-        one = b.used - a.used;
-        for (int k = 0; k < 3; k++) coli_vk_tensor_free(m[k]);
-    }
     ColiVkPoolStats st;
     coli_vk_pool_stats(1, &st);
-    if (st.total) { printf("tier pool: not empty at the start of its test\n"); return 1; }
+    if (st.live) { printf("tier pool: not empty at the start of its test\n"); return 1; }
+    {   /* the bytes one expert takes in a block, alignment gaps included: two experts in
+         * a fresh pool, the distance between their first ranges */
+        coli_vk_tier_pool_limit(0);
+        pool_destroy(&g_tpool);
+        ColiVkTensor *m[6]; void *w, *sc;
+        for (int k = 0; k < 6; k++) m[k] = tensor_alloc(&g_tpool, 4, k % 3 == 2 ? I : D, k % 3 == 2 ? D : I, 64, &w, &sc);
+        if (m[0] && m[3] && m[0]->wr.block == m[3]->wr.block) one = (size_t)(m[3]->wr.off - m[0]->wr.off);
+        for (int k = 0; k < 6; k++) if (m[k]) coli_vk_tensor_free(m[k]);
+        pool_destroy(&g_tpool);
+        if (!one) { printf("tier pool: could not measure an expert's footprint\n"); return 1; }
+    }
     coli_vk_tier_pool_limit(10 * one + one / 2);   /* room for 10 experts, one block of that size */
     enum { N = 16 };
     XMat mg[N], mu[N], md[N]; ColiVkExpert *ex[N]; int n = 0;
@@ -3342,6 +3356,11 @@ static int run_tier_pool(void) {
     printf("tier pool: %d experts fit a budget of 10.5 (%zu bytes each), refusals %llu, %d block(s), frag %.3f\n",
            n, one, st.refusals, st.blocks, st.frag);
     if (n != 10 || !refused_first || st.blocks != 1) { printf("  ^ the budget did not bound the pool\n"); bad = 1; }
+    if (n < 4) {   /* the rest needs four experts */
+        for (int k = 0; k < n; k++) { coli_vk_xb_expert_free(ex[k]); xmat_drop(&mg[k]); xmat_drop(&mu[k]); xmat_drop(&md[k]); }
+        coli_vk_tier_pool_limit(0);
+        return 1;
+    }
     /* a batch in flight while three experts are freed: their memory stays until the join */
     float *x = malloc((size_t)D * 4); for (int i = 0; i < D; i++) x[i] = 0.01f * (i % 17);
     const float *xr[1] = {x}, *yr[1]; int r1 = 1;
