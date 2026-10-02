@@ -524,7 +524,9 @@ int vkt_issue(int layer, const float *x, int S, int K, const int *idx, uint8_t *
         for (int g = 0; g < ng; g++) {
             if (!T.c.in_ram(T.c.ram_ctx, layer, T.touched[g])) { kept += T.brows[g]; continue; }
             T.can_balance = 1;
-            if (kept + T.brows[g] <= cap) { kept += T.brows[g]; continue; }
+            /* the first expert always stays: a step with nothing on the device would
+             * measure nothing, and the share could never come back up */
+            if (!kept || kept + T.brows[g] <= cap) { kept += T.brows[g]; continue; }
             if (!gone && !(gone = calloc((size_t)ng, 1))) break;
             gone[g] = 1;
         }
