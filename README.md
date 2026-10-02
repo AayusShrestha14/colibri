@@ -561,7 +561,7 @@ which verdict, which of the four values a field may take. Brio mode hands the
 engine the options and reads the probability of each one instead of
 generating: `completion_tokens` is 0, no answer can fall outside your list,
 and every answer comes with an entropy, so "the model is not sure" is a
-number you can put a threshold on. It runs on nine of the ten families (every one but MiMo), on the same
+number you can put a threshold on. It runs on all ten families, on the same
 server, and it is opt-in per request: chat is byte-identical for everyone who
 does not ask for it.
 

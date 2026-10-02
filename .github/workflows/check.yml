@@ -98,12 +98,17 @@ jobs:
         run: python -m pip install -r c/tools/requirements-mimo-tiny.txt
       - name: Generate fixture and run vendor oracle
         run: make -C c mimo-tiny-check
+      - name: "Brio and the prompt cache: photos exact against a cold engine"
+        run: make -C c mimo-tiny-serve-check
       - name: Same oracle under ASan and UBSan
         run: |
           make -C c clean >/dev/null
           make -C c mimo EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
           ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
             python c/tests/mimo_tiny_harness.py --binary c/mimo --fixture c/mimo_tiny
+          cd c && ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+            python -m unittest tests.test_mimo_prefix_serve tests.test_brio_serve.MimoBrioServe \
+            tests.test_brio_api.MimoBrioEndToEnd
 
   v4-tiny:
     name: Linux (generated tiny V4 target oracle)

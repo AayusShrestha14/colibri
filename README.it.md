@@ -585,8 +585,8 @@ quale coda, quale verdetto, quale dei quattro valori può prendere un campo. La
 modalità Brio passa al motore le opzioni e legge la probabilità di ciascuna
 invece di generare: `completion_tokens` è 0, nessuna risposta può uscire dalla
 tua lista, e ogni risposta arriva con un'entropia, così "il modello non è
-sicuro" è un numero su cui mettere una soglia. Funziona su nove delle dieci
-famiglie (tutte tranne MiMo), sullo stesso server, ed è opzionale per richiesta: la chat resta
+sicuro" è un numero su cui mettere una soglia. Funziona su tutte e dieci le
+famiglie, sullo stesso server, ed è opzionale per richiesta: la chat resta
 identica byte per byte per chi non la chiede.
 
 ```bash
