@@ -370,28 +370,92 @@ static inline float ue8m0(uint8_t byte) {
 }
 
 #ifdef COLI_VULKAN
-/* The Vulkan hook of the dense trunk. mv8 and mv8_rows are where every resident
- * fp8 matrix passes, as mv() is in glm53, so this is where one would leave for the
- * device. None does, and the reason is the format. qmatmul.comp decodes int8 rows
- * (fmt 1), int4 rows (2), grouped int4 (4), int3-g64 (5) and MXFP4 (7). A W8 is e4m3
- * with one ue8m0 scale per 32x32 tile, and what else stays in RAM is bf16 (embed,
- * head, router, compressor, indexer, vision; mvb) or f32. Requantising e4m3 to int8
- * at load would change the numbers tools/dsv41_ref.py holds this engine to, so it is
- * not done here. The routed experts are MXFP4, which fmt 7 reads once their ue8m0
- * scales are expanded to f32, but they come from disk into an LRU slot and leave it
- * again: a device tier for them, like kimi_k3's, is other work than this hook, and
- * they stay on the CPU.
+/* The resident trunk on the Vulkan device (COLI_VULKAN=1 in a VK=1 build), in the
+ * checkpoint's own formats: a W8 goes up as fmt 12, e4m3 with one f32 scale per 32
+ * inputs, each 32x32 tile's ue8m0 written out for its 32 rows; a WB as fmt 11, bf16.
+ * The CPU kernels multiply the same f32 activations, with no rounding of their own,
+ * so the device computes the same products and only sums them in another order.
+ * The routed experts stay on the CPU: they come from disk into an LRU slot and leave
+ * it again.
  *
- * What would turn this into a call: an e4m3 format in qmatmul.comp that reads one
- * byte per weight (the fmt 1 row layout) and one f32 scale per 32 inputs (the fmt 4/7
- * group layout, gs = 32), each tile's ue8m0 expanded to its 32 rows at upload. This
- * would then send contiguous blocks only (xstride == I, ystride == O), from the main
- * thread only (one command buffer: never under omp_in_parallel()), and keep the
- * device copy in a `vk` field of the W8. Until then it declines and the CPU kernels
- * run, exactly as in a build without VK=1. */
-static int w8_vk(float *y, int ystride, const W8 *w, const float *x, int xstride, int rows) {
-    (void)y; (void)ystride; (void)w; (void)x; (void)xstride; (void)rows;
-    return 0;
+ * The device copy is found by the weight pointer rather than kept in the matrix:
+ * wo_a's per-group blocks are W8 views built on the stack at every call, and a field
+ * there would upload them again each time. Every W8 and WB this engine multiplies
+ * lives as long as the model, so a pointer names the same bytes for the whole run.
+ * One command buffer: calls come from the thread that opened the device and never
+ * from inside an OpenMP region; anything else stays on the CPU. */
+typedef struct { const void *data; int fmt, O, I, refused; ColiVkTensor *t; } VkEntry;
+static VkEntry *g_vk_map;
+static size_t g_vk_cap, g_vk_used;
+static pthread_t g_vk_thread;
+
+static size_t vk_hash(const void *data, size_t cap) {
+    uint64_t h = (uint64_t)(uintptr_t)data * 0x9E3779B97F4A7C15ull;
+    return (size_t)(h >> 20) & (cap - 1);
+}
+
+static VkEntry *vk_entry(const void *data, int fmt, int O, int I) {
+    if ((g_vk_used + 1) * 2 > g_vk_cap) {
+        size_t cap = g_vk_cap ? g_vk_cap * 2 : 256;
+        VkEntry *map = calloc(cap, sizeof(*map));
+        if (!map) return NULL;
+        for (size_t i = 0; i < g_vk_cap; i++) {
+            if (!g_vk_map[i].data) continue;
+            size_t at = vk_hash(g_vk_map[i].data, cap);
+            while (map[at].data) at = (at + 1) & (cap - 1);
+            map[at] = g_vk_map[i];
+        }
+        free(g_vk_map);
+        g_vk_map = map; g_vk_cap = cap;
+    }
+    size_t at = vk_hash(data, g_vk_cap);
+    for (;; at = (at + 1) & (g_vk_cap - 1)) {
+        VkEntry *e = &g_vk_map[at];
+        if (!e->data) {
+            *e = (VkEntry){data, fmt, O, I, 0, NULL};
+            g_vk_used++;
+            return e;
+        }
+        if (e->data == data && e->fmt == fmt && e->O == O && e->I == I) return e;
+    }
+}
+
+/* y = W x for `rows` positions on the device; 0 sends the caller to its CPU kernel.
+ * x and y may be strided (wo_a's blocks read and write inside wider rows): the
+ * device wants them packed, so they are packed here. */
+static int vk_mul(int fmt, const void *data, const uint8_t *tiles, int O, int I,
+                  float *y, int ystride, const float *x, int xstride, int rows) {
+    if (!g_vk_ready || rows < 1 || !pthread_equal(pthread_self(), g_vk_thread)) return 0;
+#ifdef _OPENMP
+    if (omp_in_parallel()) return 0;
+#endif
+    VkEntry *e = vk_entry(data, fmt, O, I);
+    if (!e || e->refused) return 0;
+    float *scales = NULL;
+    if (!e->t && fmt == 12) {
+        int groups = (I + FP8_TILE - 1) / FP8_TILE;
+        scales = malloc((size_t)O * groups * sizeof(float));
+        if (!scales) return 0;
+        for (int o = 0; o < O; o++)
+            for (int g = 0; g < groups; g++)
+                scales[(size_t)o * groups + g] = ue8m0(tiles[(size_t)(o / FP8_TILE) * groups + g]);
+    }
+    int pack_x = rows > 1 && xstride != I, pack_y = rows > 1 && ystride != O;
+    float *xp = pack_x ? malloc((size_t)rows * I * sizeof(float)) : NULL;
+    float *yp = pack_y ? malloc((size_t)rows * O * sizeof(float)) : NULL;
+    int ok = 0;
+    if ((!pack_x || xp) && (!pack_y || yp)) {
+        for (int r = 0; pack_x && r < rows; r++)
+            memcpy(xp + (size_t)r * I, x + (size_t)r * xstride, (size_t)I * sizeof(float));
+        int had = e->t != NULL;
+        ok = coli_vk_matmul(&e->t, pack_y ? yp : y, pack_x ? xp : x, data, scales,
+                            fmt, rows, I, O, fmt == 12 ? FP8_TILE : 0);
+        if (!ok && !had && !e->t) e->refused = 1;   /* no device room: CPU from now on */
+        for (int r = 0; ok && pack_y && r < rows; r++)
+            memcpy(y + (size_t)r * ystride, yp + (size_t)r * O, (size_t)O * sizeof(float));
+    }
+    free(xp); free(yp); free(scales);
+    return ok;
 }
 #endif
 
@@ -404,7 +468,7 @@ static int w8_vk(float *y, int ystride, const W8 *w, const float *x, int xstride
  * the expert reads from disk. A scalar byte-at-a-time decode was most of it. */
 static void mv8(float *y, const W8 *w, const float *x) {
 #ifdef COLI_VULKAN
-    if (g_vk_ready && w8_vk(y, w->O, w, x, w->I, 1)) return;
+    if (vk_mul(12, w->q, w->s, w->O, w->I, y, w->O, x, w->I, 1)) return;
 #endif
     int I = w->I, tiles_i = (I + FP8_TILE - 1) / FP8_TILE;
     #pragma omp parallel for schedule(static)
@@ -455,7 +519,7 @@ static int mv_block_rows(int I) {
 
 static void mv8_rows(float *y, int ystride, const W8 *w, const float *x, int xstride, int rows) {
 #ifdef COLI_VULKAN
-    if (g_vk_ready && w8_vk(y, ystride, w, x, xstride, rows)) return;
+    if (vk_mul(12, w->q, w->s, w->O, w->I, y, ystride, x, xstride, rows)) return;
 #endif
     int I = w->I, tiles_i = (I + FP8_TILE - 1) / FP8_TILE;
     int block = mv_block_rows(I);
@@ -500,6 +564,9 @@ static void mv8_rows(float *y, int ystride, const W8 *w, const float *x, int xst
 }
 
 static void mvb(float *y, const WB *w, const float *x) {
+#ifdef COLI_VULKAN
+    if (vk_mul(11, w->w, NULL, w->O, w->I, y, w->O, x, w->I, 1)) return;
+#endif
     int I = w->I;
     #pragma omp parallel for schedule(static)
     for (int o = 0; o < w->O; o++) {
@@ -3943,9 +4010,12 @@ static int *load_ids(jval *root, const char *key, int *count) {
  * initialised and never ran cannot pass for one that did. */
 static void vk_report(void) {
 #ifdef COLI_VULKAN
-    if (g_vk_ready)
-        fprintf(stderr, "[VK] deepseek_v41: %llu matmuls on the GPU\n",
-                coli_vk_matmul_calls());
+    if (!g_vk_ready) return;
+    size_t bytes = 0, tensors = 0;
+    coli_vk_mem_info(&bytes, &tensors);
+    fprintf(stderr, "[VK] deepseek_v41: %llu matmuls on the GPU\n", coli_vk_matmul_calls());
+    fprintf(stderr, "[VK] deepseek_v41: %zu resident matrices on the device, %.1f MiB "
+                    "(fp8 as fmt 12, bf16 as fmt 11)\n", tensors, bytes / 1048576.0);
 #endif
 }
 
@@ -3980,13 +4050,9 @@ int main(int argc, char **argv) {
             m.engram.active ? "on" : "off", now_s() - started);
 #ifdef COLI_VULKAN
     /* After the weights, as in glm53: the device is an option, never a requirement.
-     * The shared line says resident matrices go to the GPU; on this engine none can
-     * (see w8_vk), and the second line says so rather than let the first stand. */
+     * The matrices go up on their first multiply (see vk_mul), from this thread. */
+    g_vk_thread = pthread_self();
     g_vk_ready = coli_vk_init_env("deepseek_v41");
-    if (g_vk_ready)
-        fprintf(stderr, "[VK] deepseek_v41: no resident matrix is in a format the "
-                        "shaders decode (dense e4m3 with 32x32 ue8m0 tiles, bf16), "
-                        "every matmul stays on the CPU\n");
 #endif
 
     if (getenv("SERVE") && atoi(getenv("SERVE"))) {
