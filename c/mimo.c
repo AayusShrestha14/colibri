@@ -1014,9 +1014,8 @@ static int moe_cpu(Model *m, int li, const float *xn, int n, const int *sel,
  * the device's and the CPU's alike: the order never depends on which experts were
  * resident. The experts the CPU computed are offered to the tier after the join
  * (those still in the RAM cache), not while the batch runs: a promotion that
- * displaces a resident then frees it at once, instead of at the next step, so
- * its upload never meets a full pool (with COLI_VK_TIER_SYNC=1 such an upload
- * would fail rather than wait, and the tier's budget would shrink). */
+ * displaces a resident then frees it at once, and its upload starts on a pool
+ * with room instead of waiting on the uploader thread for the join's free. */
 #define MIMO_VK_ROWS 64              /* rows whose pairs one device batch carries at most */
 static void moe(Model *m, int li, const float *xn, int n, float *out) {
     Cfg *c = &m->c;

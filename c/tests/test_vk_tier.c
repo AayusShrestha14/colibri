@@ -11,6 +11,9 @@
  *            go to the device;
  *   partial  a step with more assignments than max_rows: the device takes
  *            max_rows of them, the CPU the rest, the sum is still right;
+ *   sync     COLI_VK_TIER_SYNC=1 and a budget of two experts: a promotion that
+ *            displaces a resident while a batch is in flight finds its room at
+ *            the join (no failed upload, the budget holds);
  *   books    device + CPU = routed, resident <= budget, no failed upload;
  *   v4       DeepSeek V4's activation (route weight on the device, its bf16 and E4M3
  *            roundings): device rows against the engine's CPU arithmetic.
@@ -20,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <unistd.h>
 #include "../backend_vulkan.h"
 #include "../vk_tier.h"
 
@@ -328,6 +332,65 @@ static void partial(void) {
     vkt_shutdown(); model_free();
 }
 
+/* vkt_report's evictions and failed uploads, read back from its stderr line */
+static void report_counts(unsigned long long *evictions, unsigned long long *failed) {
+    *evictions = *failed = ~0ull;
+    FILE *t = tmpfile();
+    if (!t) return;
+    fflush(stderr);
+    int saved = dup(2);
+    if (saved < 0) { fclose(t); return; }
+    dup2(fileno(t), 2);
+    vkt_report("test", 0, 0);
+    fflush(stderr);
+    dup2(saved, 2); close(saved);
+    rewind(t);
+    char line[4096];
+    while (fgets(line, sizeof line, t)) {
+        fputs(line, stderr);
+        const char *e = strstr(line, "evictions "), *f = strstr(line, "failed ");
+        if (e) *evictions = strtoull(e + 10, NULL, 10);
+        if (f) *failed = strtoull(f + 7, NULL, 10);
+    }
+    fclose(t);
+}
+
+/* COLI_VK_TIER_SYNC=1 and a budget of two experts. Phase A makes experts 0 and 1 of
+ * layer 0 resident; in phase B every step routes 0 (resident: the step's batch is in
+ * flight) with 5 and 6, which the CPU computes and notes, so the promotion of 5 that
+ * displaces the cold 1 is decided while a batch runs and 1 is freed only at the
+ * join. The uploader must wait for that free: it used to try at once, meet the full
+ * pool and give up (sync mode does not retry), the upload counted as failed and the
+ * budget shrank to the one expert left, so 5 never became resident. */
+static void sync_evict(void) {
+    VktFmt f = {VKT_SRC_I8_ROW, 0};
+    model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    set_budget(2, f, f);
+    setenv("COLI_VK_TIER_RATE", "64", 1);
+    setenv("COLI_VK_TIER_SYNC", "1", 1);
+    VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+    int on = vkt_init(&vc, NULL);
+    unsetenv("COLI_VK_TIER_SYNC");
+    CHECK(on, "sync: the tier did not start");
+    if (!on) { model_free(); return; }
+    Books a = {0, 0}, b = {0, 0}; double worst = 0;
+    int idx_a[K] = {0, 1, 2}, idx_b[K] = {0, 5, 6}; float w[K] = {0.5f, 0.3f, 0.2f};
+    for (int t = 0; t < 12; t++) { vkt_begin_forward(); double r = step(0, 1, idx_a, w, &a); if (r > worst) worst = r; }
+    int res_a = vkt_resident(0, 0) + vkt_resident(0, 1);
+    for (int t = 0; t < 40; t++) { vkt_begin_forward(); double r = step(0, 1, idx_b, w, &b); if (r > worst) worst = r; }
+    int res = 0; for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) res += vkt_resident(l, e);
+    unsigned long long ev, failed;
+    report_counts(&ev, &failed);
+    printf("  sync: phase A resident %d of 2; phase B device %llu of %llu, resident 0 %d, 1 %d, 5 %d, all %d (budget 2), evictions %llu, failed %llu\n",
+           res_a, b.dev, b.routed, vkt_resident(0, 0), vkt_resident(0, 1), vkt_resident(0, 5), res, ev, failed);
+    CHECK(res_a == 2, "sync: phase A made %d of experts 0 and 1 resident", res_a);
+    CHECK(ev >= 1 && failed == 0, "sync: %llu evictions, %llu failed uploads (a promotion gave up on its victim's room)", ev, failed);
+    CHECK(vkt_resident(0, 5) && !vkt_resident(0, 1) && res == 2,
+          "sync: expert 5 did not displace expert 1 (resident 1 %d, 5 %d, all %d of a budget of 2)", vkt_resident(0, 1), vkt_resident(0, 5), res);
+    CHECK(worst < 2e-3, "sync: relative error %.3g", worst);
+    vkt_shutdown(); model_free();
+}
+
 /* DeepSeek V4's activation (VKT_ACT_SWIGLU_V4) through the tier: MXFP4 ue8m0 experts,
  * x rounded to E4M3 per 128 here as the engine rounds it, the route weight applied on
  * the device (vkt_issue_w), each device row rounded to bf16 and added with no weight
@@ -447,6 +510,7 @@ int main(int argc, char **argv) {
     printf("warm:\n"); warm();
     printf("adapt:\n"); adapt();
     printf("partial:\n"); partial();
+    printf("sync:\n"); sync_evict();
     printf("DeepSeek V4:\n"); v4_act();
     ColiVkPoolStats ps; coli_vk_pool_stats(1, &ps);
     CHECK(ps.live == 0, "%d tier ranges still live after every shutdown", ps.live);

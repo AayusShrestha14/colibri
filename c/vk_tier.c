@@ -8,7 +8,8 @@
  * thread makes them resident at a quiescent point (no batch in flight), where it
  * also frees evicted experts. So the slot table, the counters and every Vulkan
  * call but the pool's allocation are single-threaded; the lock guards the queue,
- * the done list and the room-made signal only. */
+ * the done list, the room-made signal and the count of victims not freed yet
+ * only. */
 #ifdef COLI_VULKAN
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,6 +52,7 @@ static struct {
     pthread_mutex_t mx; pthread_cond_t cv, cv_room, cv_done;
     int busy;                          /* the uploader is between taking an entry and push_done */
     int sync;                          /* COLI_VK_TIER_SYNC=1: quiescent points wait for the uploader */
+    int evict_pending;                 /* victims chosen and not freed yet (a batch is in flight) */
     VQ q[VKT_QCAP]; int qh, qn;
     VDone *done; int ndone, cdone;
     unsigned long room_gen;
@@ -245,6 +247,11 @@ static void *uploader(void *arg) {
     for (;;) {
         pthread_mutex_lock(&T.mx);
         while (!T.qn && !T.stop) pthread_cond_wait(&T.cv, &T.mx);
+        /* COLI_VK_TIER_SYNC=1: a victim chosen while a batch is in flight is freed at that
+         * batch's join, before the join waits for the uploads staged so far: wait for
+         * that free here, so the promotion that displaced it finds its room. Uploading
+         * first would meet the full pool, and a refusal is final in this mode. */
+        while (T.sync && T.evict_pending && !T.stop) pthread_cond_wait(&T.cv_room, &T.mx);
         if (T.stop) { pthread_mutex_unlock(&T.mx); return NULL; }
         VQ e = T.q[T.qh]; T.qh = (T.qh + 1) % VKT_QCAP; T.qn--; T.busy = 1;
         pthread_mutex_unlock(&T.mx);
@@ -260,7 +267,9 @@ static void *uploader(void *arg) {
          * minute (the engine stopped stepping), the pool is full for real. */
         for (int frees = 0, waited = 0; !ok; ) {
             ok = upload(g, u, d, gs, us, ds, t);
-            if (ok || frees >= 3 || waited >= 600 || T.sync) break;   /* sync: the engine waits on us, not we on it */
+            /* sync: every free decided so far came first (above), and the engine now waits
+             * on us, not we on it: the pool is full for real */
+            if (ok || frees >= 3 || waited >= 600 || T.sync) break;
             pthread_mutex_lock(&T.mx);
             unsigned long gen = T.room_gen;
             while (T.room_gen == gen && !T.stop && waited < 600) {
@@ -282,15 +291,19 @@ static void *uploader(void *arg) {
 /* ---- quiescent points: nothing in flight ---------------------------------------- */
 static void quiesce(void) {
     if (T.inflight) return;
-    int freed = 0;
+    int freed = 0, had = T.nevict;
     for (int i = 0; i < T.nevict; i++) {
         VSlot *v = &T.s[T.evict[i]];
         if (v->ex) { coli_vk_xb_expert_free(v->ex); v->ex = NULL; freed = 1; }
         v->state = VS_NONE;
     }
     T.nevict = 0;
-    if (freed) {
-        pthread_mutex_lock(&T.mx); T.room_gen++; pthread_cond_broadcast(&T.cv_room); pthread_mutex_unlock(&T.mx);
+    if (had) {   /* room made: an upload may be waiting for it */
+        pthread_mutex_lock(&T.mx);
+        if (freed) T.room_gen++;
+        T.evict_pending = 0;
+        pthread_cond_broadcast(&T.cv_room);
+        pthread_mutex_unlock(&T.mx);
     }
     /* finished uploads become resident; COLI_VK_TIER_SYNC=1 waits for every staged one
      * first, so what is resident depends on the routing alone, not on thread timing
@@ -400,7 +413,8 @@ void vkt_note(int layer, int eid, const VktExpertSrc *src) {
             T.evict = n; T.cevict = nc;
         }
         T.evict[T.nevict++] = victim;
-        quiesce();   /* nothing in flight: free it right away */
+        pthread_mutex_lock(&T.mx); T.evict_pending = T.nevict; pthread_mutex_unlock(&T.mx);
+        quiesce();   /* nothing in flight: free it right away; else at the join */
     }
     v->state = VS_QUEUED; T.queued++; T.promos++;
     pthread_mutex_lock(&T.mx);

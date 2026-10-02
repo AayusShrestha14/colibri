@@ -2024,9 +2024,9 @@ static float *k3_shared(Model *m, Moe *o, const float *x, int C){
  * the sum never depends on which experts were resident, and an expert computed
  * on the CPU keeps the CPU run's bits. The experts the CPU computed are offered
  * to the tier (vkt_note) after the join, those still in the RAM cache: a
- * promotion that displaces a resident then frees it at once instead of at the
- * next step, so its upload never meets a full pool (with COLI_VK_TIER_SYNC=1 such
- * an upload would fail rather than wait, and the tier's budget would shrink). */
+ * promotion that displaces a resident then frees it at once, and its upload
+ * starts on a pool with room instead of waiting on the uploader thread for the
+ * join's free. */
 typedef struct { int *idx, *left; uint8_t *taken; const float **dev; int ndev; } K3VkStep;
 static void k3_vk_issue(Model *m, int li, int C, const int *keff, const int *idxs,
                         const float *z, K3VkStep *st){

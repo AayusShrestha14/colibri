@@ -2109,6 +2109,10 @@ void coli_vk_tier_pool_limit(size_t bytes) {
     g_tpool.p.limit = bytes;
     /* blocks no larger than the budget, so a small budget is not one refused block */
     g_tpool.p.block_bytes = bytes && bytes < VK_WBLOCK ? ((bytes + 4095) & ~(size_t)4095) : VK_WBLOCK;
+    /* the empty block the pool keeps as a spare (vka_free) goes too: a tier started
+     * again after a shutdown would otherwise fill it past its new, smaller budget */
+    for (int k = 0; k < g_tpool.p.nb; k++)
+        if (g_tpool.p.b[k].present && !g_tpool.p.b[k].live) pool_release_block(&g_tpool, k);
     pthread_mutex_unlock(&g_tpool.mx);
 }
 
