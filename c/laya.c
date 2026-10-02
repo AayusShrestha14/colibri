@@ -225,18 +225,9 @@ static QiMat load_mat(shards *S, const char *name, int N, int K)
     return m;
 }
 
-/* COLI_LAYA_INT8=1: the large matrices as int8 with one scale per row. Opt-in,
- * and only worth it where it was measured to leave the decisions unchanged. */
-static void maybe_int8(QiMat *m)
-{
-    const char *flag = getenv("COLI_LAYA_INT8");
-    if (!flag || strcmp(flag, "1")) return;
-    int8_t *q = (int8_t *)xmalloc((size_t)m->N * m->K);
-    float *sc = (float *)xmalloc((size_t)m->N * sizeof(float));
-    qi_quantize_i8((const float *)m->w, m->N, m->K, q, sc);
-    free((void *)m->w);
-    m->fmt = QI_I8; m->w = q; m->sc = sc;
-}
+/* No int8 option: measured on the release (tools/compare_laya.py, 36 requests,
+ * 117 questions), int8 weights flip 1 decision and int8 weights with int8
+ * activations flip 4, against 0 for f32. The decisions are the contract. */
 
 static void rope_table(float *table, int max_pos, int hd, float theta)
 {
@@ -425,7 +416,6 @@ static void load_model(Laya *M, const char *dir)
         E->bi = load_opt(&S, NAME("mlp.Wi.bias"), 2 * I);
         E->wo2 = load_mat(&S, NAME("mlp.Wo.weight"), d, I);
         E->bo2 = load_opt(&S, NAME("mlp.Wo.bias"), d);
-        maybe_int8(&E->wqkv); maybe_int8(&E->wo); maybe_int8(&E->wi); maybe_int8(&E->wo2);
 #undef NAME
     }
     M->head_heads = d / 64 > 1 ? d / 64 : 1;        /* DecisionModel: nhead = max(1, d // 64) */
@@ -446,7 +436,6 @@ static void load_model(Laya *M, const char *dir)
         H->lin1_b = load_f32(&S, NAME("linear1.bias"), 4 * d);
         H->lin2 = load_mat(&S, NAME("linear2.weight"), d, 4 * d);
         H->lin2_b = load_f32(&S, NAME("linear2.bias"), d);
-        maybe_int8(&H->in_proj); maybe_int8(&H->out_proj); maybe_int8(&H->lin1); maybe_int8(&H->lin2);
 #undef NAME
     }
     M->type_emb = load_f32(&S, "type_emb.weight", 3 * d);
@@ -1119,9 +1108,8 @@ int main(int argc, char **argv)
     Laya *M = (Laya *)xcalloc(1, sizeof(Laya));
     load_model(M, model);
     fprintf(stderr, "[laya] %s: ModernBERT %d layers x %d, %d heads; head %d layers; max_len %d "
-            "(head %d); loaded in %.1f s%s\n", M->model_name, M->layers, M->d, M->heads,
-            M->head_layers, M->max_len, M->head_max_len, (now_ms() - t0) / 1e3,
-            getenv("COLI_LAYA_INT8") && !strcmp(getenv("COLI_LAYA_INT8"), "1") ? ", int8 weights" : "");
+            "(head %d); loaded in %.1f s\n", M->model_name, M->layers, M->d, M->heads,
+            M->head_layers, M->max_len, M->head_max_len, (now_ms() - t0) / 1e3);
     if (tokenize) return run_tokenize(M, tokenize);
     if (records) return run_records(M, records, dump_ids);
     if (!serving) die("nothing to do: set SERVE=1, or pass --records / --tokenize");
