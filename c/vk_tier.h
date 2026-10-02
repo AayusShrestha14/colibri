@@ -108,7 +108,13 @@
  *   VKT_SRC_BF16, VKT_SRC_F32                                    -> fmt 11, 10
  * Activations (VktConfig.act): VKT_ACT_SWIGLU silu(g)*u, act_limit > 0 clamps the
  * gate from above and up to [-limit, limit] first (GLM-5.3, DeepSeek V4/V4.1);
- * VKT_ACT_SITU a*tanh(g/a)*sigmoid(g) * b*tanh(u/b) with act_a, act_b (Kimi K3). */
+ * VKT_ACT_SITU a*tanh(g/a)*sigmoid(g) * b*tanh(u/b) with act_a, act_b (Kimi K3);
+ * VKT_ACT_SWIGLU_V4 DeepSeek V4's expert with its CPU kernel's roundings: gate and
+ * up to bf16, the clamped SwiGLU, times the route weight (vkt_issue_w) and to bf16,
+ * then E4M3 and back per 128 inputs before down. The engine hands in x already
+ * rounded to E4M3 per 128 (as its kernel rounds it), adds a device row with no
+ * weight of its own (the weight is in it) and rounds the row to bf16 first, as
+ * its CPU expert rounds its output. */
 #ifndef COLI_VK_TIER_H
 #define COLI_VK_TIER_H
 #include <stdint.h>
@@ -125,6 +131,7 @@ typedef struct { VktSrc kind; int gs; } VktFmt;     /* gs: group (block) size, 0
 
 #define VKT_ACT_SWIGLU 0
 #define VKT_ACT_SITU   1
+#define VKT_ACT_SWIGLU_V4 2
 
 typedef struct {
     const char *engine;            /* names the [VK] tier lines */
@@ -163,6 +170,14 @@ int  vkt_put(int layer, int eid, const VktExpertSrc *src);   /* any thread */
 void vkt_put_done(void);
 void vkt_note(int layer, int eid, const VktExpertSrc *src);
 int  vkt_issue(int layer, const float *x, int S, int K, const int *idx, uint8_t *taken);
+/* vkt_issue with the route weights w[S*K] (beside idx), for VKT_ACT_SWIGLU_V4, which
+ * applies them on the device; the other activations ignore them. */
+int  vkt_issue_w(int layer, const float *x, int S, int K, const int *idx, const float *w, uint8_t *taken);
+/* 1 when vkt_note would take this expert now (not on the device or on its way, the
+ * promotion rate not spent, room or a colder resident to displace): for an engine
+ * whose RAM form must be converted before vkt_note can read it, so it converts only
+ * the experts the tier will take. No side effects. */
+int  vkt_wants(int layer, int eid);
 int  vkt_join(const float **rows);
 int  vkt_resident(int layer, int eid);
 void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long long disk_loads);
@@ -178,6 +193,8 @@ static inline int  vkt_put(int l,int e,const VktExpertSrc *s){(void)l;(void)e;(v
 static inline void vkt_put_done(void){}
 static inline void vkt_note(int l,int e,const VktExpertSrc *s){(void)l;(void)e;(void)s;}
 static inline int  vkt_issue(int l,const float *x,int S,int K,const int *i,uint8_t *t){(void)l;(void)x;(void)S;(void)K;(void)i;(void)t;return 0;}
+static inline int  vkt_issue_w(int l,const float *x,int S,int K,const int *i,const float *w,uint8_t *t){(void)l;(void)x;(void)S;(void)K;(void)i;(void)w;(void)t;return 0;}
+static inline int  vkt_wants(int l,int e){(void)l;(void)e;return 0;}
 static inline int  vkt_join(const float **r){(void)r;return 0;}
 static inline int  vkt_resident(int l,int e){(void)l;(void)e;return 0;}
 static inline void vkt_report(const char *s,unsigned long long r,unsigned long long d){(void)s;(void)r;(void)d;}
