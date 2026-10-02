@@ -222,7 +222,12 @@ Per-drive byte counts are reported in a `MIRROR:` stats line. Combine with `DIRE
 | `COLI_VK_ATTN` | `0` | Run the S≤4 MLA absorb attention core (+ fused o-projection) on the GPU, with a persistent device-side KV mirror. |
 | `COLI_VK_QPREP` | `1` (on) | Fuse the Q-prep step (RMSNorm + rope + compress) into one GPU dispatch instead of splitting it, which cost three fences where one suffices. `0` restores the split path; `2` additionally keeps CPU reference copies of Q and comp for A/B comparison. |
 | `COLI_VK_RESERVE_GB` | `3.0` | VRAM (GB) held back from the expert tier for the lazily-allocated dense weights, KV mirror and staging buffers (measured ~1.7 GB at 4k ctx, growing with `max_t`). Only meaningful when the driver reports `VK_EXT_memory_budget`; without it the `COLI_VK_EXPERTS` count cap applies alone. |
-| `COLI_VK_SPIN_US` | `300` | Microseconds to spin-poll a fence before blocking. `0` always blocks — lower latency at idle, at the cost of a core spinning. |
+| `COLI_VK_SPIN_US` | `300` | Microseconds to spin-poll a fence before blocking. `0` always blocks — lower latency at idle, at the cost of a core spinning. A tiled GEMM call spins through its dispatch (up to 50 ms) unless this is `0`: a blocked wait wakes up to a millisecond late, which doubled a 0.6 ms prefill GEMM on a Radeon 780M. |
+| `COLI_VK_GEMM_MIN_S` | measured | When a resident matmul (`coli_vk_matmul`, every engine) takes the tiled GEMM instead of the per-row GEMV. Unset: S ≥ 2 and S·O ≥ 4096, measured on a Radeon 780M (a narrow matrix at small S stays on the GEMV). `N`: every call with S ≥ N. `0`: the GEMV for every S. S = 1 (decode) always stays on the GEMV. See [vulkan.md](vulkan.md#prefill-the-tiled-gemms). |
+| `COLI_VK_COOP` | on where supported | The cooperative-matrix GEMM (`VK_KHR_cooperative_matrix`, 16x16x16 fp16 → fp32) for the formats whose weights decode exactly to fp16: int8, int4, int3-g64, MXFP4 and fp8, the grouped ones with a group size that is a multiple of 32. `0` keeps every format on the fp32 GEMM. |
+| `COLI_VK_COOP_SG` | `64` where allowed | Subgroup size the cooperative-matrix pipeline requires (RDNA3: wave64 measured fastest). Tuning only. |
+| `COLI_VK_GEMM_TILE` | measured | `bm,bn,bk,tm,tn[,pf]`: one tile for every width of the fp32 GEMM instead of the measured pair. Tuning only (`COLI_VK_TEST_GEMM_BENCH`). |
+| `COLI_VK_COOP_TILE` | measured | `bm,bn,wm,wn,bk`: one tile for every width of the cooperative-matrix GEMM. Tuning only. |
 
 ### Second Vulkan device (opt-in)
 
@@ -335,8 +340,9 @@ These are for testing, benchmarking, or internal use — not part of the everyda
 | `I3_AVX512_TEST` | unset | Run the AVX-512 int3 self-test and exit. |
 | `COLI_GPU_FAIL_AFTER` | unset | Fault injection: make GPU compute calls start failing after N of them, to exercise the CPU fallback without real hardware faults. Uploads and queries are not gated. |
 | `COLI_VK_TEST_BALLAST` | `0` | Allocate N extra dummy Vulkan buffers to reproduce decode attention degrading with expert-tier size even when VRAM is free (measured 7.9s @2.6k buffer objects → 15.6s @4.3k with 2.9 GB still free). |
+| `COLI_VK_TEST_GEMM_BENCH` | unset | In the `VK_TEST` harness, time the GEMV against the fp32 and the cooperative-matrix GEMM per weight format and S, in GFLOP/s, instead of running the cases. `COLI_VK_TEST_GEMM_FMT=a,b,...`, `COLI_VK_TEST_GEMM_S=a,b,...` and `COLI_VK_TEST_GEMM_SHAPE=I,O` (default `2560,6144`) narrow it. |
 | `COLI_SERVE_ALL_STOPS` | unset | In batched serve mode, keep every stop token instead of filtering to the EOS-like ones. Trades the #401 tool-call safety for behaviour some non-tool clients prefer. |
-| `VK_PROF` | unset | If set, time the Vulkan expert-group path and report it. |
+| `VK_PROF` | unset | If set, time the Vulkan expert-group path and report it, and print at exit how the resident matmuls split between the GEMV, the fp32 GEMM and the cooperative-matrix GEMM, with their wall time. |
 | `COLI_USAGE` | `<model>/.coli_usage` | Path to the expert-usage history to seed the ranking from, and to write back to. Shared by every engine (`route_trace.h`). |
 | `COLI_USAGE_DECAY` | `1.0` (no decay) | Per-run multiplier applied to the recorded counts before ranking, i.e. a half-life. Without one the ranking freezes: after ~18M recorded selections one more turn moves it by 0.2% and the profile stops following the workload (#780). Values outside `(0,1]` are ignored. |
 | `USAGE_SAVE` | `1` (on) | `=0` runs read-only — the usage history is loaded but never written back. For benchmark loops that would otherwise skew the profile they are measuring. |

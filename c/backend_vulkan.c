@@ -34,6 +34,16 @@ typedef struct {
     VkBuffer buf; VkDeviceMemory mem; void *ptr; size_t cap;
 } Scratch;
 
+/* Tile of the fp32 GEMM pipeline: BM outputs x BN activation rows per workgroup, BK
+ * inputs per shared-memory step, TM x TN accumulators per thread; pf = fetch the next
+ * step's words while this one's products run. */
+typedef struct { int bm, bn, bk, tm, tn, pf; } VkGemmTile;
+/* Tile of the cooperative-matrix pipeline: BM outputs x BN activation rows per
+ * workgroup, WM x WN of it per subgroup (multiples of 16), BK inputs per staged step. */
+typedef struct { int bm, bn, wm, wn, bk; } VkCoopTile;
+#define VK_GEMM_SLOTS 2
+#define VK_COOP_SLOTS 3
+
 /* Persistent device-side KV latent/rope cache for one layer (MLA attention).
  * Host appends rows as tokens decode (absolute-position indexing); the absorb
  * kernel reads them in place. Allocated once at max_t rows, like the CUDA
@@ -59,6 +69,19 @@ static struct {
     VkShaderModule shader;
     VkDescriptorPool dpool;
     VkDescriptorSet dset;
+    /* Tiled GEMMs for prefill-sized S, with the GEMV's 4 bindings and push constants so
+     * they bind through G.plyt/G.dset: the fp32 one (qmatmul_gemm.spv) and, when the
+     * device has a 16x16x16 fp16 -> fp32 subgroup MMA and a settable subgroup size
+     * (coop_sg), the cooperative-matrix one (qmatmul_coop.spv) for the formats whose
+     * decoded weights are fp16 values. Each is built at a few tile widths (specialization
+     * constants, slots of growing BN) and a call takes the narrowest that covers its S.
+     * A call takes a GEMM when S >= gemm_min_s (0 = GEMV for every S) and S*O >=
+     * gemm_min_so; coop_off is the harness's switch to the fp32 GEMM. */
+    VkShaderModule shader_gemm, shader_coop;
+    VkPipeline pipe_gemm[VK_GEMM_SLOTS], pipe_coop[VK_COOP_SLOTS];
+    VkGemmTile gemm_t[VK_GEMM_SLOTS];
+    VkCoopTile coop_t[VK_COOP_SLOTS];
+    int gemm_min_s, gemm_min_so, has_coop, coop_sg, coop_off;
     /* fused dual gate+up+silu pipeline (6 bindings): x, Wg, gscale, Wu, uscale, hidden */
     VkShaderModule shader_gu; VkDescriptorSetLayout dsl_gu; VkPipelineLayout plyt_gu;
     VkPipeline pipe_gu; VkDescriptorPool dpool_gu; VkDescriptorSet dset_gu;
@@ -96,7 +119,7 @@ static struct {
      * expert-called-repeatedly pattern). The synchronous fence wait each call means no
      * submission is ever in flight, so rebinding/re-recording only when something
      * actually changed is safe. */
-    ColiVkTensor *bound_tensor; int bound_S, bound_I, bound_O, cmd_ready;
+    ColiVkTensor *bound_tensor; int bound_S, bound_I, bound_O, bound_gemm, cmd_ready;
     VkBuffer bound_xbuf, bound_ybuf;
     size_t used_bytes, tensor_count;
     /* VRAM pressure-proofing: with VK_EXT_memory_priority the attention working set
@@ -205,6 +228,11 @@ static int scratch_reserve_mt(Scratch *s, size_t bytes, uint32_t memtype) {
     if (s->cap >= bytes) return 1;
     if (s->buf) { vkDestroyBuffer(G.dev, s->buf, NULL); vkFreeMemory(G.dev, s->mem, NULL); }
     s->buf = VK_NULL_HANDLE; s->cap = 0; s->ptr = NULL;
+    /* The driver may hand the next buffer the destroyed one's handle value, so the
+     * matmul binding cache cannot tell them apart by handle: drop it on every regrow.
+     * (Same tensor, growing S, e.g. a prefill chunk after decode, left the descriptor
+     * on the freed memory: a GPUVM fault on RADV.) */
+    G.bound_tensor = NULL; G.cmd_ready = 0;
     float p0 = G.prio; G.prio = 1.0f;            /* scratches ride every submit: never evict */
     int ok = alloc_hostvis_mt(bytes, &s->buf, &s->mem, &s->ptr, memtype);
     G.prio = p0;
@@ -302,6 +330,89 @@ static void derive_dir_file(const char *spv, const char *fname, char *out, size_
     else snprintf(out, n, "%s", fname);
 }
 
+static int gemm_tile_ok(VkGemmTile t, const VkPhysicalDeviceLimits *lim) {
+    if (t.bm < 1 || t.bn < 1 || t.tm < 1 || t.tn < 1 || t.bk < 8 || t.bk % 8 ||
+        t.bm % t.tm || t.bn % t.tn) return 0;
+    long threads = (long)(t.bm / t.tm) * (t.bn / t.tn);
+    long lds = (long)(t.bm + t.bn) * (t.bk / 4 + 1) * 16;     /* wsh + xsh, vec4 quads */
+    return threads >= 32 && threads <= (long)lim->maxComputeWorkGroupInvocations &&
+           threads <= (long)lim->maxComputeWorkGroupSize[0] && lds <= (long)lim->maxComputeSharedMemorySize;
+}
+static int gemm_pipeline(VkGemmTile t, int slot) {
+    int32_t sv[7] = {t.bm, t.bn, t.bk, t.tm, t.tn, (t.bm / t.tm) * (t.bn / t.tn), t.pf ? 1 : 0};
+    VkSpecializationMapEntry me[7];
+    for (int i = 0; i < 7; i++) me[i] = (VkSpecializationMapEntry){(uint32_t)i, (uint32_t)(i * 4), 4};
+    VkSpecializationInfo si = {7, me, sizeof(sv), sv};
+    VkComputePipelineCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                  .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = G.shader_gemm, .pName = "main",
+                  .pSpecializationInfo = &si},
+        .layout = G.plyt};
+    VkPipeline pipe;
+    VKCHECK(vkCreateComputePipelines(G.dev, VK_NULL_HANDLE, 1, &cpi, NULL, &pipe), "gemm pipeline");
+    if (G.pipe_gemm[slot]) vkDestroyPipeline(G.dev, G.pipe_gemm[slot], NULL);
+    G.pipe_gemm[slot] = pipe; G.gemm_t[slot] = t;
+    G.cmd_ready = 0;                     /* a recorded GEMM dispatch names the old pipeline */
+    return 1;
+}
+
+/* Subgroups of exactly G.coop_sg lanes; BK a multiple of 32 (group sizes are). */
+static int coop_tile_ok(VkCoopTile t, const VkPhysicalDeviceLimits *lim) {
+    if (t.wm < 16 || t.wn < 16 || t.wm % 16 || t.wn % 16 || t.bm % t.wm || t.bn % t.wn ||
+        t.bk < 32 || t.bk % 32 || G.coop_sg < 16 || 256 % G.coop_sg) return 0;
+    long nw = (long)(t.bm / t.wm) * (t.bn / t.wn), threads = nw * G.coop_sg;
+    long lds = (long)(t.bm + 2 * t.bn) * (t.bk + 8) * 2 + (long)t.bm * 4 + nw * 16 * 17 * 4;
+    return threads <= (long)lim->maxComputeWorkGroupInvocations &&
+           threads <= (long)lim->maxComputeWorkGroupSize[0] && lds <= (long)lim->maxComputeSharedMemorySize;
+}
+static int coop_pipeline(VkCoopTile t, int slot) {
+#ifdef VK_KHR_cooperative_matrix
+    int32_t sv[7] = {t.bm, t.bn, t.wm, t.wn, t.bk, G.coop_sg, (t.bm / t.wm) * (t.bn / t.wn) * G.coop_sg};
+    VkSpecializationMapEntry me[7];
+    for (int i = 0; i < 7; i++) me[i] = (VkSpecializationMapEntry){(uint32_t)i, (uint32_t)(i * 4), 4};
+    VkSpecializationInfo si = {7, me, sizeof(sv), sv};
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+        .requiredSubgroupSize = (uint32_t)G.coop_sg};
+    VkComputePipelineCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = &rss,
+                  .flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT,
+                  .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = G.shader_coop, .pName = "main",
+                  .pSpecializationInfo = &si},
+        .layout = G.plyt};
+    VkPipeline pipe;
+    VKCHECK(vkCreateComputePipelines(G.dev, VK_NULL_HANDLE, 1, &cpi, NULL, &pipe), "coop pipeline");
+    if (G.pipe_coop[slot]) vkDestroyPipeline(G.dev, G.pipe_coop[slot], NULL);
+    G.pipe_coop[slot] = pipe; G.coop_t[slot] = t;
+    G.cmd_ready = 0;
+    return 1;
+#else
+    (void)t; (void)slot; return 0;
+#endif
+}
+
+/* The tiles, narrowest first, measured on a Radeon 780M (RDNA3, RADV) over Qwen3.8's
+ * shapes: BN = 32 serves a 32-row prefill chunk, the wider ones longer prompts.
+ * COLI_VK_GEMM_TILE=bm,bn,bk,tm,tn[,pf] and COLI_VK_COOP_TILE=bm,bn,wm,wn,bk put one
+ * tile in every slot (bench). */
+static const VkGemmTile gemm_tiles[VK_GEMM_SLOTS] = {{128, 32, 32, 4, 4, 1}, {64, 64, 32, 4, 4, 0}};
+static const VkCoopTile coop_tiles[VK_COOP_SLOTS] = {{128, 32, 32, 32, 32}, {128, 64, 32, 32, 32},
+                                                     {128, 128, 64, 32, 32}};
+/* The narrowest slot whose BN covers S, else the widest. */
+static int gemm_slot(int S) {
+    int k = 0;
+    while (k + 1 < VK_GEMM_SLOTS && G.pipe_gemm[k + 1] && S > G.gemm_t[k].bn) k++;
+    return k;
+}
+static int coop_slot(int S) {
+    int k = 0;
+    while (k + 1 < VK_COOP_SLOTS && G.pipe_coop[k + 1] && S > G.coop_t[k].bn) k++;
+    return k;
+}
+
+static void vk_prof_paths(void);
+static int g_vk_prof;
+
 int coli_vk_init(const char *spv_path) {
     if (G.ready) return 1;
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
@@ -343,7 +454,8 @@ int coli_vk_init(const char *spv_path) {
     /* Pressure-proofing extensions (both optional, detected at runtime):
      * memory_priority ranks allocations for the kernel's eviction order,
      * memory_budget exposes how much VRAM a new allocation can still take. */
-    const char *dext[2]; uint32_t ndext = 0;
+    const char *dext[4]; uint32_t ndext = 0;
+    int has_cm = 0, has_ssc = 0;
     {
         uint32_t ne = 0;
         vkEnumerateDeviceExtensionProperties(G.phys, NULL, &ne, NULL);
@@ -357,10 +469,71 @@ int coli_vk_init(const char *spv_path) {
 #ifdef VK_EXT_memory_budget
                 if (!strcmp(ep[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) G.has_budget = 1;
 #endif
+#ifdef VK_KHR_cooperative_matrix
+                if (!strcmp(ep[i].extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) has_cm = 1;
+                if (!strcmp(ep[i].extensionName, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME)) has_ssc = 1;
+#endif
             }
             free(ep);
         }
     }
+    /* Cooperative-matrix GEMM (optional, COLI_VK_COOP=0 turns it off): the KHR extension
+     * with a 16x16x16 fp16 x fp16 -> fp32 subgroup shape, shaderFloat16, the Vulkan
+     * memory model, and a subgroup size the pipeline can require. All of it or none. */
+#ifdef VK_KHR_cooperative_matrix
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR cmf = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+    VkPhysicalDeviceSubgroupSizeControlFeaturesEXT sscf = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT, .pNext = &cmf};
+    VkPhysicalDeviceVulkan12Features v12f = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &sscf};
+    {
+        const char *e = getenv("COLI_VK_COOP");
+        VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(G.phys, &pp);
+        if (has_cm && has_ssc && pp.apiVersion >= VK_API_VERSION_1_2 && !(e && *e == '0')) {
+            VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &v12f};
+            vkGetPhysicalDeviceFeatures2(G.phys, &f2);
+            VkPhysicalDeviceSubgroupSizeControlPropertiesEXT ssp = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES_EXT};
+            VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &ssp};
+            vkGetPhysicalDeviceProperties2(G.phys, &p2);
+            int shape = 0;
+            PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR cmp = (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)
+                vkGetInstanceProcAddr(G.inst, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
+            uint32_t nc = 0;
+            if (cmp && cmp(G.phys, &nc, NULL) == VK_SUCCESS && nc) {
+                VkCooperativeMatrixPropertiesKHR *cp = calloc(nc, sizeof(*cp));
+                if (cp) {
+                    for (uint32_t i = 0; i < nc; i++) cp[i].sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+                    if (cmp(G.phys, &nc, cp) == VK_SUCCESS)
+                        for (uint32_t i = 0; i < nc; i++)
+                            if (cp[i].MSize == 16 && cp[i].NSize == 16 && cp[i].KSize == 16 &&
+                                cp[i].AType == VK_COMPONENT_TYPE_FLOAT16_KHR && cp[i].BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                                cp[i].CType == VK_COMPONENT_TYPE_FLOAT32_KHR && cp[i].ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+                                cp[i].scope == VK_SCOPE_SUBGROUP_KHR) shape = 1;
+                    free(cp);
+                }
+            }
+            /* Subgroups of 64 where the device allows (RDNA3: the wave64 MMA measured
+             * fastest), else the largest it can require; COLI_VK_COOP_SG overrides. */
+            int sgz = ssp.maxSubgroupSize >= 64 && ssp.minSubgroupSize <= 64 ? 64 : (int)ssp.maxSubgroupSize;
+            const char *se = getenv("COLI_VK_COOP_SG");
+            if (se && atoi(se) >= (int)ssp.minSubgroupSize && atoi(se) <= (int)ssp.maxSubgroupSize) sgz = atoi(se);
+            if (shape && cmf.cooperativeMatrix && v12f.shaderFloat16 && v12f.vulkanMemoryModel &&
+                sscf.subgroupSizeControl && sscf.computeFullSubgroups &&
+                (ssp.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) && sgz >= 16) {
+                G.has_coop = 1; G.coop_sg = sgz;
+            }
+        }
+    }
+    /* enable exactly what the cooperative-matrix shader needs, nothing else */
+    memset(&v12f, 0, sizeof(v12f)); memset(&sscf, 0, sizeof(sscf)); memset(&cmf, 0, sizeof(cmf));
+    cmf.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR; cmf.cooperativeMatrix = VK_TRUE;
+    sscf.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT; sscf.pNext = &cmf;
+    sscf.subgroupSizeControl = VK_TRUE; sscf.computeFullSubgroups = VK_TRUE;
+    v12f.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES; v12f.pNext = &sscf;
+    v12f.shaderFloat16 = VK_TRUE; v12f.vulkanMemoryModel = VK_TRUE;
+#endif
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi};
 #ifdef VK_EXT_memory_priority
@@ -374,6 +547,19 @@ int coli_vk_init(const char *spv_path) {
 #endif
     di.enabledExtensionCount = ndext; di.ppEnabledExtensionNames = ndext ? dext : NULL;
     G.prio = 0.75f;                              /* default class: dense/resident weights */
+#ifdef VK_KHR_cooperative_matrix
+    if (G.has_coop) {   /* a device that refuses the extra features still comes up without them */
+        VkDeviceCreateInfo dc = di;
+        const char *cext[4]; uint32_t nc = 0;
+        for (uint32_t i = 0; i < ndext; i++) cext[nc++] = dext[i];
+        cext[nc++] = VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME;
+        cext[nc++] = VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME;
+        cmf.pNext = (void *)di.pNext; dc.pNext = &v12f;
+        dc.enabledExtensionCount = nc; dc.ppEnabledExtensionNames = cext;
+        if (vkCreateDevice(G.phys, &dc, NULL, &G.dev) != VK_SUCCESS) { G.has_coop = 0; G.dev = VK_NULL_HANDLE; }
+    }
+    if (!G.dev)
+#endif
     VKCHECK(vkCreateDevice(G.phys, &di, NULL, &G.dev), "vkCreateDevice");
     vkGetDeviceQueue(G.dev, G.qfam, 0, &G.queue);
     if (G.has_prio || G.has_budget)
@@ -415,6 +601,61 @@ int coli_vk_init(const char *spv_path) {
     G.shader = load_spv(G.dev, spv_path);
     if (!G.shader) return 0;
     if (!build_pipeline(G.dev, 4, sizeof(struct PC), G.shader, &G.dsl, &G.plyt, &G.pipe, &G.dpool, &G.dset)) return 0;
+
+    /* Optional tiled GEMMs: an absent shader or a tile the device cannot hold leaves
+     * that slot empty; without the fp32 one every S stays on the GEMV. The cooperative-
+     * matrix one only comes up on devices that passed the checks above, and alongside
+     * the fp32 one, which takes the formats it does not. */
+    {
+        VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(G.phys, &pp);
+        char gm_path[512]; derive_sibling(spv_path, "_gemm.spv", gm_path, sizeof(gm_path));
+        G.shader_gemm = load_spv(G.dev, gm_path);
+        const char *e = getenv("COLI_VK_GEMM_TILE");
+        VkGemmTile u = {0, 0, 0, 0, 0, 0};
+        int one = e && *e && sscanf(e, "%d,%d,%d,%d,%d,%d", &u.bm, &u.bn, &u.bk, &u.tm, &u.tn, &u.pf) >= 5 &&
+                  gemm_tile_ok(u, &pp.limits);
+        if (e && *e && !one) fprintf(stderr, "[VK] COLI_VK_GEMM_TILE=%s rejected\n", e);
+        for (int k = 0; G.shader_gemm && k < (one ? 1 : VK_GEMM_SLOTS); k++) {
+            VkGemmTile t = one ? u : gemm_tiles[k];
+            if (gemm_tile_ok(t, &pp.limits)) gemm_pipeline(t, k);
+        }
+        if (G.shader_gemm && !G.pipe_gemm[0]) {
+            vkDestroyShaderModule(G.dev, G.shader_gemm, NULL); G.shader_gemm = VK_NULL_HANDLE;
+            for (int k = 1; k < VK_GEMM_SLOTS; k++)
+                if (G.pipe_gemm[k]) { vkDestroyPipeline(G.dev, G.pipe_gemm[k], NULL); G.pipe_gemm[k] = VK_NULL_HANDLE; }
+        }
+        if (G.has_coop && G.pipe_gemm[0]) {
+            char cm_path[512]; derive_sibling(spv_path, "_coop.spv", cm_path, sizeof(cm_path));
+            G.shader_coop = load_spv(G.dev, cm_path);
+            e = getenv("COLI_VK_COOP_TILE");
+            VkCoopTile c = {0, 0, 0, 0, 0};
+            one = e && *e && sscanf(e, "%d,%d,%d,%d,%d", &c.bm, &c.bn, &c.wm, &c.wn, &c.bk) == 5 &&
+                  coop_tile_ok(c, &pp.limits);
+            if (e && *e && !one) fprintf(stderr, "[VK] COLI_VK_COOP_TILE=%s rejected\n", e);
+            /* every slot shares BK: coop_fmt checks group sizes against it */
+            for (int k = 0; G.shader_coop && k < (one ? 1 : VK_COOP_SLOTS); k++) {
+                VkCoopTile t = one ? c : coop_tiles[k];
+                if (coop_tile_ok(t, &pp.limits)) coop_pipeline(t, k);
+            }
+        }
+        if (!G.pipe_coop[0]) {
+            for (int k = 1; k < VK_COOP_SLOTS; k++)
+                if (G.pipe_coop[k]) { vkDestroyPipeline(G.dev, G.pipe_coop[k], NULL); G.pipe_coop[k] = VK_NULL_HANDLE; }
+            if (G.shader_coop) vkDestroyShaderModule(G.dev, G.shader_coop, NULL);
+            G.shader_coop = VK_NULL_HANDLE; G.has_coop = 0;
+        }
+        /* Where the GEMM overtakes the GEMV, measured on the 780M over Qwen3.8's shapes
+         * (int8, int4-g64, bf16): from S = 2 on a wide matrix (O = 2560: 0.65 against
+         * 0.90 ms in int8, 1.0 against 2.2 in bf16), but a narrow one fills too few
+         * tiles (O = 48: the GEMV wins up to S = 32, loses from 128). The rule that
+         * fits: S >= 2 and S*O >= 4096. COLI_VK_GEMM_MIN_S=N puts every S >= N on the
+         * GEMM, 0 none; S == 1 (decode) always stays on the GEMV. */
+        const char *m = getenv("COLI_VK_GEMM_MIN_S");
+        G.gemm_min_s = !G.pipe_gemm[0] ? 0 : m && *m ? atoi(m) : 2;
+        G.gemm_min_so = m && *m ? 0 : 4096;
+        if (G.gemm_min_s == 1) G.gemm_min_s = 2;
+        if (G.gemm_min_s < 0) G.gemm_min_s = 0;
+    }
 
     /* Optional fused gate+up pipeline: skip gracefully if its shader isn't present
      * (single-matmul path keeps working). */
@@ -459,9 +700,13 @@ int coli_vk_init(const char *spv_path) {
     VKCHECK(vkCreateFence(G.dev, &fi, NULL, &G.eg_fence), "eg fence");
 
     G.ready = 1;
+    if ((g_vk_prof = getenv("VK_PROF") != NULL)) atexit(vk_prof_paths);
     VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(G.phys, &p);
-    fprintf(stderr, "[VK] ready: %s, compute qfam %u, memtype %u%s%s\n", p.deviceName, G.qfam, G.memtype,
+    fprintf(stderr, "[VK] ready: %s, compute qfam %u, memtype %u%s%s", p.deviceName, G.qfam, G.memtype,
             G.shader_gu ? ", fused gate+up" : "", G.shader_att ? ", absorb attention" : "");
+    if (G.gemm_min_s) fprintf(stderr, ", tiled GEMM from S=%d%s%s", G.gemm_min_s,
+                              G.gemm_min_so ? " and S*O>=4096" : "", G.pipe_coop[0] ? " (cooperative matrix)" : "");
+    fprintf(stderr, "\n");
     return 1;
 }
 
@@ -572,20 +817,31 @@ int coli_vk_tensor_ensure(ColiVkTensor **tensor, const void *weights, const floa
  * then fall back to the blocking wait. The spinning thread is stalled on the
  * GPU result anyway. COLI_VK_SPIN_US=0 restores the pure blocking wait. */
 static long g_vk_spin_us = -1;
-static VkResult vk_fence_wait(VkDevice dev, VkFence f) {
+static VkResult vk_fence_wait_us(VkDevice dev, VkFence f, long spin_us) {
+    if (spin_us > 0) {
+        double t0 = vk_now();
+        do {
+            VkResult r = vkGetFenceStatus(dev, f);
+            if (r != VK_NOT_READY) return r;   /* VK_SUCCESS or a real error */
+        } while ((vk_now() - t0) * 1000.0 < (double)spin_us);
+    }
+    return vkWaitForFences(dev, 1, &f, VK_TRUE, 10000000000ULL);
+}
+static long vk_spin_us(void) {
     if (g_vk_spin_us < 0) {
         const char *e = getenv("COLI_VK_SPIN_US");
         g_vk_spin_us = e ? atol(e) : 300;
         if (g_vk_spin_us < 0) g_vk_spin_us = 0;
     }
-    if (g_vk_spin_us > 0) {
-        double t0 = vk_now();
-        do {
-            VkResult r = vkGetFenceStatus(dev, f);
-            if (r != VK_NOT_READY) return r;   /* VK_SUCCESS or a real error */
-        } while ((vk_now() - t0) * 1000.0 < (double)g_vk_spin_us);
-    }
-    return vkWaitForFences(dev, 1, &f, VK_TRUE, 10000000000ULL);
+    return g_vk_spin_us;
+}
+static VkResult vk_fence_wait(VkDevice dev, VkFence f) { return vk_fence_wait_us(dev, f, vk_spin_us()); }
+/* A tiled GEMM runs for milliseconds, past the spin budget, and the blocked wait then
+ * wakes up to a millisecond late: measured on the 780M, a 0.6 ms S=32 GEMM took 0.6 or
+ * 1.05 ms per call at random. Its wait spins through the dispatch, bounded at 50 ms;
+ * COLI_VK_SPIN_US=0 still blocks. */
+static VkResult vk_fence_wait_gemm(VkDevice dev, VkFence f) {
+    return vk_fence_wait_us(dev, f, vk_spin_us() > 0 ? 50000 : 0);
 }
 
 /* Global submit/wait totals across EVERY synchronous GPU path (VK_PROF=1) — the
@@ -598,6 +854,48 @@ static void vkprof_tick(void) {
 }
 
 static unsigned long long g_vk_matmul_calls;   /* successful coli_vk_matmul calls */
+static unsigned long long g_vk_gemm_calls;     /* ... of which through a tiled GEMM */
+static unsigned long long g_vk_coop_calls;     /* ... of which the cooperative-matrix one */
+
+/* VK_PROF=1: at exit, how the matmuls and their wall time (upload to readback) split
+ * between the GEMV and the two tiled GEMMs. */
+static double g_vk_path_ms[3];
+static unsigned long long g_vk_path_n[3];
+static void vk_prof_paths(void) {
+    fprintf(stderr, "[VK_PROF] %llu matmuls: GEMV %llu in %.0f ms, fp32 GEMM %llu in %.0f ms, "
+            "cooperative-matrix GEMM %llu in %.0f ms\n", g_vk_matmul_calls,
+            g_vk_path_n[0], g_vk_path_ms[0], g_vk_path_n[1], g_vk_path_ms[1], g_vk_path_n[2], g_vk_path_ms[2]);
+}
+
+/* Formats the cooperative-matrix GEMM takes: decoded weights exact in fp16, and group
+ * boundaries on its staged steps (one group scale per step). */
+static int coop_fmt(const ColiVkTensor *t) {
+    int gs = t->fmt == 5 ? 64 : t->gs;
+    return t->fmt == 1 || t->fmt == 2 ||
+           ((t->fmt == 4 || t->fmt == 5 || t->fmt == 7 || t->fmt == 12) && gs % G.coop_t[0].bk == 0);
+}
+/* Its x upload: the rows, then their powers of two rs[s] = 2^(15-e) with
+ * max|x[s,:]| < 2^e, so a scaled row stays under 2^15 (fp16 max 65504) and its hi/lo
+ * fp16 split keeps 22 bits. One pass copies and takes the integer max of the magnitude
+ * bits (vectorizes without fast-math); a row holding Inf or NaN keeps rs = 1 and its
+ * non-finite result, as on the GEMV. */
+static void coop_stage_x(float *restrict dst, const float *restrict x, int S, int I) {
+    float *rs = dst + (size_t)S * I;
+    for (int s = 0; s < S; s++) {
+        const float *restrict r = x + (size_t)s * I;
+        float *restrict d = dst + (size_t)s * I;
+        uint32_t m = 0;
+        for (int i = 0; i < I; i++) {
+            uint32_t u; memcpy(&u, &r[i], 4);
+            d[i] = r[i]; u &= 0x7fffffffu; m = u > m ? u : m;
+        }
+        int e = (int)(m >> 23) - 126;                 /* m < 2^e for a normal m */
+        if (m >= 0x7f800000u) e = 15;
+        if (e < -100) e = -100;                       /* zero and subnormal rows */
+        uint32_t b = (uint32_t)(15 - e + 127) << 23;
+        memcpy(&rs[s], &b, sizeof(b));
+    }
+}
 
 int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
                    const void *weights, const float *scales,
@@ -608,11 +906,20 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
      * separates our code (memcpy/desc/record) from the driver (submit) and the GPU
      * (fence wait) to localize the tier-size-linear tax. */
     static double p_x, p_desc, p_rec, p_sub, p_wait, p_y; static long p_n;
-    double t0 = G.eg_prof ? vk_now() : 0, tA;
+    double t0 = G.eg_prof ? vk_now() : 0, tA, tp = g_vk_prof ? vk_now() : 0;
+    /* Prefill-sized S takes a tiled GEMM: one BM x BN tile of y per workgroup, so each
+     * weight is fetched ceil(S/BN) times instead of S; the cooperative-matrix one where
+     * the device and the format allow (path 2), else the fp32 one (1). Decode (S = 1),
+     * and a matrix too narrow to fill the device at this S, keep the GEMV (0). */
+    int path = 0;
+    if (G.gemm_min_s && S >= G.gemm_min_s && (int64_t)S * O >= G.gemm_min_so)
+        path = G.pipe_coop[0] && !G.coop_off && coop_fmt(t) ? 2 : 1;
     size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
     VkBuffer old_x = G.x.buf, old_y = G.y.buf;
-    if (!scratch_reserve(&G.x, xb) || !scratch_reserve_mt(&G.y, yb, G.memtype_cached)) return 0;  /* y read back */
-    memcpy(G.x.ptr, x, xb);
+    if (!scratch_reserve(&G.x, xb + (path == 2 ? (size_t)S * sizeof(float) : 0)) ||   /* + rs[S] */
+        !scratch_reserve_mt(&G.y, yb, G.memtype_cached)) return 0;  /* y read back */
+    if (path == 2) coop_stage_x(G.x.ptr, x, S, I);
+    else memcpy(G.x.ptr, x, xb);
     if (G.eg_prof) { tA = vk_now(); p_x += tA - t0; t0 = tA; }
 
     /* Rebind descriptors only when the tensor or a scratch buffer changed (a realloc
@@ -638,19 +945,26 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
     /* Re-record the command buffer only when the binding or the dispatch shape changed.
      * Recorded WITHOUT one-time-submit so the same buffer can be resubmitted verbatim —
      * for repeated calls to the same expert this drops setup to a bare submit+wait. */
-    if (rebind || !G.cmd_ready || G.bound_S != S || G.bound_I != I || G.bound_O != O) {
+    if (rebind || !G.cmd_ready || G.bound_S != S || G.bound_I != I || G.bound_O != O || G.bound_gemm != path) {
         VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
         VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
-        vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
+        int slot = path == 2 ? coop_slot(S) : path ? gemm_slot(S) : 0;
+        vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          path == 2 ? G.pipe_coop[slot] : path ? G.pipe_gemm[slot] : G.pipe);
         vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.dset, 0, NULL);
         struct PC pc = {fmt, S, I, O, t->rowWords, t->gs};
         vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        /* Grid-stride shader: one subgroup per output row (~8 rows/workgroup at wave32).
-         * Launch ~O/8 workgroups for occupancy; the shader loops to cover any O / wave width. */
-        vkCmdDispatch(G.cmd, (uint32_t)((O + 7) / 8), (uint32_t)S, 1);
+        if (path) {
+            int bm = path == 2 ? G.coop_t[slot].bm : G.gemm_t[slot].bm;
+            int bn = path == 2 ? G.coop_t[slot].bn : G.gemm_t[slot].bn;
+            vkCmdDispatch(G.cmd, (uint32_t)((O + bm - 1) / bm), (uint32_t)((S + bn - 1) / bn), 1);
+        } else
+            /* Grid-stride shader: one subgroup per output row (~8 rows/workgroup at wave32).
+             * Launch ~O/8 workgroups for occupancy; the shader loops to cover any O / wave width. */
+            vkCmdDispatch(G.cmd, (uint32_t)((O + 7) / 8), (uint32_t)S, 1);
         VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
-        G.cmd_ready = 1; G.bound_S = S; G.bound_I = I; G.bound_O = O;
+        G.cmd_ready = 1; G.bound_S = S; G.bound_I = I; G.bound_O = O; G.bound_gemm = path;
     }
     if (G.eg_prof) { tA = vk_now(); p_rec += tA - t0; t0 = tA; }
 
@@ -662,7 +976,7 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
     // Bounded wait: a GPU hang/TDR must never wedge the process. 10s is orders of
     // magnitude over a single-GEMV dispatch; on timeout/device-loss disable VK for
     // the rest of the run and fall back to CPU (the caller degrades on our 0 return).
-    VkResult wr = vk_fence_wait(G.dev, G.fence);
+    VkResult wr = path ? vk_fence_wait_gemm(G.dev, G.fence) : vk_fence_wait(G.dev, G.fence);
     if (wr != VK_SUCCESS) {
         fprintf(stderr, "[VK] fence wait failed: %d — disabling GPU offload, staying on CPU\n", wr);
         G.ready = 0;
@@ -677,6 +991,9 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
                     p_n, p_x, p_desc, p_rec, p_sub, p_wait, p_y);
     }
     g_vk_matmul_calls++;
+    g_vk_gemm_calls += path != 0;
+    g_vk_coop_calls += path == 2;
+    if (g_vk_prof) { g_vk_path_ms[path] += vk_now() - tp; g_vk_path_n[path]++; }
     return 1;
 }
 
@@ -1633,6 +1950,10 @@ void coli_vk_shutdown(void) {
     vkDestroyCommandPool(G.dev, G.cpool, NULL);
     vkDestroyDescriptorPool(G.dev, G.dpool, NULL);
     vkDestroyPipeline(G.dev, G.pipe, NULL);
+    for (int k = 0; k < VK_GEMM_SLOTS; k++) if (G.pipe_gemm[k]) vkDestroyPipeline(G.dev, G.pipe_gemm[k], NULL);
+    for (int k = 0; k < VK_COOP_SLOTS; k++) if (G.pipe_coop[k]) vkDestroyPipeline(G.dev, G.pipe_coop[k], NULL);
+    if (G.shader_gemm) vkDestroyShaderModule(G.dev, G.shader_gemm, NULL);
+    if (G.shader_coop) vkDestroyShaderModule(G.dev, G.shader_coop, NULL);
     vkDestroyPipelineLayout(G.dev, G.plyt, NULL);
     vkDestroyDescriptorSetLayout(G.dev, G.dsl, NULL);
     vkDestroyShaderModule(G.dev, G.shader, NULL);
@@ -1677,7 +1998,7 @@ static size_t ref_rowbytes(int fmt, int I) {
 static size_t ref_scales(int fmt, int I, int O) {   // scale COUNT (per-group for fmt 4/5)
     if (fmt == 10 || fmt == 11) return 1;
     if (fmt == 5) return (size_t)O * (size_t)((I + 63) / 64);
-    if (fmt == 4 || fmt == 12) return (size_t)O * (size_t)((I + g_ref_gs - 1) / g_ref_gs);
+    if (fmt == 4 || fmt == 7 || fmt == 12) return (size_t)O * (size_t)((I + g_ref_gs - 1) / g_ref_gs);
     return (size_t)O;
 }
 static float deq(const uint8_t *row, int fmt, int i) {
@@ -1693,16 +2014,19 @@ static float deq(const uint8_t *row, int fmt, int i) {
         const uint8_t *lo = row + (size_t)(i >> 6) * 24, *hi = lo + 16; int j = i & 63;
         unsigned u = ((lo[j >> 2] >> ((j & 3) * 2)) & 3u) | (((hi[j >> 3] >> (j & 7)) & 1u) << 2);
         return (float)((int)u - 4); }
-    uint8_t v = row[i >> 1]; int nib = (i & 1) ? (v >> 4) : (v & 15); return (float)(nib - 8);
+    uint8_t v = row[i >> 1]; int nib = (i & 1) ? (v >> 4) : (v & 15);
+    if (fmt == 7) { static const float e2m1[8] = {0, 0.5f, 1, 1.5f, 2, 3, 4, 6};   /* MXFP4 */
+                    return (nib & 8) ? -e2m1[nib & 7] : e2m1[nib & 7]; }
+    return (float)(nib - 8);
 }
 
 static void cpu_ref(float *y, const float *x, const uint8_t *w, const float *sc,
                     int fmt, int S, int I, int O) {
     size_t rb = ref_rowbytes(fmt, I);
-    int gw2 = (fmt == 4 || fmt == 12) ? g_ref_gs : 64, ng = (I + gw2 - 1) / gw2;
+    int gw2 = (fmt == 4 || fmt == 7 || fmt == 12) ? g_ref_gs : 64, ng = (I + gw2 - 1) / gw2;
     for (int s = 0; s < S; s++) for (int o = 0; o < O; o++) {
         double sum = 0; const uint8_t *row = w + (size_t)o * rb;
-        if (fmt == 5 || fmt == 4 || fmt == 12) {   // per-group scales fold inside the sum
+        if (fmt == 5 || fmt == 4 || fmt == 7 || fmt == 12) {   // per-group scales fold inside the sum
             for (int g = 0; g < ng; g++) {
                 double a = 0; int end = (g + 1) * gw2 < I ? (g + 1) * gw2 : I;
                 for (int i = g * gw2; i < end; i++) a += x[s * I + i] * deq(row, fmt, i);
@@ -1734,28 +2058,36 @@ static double ref_dot(const float *x, const uint8_t *row, const float *scb, int 
     return sum * scb[o];
 }
 
-static int run_case(int fmt, int S, int I, int O, int iters) {
+/* Random activations, weights and scales for one case: x[S,I] in [-1,1), raw weight
+ * bytes (no NaN/Inf for the float and fp8 formats), scales in [0.01,0.02). */
+static void case_fill(int fmt, int S, int I, int O, float **x, uint8_t **w, float **sc) {
     size_t rb = ref_rowbytes(fmt, I), nsc = ref_scales(fmt, I, O);
-    float *x = malloc((size_t)S * I * sizeof(float));
-    uint8_t *w = malloc(rb * O);
-    float *sc = malloc(nsc * sizeof(float));
-    float *yg = malloc((size_t)S * O * sizeof(float));
-    float *yc = malloc((size_t)S * O * sizeof(float));
-    for (int i = 0; i < S * I; i++) x[i] = (float)((rand() % 200 - 100) / 100.0);
-    for (size_t i = 0; i < rb * O; i++) w[i] = rand() & 0xff;
+    *x = malloc((size_t)S * I * sizeof(float));
+    *w = malloc(rb * O);
+    *sc = malloc(nsc * sizeof(float));
+    for (size_t i = 0; i < (size_t)S * I; i++) (*x)[i] = (float)((rand() % 200 - 100) / 100.0);
+    for (size_t i = 0; i < rb * O; i++) (*w)[i] = rand() & 0xff;
     if (fmt == 12)                         /* no NaN bytes: they would poison the comparison */
-        for (size_t i = 0; i < rb * O; i++) if ((w[i] & 0x7f) == 0x7f) w[i] ^= 1;
+        for (size_t i = 0; i < rb * O; i++) if (((*w)[i] & 0x7f) == 0x7f) (*w)[i] ^= 1;
     if (fmt == 10 || fmt == 11)            /* float weights: random bytes could be NaN/Inf */
         for (size_t i = 0; i < (size_t)I * O; i++) {
             float f = (float)((rand() % 2001 - 1000) / 1000.0);
-            if (fmt == 10) memcpy(w + i * 4, &f, 4);
-            else { uint32_t u; memcpy(&u, &f, 4); uint16_t h = (uint16_t)(u >> 16); memcpy(w + i * 2, &h, 2); }
+            if (fmt == 10) memcpy(*w + i * 4, &f, 4);
+            else { uint32_t u; memcpy(&u, &f, 4); uint16_t h = (uint16_t)(u >> 16); memcpy(*w + i * 2, &h, 2); }
         }
-    for (size_t o = 0; o < nsc; o++) sc[o] = 0.01f + (rand() % 100) / 10000.0f;
+    for (size_t o = 0; o < nsc; o++) (*sc)[o] = 0.01f + (rand() % 100) / 10000.0f;
+}
+
+static int run_case(int fmt, int S, int I, int O, int iters) {
+    float *x, *sc; uint8_t *w;
+    case_fill(fmt, S, I, O, &x, &w, &sc);
+    float *yg = malloc((size_t)S * O * sizeof(float));
+    float *yc = malloc((size_t)S * O * sizeof(float));
 
     ColiVkTensor *t = NULL;
     if (!coli_vk_matmul(&t, yg, x, w, sc, fmt, S, I, O, g_ref_gs)) { printf("matmul failed\n"); return 1; }
-    cpu_ref(yc, x, w, sc, fmt, S, I, O);
+    const char *path = G.bound_gemm == 2 ? "coop" : G.bound_gemm ? "gemm" : "gemv";
+    double c0 = now(); cpu_ref(yc, x, w, sc, fmt, S, I, O); double cpu_ms = (now() - c0) * 1000;
     double maxerr = 0, maxrel = 0;
     for (int i = 0; i < S * O; i++) {
         double e = fabs(yg[i] - yc[i]); if (e > maxerr) maxerr = e;
@@ -1765,13 +2097,112 @@ static int run_case(int fmt, int S, int I, int O, int iters) {
     double t0 = now();
     for (int k = 0; k < iters; k++) coli_vk_matmul(&t, yg, x, w, sc, fmt, S, I, O, g_ref_gs);
     double gpu_ms = (now() - t0) * 1000 / iters;
-    // microbench (CPU ref, 1 iter — it's slow)
-    double c0 = now(); cpu_ref(yc, x, w, sc, fmt, S, I, O); double cpu_ms = (now() - c0) * 1000;
-    printf("fmt=%d S=%d I=%d O=%d | maxerr=%.4g maxrel=%.4g | gpu=%.3f ms  cpu_ref=%.3f ms\n",
-           fmt, S, I, O, maxerr, maxrel, gpu_ms, cpu_ms);
+    char gsb[16] = "";
+    if (fmt == 4 || fmt == 7 || fmt == 12) snprintf(gsb, sizeof(gsb), " gs=%d", g_ref_gs);
+    printf("fmt=%d%s S=%d I=%d O=%d %s | maxerr=%.4g maxrel=%.4g | gpu=%.3f ms  cpu_ref=%.3f ms\n",
+           fmt, gsb, S, I, O, path, maxerr, maxrel, gpu_ms, cpu_ms);
     coli_vk_tensor_free(t);
     free(x); free(w); free(sc); free(yg); free(yc);
     return maxrel > 1e-3 ? 1 : 0;
+}
+
+/* The tiled GEMMs against the same reference, forced for this S whatever the device
+ * threshold, and required to have really run: a missing qmatmul_gemm.spv must fail
+ * here, not pass on the GEMV. The fp32 GEMM always; then, on a device with the
+ * cooperative-matrix pipeline, that one too for the formats it takes. gs is the group
+ * size of fmt 4, 7 and 12. */
+static int coop_takes(int fmt, int gs) {
+    ColiVkTensor t = {.fmt = fmt, .gs = gs};
+    return G.pipe_coop[0] && coop_fmt(&t);
+}
+static int run_gemm_case(int fmt, int S, int I, int O, int gs) {
+    if (!G.pipe_gemm[0]) { printf("gemm fmt=%d: no tiled GEMM pipeline (qmatmul_gemm.spv missing?)\n", fmt); return 1; }
+    int keep_s = G.gemm_min_s, keep_so = G.gemm_min_so, keep_gs = g_ref_gs, bad = 0;
+    G.gemm_min_s = 2; G.gemm_min_so = 0; g_ref_gs = gs;
+    G.coop_off = 1;                                     /* the fp32 GEMM */
+    unsigned long long n0 = g_vk_gemm_calls;
+    bad |= run_case(fmt, S, I, O, 2);
+    if (g_vk_gemm_calls == n0) { printf("  ^ did not take the tiled GEMM\n"); bad = 1; }
+    G.coop_off = 0;
+    if (coop_takes(fmt, gs)) {                          /* the cooperative-matrix one */
+        n0 = g_vk_coop_calls;
+        bad |= run_case(fmt, S, I, O, 2);
+        if (g_vk_coop_calls == n0) { printf("  ^ did not take the cooperative-matrix GEMM\n"); bad = 1; }
+    }
+    G.gemm_min_s = keep_s; G.gemm_min_so = keep_so; g_ref_gs = keep_gs;
+    return bad;
+}
+
+/* Seconds per coli_vk_matmul call with the GEMM threshold at min_s (0 = GEMV): x upload,
+ * dispatch and y readback, what an engine pays; and, in *gpu, per resubmit of the
+ * recorded command buffer, the dispatch alone plus the submit roundtrip. */
+static double time_matmul(ColiVkTensor **t, float *y, const float *x, const void *w, const float *sc,
+                          int fmt, int S, int I, int O, int gs, int min_s, double *gpu) {
+    int keep = G.gemm_min_s, keep_so = G.gemm_min_so; G.gemm_min_s = min_s; G.gemm_min_so = 0;
+    coli_vk_matmul(t, y, x, w, sc, fmt, S, I, O, gs);            /* record + warm */
+    int it = 0; double t0 = now(), el;
+    do { coli_vk_matmul(t, y, x, w, sc, fmt, S, I, O, gs); it++; } while ((el = now() - t0) < 0.25 && it < 500);
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
+    int ig = 0; double g0 = now(), gl;
+    do { vkResetFences(G.dev, 1, &G.fence); vkQueueSubmit(G.queue, 1, &si, G.fence);
+         vk_fence_wait_gemm(G.dev, G.fence); ig++;
+    } while ((gl = now() - g0) < 0.25 && ig < 500);
+    G.gemm_min_s = keep; G.gemm_min_so = keep_so;
+    *gpu = gl / ig;
+    return el / it;
+}
+
+/* COLI_VK_TEST_GEMM_BENCH=1: GEMV against the tiled GEMM, format by format, over S on
+ * one engine-sized matrix (COLI_VK_TEST_GEMM_SHAPE=I,O; default 2560,6144, Qwen3.8's
+ * DeltaNet z projection). GFLOP/s per call and per resubmit; the S where the GEMM
+ * overtakes is what COLI_VK_GEMM_MIN_S defaults to. COLI_VK_TEST_GEMM_FMT=a,b,... and
+ * COLI_VK_TEST_GEMM_S=a,b,... restrict the formats and the S values. Runs instead of
+ * every other case. */
+static void bench_gemm(void) {
+    int I = 2560, O = 6144, fm[8] = {1, 2, 4, 5, 7, 10, 11, 12}, nf = 8;
+    const char *e = getenv("COLI_VK_TEST_GEMM_SHAPE");
+    if (e) sscanf(e, "%d,%d", &I, &O);
+    if ((e = getenv("COLI_VK_TEST_GEMM_FMT"))) {
+        nf = 0;
+        for (const char *c = e; *c && nf < 8; ) { fm[nf++] = atoi(c); while (*c && *c != ',') c++; if (*c) c++; }
+    }
+    int Ss[16] = {2, 4, 8, 16, 32, 64, 128, 256, 512}, ns = 9, Smax = 0;
+    if ((e = getenv("COLI_VK_TEST_GEMM_S"))) {         /* the S values, a,b,... */
+        ns = 0;
+        for (const char *c = e; *c && ns < 16; ) { Ss[ns++] = atoi(c); while (*c && *c != ',') c++; if (*c) c++; }
+    }
+    for (int k = 0; k < ns; k++) if (Ss[k] > Smax) Smax = Ss[k];
+    printf("GEMM bench I=%d O=%d, threshold now S>=%d and S*O>=%d; GEMM tiles", I, O, G.gemm_min_s, G.gemm_min_so);
+    for (int k = 0; k < VK_GEMM_SLOTS; k++) if (G.pipe_gemm[k]) printf(" %dx%d", G.gemm_t[k].bm, G.gemm_t[k].bn);
+    printf("; COOP tiles (subgroup %d)", G.coop_sg);
+    for (int k = 0; k < VK_COOP_SLOTS; k++) if (G.pipe_coop[k]) printf(" %dx%d", G.coop_t[k].bm, G.coop_t[k].bn);
+    printf("\n");
+    for (int f = 0; f < nf; f++) {
+        int fmt = fm[f];
+        g_ref_gs = fmt == 7 ? 32 : 64;
+        float *x, *sc; uint8_t *w;
+        case_fill(fmt, Smax, I, O, &x, &w, &sc);
+        float *y = malloc((size_t)Smax * O * sizeof(float));
+        ColiVkTensor *t = NULL;
+        if (!coli_vk_matmul(&t, y, x, w, sc, fmt, 1, I, O, g_ref_gs)) { printf("fmt=%d: upload failed\n", fmt); continue; }
+        for (int k = 0; k < ns; k++) {
+            int S = Ss[k];
+            double gv, gm, gvg, gmg, cm = 0, cmg = 0;
+            gv = time_matmul(&t, y, x, w, sc, fmt, S, I, O, g_ref_gs, 0, &gvg);
+            G.coop_off = 1;
+            gm = time_matmul(&t, y, x, w, sc, fmt, S, I, O, g_ref_gs, 2, &gmg);
+            G.coop_off = 0;
+            if (coop_takes(fmt, g_ref_gs)) cm = time_matmul(&t, y, x, w, sc, fmt, S, I, O, g_ref_gs, 2, &cmg);
+            double fl = 2.0 * S * I * O / 1e9;
+            printf("fmt=%-2d S=%-4d | GEMV %8.3f ms %7.1f GFLOP/s (gpu %8.3f) | GEMM %8.3f ms %7.1f GFLOP/s (gpu %8.3f)",
+                   fmt, S, gv * 1e3, fl / gv, gvg * 1e3, gm * 1e3, fl / gm, gmg * 1e3);
+            if (cm > 0) printf(" | COOP %8.3f ms %7.1f GFLOP/s (gpu %8.3f)", cm * 1e3, fl / cm, cmg * 1e3);
+            printf("\n");
+        }
+        coli_vk_tensor_free(t);
+        free(x); free(w); free(sc); free(y);
+    }
+    g_ref_gs = 64;
 }
 
 /* Batched throughput: record N dispatches in ONE command buffer, one submit + one
@@ -2144,6 +2575,12 @@ int main(int argc, char **argv) {
         }
         if (nb) printf("ballast: %d x 4 MB idle allocations\n", nb);
     }
+    if (getenv("COLI_VK_TEST_GEMM_BENCH") && atoi(getenv("COLI_VK_TEST_GEMM_BENCH"))) {
+        bench_gemm();
+        coli_vk_shutdown();
+        return 0;
+    }
+    G.gemm_min_s = 0;   /* every case below is the GEMV's, but for run_gemm_case's */
     bad |= run_case(1, 1, 6144, 1536, 50);   // int8 expert gate/up shape (S=1 decode)
     bad |= run_case(2, 1, 6144, 1536, 50);   // int4 expert
     bad |= run_case(1, 1, 1536, 6144, 50);   // down proj shape
@@ -2173,6 +2610,23 @@ int main(int argc, char **argv) {
     g_ref_gs = 32;  bad |= run_case(12, 2, 4096, 256, 5);
     g_ref_gs = 128; bad |= run_case(12, 2, 4096, 256, 5);
     g_ref_gs = 64;
+    /* Tiled GEMM (prefill-sized S), every format: S = 16, 64 and 512 against odd O and
+     * odd or unaligned I, so the last output, row and input tiles are all partial, the
+     * last group is a tail, and x rows come both on and off a 16-byte quad. */
+    {
+        static const int gf[8] = {1, 2, 4, 5, 7, 10, 11, 12};
+        for (int f = 0; f < 8; f++) {
+            int gs = gf[f] == 7 ? 32 : 64;
+            bad |= run_gemm_case(gf[f], 16, 1001, 193, gs);   // odd I: tail group, x off a quad
+            bad |= run_gemm_case(gf[f], 64, 1536, 97, gs);    // I % 4 == 0: x by quads
+            bad |= run_gemm_case(gf[f], 512, 520, 131, gs);   // 8-input tail group
+        }
+        bad |= run_gemm_case(1, 37, 999, 65, 0);      // odd S, a 1-output last tile
+        bad |= run_gemm_case(4, 33, 1001, 70, 8);     // the smallest grouped-int4 group
+        bad |= run_gemm_case(4, 33, 1001, 70, 24);    // a group that is no power of two
+        bad |= run_gemm_case(12, 33, 1001, 70, 12);   // fp8: the two words of a unit in two groups
+        bad |= run_gemm_case(12, 33, 1001, 70, 128);
+    }
     /* COLI_VK_TEST_MATMUL_ONLY=1: stop after the per-format matmul cases above. CI runs
      * this on Lavapipe, where the benches below say nothing and take most of the time. */
     if (getenv("COLI_VK_TEST_MATMUL_ONLY") && atoi(getenv("COLI_VK_TEST_MATMUL_ONLY"))) {

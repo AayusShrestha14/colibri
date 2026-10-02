@@ -235,7 +235,8 @@ LDFLAGS += -lvulkan
 endif
 V4_VK_OBJ = backend_vulkan_v4.o
 V4_VK_SPV = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv \
-	shaders/attention_absorb.spv shaders/rmsnorm.spv
+	shaders/attention_absorb.spv shaders/rmsnorm.spv \
+	shaders/qmatmul_gemm.spv shaders/qmatmul_coop.spv
 endif
 
 include Makefile.deepseek-v4.units
@@ -312,6 +313,11 @@ backend_vulkan_v4.o: backend_vulkan.c backend_vulkan.h $(V4_FLAGS_STAMP)
 shaders/%.spv: shaders/%.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@
+# As in the parent: an older glslc keeps the committed cooperative-matrix .spv.
+shaders/qmatmul_coop.spv: shaders/qmatmul_coop.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
 
 # Pluggable expert-store backend registry (standalone; not a deepseek_v4.c unit).
 # Linked into the binary so the engine can dispatch COLI_EXPERT_STORE backends.
