@@ -828,7 +828,10 @@ def start_server(cfg, *, background=False, open_browser=True, out=print, wait=5.
     handle.flush()
     kwargs = {"stdin": subprocess.DEVNULL, "stdout": handle, "stderr": subprocess.STDOUT, "env": env}
     if sys.platform == "win32":
-        kwargs["creationflags"] = 0x00000008 | 0x00000200 | 0x08000000  # detached, new group, no window
+        # A hidden console of its own (CREATE_NO_WINDOW), in a new process group:
+        # it outlives this window, and the engine .exe it starts inherits the
+        # hidden console instead of opening one (DETACHED_PROCESS would).
+        kwargs["creationflags"] = 0x00000200 | 0x08000000
     else:
         kwargs["start_new_session"] = True
     process = spawn_detached(cmd, **kwargs)

@@ -204,7 +204,7 @@ def tool_install(args, notify):
     kwargs = {"stdin": subprocess.DEVNULL, "stdout": handle, "stderr": subprocess.STDOUT,
               "env": dict(os.environ, PYTHONUNBUFFERED="1")}
     if sys.platform == "win32":
-        kwargs["creationflags"] = 0x00000008 | 0x00000200 | 0x08000000
+        kwargs["creationflags"] = 0x00000200 | 0x08000000   # new group, hidden console
     else:
         kwargs["start_new_session"] = True   # survives the assistant closing this server
     process = setup_flow.spawn_detached(cmd, **kwargs)
