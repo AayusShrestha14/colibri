@@ -77,6 +77,30 @@ through ROCm with `make -C c qwen36 HIP=1 HIP_ARCH=<gfx>` (for example
 measured on a Ryzen AI MAX+ 395, output bit-identical to the CPU path and 2.4x
 faster than CPU-only (#1502).
 
+## Vulkan
+
+In a `VK=1` build (`make -C c qwen36 VK=1`), `COLI_VULKAN=1` puts the dense trunk on
+the Vulkan device and the routed experts on the shared Vulkan expert tier
+(`c/vk_tier.c`, [vulkan.md](vulkan.md#the-routed-expert-tier-vk_tierc)): a cache of
+experts in device memory, filled at startup from the expert history and adapted
+while you chat, computed by the device while the CPU computes the rest of the
+layer step, every expert's output joining its row in rank order. It takes every
+container this engine reads: the shared kernel's planar int4-g64 slots, the int8
+copy of an int4 container (packed back to int4 on the device), int8 per row or gs64,
+and the mixed int4 gate/up + int8 down layout. `COLI_VK_DENSE=0` keeps the trunk on
+the CPU and gives the device the experts only; `COLI_VK_TIER=0` the other way round.
+
+This engine kept no expert history before; with the tier on it keeps route_trace.h's
+`.coli_usage` beside the container (`COLI_USAGE` moves it), saved at the end of
+every run and serve turn, and fills the tier from it at the next start. With
+`COLI_CUDA=1` as well, the CUDA tier wins.
+
+On an integrated Radeon 780M, with the int4 gs64 container at cap 64 and the trunk
+on the CPU, the tier decoded at 8.03 tok/s against the CPU's 6.02 and reached the
+first token of a 512-token prompt in 12.3 s against 35.7 s, the same text; the
+measurements and what they leave out are in
+[vulkan.md](vulkan.md#measured-on-a-radeon-780m).
+
 ## The expert kernel
 
 Routed experts run through `c/expert_ffn.h`, a header shared with the other

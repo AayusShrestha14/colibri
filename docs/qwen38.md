@@ -350,6 +350,33 @@ without them across caps, prefill batching, both trunk formats, BF16, FP8 and
 int4 experts, text and serve, with drafts all rejected, all accepted and
 alternating.
 
+## GPU: Vulkan expert tier
+
+In a `VK=1` build, `COLI_VULKAN=1` puts the trunk on the Vulkan device (as before)
+and the routed experts of the model's layers on the shared Vulkan expert tier
+(`c/vk_tier.c`, [vulkan.md](vulkan.md#the-routed-expert-tier-vk_tierc)): a cache of
+experts in device memory, filled at startup from `.coli_usage` and adapted while
+you chat, whose experts the device computes while the CPU computes the rest of the
+step. It takes every expert form this engine reads: the int4-g64 sidecar's planar
+records (as int4 groups of 64 on the device), the release's FP8 with the 128x128
+block-scale bank (fmt 12, the block scale repeated over its rows), BF16. Decode and
+prefill both use it; an MTP verify's two rows take the device's per-row route, so
+they get a decode step's bits; the MTP head's own layer stays on the CPU. Every
+expert's output joins its row in rank order, device or not.
+
+```bash
+make -C c qwen38 VK=1
+COLI_VULKAN=1 SNAP=<checkpoint> ./c/qwen38 96 8 prompt.txt    # trunk + experts
+COLI_VULKAN=1 COLI_VK_DENSE=0 ...                              # experts only, trunk on the CPU
+```
+
+On an integrated Radeon 780M the tier with the trunk on the CPU decoded at
+3.80 tok/s against the CPU's 3.51 and reached the first token of a 512-token prompt
+in 38.3 s against 43.9 s; the trunk on the device cost more there than the tier
+gained. The budget, the knobs (`COLI_VK_TIER*`), those measurements and what they
+leave out are in [vulkan.md](vulkan.md#the-routed-expert-tier-vk_tierc). With
+`COLI_CUDA=1` as well, the CUDA tier below wins.
+
 ## GPU: CUDA VRAM expert tier
 
 With `CUDA=1` the engine links the same expert tier as Qwen3.6
