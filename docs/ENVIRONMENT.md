@@ -217,11 +217,11 @@ Per-drive byte counts are reported in a `MIRROR:` stats line. Combine with `DIRE
 | `COLI_VULKAN` | off | Enable the Vulkan backend. Requires a `make VK=1` build. The GLM engine fails at startup (no silent fallback) if libvulkan or the compiled shaders are missing. The other engines (qwen36, qwen38, inkling, olmoe, deepseek_v41, deepseek_v4, mimo, qwenimage) print one line and run on the CPU. What each one puts on the device: [vulkan.md](vulkan.md#the-other-engines). |
 | `COLI_VK_DEV` | unset | Select the primary Vulkan physical-device enumeration index. Without it, the backend prefers a discrete GPU, then integrated/virtual devices. |
 | `COLI_VK_SHADERS` | auto | Path to the compiled `qmatmul.spv` **or** the directory holding the `.spv` set; the other shaders are found next to it. Unset: `shaders/` next to the binary, then CWD-relative `shaders/qmatmul.spv`. |
-| `COLI_VK_EXPERTS` | `320` | Pinned VRAM expert tier size: top-N experts by `.coli_usage` heat uploaded once at startup and served from VRAM with no RAM slot or disk read. `0` disables the tier (experts stay on the CPU path). ~19 MB VRAM per int4 expert. |
+| `COLI_VK_EXPERTS` | unset | Deprecated. The GLM engine's routed experts are on the shared expert tier (below), sized by its budget. `N`: the tier holds at most N experts (it was the size of a fixed top-N set, 320 by default); `0`: no tier, as `COLI_VK_TIER=0`. ~19 MB per int4 expert. |
 | `COLI_VK_DENSE` | `0` in this engine | Run the resident dense matmuls (attention projections, shared expert) on the GPU. The other engines read the same variable with a default of on (see the expert tier below); all of them go through `coli_vk_dense_decide()` in the backend. |
 | `COLI_VK_ATTN` | `0` | Run the S≤4 MLA absorb attention core (+ fused o-projection) on the GPU, with a persistent device-side KV mirror. |
 | `COLI_VK_QPREP` | `1` (on) | Fuse the Q-prep step (RMSNorm + rope + compress) into one GPU dispatch instead of splitting it, which cost three fences where one suffices. `0` restores the split path; `2` additionally keeps CPU reference copies of Q and comp for A/B comparison. |
-| `COLI_VK_RESERVE_GB` | `3.0` | VRAM (GB) held back from the expert tier for the lazily-allocated dense weights, KV mirror and staging buffers (measured ~1.7 GB at 4k ctx, growing with `max_t`). Only meaningful when the driver reports `VK_EXT_memory_budget`; without it the `COLI_VK_EXPERTS` count cap applies alone. |
+| `COLI_VK_RESERVE_GB` | unset | Deprecated, GLM engine. Device memory (GB) the expert tier leaves to everything else, as `COLI_VK_TIER_RESERVE_GB`, of which it is now an alias: the larger of the two applies. With `COLI_VK_ATTN=1` the tier also leaves room for the absorb core's KV mirror (`CTX` rows a layer). |
 | `COLI_VK_SPIN_US` | `300` | Microseconds to spin-poll a fence before blocking. `0` always blocks — lower latency at idle, at the cost of a core spinning. A tiled GEMM call spins through its dispatch (up to 50 ms) unless this is `0`: a blocked wait wakes up to a millisecond late, which doubled a 0.6 ms prefill GEMM on a Radeon 780M. |
 | `COLI_VK_GEMM_MIN_S` | measured | When a resident matmul (`coli_vk_matmul`, every engine) takes the tiled GEMM instead of the per-row GEMV. Unset: S ≥ 2 and S·O ≥ 4096, measured on a Radeon 780M (a narrow matrix at small S stays on the GEMV). `N`: every call with S ≥ N. `0`: the GEMV for every S. S = 1 (decode) always stays on the GEMV. See [vulkan.md](vulkan.md#prefill-the-tiled-gemms). |
 | `COLI_VK_COOP` | on where supported | The cooperative-matrix GEMM (`VK_KHR_cooperative_matrix`, 16x16x16 fp16 → fp32) for the formats whose weights decode exactly to fp16: int8, int4, int3-g64, MXFP4 and fp8, the grouped ones with a group size that is a multiple of 32. `0` keeps every format on the fp32 GEMM. |
@@ -229,9 +229,9 @@ Per-drive byte counts are reported in a `MIRROR:` stats line. Combine with `DIRE
 | `COLI_VK_GEMM_TILE` | measured | `bm,bn,bk,tm,tn[,pf]`: one tile for every width of the fp32 GEMM instead of the measured pair. Tuning only (`COLI_VK_TEST_GEMM_BENCH`). |
 | `COLI_VK_COOP_TILE` | measured | `bm,bn,wm,wn,bk`: one tile for every width of the cooperative-matrix GEMM. Tuning only. |
 
-### The routed-expert tier (`vk_tier.c`; qwen36, qwen38)
+### The routed-expert tier (`vk_tier.c`; qwen36, qwen38, colibri, glm53)
 
-With `COLI_VULKAN=1` the engines on the shared tier keep a cache of routed experts on the device that adapts while you chat, and compute the resident ones of each layer step while the CPU computes the rest. See [vulkan.md](vulkan.md#the-routed-expert-tier-vk_tierc). With the CUDA expert tier also on, CUDA wins and this tier stays off.
+With `COLI_VULKAN=1` the engines on the shared tier keep a cache of routed experts on the device that adapts while you chat, and compute the resident ones of each layer step while the CPU computes the rest. See [vulkan.md](vulkan.md#the-routed-expert-tier-vk_tierc), and for the two GLM engines (the formats, `COLI_VK_EXPERTS`, glm53's `swiglu_limit`) [vulkan.md](vulkan.md#glm-52-and-glm-53-flash-on-the-tier). With the CUDA expert tier also on, CUDA wins and this tier stays off.
 
 | Variable | Default | Effect |
 |---|---|---|
@@ -244,17 +244,17 @@ With `COLI_VULKAN=1` the engines on the shared tier keep a cache of routed exper
 | `COLI_VK_TIER_BALANCE` | on | `0`: the device takes every resident expert of a step. On, when a join keeps waiting for the device, the step's resident experts the CPU also holds in RAM go back to the CPU beyond the device's share, which moves with every join (down when the CPU waited more than a tenth of its own time, up when the device finished before 80% of it). |
 | `COLI_VK_TIER_GEMM_ROWS` | `16` | Rows from which an expert of a step takes the tiled GEMM (prefill) instead of the per-row GEMV; `0` never. Below it a row's bits do not depend on how many rows share the dispatch. |
 | `COLI_VK_TIER_QUEUE` | a second queue | `0`: the tier's batches share the main queue with the dense matmuls (they then serialize). Unset: a second queue of the main family, else a compute-only family's (RADV), else shared (Lavapipe). |
-| `COLI_VK_DENSE` | on; off on a device sharing the CPU's RAM while the tier is on | Where the dense (non-expert) matrices of qwen36, qwen38, inkling, olmoe, mimo, deepseek_v41, deepseek_v4 and qwenimage run. `0`: on the CPU (with the tier on, the device takes the routed experts only); `1`: on the device whatever the device. Unset: on the device, except on an integrated GPU or a CPU device (Lavapipe) while the engine runs the expert tier (today qwen36 and qwen38), where they stay on the CPU: there the dense matmuls cost more than the tier gains (measured on a Radeon 780M). The `[VK] <engine>: device ready, dense matrices on the ...` line says which and why. The GLM engine reads it through the same rule with its own default, off (see above). |
+| `COLI_VK_DENSE` | on; off on a device sharing the CPU's RAM while the tier is on | Where the dense (non-expert) matrices of qwen36, qwen38, inkling, olmoe, mimo, deepseek_v41, deepseek_v4 and qwenimage run. `0`: on the CPU (with the tier on, the device takes the routed experts only); `1`: on the device whatever the device. Unset: on the device, except on an integrated GPU or a CPU device (Lavapipe) while the engine runs the expert tier (today qwen36, qwen38 and glm53), where they stay on the CPU: there the dense matmuls cost more than the tier gains (measured on a Radeon 780M). The `[VK] <engine>: device ready, dense matrices on the ...` line says which and why. The GLM engine reads it through the same rule with its own default, off (see above). |
 
 ### Second Vulkan device (opt-in)
 
-A second GPU can hold the *next* heat-ranked experts after dev0's budget stops. Deliberately separate from the first device so the dev0 hot path is untouched and both groups can be in flight at once.
+GLM engine. A second GPU holds, fixed at startup, the hottest experts of the history that the expert tier on the first device does not hold (with the tier off, the hottest ones). Deliberately separate from the first device so the dev0 hot path is untouched and both groups can be in flight at once.
 
 | Variable | Default | Effect |
 |---|---|---|
 | `COLI_VK_DEV2` | unset (off) | Enable the second device tier. A number selects that physical device index; `auto` picks a distinct real GPU (a second *logical* device on the same physical GPU is accepted only when forced by index — that is the pre-hardware test mode). |
 | `COLI_VK_EXPERTS2` | `512` | Expert count cap for the dev2 tier (only read when `COLI_VK_DEV2` brought a device up). |
-| `COLI_VK_RESERVE2_GB` | `0.5` | VRAM (GB) held back on dev2, as `COLI_VK_RESERVE_GB` is for dev0. |
+| `COLI_VK_RESERVE2_GB` | `0.5` | VRAM (GB) held back on dev2, as `COLI_VK_TIER_RESERVE_GB` is for dev0's tier. |
 
 See [docs/vulkan.md](vulkan.md). On multi-core boxes also set `COLI_NO_OMP_TUNE=1` (see that doc for why).
 
@@ -388,7 +388,7 @@ See `docs/glm53-flash.md`.
 | `GLM53_VERBOSE` | unset | Print the parsed geometry, the expert budget and the per-token cache cost to stderr. |
 | `GLM53_DUMP_INDEX` | unset | Print the rows the sparse indexer selected. The first place to look when the engine diverges only at certain lengths. |
 | `COLI_MAP_EXPERTS` | `0` | Serve the routed-expert pieces as read-only views of a per-shard mapping instead of copying each miss into a slab. CPU runs only: with Metal active the slots keep owned slabs, because the batched Metal MoE cannot register a view that does not start on its mapping's base. Also read by `qwen38`. See [Weights from disk instead of RAM](#weights-from-disk-instead-of-ram). |
-| `COLI_VULKAN` | `0` | Route the resident matrices through the shared Vulkan backend. Needs a `VK=1` build and the compiled shaders (`COLI_VK_SHADERS`). Experts stay on the CPU: they arrive from disk on every use, so uploading one costs what reading it costs. |
+| `COLI_VULKAN` | `0` | Open the shared Vulkan backend. Needs a `VK=1` build and the compiled shaders (`COLI_VK_SHADERS`). The streaming container's routed experts go to the shared expert tier (`COLI_VK_TIER*`, see the Vulkan section), which keeps the hot ones on the device instead of uploading each one as it arrives; it runs only when the checkpoint's `swiglu_limit` is above 0, the only clamp the device applies as the CPU does. The resident matrices follow `COLI_VK_DENSE`: unset, on the device, except on a device sharing the CPU's RAM while the tier runs. |
 
 ## Kimi K3 engine (`kimi_k3`)
 
