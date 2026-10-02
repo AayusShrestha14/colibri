@@ -3,6 +3,7 @@
 # Vulkan), one family per call so CI can run them side by side:
 #
 #   bash tests/vulkan_engines.sh qwen | qwen-sanitize | inkling-olmoe | mimo-qwenimage | deepseek
+#   bash tests/vulkan_engines.sh kimi | kimi-mimo-sanitize
 #   bash tests/vulkan_engines.sh shader    # the qmatmul formats, the expert batch and the tier, no engine
 #
 # Needs libvulkan-dev, glslc and mesa-vulkan-drivers, plus the Python packages of
@@ -355,12 +356,18 @@ family_mimo_qwenimage() {
   make mimo qwenimage VK=1
   # mimo: Xiaomi's vendor oracle on the GPU (its engine_env is the f32 dense
   # configuration; its variants include the native FP8/BF16 one and the BF16 vision
-  # tower), once with the experts on the CPU, once all on the GPU (MXFP4, fmt 7).
+  # tower): the trunk on the device with the experts on the CPU (COLI_VK_TIER=0), the
+  # routed experts on the shared tier (MXFP4, fmt 7) with the trunk where the default
+  # puts it (the CPU on Lavapipe), and both on the device.
   $PY tools/make_mimo_tiny.py --output ./mimo_tiny --force --vision
-  COLI_VULKAN=1 $PY tests/mimo_tiny_harness.py --binary ./mimo --fixture ./mimo_tiny
-  COLI_VULKAN=1 MIMO_VK_EXPERTS=4096 $PY tests/mimo_tiny_harness.py --binary ./mimo --fixture ./mimo_tiny
+  COLI_VULKAN=1 COLI_VK_TIER=0 $PY tests/mimo_tiny_harness.py --binary ./mimo --fixture ./mimo_tiny
+  COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 $PY tests/mimo_tiny_harness.py --binary ./mimo --fixture ./mimo_tiny
+  COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 COLI_VK_DENSE=1 $PY tests/mimo_tiny_harness.py --binary ./mimo --fixture ./mimo_tiny
   # MIMO_DENSE_BITS 0 (native fp8/bf16: fmt 12, 11), 8 (fmt 1) and 32 (fmt 10):
-  # the CPU's tokens for every case of ref.json and for the picture.
+  # the CPU's tokens for every case of ref.json and for the picture, with the experts
+  # on the CPU (MIMO_VK_EXPERTS=0, the trunk on the device), on the tier with the trunk
+  # on the CPU (the tier must have served some), and on the tier with the trunk on the
+  # device (both).
   ids() { $PY -c "import json,sys;r=json.load(open('mimo_tiny/ref.json'));c=r['image'] if sys.argv[1]=='image' else r['cases'][sys.argv[1]];print(' '.join(map(str,c['prompt_ids'])))" "$1"; }
   local grid bits c x extra
   grid=$($PY -c "import json;i=json.load(open('mimo_tiny/ref.json'))['image'];print(i['grid_h'],i['grid_w'])")
@@ -368,15 +375,30 @@ family_mimo_qwenimage() {
     for c in short window long image; do
       extra=(); [ "$c" = image ] && extra=(--image mimo_tiny/patches.f32 --grid $grid)
       MIMO_DENSE_BITS=$bits COLI_TEMP=0 ./mimo mimo_tiny --ids "$(ids $c)" --ngen 6 "${extra[@]}" > mimo-cpu.txt 2>/dev/null
-      for x in 0 4096; do
-        COLI_VULKAN=1 MIMO_VK_EXPERTS=$x MIMO_DENSE_BITS=$bits COLI_TEMP=0 \
+      for x in MIMO_VK_EXPERTS=0 COLI_VK_DENSE=0 COLI_VK_DENSE=1; do
+        env COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 $x MIMO_DENSE_BITS=$bits COLI_TEMP=0 \
           ./mimo mimo_tiny --ids "$(ids $c)" --ngen 6 "${extra[@]}" > mimo-vk.txt 2> mimo-vk.err
-        cmp -s mimo-cpu.txt mimo-vk.txt || { cat mimo-vk.err; fail "mimo bits=$bits $c MIMO_VK_EXPERTS=$x differs from the CPU"; }
-        need_gpu mimo mimo-vk.err "mimo bits=$bits $c MIMO_VK_EXPERTS=$x"
+        cmp -s mimo-cpu.txt mimo-vk.txt || { cat mimo-vk.err; fail "mimo bits=$bits $c $x differs from the CPU"; }
+        [ $x = COLI_VK_DENSE=0 ] || need_gpu mimo mimo-vk.err "mimo bits=$bits $c $x"
+        if [ $x = MIMO_VK_EXPERTS=0 ]; then
+          ! grep -q '^\[VK\] tier' mimo-vk.err || { cat mimo-vk.err; fail "mimo bits=$bits $c: MIMO_VK_EXPERTS=0 started the tier"; }
+        else
+          [ "$(tier_count mimo mimo-vk.err)" -gt 0 ] || { cat mimo-vk.err; fail "mimo bits=$bits $c $x: no routed expert ran on the device"; }
+        fi
       done
     done
-    echo "OK mimo MIMO_DENSE_BITS=$bits: the CPU's tokens, text and image, experts on the CPU and on the GPU"
+    echo "OK mimo MIMO_DENSE_BITS=$bits: the CPU's tokens, text and image, experts on the CPU and on the tier, trunk on the device and on the CPU"
   done
+  # MIMO_VK_EXPERTS=N sizes the tier at N experts: at 2 it must evict as the routing
+  # moves, and still give the CPU's tokens
+  MIMO_DENSE_BITS=32 COLI_TEMP=0 ./mimo mimo_tiny --ids "$(ids long)" --ngen 6 > mimo-cpu.txt 2>/dev/null
+  COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 MIMO_VK_EXPERTS=2 MIMO_DENSE_BITS=32 COLI_TEMP=0 \
+    ./mimo mimo_tiny --ids "$(ids long)" --ngen 6 > mimo-vk.txt 2> mimo-vk.err
+  cmp -s mimo-cpu.txt mimo-vk.txt || { cat mimo-vk.err; fail "mimo MIMO_VK_EXPERTS=2 differs from the CPU"; }
+  grep -q 'budget [0-9.]* KiB = 2 experts' mimo-vk.err || { grep '\[VK\]' mimo-vk.err; fail "mimo MIMO_VK_EXPERTS=2: not a budget of two experts"; }
+  [ "$(tier_count mimo mimo-vk.err)" -gt 0 ] && [ "$(tier_evictions mimo mimo-vk.err)" -gt 0 ] || { grep '\[VK\] tier' mimo-vk.err; fail "mimo MIMO_VK_EXPERTS=2: the tier served nothing or never evicted"; }
+  grep -q ' failed 0 ' mimo-vk.err || { grep '\[VK\] tier' mimo-vk.err; fail "mimo MIMO_VK_EXPERTS=2: an upload failed"; }
+  echo "OK mimo, a budget of two experts: tokens = CPU, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' mimo-vk.err | tail -1), $(grep -a -o 'evictions [0-9]*' mimo-vk.err | tail -1)"
 
   # qwenimage: at 8, 16 and 32 bits (fmt 1, 11, 10) every oracle stage of the
   # Lavapipe run against the CPU run with the same bits and f32 activations. int8 is
@@ -466,6 +488,113 @@ PY
   echo "OK deepseek_v4: $(vk_count deepseek_v4 v4-vk.err) matmuls on the GPU"
 }
 
+# Kimi K3: the routed experts on the shared tier (MXFP4 with ue8m0 scales, fmt 7,
+# SiTU-GLU in the latent space), against Moonshot's vendor oracle and the CPU run.
+# K3_IDOT=0 everywhere: the CPU's default int8-activation expert kernel is an
+# approximation the device does not make (the oracle's engine_env sets it too).
+family_kimi() {
+  make kimi_k3 VK=1
+  $PY tools/make_kimi_k3_tiny.py --output ./kimi_k3_tiny --force
+  # Moonshot's oracle (greedy, teacher forcing at every position, determinism, the
+  # bite) with the tier on, the shared experts where the default puts them (the CPU
+  # on Lavapipe) and on the device
+  COLI_USAGE=$PWD/k3.usage USAGE_SAVE=0 COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 \
+    $PY tests/test_kimi_k3_tiny.py --binary ./kimi_k3 --fixture ./kimi_k3_tiny
+  COLI_USAGE=$PWD/k3.usage USAGE_SAVE=0 COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 COLI_VK_DENSE=1 \
+    $PY tests/test_kimi_k3_tiny.py --binary ./kimi_k3 --fixture ./kimi_k3_tiny
+  k3ids() { $PY -c "import json,sys;print(' '.join(map(str,json.load(open('kimi_k3_tiny/ref.json'))['cases'][sys.argv[1]]['prompt_ids'])))" "$1"; }
+  # k3_gate <tag> <env...>: the tokens of the CPU run, the tier served some experts,
+  # the shared experts where they were asked to be (dense_where); EVICT=1: it evicted
+  k3_gate() {
+    local tag=$1 c; shift
+    for c in short chunk long; do
+      rm -f k3.usage
+      env "$@" COLI_USAGE=$PWD/k3.usage USAGE_SAVE=0 ./kimi_k3 kimi_k3_tiny --ids "$(k3ids $c)" --ngen 8 2>/dev/null | sed 's/ *TUNE.*//' > cpu.tok
+      env "$@" COLI_USAGE=$PWD/k3.usage USAGE_SAVE=0 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 \
+        ./kimi_k3 kimi_k3_tiny --ids "$(k3ids $c)" --ngen 8 2> vk.log | sed 's/ *TUNE.*//' > vk.tok
+      { [ -s cpu.tok ] && cmp -s cpu.tok vk.tok; } || { cat cpu.tok vk.tok vk.log; fail "$tag $c: Vulkan tokens differ from the CPU"; }
+      [ "$(tier_count kimi_k3 vk.log)" -gt 0 ] || { cat vk.log; fail "$tag $c: no routed expert ran on the device"; }
+      if [ "${EVICT:-0}" = 1 ]; then
+        [ "$(tier_evictions kimi_k3 vk.log)" -gt 0 ] || { grep '\[VK\] tier' vk.log; fail "$tag $c: the budget forced no eviction"; }
+        grep -q ' failed 0 ' vk.log || { grep '\[VK\] tier' vk.log; fail "$tag $c: an upload failed"; }
+      fi
+      local where; where=$(dense_where kimi_k3 vk.log "$tag $c" "$@") || { echo "$where"; exit 1; }
+      echo "OK $tag $c: tokens = CPU, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' vk.log | tail -1), $(grep -a -o 'evictions [0-9]*' vk.log | tail -1), shared experts on the $where"
+    done
+  }
+  local O="K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 COLI_TEMP=0" b
+  k3_gate "kimi_k3 tier f32" $O
+  k3_gate "kimi_k3 tier f32, shared experts on the device" $O COLI_VK_DENSE=1
+  for b in 8 4; do   # the shared experts as int8 rows (fmt 1) and int4-g64 (fmt 4) on the device
+    k3_gate "kimi_k3 tier K3_BITS=$b, shared experts on the device" K3_BITS=$b K3_MLA_BITS=$b K3_HEAD_BITS=$b K3_IDOT=0 COLI_TEMP=0 COLI_VK_DENSE=1
+  done
+  k3_gate "kimi_k3 tier, prefill one token at a time" $O K3_CHUNK=1
+  k3_gate "kimi_k3 tier, loads not pipelined" $O K3_PIPE=0
+  EVICT=1 k3_gate "kimi_k3 tier, a budget of two experts" $O COLI_VK_TIER_GB=0.000005
+  # the old switches: K3_VK=1 opens the device as COLI_VULKAN=1 does and K3_VK_GB caps
+  # the tier; K3_VK=0 keeps it closed whatever COLI_VULKAN says
+  rm -f k3.usage
+  env $O COLI_USAGE=$PWD/k3.usage USAGE_SAVE=0 ./kimi_k3 kimi_k3_tiny --ids "$(k3ids long)" --ngen 8 2>/dev/null | sed 's/ *TUNE.*//' > cpu.tok
+  env $O COLI_USAGE=$PWD/k3.usage USAGE_SAVE=0 COLI_VK_TIER_SYNC=1 K3_VK=1 K3_VK_GB=0.000005 \
+    ./kimi_k3 kimi_k3_tiny --ids "$(k3ids long)" --ngen 8 2> vk.log | sed 's/ *TUNE.*//' > vk.tok
+  cmp -s cpu.tok vk.tok || { cat vk.log; fail "kimi_k3 K3_VK=1: tokens differ from the CPU"; }
+  grep -q 'K3_VK=1 read as COLI_VULKAN=1' vk.log && grep -q 'budget [0-9.]* KiB = 2 experts' vk.log &&
+    [ "$(tier_count kimi_k3 vk.log)" -gt 0 ] || { cat vk.log; fail "kimi_k3 K3_VK=1 K3_VK_GB: not the tier it asked for"; }
+  env $O COLI_USAGE=$PWD/k3.usage USAGE_SAVE=0 K3_VK=0 COLI_VULKAN=1 \
+    ./kimi_k3 kimi_k3_tiny --ids "$(k3ids long)" --ngen 8 2> vk.log | sed 's/ *TUNE.*//' > vk.tok
+  cmp -s cpu.tok vk.tok && ! grep -q '^\[VK\]' vk.log || { cat vk.log; fail "kimi_k3 K3_VK=0: the device opened"; }
+  echo "OK kimi_k3 K3_VK=1 / K3_VK_GB / K3_VK=0: the shared tier's switches"
+  # a warm start from the history of the run before: the tier starts full, serves
+  # every routed expert of the same prompt, and the tokens stay the CPU's
+  rm -f k3.usage
+  env $O COLI_USAGE=$PWD/k3.usage COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 ./kimi_k3 kimi_k3_tiny --ids "$(k3ids long)" --ngen 8 > /dev/null 2>&1
+  env $O COLI_USAGE=$PWD/k3.usage USAGE_SAVE=0 COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 \
+    ./kimi_k3 kimi_k3_tiny --ids "$(k3ids long)" --ngen 8 2> vk.log | sed 's/ *TUNE.*//' > vk.tok
+  cmp -s cpu.tok vk.tok || { cat vk.log; fail "kimi_k3 warm start: tokens differ from the CPU"; }
+  grep -q 'tier kimi_k3: warm start, [1-9]' vk.log || { cat vk.log; fail "kimi_k3: no warm start from the history"; }
+  echo "OK kimi_k3 warm start: tokens = CPU, $(grep -a -o 'warm start, [0-9]* experts' vk.log), $(grep -a -o 'device [0-9]* of [0-9]* routed experts' vk.log | tail -1)"
+  # COLI_VK_TIER=0: the shared experts alone on the device, as before the tier
+  env $O COLI_USAGE=$PWD/k3.usage USAGE_SAVE=0 COLI_VK_TIER=0 COLI_VULKAN=1 \
+    ./kimi_k3 kimi_k3_tiny --ids "$(k3ids long)" --ngen 8 2> vk.log | sed 's/ *TUNE.*//' > vk.tok
+  cmp -s cpu.tok vk.tok || { cat vk.log; fail "kimi_k3 COLI_VK_TIER=0: tokens differ from the CPU"; }
+  ! grep -q '^\[VK\] tier' vk.log || { cat vk.log; fail "kimi_k3 COLI_VK_TIER=0: the tier started"; }
+  need_gpu kimi_k3 vk.log "kimi_k3 COLI_VK_TIER=0"
+  echo "OK kimi_k3 COLI_VK_TIER=0: tokens = CPU, no tier, $(vk_count kimi_k3 vk.log) matmuls on the GPU"
+}
+
+# The Kimi K3 and MiMo expert tiers under ASan and UBSan, as qwen-sanitize does for
+# the qwen engines: memory safety is the gate, and each run must still put routed
+# experts on the device.
+family_kimi_mimo_sanitize() {
+  make clean >/dev/null 2>&1 || true
+  make kimi_k3 mimo VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  $PY tools/make_kimi_k3_tiny.py --output ./kimi_k3_tiny --force
+  $PY tools/make_mimo_tiny.py --output ./mimo_tiny --force --vision
+  ksan() {  # <engine> <tag> <env and argv...>
+    local eng=$1 tag=$2; shift 2
+    env ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2 \
+      COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 "$@" > san.log 2>&1 || true
+    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    [ "$(tier_count "$eng" san.log)" -gt 0 ] || { cat san.log; fail "$tag: no routed expert ran on the device"; }
+    echo "OK $tag: sanitizers clean, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' san.log | tail -1), $(grep -a -o 'evictions [0-9]*' san.log | tail -1)"
+  }
+  local O="K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 COLI_TEMP=0" K3IDS MIDS IMG GRID
+  K3IDS=$($PY -c "import json;print(' '.join(map(str,json.load(open('kimi_k3_tiny/ref.json'))['cases']['long']['prompt_ids'])))")
+  MIDS=$($PY -c "import json;print(' '.join(map(str,json.load(open('mimo_tiny/ref.json'))['cases']['long']['prompt_ids'])))")
+  IMG=$($PY -c "import json;print(' '.join(map(str,json.load(open('mimo_tiny/ref.json'))['image']['prompt_ids'])))")
+  GRID=$($PY -c "import json;i=json.load(open('mimo_tiny/ref.json'))['image'];print(i['grid_h'],i['grid_w'])")
+  rm -f k3.usage
+  ksan kimi_k3 "asan kimi_k3 tier" $O COLI_USAGE=$PWD/k3.usage ./kimi_k3 kimi_k3_tiny --ids "$K3IDS" --ngen 8
+  ksan kimi_k3 "asan kimi_k3 warm start, shared experts on the device" $O COLI_USAGE=$PWD/k3.usage COLI_VK_DENSE=1 ./kimi_k3 kimi_k3_tiny --ids "$K3IDS" --ngen 8
+  ksan kimi_k3 "asan kimi_k3 eviction, int8 shared experts" K3_BITS=8 K3_IDOT=0 COLI_USAGE=$PWD/k3e.usage USAGE_SAVE=0 COLI_VK_TIER_GB=0.000005 COLI_VK_DENSE=1 ./kimi_k3 kimi_k3_tiny --ids "$K3IDS" --ngen 8
+  ksan kimi_k3 "asan kimi_k3 prefill one token at a time, no pipeline" $O COLI_USAGE=$PWD/k3e.usage USAGE_SAVE=0 K3_CHUNK=1 K3_PIPE=0 ./kimi_k3 kimi_k3_tiny --ids "$K3IDS" --ngen 8
+  ksan mimo "asan mimo tier" MIMO_DENSE_BITS=32 COLI_TEMP=0 ./mimo mimo_tiny --ids "$MIDS" --ngen 6
+  ksan mimo "asan mimo eviction (MIMO_VK_EXPERTS=2)" MIMO_DENSE_BITS=32 COLI_TEMP=0 MIMO_VK_EXPERTS=2 ./mimo mimo_tiny --ids "$MIDS" --ngen 6
+  ksan mimo "asan mimo picture, native dense on the device" MIMO_DENSE_BITS=0 COLI_TEMP=0 COLI_VK_DENSE=1 ./mimo mimo_tiny --ids "$IMG" --ngen 6 --image mimo_tiny/patches.f32 --grid $GRID
+  ksan mimo "asan mimo prefill blocks of 3, cache 4" MIMO_DENSE_BITS=32 COLI_TEMP=0 MIMO_CHUNK=3 MIMO_CAP=4 ./mimo mimo_tiny --ids "$MIDS" --ngen 6
+  make clean >/dev/null 2>&1 || true
+}
+
 case "${1:-}" in
   shader)         shader_formats ;;
   qwen)           family_qwen ;;
@@ -473,5 +602,7 @@ case "${1:-}" in
   inkling-olmoe)  family_inkling_olmoe ;;
   mimo-qwenimage) family_mimo_qwenimage ;;
   deepseek)       family_deepseek ;;
-  *) echo "usage: $0 shader|qwen|qwen-sanitize|inkling-olmoe|mimo-qwenimage|deepseek" >&2; exit 2 ;;
+  kimi)           family_kimi ;;
+  kimi-mimo-sanitize) family_kimi_mimo_sanitize ;;
+  *) echo "usage: $0 shader|qwen|qwen-sanitize|inkling-olmoe|mimo-qwenimage|deepseek|kimi|kimi-mimo-sanitize" >&2; exit 2 ;;
 esac
