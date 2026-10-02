@@ -3066,44 +3066,52 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
     float scale = 1.f / sqrtf((float)kdim);
     int H = c->hidden;
 
-    /* Input projections have no recurrent dependency. Keep qkv ++ z for a
-     * bounded block, then consume rows in order through conv and recurrence. */
+    /* The projections have no recurrent dependency: the input ones (qkv, z, b,
+     * a) run once for a bounded block of rows, the conv and the recurrence then
+     * consume the block in order, and the out_proj runs once over the block's
+     * normed outputs. Every kernel computes each row on its own, so a block
+     * gives the bits of one call per token; what it changes is the device
+     * path, which sees one S-row call (a GEMM) instead of S one-row GEMVs.
+     * The CUDA tier projects qkv ++ z into one interleaved block (qkvz). */
     int proj_dim = conv_dim + value_dim;
-    int B = qt_dnproj_ready(layer) ? dnproj_batch_rows(S, H, proj_dim) : 1;
+    int B = dnproj_batch_rows(S, H, proj_dim);
     float *qkvz = falloc((int64_t)B * proj_dim);
-    int gpu_block = 0;
-    float *b   = falloc(vh);
-    float *a   = falloc(vh);
+    float *qkvb = falloc((int64_t)B * conv_dim);
+    float *zb   = falloc((int64_t)B * value_dim);
+    float *bb   = falloc((int64_t)B * vh);
+    float *ab   = falloc((int64_t)B * vh);
+    float *outrb = falloc((int64_t)B * value_dim);
     float *beta= falloc(vh);
     float *gg  = falloc(vh);
     float *conv_out = falloc(conv_dim);
     float *q = falloc(vh * kdim);
     float *k = falloc(vh * kdim);
     float *outv = falloc(value_dim);
-    float *outr = falloc(value_dim);
     float *kv = falloc(vdim);
     float *delta = falloc(vdim);
 
     float *rec = m->DN_rec[layer];      /* [vh*kdim*vdim] */
     float *ring = m->DN_conv[layer];    /* [conv_dim*(convk-1)] */
+    FILE *dbg = layer == 0 && getenv("DN_DBG") ? fopen(getenv("DN_DBG"), "wb") : NULL;
 
-    for (int s = 0; s < S; s++) {
-        const float *xs = x + (int64_t)s * H;
+    for (int base = 0; base < S; base += B) {
+        int rows = S - base < B ? S - base : B;
+        const float *xb = x + (int64_t)base * H;
         extern double g_dn_sub[4];
         double _d0 = tm_now();
-        if (s % B == 0) {
-            int rows = S - s < B ? S - s : B;
-            gpu_block = qt_dnproj_matmul_batch(layer, qkvz, xs, rows, H, proj_dim);
-        }
-        float *qkv = qkvz + (int64_t)(s % B) * proj_dim;
-        float *z = qkv + conv_dim;
+        int gpu_block = qt_dnproj_ready(layer) && qt_dnproj_matmul_batch(layer, qkvz, xb, rows, H, proj_dim);
         if (!gpu_block) {
-            matmul_d(qkv, xs, &l->dn_qkv, 1, H, conv_dim);
-            matmul_d(z,   xs, &l->dn_z,   1, H, value_dim);
+            matmul_d(qkvb, xb, &l->dn_qkv, rows, H, conv_dim);
+            matmul_d(zb,   xb, &l->dn_z,   rows, H, value_dim);
         }
-        matmul(b,   xs, l->dn_b,   1, H, vh);
-        matmul(a,   xs, l->dn_a,   1, H, vh);
+        matmul(bb, xb, l->dn_b, rows, H, vh);
+        matmul(ab, xb, l->dn_a, rows, H, vh);
         if (tm_on() && S==1){ double t=tm_now(); g_dn_sub[0]+=t-_d0; _d0=t; }
+        for (int r = 0; r < rows; r++) {
+        const float *qkv = gpu_block ? qkvz + (int64_t)r * proj_dim : qkvb + (int64_t)r * conv_dim;
+        const float *z = gpu_block ? qkv + conv_dim : zb + (int64_t)r * value_dim;
+        const float *b = bb + (int64_t)r * vh, *a = ab + (int64_t)r * vh;
+        float *outr = outrb + (int64_t)r * value_dim;
         for (int h = 0; h < vh; h++) {
             beta[h] = 1.f / (1.f + expf(-b[h]));
             gg[h] = -expf(l->dn_alog[h]) * softplus_f(a[h] + l->dn_dtbias[h]);
@@ -3182,7 +3190,8 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
             }
         }
         if (tm_on() && S==1){ double t=tm_now(); g_dn_sub[2]+=t-_d0; _d0=t; }
-        /* per-head Gated RMSNorm (plain weight, r=1/sqrt(mean+eps)) then silu(z) gate, then out_proj.
+        /* per-head Gated RMSNorm (plain weight, r=1/sqrt(mean+eps)) then silu(z) gate; the
+         * out_proj runs over the block below.
          * HF Qwen3_5MoeRMSNormGated: out = (o*r)*weight * silu(z) = (o*r)*weight * z/(1+e^-z).
          * NB: it is silu (z in numerator), NOT sigmoid. */
         #pragma omp parallel for schedule(static)
@@ -3197,29 +3206,33 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
                 outr[(int64_t)h * vdim + d] = val * zr[d] / (1.f + expf(-zr[d]));
             }
         }
-        if (!qtd(l->qth_dnout, out + (int64_t)s * H, outr, value_dim, H))
-            matmul_d(out + (int64_t)s * H, outr, &l->dn_out, 1, value_dim, H);
+        if (dbg && base + r == 0) {   /* DN_DBG: the first token of layer 0 */
+            fwrite(conv_out, sizeof(float), conv_dim, dbg);
+            fwrite(q, sizeof(float), (int64_t)vh * kdim, dbg);
+            fwrite(outv, sizeof(float), value_dim, dbg);
+            fwrite(z, sizeof(float), value_dim, dbg);
+            fwrite(outr, sizeof(float), value_dim, dbg);
+        }
+        }
+        float *ob = out + (int64_t)base * H;
+        if (rows == 1 ? !qtd(l->qth_dnout, ob, outrb, value_dim, H)
+                      : !qtd_batch(l->qth_dnout, ob, outrb, rows, value_dim, H))
+            matmul_d(ob, outrb, &l->dn_out, rows, value_dim, H);
         if (tm_on() && S==1){ g_dn_sub[3]+=tm_now()-_d0; }
-        if (layer == 0 && s == 0 && getenv("DN_DBG")) {
-            FILE *dbg = fopen(getenv("DN_DBG"), "wb");
-            if (dbg) {
-                fwrite(conv_out, sizeof(float), conv_dim, dbg);
-                fwrite(q, sizeof(float), (int64_t)vh * kdim, dbg);
-                fwrite(outv, sizeof(float), value_dim, dbg);
-                fwrite(z, sizeof(float), value_dim, dbg);
-                fwrite(outr, sizeof(float), value_dim, dbg);
-                fwrite(out + (int64_t)s * H, sizeof(float), H, dbg);
-                fwrite(b, sizeof(float), vh, dbg);
-                fwrite(a, sizeof(float), vh, dbg);
-                fwrite(beta, sizeof(float), vh, dbg);
-                fwrite(gg, sizeof(float), vh, dbg);
-                fclose(dbg);
-            }
+        if (dbg && base == 0) {       /* ... its out_proj row and gates, then done */
+            fwrite(ob, sizeof(float), H, dbg);
+            fwrite(bb, sizeof(float), vh, dbg);
+            fwrite(ab, sizeof(float), vh, dbg);
+            for (int h = 0; h < vh; h++) beta[h] = 1.f / (1.f + expf(-bb[h]));
+            fwrite(beta, sizeof(float), vh, dbg);
+            for (int h = 0; h < vh; h++) gg[h] = -expf(l->dn_alog[h]) * softplus_f(ab[h] + l->dn_dtbias[h]);
+            fwrite(gg, sizeof(float), vh, dbg);
+            fclose(dbg); dbg = NULL;
         }
     }
-    free(qkvz);   /* qkv and z are regions of this one allocation */
-    free(b); free(a); free(beta); free(gg);
-    free(conv_out); free(q); free(k); free(outv); free(outr); free(kv); free(delta);
+    free(qkvz); free(qkvb); free(zb); free(bb); free(ab); free(outrb);
+    free(beta); free(gg);
+    free(conv_out); free(q); free(k); free(outv); free(kv); free(delta);
 }
 
 /* The rest of the dense trunk, offered to the placer by name and layer with
