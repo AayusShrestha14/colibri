@@ -524,8 +524,8 @@ altre nove famiglie di modelli linguistici, e un motore genera immagini. Ognuna 
 >
 > **Vulkan opzionale** significa una build `VK=1`. Avviato con `COLI_VULKAN=1`, il
 > motore mette le sue matrici residenti su qualsiasi GPU con un driver Vulkan 1.2
-> (GLM-5.2 ha lì un percorso di decode completo, Kimi K3 un suo livello di expert,
-> `K3_VK`), e la CI verifica quei motori contro i token della CPU su un driver
+> (GLM-5.2 ha lì un percorso di decode completo), e la CI verifica quei motori
+> contro i token della CPU su un driver
 > software ([vulkan.md](docs/vulkan.md#the-other-engines)). Corretto non vuol dire
 > ancora più veloce. Sulla prima GPU reale misurata per questi motori, una Radeon
 > 780M integrata (Ryzen 7 PRO 8700GE, stessi binari, page cache fredda), oggi è più
@@ -582,8 +582,9 @@ possono attivare i checkpoint dello stato ricorrente (`COLI_K3_CKPT=N` slot in R
 o parcheggiati su disco con `COLI_K3_CKPT_DIR`): un prompt modificato o di
 follow-up ripristina il checkpoint più profondo ancora disponibile e rifà il
 prefill solo della coda, invece di ripercorrere l'intera conversazione attraverso i
-layer SSM. Sugli host Vulkan `K3_VK_UP=auto` dimensiona il caricamento del livello
-degli expert in base alla banda misurata. I percorsi KDA e MLA del motore sono
+layer SSM. Sugli host Vulkan (`COLI_VULKAN=1`) i suoi expert instradati entrano nel
+livello di expert condiviso, riempito dalla storia degli expert e aggiornato man mano
+che il routing cambia. I percorsi KDA e MLA del motore sono
 validati token-esatti in CI contro l'implementazione del vendor.
 
 Inkling distribuisce expert int4 ma **pesi densi bf16** (49,4 GB residenti); su un

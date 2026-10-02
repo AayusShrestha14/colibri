@@ -11,13 +11,19 @@
  *            go to the device;
  *   partial  a step with more assignments than max_rows: the device takes
  *            max_rows of them, the CPU the rest, the sum is still right;
- *   books    device + CPU = routed, resident <= budget, no failed upload.
+ *   sync     COLI_VK_TIER_SYNC=1 and a budget of two experts: a promotion that
+ *            displaces a resident while a batch is in flight finds its room at
+ *            the join (no failed upload, the budget holds);
+ *   books    device + CPU = routed, resident <= budget, no failed upload;
+ *   v4       DeepSeek V4's activation (route weight on the device, its bf16 and E4M3
+ *            roundings): device rows against the engine's CPU arithmetic.
  *
  *   make tests/test_vk_tier VK=1 && VK_ICD_FILENAMES=.../lvp_icd.json ./tests/test_vk_tier */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <unistd.h>
 #include "../backend_vulkan.h"
 #include "../vk_tier.h"
 
@@ -326,6 +332,175 @@ static void partial(void) {
     vkt_shutdown(); model_free();
 }
 
+/* vkt_report's evictions and failed uploads, read back from its stderr line */
+static void report_counts(unsigned long long *evictions, unsigned long long *failed) {
+    *evictions = *failed = ~0ull;
+    FILE *t = tmpfile();
+    if (!t) return;
+    fflush(stderr);
+    int saved = dup(2);
+    if (saved < 0) { fclose(t); return; }
+    dup2(fileno(t), 2);
+    vkt_report("test", 0, 0);
+    fflush(stderr);
+    dup2(saved, 2); close(saved);
+    rewind(t);
+    char line[4096];
+    while (fgets(line, sizeof line, t)) {
+        fputs(line, stderr);
+        const char *e = strstr(line, "evictions "), *f = strstr(line, "failed ");
+        if (e) *evictions = strtoull(e + 10, NULL, 10);
+        if (f) *failed = strtoull(f + 7, NULL, 10);
+    }
+    fclose(t);
+}
+
+/* COLI_VK_TIER_SYNC=1 and a budget of two experts. Phase A makes experts 0 and 1 of
+ * layer 0 resident; in phase B every step routes 0 (resident: the step's batch is in
+ * flight) with 5 and 6, which the CPU computes and notes, so the promotion of 5 that
+ * displaces the cold 1 is decided while a batch runs and 1 is freed only at the
+ * join. The uploader must wait for that free: it used to try at once, meet the full
+ * pool and give up (sync mode does not retry), the upload counted as failed and the
+ * budget shrank to the one expert left, so 5 never became resident. */
+static void sync_evict(void) {
+    VktFmt f = {VKT_SRC_I8_ROW, 0};
+    model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    set_budget(2, f, f);
+    setenv("COLI_VK_TIER_RATE", "64", 1);
+    setenv("COLI_VK_TIER_SYNC", "1", 1);
+    VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+    int on = vkt_init(&vc, NULL);
+    unsetenv("COLI_VK_TIER_SYNC");
+    CHECK(on, "sync: the tier did not start");
+    if (!on) { model_free(); return; }
+    Books a = {0, 0}, b = {0, 0}; double worst = 0;
+    int idx_a[K] = {0, 1, 2}, idx_b[K] = {0, 5, 6}; float w[K] = {0.5f, 0.3f, 0.2f};
+    for (int t = 0; t < 12; t++) { vkt_begin_forward(); double r = step(0, 1, idx_a, w, &a); if (r > worst) worst = r; }
+    int res_a = vkt_resident(0, 0) + vkt_resident(0, 1);
+    for (int t = 0; t < 40; t++) { vkt_begin_forward(); double r = step(0, 1, idx_b, w, &b); if (r > worst) worst = r; }
+    int res = 0; for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) res += vkt_resident(l, e);
+    unsigned long long ev, failed;
+    report_counts(&ev, &failed);
+    printf("  sync: phase A resident %d of 2; phase B device %llu of %llu, resident 0 %d, 1 %d, 5 %d, all %d (budget 2), evictions %llu, failed %llu\n",
+           res_a, b.dev, b.routed, vkt_resident(0, 0), vkt_resident(0, 1), vkt_resident(0, 5), res, ev, failed);
+    CHECK(res_a == 2, "sync: phase A made %d of experts 0 and 1 resident", res_a);
+    CHECK(ev >= 1 && failed == 0, "sync: %llu evictions, %llu failed uploads (a promotion gave up on its victim's room)", ev, failed);
+    CHECK(vkt_resident(0, 5) && !vkt_resident(0, 1) && res == 2,
+          "sync: expert 5 did not displace expert 1 (resident 1 %d, 5 %d, all %d of a budget of 2)", vkt_resident(0, 1), vkt_resident(0, 5), res);
+    CHECK(worst < 2e-3, "sync: relative error %.3g", worst);
+    vkt_shutdown(); model_free();
+}
+
+/* DeepSeek V4's activation (VKT_ACT_SWIGLU_V4) through the tier: MXFP4 ue8m0 experts,
+ * x rounded to E4M3 per 128 here as the engine rounds it, the route weight applied on
+ * the device (vkt_issue_w), each device row rounded to bf16 and added with no weight
+ * of its own. Every row against the engine's CPU arithmetic written out here (bf16
+ * gate and up, the clamped SwiGLU, weight, bf16, E4M3 per 128, down, bf16): the two
+ * differ only where their summation orders put a value on the other side of one of
+ * those roundings, so most rows come back bit-identical and the rest close. */
+static float bf16r(float v) {
+    uint32_t b; memcpy(&b, &v, 4);
+    if ((b & 0x7f800000u) != 0x7f800000u) b += 0x7fffu + ((b >> 16) & 1u);
+    b &= 0xffff0000u; memcpy(&v, &b, 4);
+    return v;
+}
+static float e4m3r(float value) {
+    int neg = signbit(value) != 0;
+    float a = fabsf(value), r;
+    if (!a) return value;
+    if (a >= 448.0f) r = 448.0f;
+    else if (a < 0.015625f) {
+        float sc = a * 512.0f; unsigned q = (unsigned)sc; float fr = sc - (float)q;
+        if (fr > 0.5f || (fr == 0.5f && (q & 1))) q++;
+        r = ldexpf((float)q, -9);
+    } else {
+        int e; float m = frexpf(a, &e);                     /* a = m 2^e, m in [0.5, 1) */
+        float q = nearbyintf(m * 16.0f);                     /* 1.mmm: 4 bits, ties to even */
+        r = ldexpf(q, e - 4);
+    }
+    return neg ? -r : r;
+}
+static void qdq128(float *v, int n) {
+    for (int b = 0; b < n; b += 128) {
+        int c = n - b < 128 ? n - b : 128;
+        float mx = 0;
+        for (int i = 0; i < c; i++) mx = fmaxf(mx, fabsf(v[b + i]));
+        mx = fmaxf(mx, 1e-4f);
+        int ex; float fr = frexpf(mx / 448.0f, &ex);
+        float sc = ldexpf(1.0f, fr == 0.5f ? ex - 1 : ex);
+        for (int i = 0; i < c; i++) v[b + i] = e4m3r(fmaxf(-448.0f, fminf(448.0f, v[b + i] / sc))) * sc;
+    }
+}
+static void expert_v4(const Ex *e, const float *xq, float w, float limit, float *y) {
+    float h[F];
+    for (int o = 0; o < F; o++) {
+        double a = 0, b = 0;
+        for (int i = 0; i < H; i++) { a += (double)e->g.w[(size_t)o * H + i] * xq[i]; b += (double)e->u.w[(size_t)o * H + i] * xq[i]; }
+        float g = bf16r((float)a), u = bf16r((float)b);
+        if (limit > 0) { g = fminf(g, limit); u = fmaxf(-limit, fminf(u, limit)); }
+        float sg = g >= 0 ? 1.0f / (1.0f + expf(-g)) : expf(g) / (1.0f + expf(g));
+        h[o] = bf16r(g * sg * u * w);
+    }
+    qdq128(h, F);
+    for (int o = 0; o < H; o++) { double a = 0; for (int i = 0; i < F; i++) a += (double)e->d.w[(size_t)o * F + i] * h[i]; y[o] = bf16r((float)a); }
+}
+static void v4_act(void) {
+    VktFmt f = {VKT_SRC_MXFP4_E8M0, 32};
+    model_make(f, f);
+    const float limit = 10.0f;
+    set_budget(L * E, f, f);
+    setenv("COLI_VK_TIER_RATE", "64", 1);
+    VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU_V4, limit);
+    int on = vkt_init(&vc, NULL);
+    CHECK(on, "v4: the tier did not start");
+    if (!on) { model_free(); return; }
+    unsigned long long dev = 0, rows_same = 0, routed = 0; double worst = 0, worst_sum = 0;
+    static const int Ss[] = {1, 3, 20, 1, 2, 24};
+    for (int t = 0; t < 6; t++)
+        for (int l = 0; l < L; l++) {
+            int S = Ss[t], idx[24 * K]; float w[24 * K];
+            route(S, 0, E, idx, w);
+            float *x = malloc(sizeof(float) * S * H), *xq = malloc(sizeof(float) * S * H);
+            float *cpu = calloc((size_t)S * K * H, sizeof(float)), *y = malloc(sizeof(float) * H);
+            float *out = calloc((size_t)S * H, sizeof(float)), *ref = calloc((size_t)S * H, sizeof(float));
+            uint8_t taken[24 * K]; const float *rows[24 * K];
+            for (int i = 0; i < S * H; i++) x[i] = frnd() * 4.0f;
+            memcpy(xq, x, sizeof(float) * S * H);
+            for (int s = 0; s < S; s++) qdq128(xq + (size_t)s * H, H);   /* the engine's rounding of x */
+            int n = vkt_issue_w(l, xq, S, K, idx, w, taken);
+            for (int i = 0; i < S * K; i++) {
+                if (taken[i]) continue;
+                expert_v4(&ex[l][idx[i]], xq + (size_t)(i / K) * H, w[i], limit, cpu + (size_t)i * H);
+                VktExpertSrc src = src_of(&ex[l][idx[i]]); vkt_note(l, idx[i], &src);
+            }
+            int joined = n ? vkt_join(rows) : 1;
+            CHECK(joined, "v4: join failed");
+            for (int s = 0; s < S; s++)
+                for (int k = 0; k < K; k++) {
+                    int i = s * K + k;
+                    expert_v4(&ex[l][idx[i]], xq + (size_t)s * H, w[i], limit, y);
+                    for (int d = 0; d < H; d++) ref[(size_t)s * H + d] += y[d];
+                    if (taken[i] && joined) {
+                        float dr[H];
+                        for (int d = 0; d < H; d++) dr[d] = bf16r(rows[i][d]);
+                        double r = rel(dr, y, H); if (r > worst) worst = r;
+                        rows_same += !memcmp(dr, y, sizeof dr);
+                        for (int d = 0; d < H; d++) out[(size_t)s * H + d] += dr[d];
+                        dev++;
+                    } else for (int d = 0; d < H; d++) out[(size_t)s * H + d] += cpu[(size_t)i * H + d];
+                    routed++;
+                }
+            double r = rel(out, ref, S * H); if (r > worst_sum) worst_sum = r;
+            free(x); free(xq); free(cpu); free(y); free(out); free(ref);
+        }
+    printf("  %-34s device %3llu of %3llu assignments, %llu rows bit-identical to the CPU's arithmetic, worst row %.2e, worst sum %.2e\n",
+           "MXFP4 ue8m0, DeepSeek V4 roundings", dev, routed, rows_same, worst, worst_sum);
+    CHECK(dev > 0, "v4: nothing ran on the device");
+    CHECK(rows_same * 2 > dev, "v4: only %llu of %llu device rows equal the CPU's arithmetic", rows_same, dev);
+    CHECK(worst < 2e-2 && worst_sum < 2e-2, "v4: device rows off the reference (row %.3g, sum %.3g)", worst, worst_sum);
+    vkt_shutdown(); model_free();
+}
+
 int main(int argc, char **argv) {
     char buf[1024];
     const char *spv = argc > 1 ? argv[1] : coli_vk_shader_path(buf, sizeof buf);
@@ -335,6 +510,8 @@ int main(int argc, char **argv) {
     printf("warm:\n"); warm();
     printf("adapt:\n"); adapt();
     printf("partial:\n"); partial();
+    printf("sync:\n"); sync_evict();
+    printf("DeepSeek V4:\n"); v4_act();
     ColiVkPoolStats ps; coli_vk_pool_stats(1, &ps);
     CHECK(ps.live == 0, "%d tier ranges still live after every shutdown", ps.live);
     printf(fails ? "FAIL (%d)\n" : "PASS\n", fails);

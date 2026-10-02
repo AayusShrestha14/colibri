@@ -439,8 +439,8 @@ GLM-5.2 是参考模型，但同样的流式方法还能运行另外九个语言
 > 流式读取的：慢盘上每秒不到一个 token，快盘在缓存预热后每秒几个 token。
 >
 > **可选 Vulkan** 指的是 `VK=1` 构建。以 `COLI_VULKAN=1` 运行时，引擎会把常驻矩阵放到任何
-> 具有 Vulkan 1.2 驱动的 GPU 上（GLM-5.2 在那里有完整的解码路径，Kimi K3 有自己的专家层级
-> `K3_VK`），CI 在软件驱动上将这些引擎与 CPU 的 token 对照检查
+> 具有 Vulkan 1.2 驱动的 GPU 上（GLM-5.2 在那里有完整的解码路径），CI 在软件驱动上将这些
+> 引擎与 CPU 的 token 对照检查
 > （[vulkan.md](docs/vulkan.md#the-other-engines)）。正确还不等于更快。在这些引擎首次实测的
 > 真实 GPU，即集成显卡 Radeon 780M（Ryzen 7 PRO 8700GE，同样的二进制文件，冷页缓存）上，
 > 目前比 CPU 慢：Qwen3.6-35B-A3B 解码 3.06 tok/s，CPU 为 5.97，输出完全相同；使用 int4 专家的
@@ -484,8 +484,9 @@ cap 170 时从 4.15 到 4.74）。在那台机器上收益不大，因为从磁�
 Kimi K3 无需转换：其 QAT 训练的 MXFP4 专家直接从原始 Hugging Face shard 流式读取，bf16 稠密部分
 在加载时量化。长时间的 agent 会话可以选用循环状态检查点（RAM 中 `COLI_K3_CKPT=N` 个 slot，或用
 `COLI_K3_CKPT_DIR` 存到磁盘）：编辑过的或后续的 prompt 会恢复仍然保留的最深检查点，只对尾部重新
-prefill，而不是让整个对话重新经过 SSM 层回放。在 Vulkan 主机上，`K3_VK_UP=auto` 根据实测带宽
-决定专家层级的上传量。引擎的 KDA 与 MLA 路径在 CI 中与厂商实现逐 token 对照验证。
+prefill，而不是让整个对话重新经过 SSM 层回放。在 Vulkan 主机上（`COLI_VULKAN=1`），路由专家进入
+共享的专家层级：按专家历史预先填充，并随路由变化逐出。引擎的 KDA 与 MLA 路径在 CI 中与厂商实现逐
+token 对照验证。
 
 Inkling 提供 int4 专家，但稠密权重为 **bf16**（常驻 49.4 GB）；对于放不下这些权重的主机，
 [inkling.md](docs/inkling.md) 提供一个单次处理工具，把稠密部分降到 15.3 GB，让 975B 能在

@@ -61,9 +61,11 @@
 #ifdef COLI_VULKAN
 /* Vulkan (opt-in, VK=1 build + COLI_VULKAN=1): the resident f32 matrices --
  * attention q/k/v/o, the router and lm_head -- through the shader's fmt 10, the
- * same f32 weights times f32 activations the CPU computes, uploaded on first use.
- * Routed experts, which arrive from disk, and the embedding lookup stay on the CPU. */
+ * same f32 weights times f32 activations the CPU computes, uploaded on first use;
+ * the routed experts through the shared expert tier (vk_tier.h, moe_vk_run), their
+ * int8 rows as the slots hold them (fmt 1). The embedding lookup stays on the CPU. */
 #include "backend_vulkan.h"
+#include "vk_tier.h"
 static int g_vk_ready = 0;
 #endif
 
@@ -711,17 +713,25 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     }
 }
 
+#ifdef COLI_VULKAN
+static void olmoe_vk_tier_start(Model *m);
+#endif
 static void model_init(Model *m, const char *snap, int cap, int bits) {
     model_init_range(m, snap, cap, bits, 0, 0, 1, 1);
 #ifdef COLI_VULKAN
     /* After the weights, for the standalone engine only (Segment ranges stay on
      * the CPU). The host copies stay: they are the fallback, so on a GPU that
-     * shares RAM with the CPU the dense set is held twice. */
-    if (!g_vk_ready) g_vk_ready = coli_vk_init_env("olmoe");
+     * shares RAM with the CPU the dense set is held twice. The device opens saying
+     * the expert tier will be tried (vk_tier.h step 0): on a device sharing the
+     * CPU's RAM the dense matrices then stay on the CPU unless COLI_VK_DENSE=1. */
+    if (!g_vk_ready) g_vk_ready = coli_vk_init_env_tier("olmoe", vkt_wanted() && m->c.n_experts > 0);
+    if (g_vk_ready) olmoe_vk_tier_start(m);   /* after the history: COLI_USAGE, read above */
+    if (g_vk_ready && !vkt_ready() && !coli_vk_dense()) coli_vk_dense_decide("olmoe", 0, 1);   /* no tier after all */
     if (g_vk_ready && coli_vk_dense())
         fprintf(stderr, "[VK] olmoe: %d resident f32 matrices (attention q/k/v/o, router, lm_head) "
-                "go to the GPU on first use; routed experts and the embedding lookup stay on the CPU\n",
-                5 * m->c.n_layers + 1);
+                "go to the GPU on first use; %s\n", 5 * m->c.n_layers + 1,
+                vkt_ready() ? "routed experts go to the expert tier, the embedding lookup stays on the CPU"
+                            : "routed experts and the embedding lookup stay on the CPU");
 #endif
 }
 
@@ -782,6 +792,61 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
     st_read_f32(&m->S, qsnm, s->gs, 0);  /* scales are F32; use typed reader for dtype safety */
     __atomic_fetch_add(&m->disk_ns, (uint64_t)((now_s() - started) * 1e9), __ATOMIC_RELAXED);
 }
+
+#ifdef COLI_VULKAN
+#define OLMOE_VK_ROWS 64   /* rows per expert-tier step (moe_vk_run) */
+/* One expert as a slot holds it: int8 gate, up, down, one f32 scale per row. */
+static VktExpertSrc olmoe_vk_src(const Slot *e) {
+    return (VktExpertSrc){e->g, e->u, e->d, e->gs, e->us, e->ds};
+}
+/* Is the expert in this layer's RAM cache now (the tier's balance asks)? */
+static int olmoe_vk_in_ram(void *ctx, int layer, int e) {
+    pthread_mutex_lock(&g_pilot_mx);
+    int r = slot_indexed((Model *)ctx, layer, e) != NULL;
+    pthread_mutex_unlock(&g_pilot_mx);
+    return r;
+}
+/* COLI_VULKAN=1: describe the experts to the tier (int8 rows with an f32 scale per
+ * row, gate, up and down as the merged container holds them: fmt 1), after the
+ * weights and the history (COLI_USAGE, read by model_init_range), and warm it from
+ * that history: the hottest experts first, read from disk in parallel. */
+static void olmoe_vk_tier_start(Model *m) {
+    Cfg *c = &m->c;
+    if (!vkt_wanted() || c->n_experts < 1) return;
+    int64_t D = c->hidden, I = c->inter;
+    size_t slotb = (size_t)(3 * I * D + (2 * I + D) * 4);
+    size_t dense = coli_vk_dense() ? (size_t)c->n_layers * (size_t)(4 * D * D + (int64_t)c->n_experts * D) * 4 +
+                                     (size_t)c->vocab * (size_t)D * 4 : 0;
+    VktConfig vc = {.engine = "olmoe", .layers = c->n_layers, .experts = c->n_experts,
+                    .hidden = c->hidden, .inter = c->inter, .topk = c->topk,
+                    .gate_up = {VKT_SRC_I8_ROW, 0}, .down = {VKT_SRC_I8_ROW, 0},
+                    .act = VKT_ACT_SWIGLU, .max_rows = OLMOE_VK_ROWS * c->topk,
+                    .ram_reserve = slotb * (size_t)m->cache[0].cap * (size_t)c->n_layers,
+                    .dense_bytes = dense, .in_ram = olmoe_vk_in_ram, .ram_ctx = m};
+    atexit(coli_vk_shutdown);   /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
+    if (!vkt_init(&vc, m->freq)) return;
+    atexit(vkt_shutdown);
+    int all = c->n_layers * c->n_experts;
+    int *pl = malloc((size_t)all * sizeof(int)), *pe = malloc((size_t)all * sizeof(int));
+    const char *warm = getenv("COLI_VK_TIER_WARM");   /* 0: no warm start, the tier fills as experts pass by */
+    int n = pl && pe && !(warm && *warm == '0') ? vkt_plan(pl, pe, all) : 0;
+    if (n > 0) {
+        double t0 = now_s();
+        #pragma omp parallel for schedule(dynamic, 4)
+        for (int i = 0; i < n; i++) {
+            Slot tmp; memset(&tmp, 0, sizeof tmp);
+            slot_ensure_allocated(m, &tmp);
+            load_expert_merged(m, pl[i], pe[i], &tmp);
+            VktExpertSrc src = olmoe_vk_src(&tmp);
+            vkt_put(pl[i], pe[i], &src);
+            free(tmp.g); free(tmp.gs);   /* the two blocks slot_ensure_allocated made */
+        }
+        vkt_put_done();
+        fprintf(stderr, "[VK] tier olmoe: warm start, %d experts from the history in %.1fs\n", n, now_s() - t0);
+    }
+    free(pl); free(pe);
+}
+#endif
 
 /* ---------- cache expert: ritorna i pesi quantizzati (q+scale) da cache o disco ---------- */
 /* One byte per expert: routed in this turn or not. The dashboard's Brain tab
@@ -1007,84 +1072,169 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     free(q); free(k); free(vv); free(ctx);
 }
 
+/* One row's routing: the momentum the PILOT prefetcher reads, softmax, the top-K
+ * ids and gates (idx[K], val[K]), the optional renormalisation, the counts and
+ * the trace. pr is the row's router logits, turned into probabilities in place. */
+static void moe_route_row(Model *m, int layer, int s, float *pr, int *idx, float *val) {
+    Cfg *c = &m->c; int E = c->n_experts, K = c->topk;
+    if (m->momentum_logits && m->pilot_smooth > 0.f) {
+        float *ema = m->momentum_logits + (int64_t)layer * E;
+        int is_zero = 1;
+        for (int e = 0; e < E; e++) { if (ema[e] != 0.f) { is_zero = 0; break; } }
+        if (is_zero) {
+            for (int e = 0; e < E; e++) ema[e] = pr[e];
+        } else {
+            for (int e = 0; e < E; e++) {
+                ema[e] = (1.f - m->pilot_smooth) * pr[e] + m->pilot_smooth * ema[e];
+            }
+        }
+    }
+
+    softmax_row(pr, E);
+    /* top-K indici (selezione parziale) */
+    for (int kk = 0; kk < K; kk++) {
+        int best = -1; float bv = -1e30f;
+        for (int e = 0; e < E; e++) {
+            int taken = 0; for (int j = 0; j < kk; j++) if (idx[j]==e){taken=1;break;}
+            if (!taken && pr[e] > bv) { bv = pr[e]; best = e; }
+        }
+        /* SEC: all-NaN probabilities leave best at -1, which reaches
+         * expert_get() and then last_access[layer*E - 1] -- a heap write at
+         * a negative index. See rt_router_pick in route_trace.h. */
+        best = rt_router_pick(best, kk, E, layer);
+        idx[kk] = best; val[kk] = pr[best];
+    }
+    if (c->norm_topk) { float sm=0; for(int kk=0;kk<K;kk++) sm+=val[kk]; for(int kk=0;kk<K;kk++) val[kk]/=sm; }
+    /* IMPROVEMENT 2 activation heatmap AND the ROUTE_TRACE stream, in one
+     * call. The counters were the only thing this engine recorded, and it
+     * recorded them HERE, before pinning activates — rt_count keeps that
+     * placement exactly. The trace is the half olmoe never had: it emits a
+     * line per (moe call, position, layer), so tools/route_pairs.py,
+     * route_coupling_report.py and residency_sim.py can read this engine's
+     * routing the same way they read GLM's. Until now olmoe announced
+     * ROUTE_TRACE at startup and then wrote a zero-byte file, because
+     * rt_init() opens the stream but nothing here ever called rt_trace():
+     * every consumer silently saw "no data" instead of an error.
+     *
+     * Only rt_route() is unconditional: it is a no-op for the counts when
+     * this engine has no counter row (the !hot_pinned guard below is
+     * unchanged) and a no-op for the trace when ROUTE_TRACE is unset, so a
+     * run without the variable behaves exactly as before. Measurement only,
+     * never the computation: idx[] and val[] are the ids and the
+     * post-normalisation gates the layer is about to apply. */
+    if (!m->hot_pinned) rt_route(layer, s, idx, val, K);
+}
+
+/* One routed expert on one row: hh[D] = down(silu(gate(xs)) * up(xs)); g, u are
+ * scratch of I floats. */
+static void moe_expert_row(const Model *m, const Slot *e, const float *xs, float *g, float *u, float *hh) {
+    const Cfg *c = &m->c; int D = c->hidden, I = c->inter;
+#if defined(__AVX2__)
+    /* FUSED3: same contract as matmul_q's IDOT fast branch (IDOT env,
+     * dims %16==0, <=4096) — outside it the stock calls below run
+     * unchanged. Exact integer arithmetic only: bit-identical output
+     * (verified by memcmp in tests/bench_fused3.c). OFF by default. */
+    static int idot_moe = -1;
+    if (idot_moe < 0) { const char *ie = getenv("IDOT"); idot_moe = !(ie && *ie == '0'); }
+    if (g_fused3 && idot_moe && D % 16 == 0 && D <= 4096 && I % 16 == 0 && I <= 4096) {
+        matmul_q_idot_pair_v3(g, u, xs, e->g, e->gs, e->u, e->us, D, I);   /* gate+up share one quant of xs */
+        for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
+        matmul_q_idot_v3(hh, g, e->d, e->ds, I, D);                        /* down_proj [D,I] */
+    } else
+#endif
+    {
+    matmul_q(g, xs, e->g, e->gs, D, I);     /* gate_proj [I,D] */
+    matmul_q(u, xs, e->u, e->us, D, I);     /* up_proj   [I,D] */
+    for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
+    matmul_q(hh, g, e->d, e->ds, I, D);     /* down_proj [D,I] */
+    }
+}
+
+#ifdef COLI_VULKAN
+/* ---- the Vulkan routed-expert tier (vk_tier.c) ---------------------------------
+ * With the tier on, a MoE layer routes every row first, then runs per block of
+ * rows: the block's resident experts go to the device as one batch (vkt_issue),
+ * the CPU computes the other (row, rank) pairs into rows of their own with the
+ * kernel moe() uses, then every rank of every row joins `out` in rank order, the
+ * device's and the CPU's alike, as moe() adds them; so the order of the sum never
+ * depends on which experts were resident. Every expert the CPU computed passes its
+ * RAM bytes to the tier (vkt_note), which may promote it. */
+/* The CPU's pairs of a block (want[i] set) into ctb[i]. The PILOT worker reloads
+ * slots off the lock, so a slot is handed to the tier only under the lock and only
+ * while it still holds that expert: a worker's read into it starts with a reserve
+ * under the same lock, which changes its id. */
+static void moe_vk_cpu(Model *m, int layer, const float *x, int n, const int *ib,
+                       const uint8_t *want, float *ctb, float *g, float *u) {
+    int D = m->c.hidden, K = m->c.topk;
+    for (int i = 0; i < n; i++) {
+        if (!want[i]) continue;
+        Slot *e; expert_get(m, layer, ib[i], &e);
+        moe_expert_row(m, e, x + (int64_t)(i / K) * D, g, u, ctb + (int64_t)i * D);
+        pthread_mutex_lock(&g_pilot_mx);
+        if (e->eid == ib[i]) { VktExpertSrc vs = olmoe_vk_src(e); vkt_note(layer, ib[i], &vs); }
+        pthread_mutex_unlock(&g_pilot_mx);
+    }
+}
+static void moe_vk_run(Model *m, int layer, const float *x, int S, float *logits, float *out) {
+    Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
+    int *idx = malloc((size_t)S * K * sizeof(int));
+    float *val = malloc((size_t)S * K * sizeof(float));
+    int B = S < OLMOE_VK_ROWS ? S : OLMOE_VK_ROWS;
+    float *ctb = falloc((int64_t)B * K * D), *g = falloc(I), *u = falloc(I);
+    uint8_t *taken = malloc((size_t)B * K), *want = malloc((size_t)B * K);
+    const float **dev = malloc((size_t)B * K * sizeof(*dev));
+    if (!idx || !val || !taken || !want || !dev) { fprintf(stderr, "OOM moe_vk_run\n"); exit(1); }
+    for (int s = 0; s < S; s++) moe_route_row(m, layer, s, logits + (int64_t)s * E, idx + (int64_t)s * K, val + (int64_t)s * K);
+    for (int s0 = 0; s0 < S; s0 += B) {
+        int rows = S - s0 < B ? S - s0 : B, n = rows * K;
+        const float *xb = x + (int64_t)s0 * D;
+        const int *ib = idx + (int64_t)s0 * K;
+        const float *vb = val + (int64_t)s0 * K;
+        int ndev = vkt_issue(layer, xb, rows, K, ib, taken);
+        pthread_mutex_lock(&g_pilot_mx);   /* HITS for the device's pairs, as expert_get marks the CPU's */
+        for (int i = 0; i < n; i++) { want[i] = !taken[i]; if (taken[i]) ehit_mark(m, layer, ib[i]); }
+        pthread_mutex_unlock(&g_pilot_mx);
+        moe_vk_cpu(m, layer, xb, n, ib, want, ctb, g, u);
+        if (ndev && !vkt_join(dev)) {   /* the batch failed (the tier stops): those pairs here */
+            moe_vk_cpu(m, layer, xb, n, ib, taken, ctb, g, u);
+            memset(taken, 0, (size_t)n);
+        }
+        for (int s = 0; s < rows; s++) {
+            float *os = out + (int64_t)(s0 + s) * D;
+            for (int kk = 0; kk < K; kk++) {
+                int i = s * K + kk;
+                const float *hh = taken[i] ? dev[i] : ctb + (int64_t)i * D;
+                float w = vb[i];
+                for (int d = 0; d < D; d++) os[d] += w * hh[d];
+            }
+        }
+    }
+    free(idx); free(val); free(ctb); free(g); free(u); free(taken); free(want); free(dev);
+}
+#endif
+
 /* MoE sui token x[S,hidden] -> out[S,hidden] */
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
     float *logits = falloc((int64_t)S*E);
     MATMUL_RES(logits, x, l->gate, l->vk_gate, S, D, E);
     memset(out, 0, (int64_t)S*D*sizeof(float));
+#ifdef COLI_VULKAN
+    if (vkt_ready()) {   /* the Vulkan expert tier (moe_vk_run) */
+        moe_vk_run(m, layer, x, S, logits, out);
+        free(logits);
+        rt_trace_end();
+        return;
+    }
+#endif
     float *g = falloc(I), *u = falloc(I), *hh = falloc(D);
     for (int s = 0; s < S; s++) {
-        float *pr = logits + (int64_t)s*E;
-        if (m->momentum_logits && m->pilot_smooth > 0.f) {
-            float *ema = m->momentum_logits + (int64_t)layer * E;
-            int is_zero = 1;
-            for (int e = 0; e < E; e++) { if (ema[e] != 0.f) { is_zero = 0; break; } }
-            if (is_zero) {
-                for (int e = 0; e < E; e++) ema[e] = pr[e];
-            } else {
-                for (int e = 0; e < E; e++) {
-                    ema[e] = (1.f - m->pilot_smooth) * pr[e] + m->pilot_smooth * ema[e];
-                }
-            }
-        }
-
-        softmax_row(pr, E);
-        /* top-K indici (selezione parziale) */
         int idx[64]; float val[64];
-        for (int kk = 0; kk < K; kk++) {
-            int best = -1; float bv = -1e30f;
-            for (int e = 0; e < E; e++) {
-                int taken = 0; for (int j = 0; j < kk; j++) if (idx[j]==e){taken=1;break;}
-                if (!taken && pr[e] > bv) { bv = pr[e]; best = e; }
-            }
-            /* SEC: all-NaN probabilities leave best at -1, which reaches
-             * expert_get() and then last_access[layer*E - 1] -- a heap write at
-             * a negative index. See rt_router_pick in route_trace.h. */
-            best = rt_router_pick(best, kk, E, layer);
-            idx[kk] = best; val[kk] = pr[best];
-        }
-        if (c->norm_topk) { float sm=0; for(int kk=0;kk<K;kk++) sm+=val[kk]; for(int kk=0;kk<K;kk++) val[kk]/=sm; }
-        /* IMPROVEMENT 2 activation heatmap AND the ROUTE_TRACE stream, in one
-         * call. The counters were the only thing this engine recorded, and it
-         * recorded them HERE, before pinning activates — rt_count keeps that
-         * placement exactly. The trace is the half olmoe never had: it emits a
-         * line per (moe call, position, layer), so tools/route_pairs.py,
-         * route_coupling_report.py and residency_sim.py can read this engine's
-         * routing the same way they read GLM's. Until now olmoe announced
-         * ROUTE_TRACE at startup and then wrote a zero-byte file, because
-         * rt_init() opens the stream but nothing here ever called rt_trace():
-         * every consumer silently saw "no data" instead of an error.
-         *
-         * Only rt_route() is unconditional: it is a no-op for the counts when
-         * this engine has no counter row (the !hot_pinned guard below is
-         * unchanged) and a no-op for the trace when ROUTE_TRACE is unset, so a
-         * run without the variable behaves exactly as before. Measurement only,
-         * never the computation: idx[] and val[] are the ids and the
-         * post-normalisation gates the layer is about to apply. */
-        if (!m->hot_pinned) rt_route(layer, s, idx, val, K);
+        moe_route_row(m, layer, s, logits + (int64_t)s*E, idx, val);
         const float *xs = x + (int64_t)s*D;
         for (int kk = 0; kk < K; kk++) {
             Slot *e; expert_get(m, layer, idx[kk], &e);
-#if defined(__AVX2__)
-            /* FUSED3: same contract as matmul_q's IDOT fast branch (IDOT env,
-             * dims %16==0, <=4096) — outside it the stock calls below run
-             * unchanged. Exact integer arithmetic only: bit-identical output
-             * (verified by memcmp in tests/bench_fused3.c). OFF by default. */
-            static int idot_moe = -1;
-            if (idot_moe < 0) { const char *ie = getenv("IDOT"); idot_moe = !(ie && *ie == '0'); }
-            if (g_fused3 && idot_moe && D % 16 == 0 && D <= 4096 && I % 16 == 0 && I <= 4096) {
-                matmul_q_idot_pair_v3(g, u, xs, e->g, e->gs, e->u, e->us, D, I);   /* gate+up share one quant of xs */
-                for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
-                matmul_q_idot_v3(hh, g, e->d, e->ds, I, D);                        /* down_proj [D,I] */
-            } else
-#endif
-            {
-            matmul_q(g, xs, e->g, e->gs, D, I);     /* gate_proj [I,D] */
-            matmul_q(u, xs, e->u, e->us, D, I);     /* up_proj   [I,D] */
-            for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
-            matmul_q(hh, g, e->d, e->ds, I, D);     /* down_proj [D,I] */
-            }
+            moe_expert_row(m, e, xs, g, u, hh);
             float w = val[kk];
             float *os = out + (int64_t)s*D;
             for (int d = 0; d < D; d++) os[d] += w * hh[d];
@@ -1384,6 +1534,9 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S) {
             pthread_mutex_lock(&g_pilot_mx);
             found = slot_indexed(m, lnext, eid) != NULL;
             pthread_mutex_unlock(&g_pilot_mx);
+#ifdef COLI_VULKAN
+            if (vkt_resident(lnext, eid)) found = 1;   /* the device serves it: nothing to read */
+#endif
             if (!found) {
                 int gidx = lnext * E + eid;
                 pthread_mutex_lock(&g_pilot_mx);
@@ -1568,7 +1721,7 @@ static void run_chat(Model *m, Tok *T, int ctx_cap) {
         printf("%s\n", outbuf);
         fflush(stdout);
 #ifdef COLI_VULKAN
-        olmoe_vk_report();
+        olmoe_vk_report(); vkt_report("turn", m->hits, m->miss);
 #endif
     }
     free(line); free(turn); free(newids); free(gen); free(outbuf); free(hist);
@@ -1805,7 +1958,7 @@ static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
            g_prof_attn_s - attn0, g_prof_head_s - head0, g_prof_forwards - fwd0);
     fflush(stdout);
 #ifdef COLI_VULKAN
-    olmoe_vk_report();
+    olmoe_vk_report(); vkt_report("turn", m->hits, m->miss);
 #endif
     serve_hits(m);
     free(ids);
@@ -1878,13 +2031,16 @@ static void serve_tiers_emap(Model *m) {
     /* per-expert resident bytes: int8 gate/up/down + one f32 scale per row */
     int64_t slotb = 3*I*D + (2*I+D)*4;
     printf("TIERS 0 %d %d 0.00 %.2f\n", filled, c->n_layers*E - filled, filled*(double)slotb/1e9);
-    /* EMAP: 1 byte/expert hex — tier(2b: 0=disk 1=RAM)<<6 | heat(6b: log2 usage) */
+    /* EMAP: 1 byte/expert hex — tier(2b: 0=disk 1=RAM 2=Vulkan device)<<6 | heat(6b: log2 usage) */
     char *hex = malloc((size_t)c->n_layers*E*2 + 1); int w = 0;
     for (int i = 0; i < c->n_layers; i++) {
         LCache *lc = &m->cache[i];
         for (int e = 0; e < E; e++) {
             int tier = 0;
             for (int z = 0; z < lc->n; z++) if (lc->slots[z].eid == e) { tier = 1; break; }
+#ifdef COLI_VULKAN
+            if (vkt_resident(i, e)) tier = 2;   /* on the Vulkan device */
+#endif
             uint32_t u = m->freq[i] ? m->freq[i][e] : 0;
             int heat = 0; while (u) { heat++; u >>= 1; } if (heat > 63) heat = 63;
             int b = (tier << 6) | heat;
@@ -2056,7 +2212,7 @@ int main(int argc, char **argv) {
                (unsigned long long)m.hits, (unsigned long long)m.miss);
         printf("Speed: %.2f tok/s (%.1fs for %d tokens) | PEAK RSS: %.2f GB\n", scored/dt, dt, scored, rss_gb());
 #ifdef COLI_VULKAN
-        fflush(stdout); olmoe_vk_report();
+        fflush(stdout); olmoe_vk_report(); vkt_report("run", m.hits, m.miss);
 #endif
         free(buf); free(arena);
         return 0;      /* PPL is a measurement run: no rt_save on purpose, so a loss
@@ -2109,7 +2265,7 @@ int main(int argc, char **argv) {
      * rates this engine runs at). */
     printf("TUNE decode: %d tokens in %.3fs\n", n_new, dt);
 #ifdef COLI_VULKAN
-    fflush(stdout); olmoe_vk_report();
+    fflush(stdout); olmoe_vk_report(); vkt_report("run", m.hits, m.miss);
 #endif
     free(buf); free(arena);
     return 0;

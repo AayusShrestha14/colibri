@@ -170,11 +170,30 @@ jobs:
             req: c/tools/requirements-qwen38-tiny.txt
           - family: inkling-olmoe
             req: c/tools/oracle-requirements.txt
+          # the routed-expert tier of inkling and olmoe under ASan and UBSan
+          - family: inkling-olmoe-sanitize
+            req: c/tools/oracle-requirements.txt
           - family: mimo-qwenimage
             req: c/tools/requirements-qwenimage-tiny.txt
           - family: deepseek
             req: c/tools/requirements-deepseek-v4-tiny.txt
             extra: sympy pillow   # the V4.1 fixture's reference and its vision tower
+          # the routed-expert tier of deepseek_v41 and deepseek_v4 under ASan and UBSan
+          - family: deepseek-sanitize
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          # Kimi K3's routed experts on the shared tier, and its and MiMo's tier under
+          # ASan and UBSan (MiMo's tier runs in mimo-qwenimage)
+          - family: kimi
+            req: c/tools/requirements-kimi-k3-tiny.txt
+          - family: kimi-mimo-sanitize
+            req: c/tools/requirements-mimo-tiny.txt
+          # GLM-5.2 (colibri) and GLM-5.3 Flash (glm53) on the routed-expert tier, and
+          # the same under ASan and UBSan
+          - family: glm
+            req: c/tools/requirements-glm53-tiny.txt
+          - family: glm-sanitize
+            req: c/tools/requirements-glm53-tiny.txt
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

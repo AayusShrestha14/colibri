@@ -2,7 +2,9 @@
 # Every engine's Vulkan path against its own CPU run, on Lavapipe (Mesa's software
 # Vulkan), one family per call so CI can run them side by side:
 #
-#   bash tests/vulkan_engines.sh qwen | qwen-sanitize | inkling-olmoe | mimo-qwenimage | deepseek
+#   bash tests/vulkan_engines.sh qwen | qwen-sanitize | inkling-olmoe | inkling-olmoe-sanitize
+#   bash tests/vulkan_engines.sh mimo-qwenimage | kimi | kimi-mimo-sanitize | deepseek | deepseek-sanitize
+#   bash tests/vulkan_engines.sh glm | glm-sanitize   # GLM-5.2 (colibri) and GLM-5.3 Flash (glm53)
 #   bash tests/vulkan_engines.sh shader    # the qmatmul formats, the expert batch and the tier, no engine
 #
 # Needs libvulkan-dev, glslc and mesa-vulkan-drivers, plus the Python packages of
@@ -45,16 +47,19 @@ same_tokens() {  # <cpu log> <vk log> <tag>: the engines' "C engine" token lines
 # then the expert batch and the weight pool in the same harness, and the routed-expert
 # tier (vk_tier.c) on a synthetic model in every source format.
 shader_formats() {
+  make tests/test_vk_tier VK=1   # every shader too: the harness's expert batch needs them
   cc -O2 -pthread -DVK_TEST backend_vulkan.c -o vk_test -lvulkan -lm
   COLI_VK_TEST_MATMUL_ONLY=1 ./vk_test shaders/qmatmul.spv | tee vk_test.log
   tail -1 vk_test.log | grep -qx PASS || fail "qmatmul format cases"
-  make tests/test_vk_tier VK=1
   ./tests/test_vk_tier shaders/qmatmul.spv | tee vk_tier.log
   tail -1 vk_tier.log | grep -qx PASS || fail "routed-expert tier"
 }
 
 # tier_count <engine> <log>: N from the last "[VK] tier <engine> run: device N of M" line;
-# tier_evictions <engine> <log>: the evictions of that line
+# tier_evictions <engine> <log>: the evictions of that line; tier_failed: its failed
+# uploads (an eviction case must have none: a promotion that displaces a resident
+# while a batch is in flight waits for the join to free it, even with
+# COLI_VK_TIER_SYNC=1, instead of failing and shrinking the budget)
 tier_count() {
   local n
   n=$(sed -n "s/^\[VK\] tier $1 run: device \([0-9][0-9]*\) of .*/\1/p" "$2" | tail -1)
@@ -63,6 +68,11 @@ tier_count() {
 tier_evictions() {
   local n
   n=$(sed -n "s/^\[VK\] tier $1 run: .* evictions \([0-9][0-9]*\),.*/\1/p" "$2" | tail -1)
+  echo "${n:-0}"
+}
+tier_failed() {
+  local n
+  n=$(sed -n "s/^\[VK\] tier $1 run: .* failed \([0-9][0-9]*\) |.*/\1/p" "$2" | tail -1)
   echo "${n:-0}"
 }
 
@@ -107,6 +117,7 @@ tier_gate() {
   [ "$(tier_count "$eng" vk.log)" -gt 0 ] || { cat vk.log; fail "$tag: no routed expert ran on the device"; }
   if [ "${EVICT:-0}" = 1 ]; then
     [ "$(tier_evictions "$eng" vk.log)" -gt 0 ] || { grep '\[VK\] tier' vk.log; fail "$tag: the budget forced no eviction"; }
+    [ "$(tier_failed "$eng" vk.log)" = 0 ] || { grep '\[VK\] tier' vk.log; fail "$tag: an upload failed (the budget shrank)"; }
   fi
   local where; where=$(dense_where "$eng" vk.log "$tag" "${envs[@]}") || { echo "$where"; exit 1; }
   echo "OK $tag: tokens = CPU, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' vk.log | tail -1), $(grep -a -o 'evictions [0-9]*' vk.log | tail -1), trunk on the $where"
@@ -281,11 +292,14 @@ family_qwen_sanitize() {
 family_inkling_olmoe() {
   make inkling olmoe VK=1
   local cap
-  # inkling, f32 fixture (fmt 10): the oracle and the CPU's ids, at three caps
+  # inkling, f32 fixture (fmt 10): the oracle and the CPU's ids, at three caps. These
+  # arms and the next two test the dense matrices' formats: COLI_VK_DENSE=1, because on
+  # Lavapipe (a CPU device sharing the CPU's RAM) the trunk otherwise stays on the CPU
+  # while the expert tier is on; the tier runs beside it.
   $PY tools/make_tiny_inkling.py tiny_inkling
   for cap in 1 2 8; do
     SNAP=tiny_inkling ./inkling $cap 0 tiny_inkling/ref_inkling.json > cpu.log 2>&1
-    COLI_VULKAN=1 SNAP=tiny_inkling ./inkling $cap 0 tiny_inkling/ref_inkling.json > vk.log 2>&1
+    COLI_VK_DENSE=1 COLI_VULKAN=1 SNAP=tiny_inkling ./inkling $cap 0 tiny_inkling/ref_inkling.json > vk.log 2>&1
     grep -qE 'Matching tokens: ([0-9]+)/\1$' vk.log || { cat vk.log; fail "inkling f32 cap=$cap: oracle"; }
     same_tokens cpu.log vk.log "inkling f32 cap=$cap"
     need_gpu inkling vk.log "inkling f32 cap=$cap"
@@ -314,7 +328,7 @@ with open(dst, "wb") as f:
     f.write(struct.pack("<Q", len(h))); f.write(h); [f.write(b) for b in blobs]
 EOF
   SNAP=tiny_inkling_bf16 ./inkling 8 0 tiny_inkling/ref_inkling.json > cpu.log 2>&1 || true
-  COLI_VULKAN=1 SNAP=tiny_inkling_bf16 ./inkling 8 0 tiny_inkling/ref_inkling.json > vk.log 2>&1 || true
+  COLI_VK_DENSE=1 COLI_VULKAN=1 SNAP=tiny_inkling_bf16 ./inkling 8 0 tiny_inkling/ref_inkling.json > vk.log 2>&1 || true
   same_tokens cpu.log vk.log "inkling bf16"
   grep -q ', 0 bf16)' vk.log || need_gpu inkling vk.log "inkling bf16"
   echo "OK inkling bf16: tokens = CPU, $(vk_count inkling vk.log) matmuls on the GPU"
@@ -335,32 +349,212 @@ EOF
   mkdir -p tiny_inkling_q/dense-int4g64
   mv tiny_inkling_q/dense-int4g64.safetensors tiny_inkling_q/dense-int4g64/dense.safetensors
   SNAP=tiny_inkling_q ./inkling 8 0 tiny_inkling/ref_inkling.json > cpu.log 2>&1 || true
-  COLI_VULKAN=1 SNAP=tiny_inkling_q ./inkling 8 0 tiny_inkling/ref_inkling.json > vk.log 2>&1 || true
+  COLI_VK_DENSE=1 COLI_VULKAN=1 SNAP=tiny_inkling_q ./inkling 8 0 tiny_inkling/ref_inkling.json > vk.log 2>&1 || true
   same_tokens cpu.log vk.log "inkling int4-g64 container"
   need_gpu inkling vk.log "inkling int4-g64 container"
   echo "OK inkling int4-g64 container: tokens = CPU, $(vk_count inkling vk.log) matmuls on the GPU"
 
-  # olmoe: f32 residents (fmt 10), the oracle and the CPU's ids
+  # olmoe: f32 residents (fmt 10), the oracle and the CPU's ids (the trunk on the
+  # device, as above)
   $PY tools/make_olmoe_tiny.py --output olmoe_tiny
   $PY tools/convert_olmoe_merged.py --model olmoe_tiny --out olmoe_tiny_c
   SNAP=olmoe_tiny_c ./olmoe 8 8 olmoe_tiny/ref_olmoe.json > cpu.log 2>&1
-  COLI_VULKAN=1 SNAP=olmoe_tiny_c ./olmoe 8 8 olmoe_tiny/ref_olmoe.json > vk.log 2>&1
+  COLI_VK_DENSE=1 COLI_VULKAN=1 SNAP=olmoe_tiny_c ./olmoe 8 8 olmoe_tiny/ref_olmoe.json > vk.log 2>&1
   grep -qE 'Matching tokens: ([0-9]+)/\1$' vk.log || { cat vk.log; fail "olmoe: oracle"; }
   same_tokens cpu.log vk.log "olmoe"
   need_gpu olmoe vk.log "olmoe"
   echo "OK olmoe: $(grep -o 'Matching tokens: [0-9/]*' vk.log), $(vk_count olmoe vk.log) matmuls on the GPU"
+
+  inkling_olmoe_tier_fixtures
+  # The routed-expert tier (COLI_VULKAN=1 turns it on; the runs above already had it).
+  # inkling: experts in f32 (fmt 10) under the f32, bf16 and dense-int4g64 snapshots,
+  # the int4 and int8 expert containers (fmt 2 and fmt 1: gate and up in one fused
+  # tensor, up I rows in), the runtime int4 and int8 quantization (fmt 2 from int8 rows,
+  # fmt 1), at cap=1 with the trunk where the default puts it (on the CPU here) and at
+  # cap=8 with the trunk on the device (COLI_VK_DENSE=1); TOPP's trimmed ranks; the tier
+  # alone (COLI_VK_DENSE=0); and a budget of two experts, which must evict.
+  local fx D bits R=tiny_inkling/ref_inkling.json OR=olmoe_tiny/ref_olmoe.json
+  for fx in tiny_inkling tiny_inkling_bf16 tiny_inkling_q tiny_inkling_x-i4 tiny_inkling_x-i8; do
+    for cap in 1 8; do
+      D=; [ $cap = 8 ] && D=COLI_VK_DENSE=1
+      tier_gate inkling "inkling tier $fx cap=$cap" $D SNAP=$fx -- $cap 0 $R
+    done
+  done
+  for bits in 4 8; do tier_gate inkling "inkling tier runtime int$bits" SNAP=tiny_inkling -- 2 $bits $R; done
+  tier_gate inkling "inkling tier TOPP" TOPP=0.3 SNAP=tiny_inkling_x-i4 -- 2 0 $R
+  tier_gate inkling "inkling tier alone (COLI_VK_DENSE=0)" COLI_VK_DENSE=0 SNAP=tiny_inkling_x-i4 -- 8 0 $R
+  EVICT=1 tier_gate inkling "inkling tier, a budget of two experts" COLI_VK_TIER_GB=0.00006 SNAP=tiny_inkling -- 8 0 $R
+  # olmoe: int8 rows (fmt 1), the same placements, PILOT's prefetch worker beside the
+  # tier, the tier alone and a budget of three experts, which must evict.
+  for cap in 1 8; do
+    D=; [ $cap = 8 ] && D=COLI_VK_DENSE=1
+    tier_gate olmoe "olmoe tier cap=$cap" $D SNAP=olmoe_tiny_c -- $cap 8 $OR
+  done
+  tier_gate olmoe "olmoe tier PILOT" PILOT=1 WIDE=2 SNAP=olmoe_tiny_c -- 2 8 $OR
+  tier_gate olmoe "olmoe tier alone (COLI_VK_DENSE=0)" COLI_VK_DENSE=0 SNAP=olmoe_tiny_c -- 8 8 $OR
+  EVICT=1 tier_gate olmoe "olmoe tier, a budget of three experts" COLI_VK_TIER_GB=0.000025 SNAP=olmoe_tiny_c -- 8 8 $OR
+
+  # The warm start: a CPU run writes the history (inkling's PIN=<file>, olmoe's
+  # COLI_USAGE), and the tier's run fills the device from it before the first token.
+  rm -f tier.hist
+  PIN=tier.hist SNAP=tiny_inkling ./inkling 8 -p "The capital of France is" -n 8 > cpu.log 2>&1
+  PIN=tier.hist COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 SNAP=tiny_inkling ./inkling 8 -p "The capital of France is" -n 8 > vk.log 2>&1
+  $PY - cpu.log vk.log <<'PY' || { cat vk.log; fail "inkling tier warm start: the text differs from the CPU's"; }
+import re, sys
+def text(p):
+    m = re.search(rb"\[\d+ prompt tokens\](.*?)\n\[prefill", open(p, "rb").read(), re.S)
+    return m.group(1) if m else None
+a, b = text(sys.argv[1]), text(sys.argv[2])
+sys.exit(0 if a is not None and a == b else 1)
+PY
+  grep -qa '^\[VK\] tier inkling: warm start, [1-9]' vk.log || { cat vk.log; fail "inkling tier: no warm start"; }
+  [ "$(tier_count inkling vk.log)" -gt 0 ] || { cat vk.log; fail "inkling tier warm start: no routed expert ran on the device"; }
+  echo "OK inkling tier warm start: text = CPU, $(grep -a -o 'warm start, [0-9]* experts' vk.log), $(grep -a -o 'device [0-9]* of [0-9]* routed experts' vk.log | tail -1)"
+  rm -f tier.hist
+  COLI_USAGE=tier.hist SNAP=olmoe_tiny_c ./olmoe 8 8 $OR > cpu.log 2>&1
+  COLI_USAGE=tier.hist COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 SNAP=olmoe_tiny_c ./olmoe 8 8 $OR > vk.log 2>&1
+  same_tokens cpu.log vk.log "olmoe tier warm start"
+  grep -qa '^\[VK\] tier olmoe: warm start, [1-9]' vk.log || { cat vk.log; fail "olmoe tier: no warm start"; }
+  [ "$(tier_count olmoe vk.log)" -gt 0 ] || { cat vk.log; fail "olmoe tier warm start: no routed expert ran on the device"; }
+  echo "OK olmoe tier warm start: tokens = CPU, $(grep -a -o 'warm start, [0-9]* experts' vk.log), $(grep -a -o 'device [0-9]* of [0-9]* routed experts' vk.log | tail -1)"
+
+  # The serve protocol with the tier on: KV prefix reuse token-identical to a cold
+  # engine, HITS and EMAP (tier 2 on the device) after every turn, Brio's snapshot
+  # scoring; every engine after the first warm-starts from the history the one before
+  # it saved.
+  COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 INKLING_TINY=tiny_inkling \
+    $PY -m unittest tests.test_inkling_prefix_serve tests.test_inkling_dashboard_hits
+  COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 OLMOE_TINY=olmoe_tiny_c \
+    $PY -m unittest tests.test_olmoe_prefix_serve tests.test_olmoe_dashboard_hits tests.test_brio_serve
+}
+
+# The fixtures the expert tier's arms add to the family's own: inkling's int4 and int8
+# expert containers through tools/convert_inkling_int4.py's round trip (its fake
+# vendor checkpoint knows the embedding norm by the name transformers used before
+# 5.18), a tokenizer for inkling's -p mode and serve, and olmoe's for serve.
+inkling_olmoe_tier_fixtures() {
+  $PY - <<'PY'
+import importlib.util, os, shutil
+from safetensors.torch import load_file, save_file
+spec = importlib.util.spec_from_file_location("conv", "tools/convert_inkling_int4.py")
+conv = importlib.util.module_from_spec(spec); spec.loader.exec_module(conv)
+t = load_file("tiny_inkling/model.safetensors")
+if "model.embed_tokens.embed_norm.weight" in t:
+    t["model.embed_norm.weight"] = t.pop("model.embed_tokens.embed_norm.weight")
+for d in ("tiny_inkling_hf", "tiny_inkling_x-tml", "tiny_inkling_x-pass", "tiny_inkling_x-i4", "tiny_inkling_x-i8"):
+    shutil.rmtree(d, ignore_errors=True)
+os.makedirs("tiny_inkling_hf")
+save_file(t, "tiny_inkling_hf/model.safetensors")
+shutil.copy("tiny_inkling/config.json", "tiny_inkling_hf/")
+conv.selftest_e2e("tiny_inkling_hf", "tiny_inkling_x")          # tiny_inkling_x-i4: int4 experts
+conv.convert_dir("tiny_inkling_x-tml", "tiny_inkling_x-i8", 8)   # int8 experts
+PY
+  $PY -c 'import sys; from pathlib import Path; sys.path.insert(0, "."); from tests.test_inkling_prefix_serve import ensure_tokenizer; ensure_tokenizer(Path("tiny_inkling"))'
+  $PY tools/make_edge_tiny_tokenizer.py --vocab-size 128 olmoe_tiny_c
+}
+
+# inkling's and olmoe's expert tier under ASan and UBSan: a sanitized VK=1 build, the
+# tier's configurations on Lavapipe (the expert formats, eviction, TOPP, PILOT's worker
+# beside the tier, the tier alone, the trunk on the device or on the CPU, the warm
+# start) and a serve session of each engine, twice, the second warm-started. Memory
+# safety is the gate, not the tokens (a sanitized build vectorizes differently); each
+# run must still put experts on the device, or the tier was never exercised.
+family_inkling_olmoe_sanitize() {
+  make clean >/dev/null 2>&1 || true
+  make inkling olmoe VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  $PY tools/make_tiny_inkling.py tiny_inkling
+  $PY tools/make_olmoe_tiny.py --output olmoe_tiny --force
+  $PY tools/convert_olmoe_merged.py --model olmoe_tiny --out olmoe_tiny_c
+  inkling_olmoe_tier_fixtures
+  san_io() {  # <engine> <tag> <env and argv...>; KEEP=1 keeps the history of the run before
+    local eng=$1 tag=$2; shift 2
+    [ "${KEEP:-0}" = 1 ] || rm -f tier.usage
+    env ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2 \
+      COLI_USAGE=tier.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 "$@" > san.log 2>&1 || true
+    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    [ "$(tier_count "$eng" san.log)" -gt 0 ] || { cat san.log; fail "$tag: no routed expert ran on the device"; }
+    echo "OK $tag: sanitizers clean, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' san.log | tail -1), $(grep -a -o 'evictions [0-9]*' san.log | tail -1)$(grep -a -o 'warm start, [0-9]* experts' san.log | sed 's/^/, /')"
+  }
+  local fx cap D R=tiny_inkling/ref_inkling.json OR=olmoe_tiny/ref_olmoe.json
+  for fx in tiny_inkling tiny_inkling_x-i4 tiny_inkling_x-i8; do
+    for cap in 1 8; do
+      D=; [ $cap = 8 ] && D=COLI_VK_DENSE=1
+      san_io inkling "asan inkling $fx cap=$cap" $D SNAP=$fx ./inkling $cap 0 $R
+    done
+  done
+  san_io inkling "asan inkling runtime int4" SNAP=tiny_inkling ./inkling 2 4 $R
+  san_io inkling "asan inkling TOPP" TOPP=0.3 SNAP=tiny_inkling_x-i4 ./inkling 2 0 $R
+  san_io inkling "asan inkling eviction" COLI_VK_TIER_GB=0.00006 SNAP=tiny_inkling ./inkling 8 0 $R
+  san_io inkling "asan inkling tier alone" COLI_VK_DENSE=0 SNAP=tiny_inkling_x-i4 ./inkling 8 0 $R
+  san_io inkling "asan inkling -p, history written" PIN=tier.usage SNAP=tiny_inkling ./inkling 8 -p "The capital of France is" -n 8
+  KEEP=1 san_io inkling "asan inkling -p, warm start" PIN=tier.usage SNAP=tiny_inkling ./inkling 8 -p "The capital of France is" -n 8
+  grep -qa 'tier inkling: warm start, [1-9]' san.log || { cat san.log; fail "asan inkling: no warm start"; }
+  for cap in 1 8; do
+    D=; [ $cap = 8 ] && D=COLI_VK_DENSE=1
+    san_io olmoe "asan olmoe PILOT cap=$cap" $D PILOT=1 WIDE=2 SNAP=olmoe_tiny_c ./olmoe $cap 8 $OR
+  done
+  san_io olmoe "asan olmoe eviction" COLI_VK_TIER_GB=0.000025 PILOT=1 SNAP=olmoe_tiny_c ./olmoe 8 8 $OR
+  san_io olmoe "asan olmoe tier alone" COLI_VK_DENSE=0 SNAP=olmoe_tiny_c ./olmoe 8 8 $OR
+  KEEP=1 san_io olmoe "asan olmoe warm start" PILOT=1 SNAP=olmoe_tiny_c ./olmoe 2 8 $OR
+  grep -qa 'tier olmoe: warm start, [1-9]' san.log || { cat san.log; fail "asan olmoe: no warm start"; }
+  # serve: two turns, then a second engine warm-started from the history the first saved
+  local eng
+  for eng in inkling olmoe; do
+    rm -f tier.usage
+    $PY - $eng <<'PY' || fail "asan $eng serve"
+import os, subprocess, sys, threading
+eng = sys.argv[1]
+snap, argv = ("tiny_inkling", ["8"]) if eng == "inkling" else ("olmoe_tiny_c", ["4", "8"])
+env = dict(os.environ, SNAP=snap, SERVE="1", PIN="tier.usage", COLI_USAGE="tier.usage", COLI_VULKAN="1",
+           COLI_VK_TIER_SYNC="1", OMP_NUM_THREADS="2", ASAN_OPTIONS="detect_leaks=0",
+           UBSAN_OPTIONS="print_stacktrace=1")
+for run in range(2):
+    p = subprocess.Popen(["./" + eng] + argv, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, bufsize=0)
+    err = []
+    t = threading.Thread(target=lambda: err.extend(iter(p.stderr.readline, b"")), daemon=True)
+    t.start()
+    while b"READY" not in p.stdout.readline():
+        pass
+    for rid, prompt in (("1", b"The capital of France is"), ("2", b"The capital of France is, and Spain")):
+        p.stdin.write(f"SUBMIT {rid} 0 {len(prompt)} 6 0 1\n".encode() + prompt + b"\n")
+        p.stdin.flush()
+        while True:
+            line = p.stdout.readline()
+            if not line or line.split(b" ", 1)[0] in (b"DONE", b"ERROR"):
+                break
+            if line.startswith(b"DATA "):
+                p.stdout.read(int(line.split()[2])); p.stdout.readline()
+    p.stdin.close(); p.wait(timeout=300); t.join(10)
+    log = b"".join(err).decode(errors="replace")
+    if "ERROR: AddressSanitizer" in log or "runtime error:" in log:
+        print(log); sys.exit(1)
+    turns = [l for l in log.splitlines() if l.startswith(f"[VK] tier {eng} turn: device ")]
+    if len(turns) != 2 or turns[-1].split()[5] == "0" or (run == 1 and "warm start" not in log):
+        print(log); sys.exit(1)
+    print(f"OK asan {eng} serve, engine {run + 1}: sanitizers clean, " + " ".join(turns[-1].split()[4:9]) +
+          (", warm-started" if run else ""))
+PY
+  done
+  make clean >/dev/null 2>&1 || true
 }
 
 family_mimo_qwenimage() {
   make mimo qwenimage VK=1
   # mimo: Xiaomi's vendor oracle on the GPU (its engine_env is the f32 dense
   # configuration; its variants include the native FP8/BF16 one and the BF16 vision
-  # tower), once with the experts on the CPU, once all on the GPU (MXFP4, fmt 7).
+  # tower): the trunk on the device with the experts on the CPU (COLI_VK_TIER=0), the
+  # routed experts on the shared tier (MXFP4, fmt 7) with the trunk where the default
+  # puts it (the CPU on Lavapipe), and both on the device.
   $PY tools/make_mimo_tiny.py --output ./mimo_tiny --force --vision
-  COLI_VULKAN=1 $PY tests/mimo_tiny_harness.py --binary ./mimo --fixture ./mimo_tiny
-  COLI_VULKAN=1 MIMO_VK_EXPERTS=4096 $PY tests/mimo_tiny_harness.py --binary ./mimo --fixture ./mimo_tiny
+  COLI_VULKAN=1 COLI_VK_TIER=0 $PY tests/mimo_tiny_harness.py --binary ./mimo --fixture ./mimo_tiny
+  COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 $PY tests/mimo_tiny_harness.py --binary ./mimo --fixture ./mimo_tiny
+  COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 COLI_VK_DENSE=1 $PY tests/mimo_tiny_harness.py --binary ./mimo --fixture ./mimo_tiny
   # MIMO_DENSE_BITS 0 (native fp8/bf16: fmt 12, 11), 8 (fmt 1) and 32 (fmt 10):
-  # the CPU's tokens for every case of ref.json and for the picture.
+  # the CPU's tokens for every case of ref.json and for the picture, with the experts
+  # on the CPU (MIMO_VK_EXPERTS=0, the trunk on the device), on the tier with the trunk
+  # on the CPU (the tier must have served some), and on the tier with the trunk on the
+  # device (both).
   ids() { $PY -c "import json,sys;r=json.load(open('mimo_tiny/ref.json'));c=r['image'] if sys.argv[1]=='image' else r['cases'][sys.argv[1]];print(' '.join(map(str,c['prompt_ids'])))" "$1"; }
   local grid bits c x extra
   grid=$($PY -c "import json;i=json.load(open('mimo_tiny/ref.json'))['image'];print(i['grid_h'],i['grid_w'])")
@@ -368,15 +562,30 @@ family_mimo_qwenimage() {
     for c in short window long image; do
       extra=(); [ "$c" = image ] && extra=(--image mimo_tiny/patches.f32 --grid $grid)
       MIMO_DENSE_BITS=$bits COLI_TEMP=0 ./mimo mimo_tiny --ids "$(ids $c)" --ngen 6 "${extra[@]}" > mimo-cpu.txt 2>/dev/null
-      for x in 0 4096; do
-        COLI_VULKAN=1 MIMO_VK_EXPERTS=$x MIMO_DENSE_BITS=$bits COLI_TEMP=0 \
+      for x in MIMO_VK_EXPERTS=0 COLI_VK_DENSE=0 COLI_VK_DENSE=1; do
+        env COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 $x MIMO_DENSE_BITS=$bits COLI_TEMP=0 \
           ./mimo mimo_tiny --ids "$(ids $c)" --ngen 6 "${extra[@]}" > mimo-vk.txt 2> mimo-vk.err
-        cmp -s mimo-cpu.txt mimo-vk.txt || { cat mimo-vk.err; fail "mimo bits=$bits $c MIMO_VK_EXPERTS=$x differs from the CPU"; }
-        need_gpu mimo mimo-vk.err "mimo bits=$bits $c MIMO_VK_EXPERTS=$x"
+        cmp -s mimo-cpu.txt mimo-vk.txt || { cat mimo-vk.err; fail "mimo bits=$bits $c $x differs from the CPU"; }
+        [ $x = COLI_VK_DENSE=0 ] || need_gpu mimo mimo-vk.err "mimo bits=$bits $c $x"
+        if [ $x = MIMO_VK_EXPERTS=0 ]; then
+          ! grep -q '^\[VK\] tier' mimo-vk.err || { cat mimo-vk.err; fail "mimo bits=$bits $c: MIMO_VK_EXPERTS=0 started the tier"; }
+        else
+          [ "$(tier_count mimo mimo-vk.err)" -gt 0 ] || { cat mimo-vk.err; fail "mimo bits=$bits $c $x: no routed expert ran on the device"; }
+        fi
       done
     done
-    echo "OK mimo MIMO_DENSE_BITS=$bits: the CPU's tokens, text and image, experts on the CPU and on the GPU"
+    echo "OK mimo MIMO_DENSE_BITS=$bits: the CPU's tokens, text and image, experts on the CPU and on the tier, trunk on the device and on the CPU"
   done
+  # MIMO_VK_EXPERTS=N sizes the tier at N experts: at 2 it must evict as the routing
+  # moves, and still give the CPU's tokens
+  MIMO_DENSE_BITS=32 COLI_TEMP=0 ./mimo mimo_tiny --ids "$(ids long)" --ngen 6 > mimo-cpu.txt 2>/dev/null
+  COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 MIMO_VK_EXPERTS=2 MIMO_DENSE_BITS=32 COLI_TEMP=0 \
+    ./mimo mimo_tiny --ids "$(ids long)" --ngen 6 > mimo-vk.txt 2> mimo-vk.err
+  cmp -s mimo-cpu.txt mimo-vk.txt || { cat mimo-vk.err; fail "mimo MIMO_VK_EXPERTS=2 differs from the CPU"; }
+  grep -q 'budget [0-9.]* KiB = 2 experts' mimo-vk.err || { grep '\[VK\]' mimo-vk.err; fail "mimo MIMO_VK_EXPERTS=2: not a budget of two experts"; }
+  [ "$(tier_count mimo mimo-vk.err)" -gt 0 ] && [ "$(tier_evictions mimo mimo-vk.err)" -gt 0 ] || { grep '\[VK\] tier' mimo-vk.err; fail "mimo MIMO_VK_EXPERTS=2: the tier served nothing or never evicted"; }
+  grep -q ' failed 0 ' mimo-vk.err || { grep '\[VK\] tier' mimo-vk.err; fail "mimo MIMO_VK_EXPERTS=2: an upload failed"; }
+  echo "OK mimo, a budget of two experts: tokens = CPU, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' mimo-vk.err | tail -1), $(grep -a -o 'evictions [0-9]*' mimo-vk.err | tail -1)"
 
   # qwenimage: at 8, 16 and 32 bits (fmt 1, 11, 10) every oracle stage of the
   # Lavapipe run against the CPU run with the same bits and f32 activations. int8 is
@@ -425,6 +634,8 @@ family_deepseek() {
   # deepseek_v41: fp8 dense in 32x32 ue8m0 tiles (fmt 12, gs 32, the tile scale
   # repeated over its rows) and bf16 (fmt 11). The engine exits non-zero on any
   # token mismatch with the reference; the CPU run must print the same stream.
+  # These arms test the dense trunk: COLI_VK_DENSE=1, because on Lavapipe the trunk
+  # otherwise stays on the CPU while the expert tier is on; the tier runs beside it.
   $PY tools/make_dsv41_tiny.py --out dsv41_tiny --emit-ref dsv41_tiny/ref.json
   $PY tools/make_dsv41_tiny.py --out dsv41_long --emit-ref dsv41_long/ref.json --prompt-len 40 --max-new 6
   v41() {  # <tag> <env and argv...>
@@ -433,27 +644,56 @@ family_deepseek() {
     env COLI_VULKAN=1 "$@" > v41-vk.txt 2> v41-vk.err || { cat v41-vk.err; fail "deepseek_v41 $tag: Vulkan run misses the oracle"; }
     cmp -s v41-cpu.txt v41-vk.txt || { diff v41-cpu.txt v41-vk.txt | head; fail "deepseek_v41 $tag: Vulkan output differs from the CPU"; }
     need_gpu deepseek_v41 v41-vk.err "deepseek_v41 $tag"
-    echo "OK deepseek_v41 $tag: output = CPU, $(vk_count deepseek_v41 v41-vk.err) matmuls on the GPU"
+    echo "OK deepseek_v41 $tag: output = CPU, $(vk_count deepseek_v41 v41-vk.err) matmuls on the GPU, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' v41-vk.err | tail -1)"
   }
   local cap force
-  for cap in 1 2 8; do v41 "cap=$cap" SNAP=dsv41_tiny ./deepseek_v41 $cap dsv41_tiny/ref.json; done
-  for cap in 2 8; do v41 "40-token prompt cap=$cap" SNAP=dsv41_long ./deepseek_v41 $cap dsv41_long/ref.json; done
+  for cap in 1 2 8; do v41 "cap=$cap" COLI_VK_DENSE=1 SNAP=dsv41_tiny ./deepseek_v41 $cap dsv41_tiny/ref.json; done
+  for cap in 2 8; do v41 "40-token prompt cap=$cap" COLI_VK_DENSE=1 SNAP=dsv41_long ./deepseek_v41 $cap dsv41_long/ref.json; done
   for force in 1 2 3 4 5; do
-    v41 "DSpark spec=$force" SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=$force ./deepseek_v41 8 dsv41_tiny/ref.json
+    v41 "DSpark spec=$force" COLI_VK_DENSE=1 SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=$force ./deepseek_v41 8 dsv41_tiny/ref.json
   done
+
+  # The routed-expert tier (vk_tier.c) on deepseek_v41's experts, fp4 with a ue8m0
+  # scale per 32 (fmt 7), the clamped SwiGLU; the trunk where the default puts it (the
+  # CPU here). Each run must pass the oracle, print the CPU run's stream and have
+  # served routed experts from the device; with EVICT=1 the budget (below the hot set)
+  # must also have evicted. COLI_USAGE points at a fresh history, COLI_VK_TIER_SYNC=1
+  # awaits each staged upload at the next step (as in tier_gate).
+  v41_tier() {  # <tag> <env and argv...>
+    local tag=$1; shift
+    rm -f tier.usage
+    env "$@" > v41-cpu.txt 2> v41-cpu.err || { cat v41-cpu.err; fail "deepseek_v41 tier $tag: CPU run"; }
+    env COLI_USAGE=tier.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 "$@" > v41-vk.txt 2> v41-vk.err ||
+      { cat v41-vk.err; fail "deepseek_v41 tier $tag: Vulkan run misses the oracle"; }
+    cmp -s v41-cpu.txt v41-vk.txt || { diff v41-cpu.txt v41-vk.txt | head; fail "deepseek_v41 tier $tag: Vulkan output differs from the CPU"; }
+    [ "$(tier_count deepseek_v41 v41-vk.err)" -gt 0 ] || { cat v41-vk.err; fail "deepseek_v41 tier $tag: no routed expert ran on the device"; }
+    if [ "${EVICT:-0}" = 1 ]; then
+      [ "$(tier_evictions deepseek_v41 v41-vk.err)" -gt 0 ] || { grep '\[VK\] tier' v41-vk.err; fail "deepseek_v41 tier $tag: the budget forced no eviction"; }
+      [ "$(tier_failed deepseek_v41 v41-vk.err)" = 0 ] || { grep '\[VK\] tier' v41-vk.err; fail "deepseek_v41 tier $tag: an upload failed (the budget shrank)"; }
+    fi
+    echo "OK deepseek_v41 tier $tag: output = CPU, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' v41-vk.err | tail -1), $(grep -a -o 'evictions [0-9]*' v41-vk.err | tail -1)"
+  }
+  for cap in 1 2 8; do v41_tier "cap=$cap" SNAP=dsv41_tiny ./deepseek_v41 $cap dsv41_tiny/ref.json; done
+  for cap in 2 8; do v41_tier "40-token prompt cap=$cap" SNAP=dsv41_long ./deepseek_v41 $cap dsv41_long/ref.json; done
+  # DSpark: the drafts stay on the CPU, the verify rows of the backbone take the device
+  for force in 1 2 3 4 5; do
+    v41_tier "DSpark spec=$force" SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=$force ./deepseek_v41 1 dsv41_tiny/ref.json
+  done
+  EVICT=1 v41_tier "a budget of three experts" COLI_VK_TIER_GB=0.00005 SNAP=dsv41_long ./deepseek_v41 8 dsv41_long/ref.json
+  v41_tier "trunk on the device too" COLI_VK_DENSE=1 SNAP=dsv41_long ./deepseek_v41 2 dsv41_long/ref.json
 
   # deepseek_v4: fp8 128x128 blocks (fmt 12, gs 128) and the bf16 router, compressors
   # and head (fmt 11). The GPU gets the activations after the CPU's own E4M3 rounding,
   # so the two runs do the same arithmetic. The tiny check builds the VK=1 binary and
-  # keeps passing with the device open; its --oracle path reloads the dense weights
-  # every forward and so stays on the CPU, which is why the device is checked on the
-  # session path below: ids and teacher-forced predictions equal to the CPU's and to
-  # the reference's greedy stream.
+  # keeps passing with the device open (the expert tier on, the trunk on the CPU);
+  # its --oracle path reloads the dense weights every forward and so stays on the CPU,
+  # which is why the device is checked on the session path below: ids and
+  # teacher-forced predictions equal to the CPU's and to the reference's greedy stream.
   COLI_VULKAN=1 make deepseek-v4-tiny-check VK=1
   local prompt
   prompt=$($PY -c 'import json; c=json.load(open("deepseek_v4_tiny/ref.json"))["cases"]["long"]; print("".join("<t%03d>" % t for t in c["prompt_ids"]))')
   ./deepseek_v4 ./deepseek_v4_tiny "$prompt" --raw-prompt --max-tokens 4 --record-oracle v4-cpu.json > /dev/null
-  COLI_VULKAN=1 ./deepseek_v4 ./deepseek_v4_tiny "$prompt" --raw-prompt --max-tokens 4 --record-oracle v4-vk.json > /dev/null 2> v4-vk.err
+  COLI_VK_DENSE=1 COLI_VULKAN=1 ./deepseek_v4 ./deepseek_v4_tiny "$prompt" --raw-prompt --max-tokens 4 --record-oracle v4-vk.json > /dev/null 2> v4-vk.err
   $PY - <<'PY' || fail "deepseek_v4: the Vulkan session differs from the CPU's"
 import json, sys
 a, b = json.load(open("v4-cpu.json")), json.load(open("v4-vk.json"))
@@ -463,7 +703,443 @@ print("OK deepseek_v4 session: ids = CPU = reference" if ok else ("CPU", a, "VK"
 sys.exit(0 if ok else 1)
 PY
   need_gpu deepseek_v4 v4-vk.err "deepseek_v4 session"
-  echo "OK deepseek_v4: $(vk_count deepseek_v4 v4-vk.err) matmuls on the GPU"
+  echo "OK deepseek_v4: $(vk_count deepseek_v4 v4-vk.err) matmuls on the GPU, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' v4-vk.err | tail -1)"
+
+  # The routed-expert tier on deepseek_v4's fp4 experts (fmt 7) with its own
+  # activation (VKT_ACT_SWIGLU_V4: the CPU kernel's bf16 and E4M3 roundings and the
+  # route weight before down, on the device). Every oracle case against the CPU run:
+  # ids equal to the CPU's and the reference's, teacher-forced predictions equal,
+  # routed experts served by the device. The history is the store's own .coli_usage
+  # in the fixture, removed before each run unless WARM=1 (the tier then warm-starts
+  # from the CPU run's): the runs use a copy of the fixture, whose committed history
+  # stays as it is. An 8-expert variant of the fixture has room for pinned hot
+  # experts, which the store keeps in its rows16 layout: the tier gets them unpacked.
+  rm -rf deepseek_v4_tiny_t && cp -r deepseek_v4_tiny deepseek_v4_tiny_t
+  $PY - tools/make_deepseek_v4_tiny.py deepseek_v4_tiny_e8 <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("gen", sys.argv[1])
+gen = importlib.util.module_from_spec(spec); spec.loader.exec_module(gen)
+gen.EXPERTS = 8          # 8 routed experts a layer: two cache slots a layer for pins
+sys.argv = ["make_deepseek_v4_tiny.py", "--output", sys.argv[2], "--force"]
+gen.main()
+PY
+  v4_tier() {  # <tag> <fixture> <case> <env...>
+    local tag=$1 fx=$2 c=$3; shift 3
+    local p mt
+    p=$($PY -c 'import json,sys; c=json.load(open(sys.argv[1]+"/ref.json"))["cases"][sys.argv[2]]; print("".join("<t%03d>" % t for t in c["prompt_ids"]))' $fx $c)
+    mt=$($PY -c 'import json,sys; print(json.load(open(sys.argv[1]+"/ref.json"))["cases"][sys.argv[2]]["max_new_tokens"])' $fx $c)
+    rm -f $fx/.coli_usage
+    env "$@" ./deepseek_v4 ./$fx "$p" --raw-prompt --max-tokens $mt --record-oracle v4-cpu.json > /dev/null 2> v4-cpu.err ||
+      { cat v4-cpu.err; fail "deepseek_v4 tier $tag: CPU run"; }
+    [ "${WARM:-0}" = 1 ] || rm -f $fx/.coli_usage
+    env "$@" COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 ./deepseek_v4 ./$fx "$p" --raw-prompt --max-tokens $mt --record-oracle v4-vk.json > /dev/null 2> v4-vk.err ||
+      { cat v4-vk.err; fail "deepseek_v4 tier $tag: Vulkan run"; }
+    rm -f $fx/.coli_usage
+    $PY - $fx $c <<'PY' || fail "deepseek_v4 tier $tag: the Vulkan session differs from the CPU's"
+import json, sys
+a, b = json.load(open("v4-cpu.json")), json.load(open("v4-vk.json"))
+ref = json.load(open(sys.argv[1] + "/ref.json"))["cases"][sys.argv[2]]["greedy_full_ids"]
+ok = a["full_ids"] == b["full_ids"] == ref and a["tf_pred"] == b["tf_pred"]
+if not ok: print("CPU", a, "VK", b, "ref", ref)
+sys.exit(0 if ok else 1)
+PY
+    [ "$(tier_count deepseek_v4 v4-vk.err)" -gt 0 ] || { cat v4-vk.err; fail "deepseek_v4 tier $tag: no routed expert ran on the device"; }
+    if [ "${EVICT:-0}" = 1 ]; then
+      [ "$(tier_evictions deepseek_v4 v4-vk.err)" -gt 0 ] || { grep '\[VK\] tier' v4-vk.err; fail "deepseek_v4 tier $tag: the budget forced no eviction"; }
+      [ "$(tier_failed deepseek_v4 v4-vk.err)" = 0 ] || { grep '\[VK\] tier' v4-vk.err; fail "deepseek_v4 tier $tag: an upload failed (the budget shrank)"; }
+    fi
+    if [ "${WARM:-0}" = 1 ]; then
+      grep -q '^\[VK\] tier deepseek_v4: warm start' v4-vk.err || { grep '\[VK\] tier' v4-vk.err; fail "deepseek_v4 tier $tag: no warm start"; }
+    fi
+    echo "OK deepseek_v4 tier $tag ($c): ids = CPU = reference, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' v4-vk.err | tail -1), $(grep -a -o 'evictions [0-9]*' v4-vk.err | tail -1), $(grep -a -o 'packed_slots=[0-9]*' v4-vk.err) rows16"
+  }
+  for c in short compressed long; do
+    v4_tier "4 experts" deepseek_v4_tiny_t $c
+    v4_tier "8 experts, pinned rows16" deepseek_v4_tiny_e8 $c
+  done
+  EVICT=1 v4_tier "a budget of three experts" deepseek_v4_tiny_e8 long COLI_VK_TIER_GB=0.00009
+  v4_tier "trunk on the device too" deepseek_v4_tiny_t long COLI_VK_DENSE=1
+  v4_tier "the GEMM route from 2 rows" deepseek_v4_tiny_t long COLI_VK_TIER_GEMM_ROWS=2
+  WARM=1 v4_tier "warm start from the CPU run's history" deepseek_v4_tiny_e8 long
+  # A served prompt with every routed expert on the device (warm start from the CPU
+  # run's history): its per-position logprob echoes against the CPU's. Measured on
+  # Lavapipe they are the same bytes; the gate allows 1e-3, for an exp() that rounds
+  # one hidden value to the other bf16 neighbour on another driver.
+  $PY - deepseek_v4_tiny_e8 <<'PY' || fail "deepseek_v4 tier: served logprobs differ from the CPU's"
+import json, os, sys
+from pathlib import Path
+sys.path.insert(0, "tests")
+import test_deepseek_v4_brio as b
+fx = Path(sys.argv[1])
+case = json.load(open(fx / "ref.json"))["cases"]["long"]
+def echoes(vk):
+    os.environ.pop("COLI_VULKAN", None)
+    if vk: os.environ.update(COLI_VULKAN="1", COLI_VK_TIER_SYNC="1")
+    else:
+        try: os.remove(fx / ".coli_usage")
+        except FileNotFoundError: pass
+    s = b.Serve(Path("deepseek_v4").resolve(), fx)
+    try: return s.submit(b.token_prompt(case["prompt_ids"]), 0, logprobs=5).echoes
+    finally:
+        s.close()
+        tier = [l for l in s.process.stderr.read().decode(errors="replace").splitlines() if "tier deepseek_v4 turn:" in l]
+        if vk: print("  ", tier[-1][:90] if tier else "no tier line")
+cpu, dev = echoes(False), echoes(True)
+os.environ.pop("COLI_VULKAN", None)
+same = sum(cpu[p] == dev.get(p) for p in cpu)
+worst = max(abs(cpu[p]["lp"] - dev[p]["lp"]) for p in cpu) if len(cpu) == len(dev) else 1.0
+print(f"OK deepseek_v4 tier served: {same} of {len(cpu)} positions' logprob echoes identical to the CPU's, worst |delta| {worst:.2e}")
+sys.exit(0 if len(cpu) == len(dev) and worst <= 1e-3 else 1)
+PY
+  rm -rf deepseek_v4_tiny_t deepseek_v4_tiny_e8
+}
+
+# The routed-expert tier of both deepseek engines under ASan and UBSan: sanitized VK=1
+# builds, the tier's configurations on Lavapipe (decode and prefill, eviction, DSpark,
+# pinned rows16 experts, the warm start, the trunk on the device). Memory safety is
+# the gate; each run must still put experts on the device.
+family_deepseek_sanitize() {
+  local SAN="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  make clean >/dev/null 2>&1 || true
+  make deepseek_v41 VK=1 EXTRA_CFLAGS="$SAN"
+  make deepseek-v4 VK=1 LTO=0 EXTRA_CFLAGS="$SAN" EXTRA_LDFLAGS="$SAN"
+  $PY tools/make_dsv41_tiny.py --out dsv41_tiny --emit-ref dsv41_tiny/ref.json
+  $PY tools/make_dsv41_tiny.py --out dsv41_long --emit-ref dsv41_long/ref.json --prompt-len 40 --max-new 6
+  $PY tools/make_deepseek_v4_tiny.py --output deepseek_v4_tiny_t --force
+  $PY - tools/make_deepseek_v4_tiny.py deepseek_v4_tiny_e8 <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("gen", sys.argv[1])
+gen = importlib.util.module_from_spec(spec); spec.loader.exec_module(gen)
+gen.EXPERTS = 8
+sys.argv = ["make_deepseek_v4_tiny.py", "--output", sys.argv[2], "--force"]
+gen.main()
+PY
+  san() {  # <engine> <tag> <env and argv...>
+    local eng=$1 tag=$2; shift 2
+    rm -f tier.usage deepseek_v4_tiny_t/.coli_usage deepseek_v4_tiny_e8/.coli_usage
+    env ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2 \
+      COLI_USAGE=tier.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 "$@" > san.log 2>&1 || true
+    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    [ "$(tier_count "$eng" san.log)" -gt 0 ] || { cat san.log; fail "$tag: no routed expert ran on the device"; }
+    echo "OK $tag: sanitizers clean, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' san.log | tail -1), $(grep -a -o 'evictions [0-9]*' san.log | tail -1)"
+  }
+  local cap force p
+  for cap in 1 8; do san deepseek_v41 "asan deepseek_v41 cap=$cap" SNAP=dsv41_long ./deepseek_v41 $cap dsv41_long/ref.json; done
+  for force in 2 4; do san deepseek_v41 "asan deepseek_v41 DSpark spec=$force" SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=$force ./deepseek_v41 1 dsv41_tiny/ref.json; done
+  san deepseek_v41 "asan deepseek_v41 eviction" COLI_VK_TIER_GB=0.00005 SNAP=dsv41_long ./deepseek_v41 8 dsv41_long/ref.json
+  san deepseek_v41 "asan deepseek_v41 trunk on the device" COLI_VK_DENSE=1 SNAP=dsv41_tiny ./deepseek_v41 2 dsv41_tiny/ref.json
+  p=$($PY -c 'import json; c=json.load(open("deepseek_v4_tiny_t/ref.json"))["cases"]["long"]; print("".join("<t%03d>" % t for t in c["prompt_ids"]))')
+  san deepseek_v4 "asan deepseek_v4" ./deepseek_v4 ./deepseek_v4_tiny_t "$p" --raw-prompt --max-tokens 4 --record-oracle san.json
+  san deepseek_v4 "asan deepseek_v4 pinned rows16" ./deepseek_v4 ./deepseek_v4_tiny_e8 "$p" --raw-prompt --max-tokens 4 --record-oracle san.json
+  san deepseek_v4 "asan deepseek_v4 eviction" COLI_VK_TIER_GB=0.00009 ./deepseek_v4 ./deepseek_v4_tiny_e8 "$p" --raw-prompt --max-tokens 4 --record-oracle san.json
+  san deepseek_v4 "asan deepseek_v4 trunk on the device" COLI_VK_DENSE=1 ./deepseek_v4 ./deepseek_v4_tiny_t "$p" --raw-prompt --max-tokens 4
+  # the warm start: a run that leaves its history, then one that starts from it
+  ./deepseek_v4 ./deepseek_v4_tiny_e8 "$p" --raw-prompt --max-tokens 4 > /dev/null 2>&1 || true
+  env ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 \
+    ./deepseek_v4 ./deepseek_v4_tiny_e8 "$p" --raw-prompt --max-tokens 4 > san.log 2>&1 || true
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan deepseek_v4 warm start: sanitizer diagnostic"; fi
+  grep -q '^\[VK\] tier deepseek_v4: warm start' san.log || { cat san.log; fail "asan deepseek_v4 warm start: no warm start"; }
+  echo "OK asan deepseek_v4 warm start: sanitizers clean, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' san.log | tail -1)"
+  rm -rf deepseek_v4_tiny_t deepseek_v4_tiny_e8 san.json
+  make clean >/dev/null 2>&1 || true
+  make deepseek-v4-clean >/dev/null 2>&1 || true
+}
+
+# Kimi K3: the routed experts on the shared tier (MXFP4 with ue8m0 scales, fmt 7,
+# SiTU-GLU in the latent space), against Moonshot's vendor oracle and the CPU run.
+# K3_IDOT=0 everywhere: the CPU's default int8-activation expert kernel is an
+# approximation the device does not make (the oracle's engine_env sets it too).
+family_kimi() {
+  make kimi_k3 VK=1
+  $PY tools/make_kimi_k3_tiny.py --output ./kimi_k3_tiny --force
+  # Moonshot's oracle (greedy, teacher forcing at every position, determinism, the
+  # bite) with the tier on, the shared experts where the default puts them (the CPU
+  # on Lavapipe) and on the device
+  COLI_USAGE=$PWD/k3.usage USAGE_SAVE=0 COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 \
+    $PY tests/test_kimi_k3_tiny.py --binary ./kimi_k3 --fixture ./kimi_k3_tiny
+  COLI_USAGE=$PWD/k3.usage USAGE_SAVE=0 COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 COLI_VK_DENSE=1 \
+    $PY tests/test_kimi_k3_tiny.py --binary ./kimi_k3 --fixture ./kimi_k3_tiny
+  k3ids() { $PY -c "import json,sys;print(' '.join(map(str,json.load(open('kimi_k3_tiny/ref.json'))['cases'][sys.argv[1]]['prompt_ids'])))" "$1"; }
+  # k3_gate <tag> <env...>: the tokens of the CPU run, the tier served some experts,
+  # the shared experts where they were asked to be (dense_where); EVICT=1: it evicted
+  k3_gate() {
+    local tag=$1 c; shift
+    for c in short chunk long; do
+      rm -f k3.usage
+      env "$@" COLI_USAGE=$PWD/k3.usage USAGE_SAVE=0 ./kimi_k3 kimi_k3_tiny --ids "$(k3ids $c)" --ngen 8 2>/dev/null | sed 's/ *TUNE.*//' > cpu.tok
+      env "$@" COLI_USAGE=$PWD/k3.usage USAGE_SAVE=0 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 \
+        ./kimi_k3 kimi_k3_tiny --ids "$(k3ids $c)" --ngen 8 2> vk.log | sed 's/ *TUNE.*//' > vk.tok
+      { [ -s cpu.tok ] && cmp -s cpu.tok vk.tok; } || { cat cpu.tok vk.tok vk.log; fail "$tag $c: Vulkan tokens differ from the CPU"; }
+      [ "$(tier_count kimi_k3 vk.log)" -gt 0 ] || { cat vk.log; fail "$tag $c: no routed expert ran on the device"; }
+      if [ "${EVICT:-0}" = 1 ]; then
+        [ "$(tier_evictions kimi_k3 vk.log)" -gt 0 ] || { grep '\[VK\] tier' vk.log; fail "$tag $c: the budget forced no eviction"; }
+        grep -q ' failed 0 ' vk.log || { grep '\[VK\] tier' vk.log; fail "$tag $c: an upload failed"; }
+      fi
+      local where; where=$(dense_where kimi_k3 vk.log "$tag $c" "$@") || { echo "$where"; exit 1; }
+      echo "OK $tag $c: tokens = CPU, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' vk.log | tail -1), $(grep -a -o 'evictions [0-9]*' vk.log | tail -1), shared experts on the $where"
+    done
+  }
+  local O="K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 COLI_TEMP=0" b
+  k3_gate "kimi_k3 tier f32" $O
+  k3_gate "kimi_k3 tier f32, shared experts on the device" $O COLI_VK_DENSE=1
+  for b in 8 4; do   # the shared experts as int8 rows (fmt 1) and int4-g64 (fmt 4) on the device
+    k3_gate "kimi_k3 tier K3_BITS=$b, shared experts on the device" K3_BITS=$b K3_MLA_BITS=$b K3_HEAD_BITS=$b K3_IDOT=0 COLI_TEMP=0 COLI_VK_DENSE=1
+  done
+  k3_gate "kimi_k3 tier, prefill one token at a time" $O K3_CHUNK=1
+  k3_gate "kimi_k3 tier, loads not pipelined" $O K3_PIPE=0
+  EVICT=1 k3_gate "kimi_k3 tier, a budget of two experts" $O COLI_VK_TIER_GB=0.000005
+  # the old switches: K3_VK=1 opens the device as COLI_VULKAN=1 does and K3_VK_GB caps
+  # the tier; K3_VK=0 keeps it closed whatever COLI_VULKAN says
+  rm -f k3.usage
+  env $O COLI_USAGE=$PWD/k3.usage USAGE_SAVE=0 ./kimi_k3 kimi_k3_tiny --ids "$(k3ids long)" --ngen 8 2>/dev/null | sed 's/ *TUNE.*//' > cpu.tok
+  env $O COLI_USAGE=$PWD/k3.usage USAGE_SAVE=0 COLI_VK_TIER_SYNC=1 K3_VK=1 K3_VK_GB=0.000005 \
+    ./kimi_k3 kimi_k3_tiny --ids "$(k3ids long)" --ngen 8 2> vk.log | sed 's/ *TUNE.*//' > vk.tok
+  cmp -s cpu.tok vk.tok || { cat vk.log; fail "kimi_k3 K3_VK=1: tokens differ from the CPU"; }
+  grep -q 'K3_VK=1 read as COLI_VULKAN=1' vk.log && grep -q 'budget [0-9.]* KiB = 2 experts' vk.log &&
+    [ "$(tier_count kimi_k3 vk.log)" -gt 0 ] || { cat vk.log; fail "kimi_k3 K3_VK=1 K3_VK_GB: not the tier it asked for"; }
+  env $O COLI_USAGE=$PWD/k3.usage USAGE_SAVE=0 K3_VK=0 COLI_VULKAN=1 \
+    ./kimi_k3 kimi_k3_tiny --ids "$(k3ids long)" --ngen 8 2> vk.log | sed 's/ *TUNE.*//' > vk.tok
+  cmp -s cpu.tok vk.tok && ! grep -q '^\[VK\]' vk.log || { cat vk.log; fail "kimi_k3 K3_VK=0: the device opened"; }
+  echo "OK kimi_k3 K3_VK=1 / K3_VK_GB / K3_VK=0: the shared tier's switches"
+  # a warm start from the history of the run before: the tier starts full, serves
+  # every routed expert of the same prompt, and the tokens stay the CPU's
+  rm -f k3.usage
+  env $O COLI_USAGE=$PWD/k3.usage COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 ./kimi_k3 kimi_k3_tiny --ids "$(k3ids long)" --ngen 8 > /dev/null 2>&1
+  env $O COLI_USAGE=$PWD/k3.usage USAGE_SAVE=0 COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 \
+    ./kimi_k3 kimi_k3_tiny --ids "$(k3ids long)" --ngen 8 2> vk.log | sed 's/ *TUNE.*//' > vk.tok
+  cmp -s cpu.tok vk.tok || { cat vk.log; fail "kimi_k3 warm start: tokens differ from the CPU"; }
+  grep -q 'tier kimi_k3: warm start, [1-9]' vk.log || { cat vk.log; fail "kimi_k3: no warm start from the history"; }
+  echo "OK kimi_k3 warm start: tokens = CPU, $(grep -a -o 'warm start, [0-9]* experts' vk.log), $(grep -a -o 'device [0-9]* of [0-9]* routed experts' vk.log | tail -1)"
+  # COLI_VK_TIER=0: the shared experts alone on the device, as before the tier
+  env $O COLI_USAGE=$PWD/k3.usage USAGE_SAVE=0 COLI_VK_TIER=0 COLI_VULKAN=1 \
+    ./kimi_k3 kimi_k3_tiny --ids "$(k3ids long)" --ngen 8 2> vk.log | sed 's/ *TUNE.*//' > vk.tok
+  cmp -s cpu.tok vk.tok || { cat vk.log; fail "kimi_k3 COLI_VK_TIER=0: tokens differ from the CPU"; }
+  ! grep -q '^\[VK\] tier' vk.log || { cat vk.log; fail "kimi_k3 COLI_VK_TIER=0: the tier started"; }
+  need_gpu kimi_k3 vk.log "kimi_k3 COLI_VK_TIER=0"
+  echo "OK kimi_k3 COLI_VK_TIER=0: tokens = CPU, no tier, $(vk_count kimi_k3 vk.log) matmuls on the GPU"
+}
+
+# The Kimi K3 and MiMo expert tiers under ASan and UBSan, as qwen-sanitize does for
+# the qwen engines: memory safety is the gate, and each run must still put routed
+# experts on the device.
+family_kimi_mimo_sanitize() {
+  make clean >/dev/null 2>&1 || true
+  make kimi_k3 mimo VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  $PY tools/make_kimi_k3_tiny.py --output ./kimi_k3_tiny --force
+  $PY tools/make_mimo_tiny.py --output ./mimo_tiny --force --vision
+  ksan() {  # <engine> <tag> <env and argv...>
+    local eng=$1 tag=$2; shift 2
+    env ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2 \
+      COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 "$@" > san.log 2>&1 || true
+    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    [ "$(tier_count "$eng" san.log)" -gt 0 ] || { cat san.log; fail "$tag: no routed expert ran on the device"; }
+    echo "OK $tag: sanitizers clean, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' san.log | tail -1), $(grep -a -o 'evictions [0-9]*' san.log | tail -1)"
+  }
+  local O="K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 COLI_TEMP=0" K3IDS MIDS IMG GRID
+  K3IDS=$($PY -c "import json;print(' '.join(map(str,json.load(open('kimi_k3_tiny/ref.json'))['cases']['long']['prompt_ids'])))")
+  MIDS=$($PY -c "import json;print(' '.join(map(str,json.load(open('mimo_tiny/ref.json'))['cases']['long']['prompt_ids'])))")
+  IMG=$($PY -c "import json;print(' '.join(map(str,json.load(open('mimo_tiny/ref.json'))['image']['prompt_ids'])))")
+  GRID=$($PY -c "import json;i=json.load(open('mimo_tiny/ref.json'))['image'];print(i['grid_h'],i['grid_w'])")
+  rm -f k3.usage
+  ksan kimi_k3 "asan kimi_k3 tier" $O COLI_USAGE=$PWD/k3.usage ./kimi_k3 kimi_k3_tiny --ids "$K3IDS" --ngen 8
+  ksan kimi_k3 "asan kimi_k3 warm start, shared experts on the device" $O COLI_USAGE=$PWD/k3.usage COLI_VK_DENSE=1 ./kimi_k3 kimi_k3_tiny --ids "$K3IDS" --ngen 8
+  ksan kimi_k3 "asan kimi_k3 eviction, int8 shared experts" K3_BITS=8 K3_IDOT=0 COLI_USAGE=$PWD/k3e.usage USAGE_SAVE=0 COLI_VK_TIER_GB=0.000005 COLI_VK_DENSE=1 ./kimi_k3 kimi_k3_tiny --ids "$K3IDS" --ngen 8
+  ksan kimi_k3 "asan kimi_k3 prefill one token at a time, no pipeline" $O COLI_USAGE=$PWD/k3e.usage USAGE_SAVE=0 K3_CHUNK=1 K3_PIPE=0 ./kimi_k3 kimi_k3_tiny --ids "$K3IDS" --ngen 8
+  ksan mimo "asan mimo tier" MIMO_DENSE_BITS=32 COLI_TEMP=0 ./mimo mimo_tiny --ids "$MIDS" --ngen 6
+  ksan mimo "asan mimo eviction (MIMO_VK_EXPERTS=2)" MIMO_DENSE_BITS=32 COLI_TEMP=0 MIMO_VK_EXPERTS=2 ./mimo mimo_tiny --ids "$MIDS" --ngen 6
+  ksan mimo "asan mimo picture, native dense on the device" MIMO_DENSE_BITS=0 COLI_TEMP=0 COLI_VK_DENSE=1 ./mimo mimo_tiny --ids "$IMG" --ngen 6 --image mimo_tiny/patches.f32 --grid $GRID
+  ksan mimo "asan mimo prefill blocks of 3, cache 4" MIMO_DENSE_BITS=32 COLI_TEMP=0 MIMO_CHUNK=3 MIMO_CAP=4 ./mimo mimo_tiny --ids "$MIDS" --ngen 6
+  make clean >/dev/null 2>&1 || true
+}
+
+# GLM-5.2 (colibri) and GLM-5.3 Flash (glm53) on the routed-expert tier: the fixtures.
+# colibri: the bf16 oracle, whose experts the loader quantizes to the bits asked for
+# (16: f32, fmt 10 on the device; 8: int8, fmt 1; 4: int4 per row, fmt 2; 3: int3-g64,
+# fmt 5), the int4-g64 and E8/IQ3 containers of the parity gate, and the FP8 oracle
+# converted to int4-g64 (its 32-wide down rows stay per row), int4 per row, int3-g64 and
+# int4-g64 with an int3-g64 down. glm53: the int4-gs64 streaming container.
+glm_fixtures() {
+  $PY tools/make_glm_oracle.py > /dev/null
+  $PY tools/make_glm_oracle.py --fmt4 > /dev/null
+  $PY tools/make_glm_oracle.py --fmt6 > /dev/null
+  mkdir -p glm_fp8 && (cd glm_fp8 && $PY ../tools/make_glm_oracle.py --fp8 > /dev/null)
+  local v
+  for v in "i4:" "i4r:--group-size 0" "i3:--xbits 3" "d3:--down-bits 3"; do
+    # shellcheck disable=SC2086
+    $PY tools/convert_fp8_to_int4.py --indir glm_fp8/glm_tiny --outdir glm_tiny_${v%%:*} \
+      --ebits 4 --io-bits 4 --n-layers 5 --min-free-gb 0 ${v#*:} > /dev/null
+    cp glm_fp8/ref_glm.json glm_tiny_${v%%:*}/
+  done
+  $PY tools/make_glm53_tiny.py --output glm53_tiny --force > /dev/null
+  $PY tools/make_glm53_streaming_pair.py --fixture glm53_tiny --output glm53_stream > /dev/null
+}
+
+# glm_tier <tag> <snap> <ref> <env...> -- <argv...>
+# colibri with the tier against its CPU run: the same greedy tokens (or teacher-forced
+# predictions, TF=1, mismatches included) and a "[VK] tier colibri run: device N" with
+# N > 0; EVICT=1: evictions too. The history the tier warms from is <snap>/.coli_usage:
+# none by default (the tier fills as experts pass by), HIST=1 writes one first from a
+# greedy run (the warm start, and the device in a teacher-forced prefill). DEV2=1: the
+# second device's registry served experts ("+ N vk" in the hit-rate line).
+glm_tier() {
+  local tag=$1 snap=$2 ref=$3; shift 3
+  local envs=() pre=() e; while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  for e in "${envs[@]}"; do [ "${e%%=*}" = TF ] || pre+=("$e"); done
+  rm -f "$snap/.coli_usage"
+  [ "${HIST:-0}" = 1 ] && { env "${pre[@]}" SNAP=$snap REF=$ref STATS=$snap/.coli_usage ./colibri "$@" > /dev/null 2>&1 || true; }
+  env "${envs[@]}" SNAP=$snap REF=$ref ./colibri "$@" > cpu.log 2>&1 || true
+  env "${envs[@]}" SNAP=$snap REF=$ref COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 ./colibri "$@" > vk.log 2>&1 || true
+  rm -f "$snap/.coli_usage"
+  grep -aE '^GLM C engine|^PREFILL|^\[ORACLE\] mismatch' cpu.log | sed 's/ | [0-9.]* pos\/s//' > cpu.tok || true
+  grep -aE '^GLM C engine|^PREFILL|^\[ORACLE\] mismatch' vk.log | sed 's/ | [0-9.]* pos\/s//' > vk.tok || true
+  { [ -s cpu.tok ] && cmp -s cpu.tok vk.tok; } || { cat cpu.tok vk.tok; tail -20 vk.log; fail "$tag: the tier's tokens differ from the CPU"; }
+  if [ "${DEV2:-0}" = 1 ]; then
+    grep -qaE 'lru \+ [1-9][0-9]* vk /' vk.log || { cat vk.log; fail "$tag: the second device served no expert"; }
+  else
+    [ "$(tier_count colibri vk.log)" -gt 0 ] || { cat vk.log; fail "$tag: no routed expert ran on the device"; }
+  fi
+  if [ "${EVICT:-0}" = 1 ]; then
+    [ "$(tier_evictions colibri vk.log)" -gt 0 ] || { grep '\[VK\] tier' vk.log; fail "$tag: the budget forced no eviction"; }
+    [ "$(tier_failed colibri vk.log)" = 0 ] || { grep '\[VK\] tier' vk.log; fail "$tag: an upload failed (the budget shrank)"; }
+  fi
+  echo "OK $tag: tokens = CPU, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' vk.log | tail -1)$(grep -a -o ' + [0-9]* vk' vk.log | tail -1), $(grep -a -o 'evictions [0-9]*' vk.log | tail -1), $(grep -a -o '(fmt [^)]*)' vk.log | head -1)"
+}
+
+# g53_tier <tag> <model dir> <env...> -- <argv...>: glm53, the same gate on its
+# teacher_forcing and greedy lines; the history is a fresh COLI_USAGE file (HIST=1: one
+# greedy run writes it first).
+g53_tier() {
+  local tag=$1 model=$2; shift 2
+  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  rm -f g53.usage
+  [ "${HIST:-0}" = 1 ] && { env "${envs[@]}" COLI_USAGE=g53.usage ./glm53 --model $model "$@" > /dev/null 2>&1 || true; }
+  env "${envs[@]}" COLI_USAGE=g53.usage USAGE_SAVE=0 ./glm53 --model $model "$@" > cpu.log 2>&1 || true
+  env "${envs[@]}" COLI_USAGE=g53.usage USAGE_SAVE=0 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 ./glm53 --model $model "$@" > vk.log 2>&1 || true
+  rm -f g53.usage
+  grep -aE '^teacher_forcing|^greedy' cpu.log > cpu.tok || true
+  grep -aE '^teacher_forcing|^greedy' vk.log > vk.tok || true
+  { [ -s cpu.tok ] && cmp -s cpu.tok vk.tok; } || { cat cpu.tok vk.tok; tail -20 vk.log; fail "$tag: the tier's tokens differ from the CPU"; }
+  [ "$(tier_count glm53 vk.log)" -gt 0 ] || { cat vk.log; fail "$tag: no routed expert ran on the device"; }
+  if [ "${EVICT:-0}" = 1 ]; then
+    [ "$(tier_evictions glm53 vk.log)" -gt 0 ] || { grep '\[VK\] tier' vk.log; fail "$tag: the budget forced no eviction"; }
+    [ "$(tier_failed glm53 vk.log)" = 0 ] || { grep '\[VK\] tier' vk.log; fail "$tag: an upload failed (the budget shrank)"; }
+  fi
+  local where; where=$(dense_where glm53 vk.log "$tag" "${envs[@]}") || { echo "$where"; exit 1; }
+  echo "OK $tag: tokens = CPU, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' vk.log | tail -1), $(grep -a -o 'evictions [0-9]*' vk.log | tail -1), trunk on the $where"
+}
+
+# GLM-5.2 and GLM-5.3 Flash on the routed-expert tier, in every expert format the two
+# engines read, warm and cold, decode and teacher-forced prefill, under eviction (a
+# budget of two experts, by COLI_VK_TIER_GB and by the deprecated COLI_VK_EXPERTS), with
+# the trunk and the attention core on the device, beside COLI_VK_DEV2's second
+# (logical) device, and with the tier off. IDOT=0 gives the CPU's int8 and int4-per-row
+# experts the f32 activations the device uses (the CPU default rounds them to int8 on
+# some ISAs), so the two sides differ by summation order only.
+family_glm() {
+  make colibri glm53 VK=1
+  glm_fixtures
+  export OMP_NUM_THREADS=2 CAP_RAISE=0
+  local cap b
+  # the oracle with f32 experts (fmt 10): decode cold at a one-slot and a full cache,
+  # the teacher-forced prefill from a warm start
+  for cap in 1 64; do glm_tier "colibri f32 experts cap=$cap" glm_tiny ref_glm.json -- $cap 16 16; done
+  HIST=1 glm_tier "colibri f32 experts, prefill from a warm start" glm_tiny ref_glm.json TF=1 -- 64 16 16
+  # quantized at load: int8 (fmt 1), int4 per row (fmt 2), int3-g64 (fmt 5)
+  for b in 8 4 3; do
+    glm_tier "colibri ${b}-bit experts cap=2" glm_tiny ref_glm.json IDOT=0 -- 2 $b 4
+    HIST=1 glm_tier "colibri ${b}-bit experts, prefill warm" glm_tiny ref_glm.json IDOT=0 TF=1 -- 2 $b 4
+  done
+  # the containers: int4-g64 gate/up/down, int4-g64 with a per-row down, int4 per row,
+  # int3-g64, int4-g64 with an int3-g64 down
+  HIST=1 glm_tier "colibri int4-g64 container" glm_tiny_fmt4 glm_tiny_fmt4/ref_glm.json -- 2 16 16
+  HIST=1 glm_tier "colibri int4-g64 container, prefill" glm_tiny_fmt4 glm_tiny_fmt4/ref_glm.json TF=1 -- 2 16 16
+  local fx
+  for fx in i4 i4r i3 d3; do
+    HIST=1 glm_tier "colibri $fx container cap=1" glm_tiny_$fx glm_tiny_$fx/ref_glm.json IDOT=0 -- 1 4 4
+    HIST=1 glm_tier "colibri $fx container, prefill" glm_tiny_$fx glm_tiny_$fx/ref_glm.json IDOT=0 TF=1 -- 2 4 4
+  done
+  # PIPE's asynchronous loads and the PILOT prefetcher beside the tier
+  glm_tier "colibri PIPE=1" glm_tiny_i4 glm_tiny_i4/ref_glm.json IDOT=0 PIPE=1 -- 1 4 4
+  glm_tier "colibri PILOT=1" glm_tiny_i4 glm_tiny_i4/ref_glm.json IDOT=0 PILOT=1 -- 2 4 4
+  # the trunk and the MLA attention core on the device too
+  HIST=1 glm_tier "colibri tier + COLI_VK_DENSE=1 COLI_VK_ATTN=1" glm_tiny_i4 glm_tiny_i4/ref_glm.json IDOT=0 COLI_VK_DENSE=1 COLI_VK_ATTN=1 -- 2 4 4
+  # a budget of two experts must evict as the routing moves: COLI_VK_TIER_GB, and the
+  # deprecated COLI_VK_EXPERTS mapped onto the tier as a cap
+  EVICT=1 glm_tier "colibri, a budget of two experts" glm_tiny ref_glm.json COLI_VK_TIER_GB=0.0001 -- 64 16 16
+  EVICT=1 glm_tier "colibri, COLI_VK_EXPERTS=2" glm_tiny ref_glm.json COLI_VK_EXPERTS=2 -- 64 16 16
+  # COLI_VK_DEV2: a second logical device on Lavapipe holds what the capped tier does not
+  HIST=1 glm_tier "colibri tier + COLI_VK_DEV2" glm_tiny_i4r glm_tiny_i4r/ref_glm.json IDOT=0 COLI_VK_EXPERTS=4 COLI_VK_DEV2=0 -- 64 4 4
+  HIST=1 DEV2=1 glm_tier "colibri COLI_VK_DEV2 alone (COLI_VK_TIER=0)" glm_tiny_i4r glm_tiny_i4r/ref_glm.json IDOT=0 COLI_VK_TIER=0 COLI_VK_DEV2=0 -- 64 4 4
+  # E8/IQ3 (fmt 6) has no device form: the tier declines, the CPU computes them
+  SNAP=glm_tiny_fmt6 REF=glm_tiny_fmt6/ref_glm.json ./colibri 2 16 16 > cpu.log 2>&1 || true
+  SNAP=glm_tiny_fmt6 REF=glm_tiny_fmt6/ref_glm.json COLI_VULKAN=1 ./colibri 2 16 16 > vk.log 2>&1 || true
+  cmp -s <(grep -a '^GLM C engine' cpu.log) <(grep -a '^GLM C engine' vk.log) || { cat vk.log; fail "colibri fmt 6: tokens differ"; }
+  grep -qa 'tier colibri: experts in fmt 6/6/6' vk.log || { cat vk.log; fail "colibri fmt 6: the tier did not decline"; }
+  echo "OK colibri E8/IQ3 (fmt 6): the tier declines, tokens = CPU"
+  # COLI_VK_TIER=0: no tier, the trunk and the attention core on the device as before
+  SNAP=glm_tiny REF=ref_glm.json COLI_VK_DENSE=1 COLI_VK_ATTN=1 ./colibri 2 16 16 > cpu.log 2>&1 || true
+  SNAP=glm_tiny REF=ref_glm.json COLI_VK_DENSE=1 COLI_VK_ATTN=1 COLI_VK_TIER=0 COLI_VULKAN=1 ./colibri 2 16 16 > vk.log 2>&1 || true
+  cmp -s <(grep -a '^GLM C engine' cpu.log) <(grep -a '^GLM C engine' vk.log) || { cat vk.log; fail "colibri COLI_VK_TIER=0: tokens differ"; }
+  ! grep -qa '^\[VK\] tier colibri' vk.log || { cat vk.log; fail "colibri COLI_VK_TIER=0: the tier started"; }
+  echo "OK colibri COLI_VK_TIER=0: tokens = CPU, no tier"
+
+  # glm53: its int4-gs64 streaming container (swiglu_limit 10), dense matrices f32 and int4
+  local ids
+  ids=$($PY -c "print(','.join(str((i*37+5)%120+2) for i in range(100)))")
+  g53_tier "glm53 decode, cold" glm53_stream-i4 GLM53_BITS=32 -- --ids 5,7,9,11,13,17,19,23 --greedy 8
+  HIST=1 g53_tier "glm53 100-token prompt, warm (two blocks of rows)" glm53_stream-i4 GLM53_BITS=32 -- --ids $ids --greedy 4
+  HIST=1 g53_tier "glm53 prefill chunks of 7, one cache slot" glm53_stream-i4 GLM53_BITS=4 GLM53_PREFILL_CHUNK=7 GLM53_EXPERT_GB=0.000001 -- --ids $ids --greedy 4
+  HIST=1 g53_tier "glm53 trunk on the device (COLI_VK_DENSE=1)" glm53_stream-i4 GLM53_BITS=4 COLI_VK_DENSE=1 -- --ids $ids --greedy 4
+  EVICT=1 g53_tier "glm53, a budget of two experts" glm53_stream-i4 GLM53_BITS=32 COLI_VK_TIER_GB=0.00006 -- --ids $ids --greedy 6
+  # COLI_VK_TIER=0: the trunk alone, on the device by default, Lavapipe included
+  GLM53_BITS=4 COLI_USAGE=g53.usage USAGE_SAVE=0 ./glm53 --model glm53_stream-i4 --ids 5,7,9,11 --greedy 4 > cpu.log 2>&1 || true
+  GLM53_BITS=4 COLI_USAGE=g53.usage USAGE_SAVE=0 COLI_VK_TIER=0 COLI_VULKAN=1 ./glm53 --model glm53_stream-i4 --ids 5,7,9,11 --greedy 4 > vk.log 2>&1 || true
+  cmp -s <(grep -aE '^teacher_forcing|^greedy' cpu.log) <(grep -aE '^teacher_forcing|^greedy' vk.log) || { cat vk.log; fail "glm53 COLI_VK_TIER=0: tokens differ"; }
+  ! grep -qa '^\[VK\] tier glm53' vk.log || { cat vk.log; fail "glm53 COLI_VK_TIER=0: the tier started"; }
+  need_gpu glm53 vk.log "glm53 COLI_VK_TIER=0"
+  echo "OK glm53 COLI_VK_TIER=0: tokens = CPU, no tier, $(vk_count glm53 vk.log) matmuls on the GPU"
+  unset OMP_NUM_THREADS CAP_RAISE
+}
+
+# The same engines under ASan and UBSan with the tier on: memory safety is the gate, and
+# each run must still put experts on the device.
+family_glm_sanitize() {
+  make clean >/dev/null 2>&1 || true
+  make colibri glm53 VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  glm_fixtures
+  export OMP_NUM_THREADS=2 CAP_RAISE=0
+  gsan() {  # <engine> <tag> <history: colibri snap, or - for glm53's COLI_USAGE> <env and argv...>
+    local eng=$1 tag=$2 snap=$3; shift 3
+    rm -f g53.usage; [ "$snap" = - ] || rm -f "$snap/.coli_usage"
+    if [ "${HIST:-0}" = 1 ]; then   # a history from a greedy run (TF=1 writes none)
+      local a=() x; for x in "$@"; do [ "$x" = TF=1 ] || a+=("$x"); done
+      if [ "$snap" = - ]; then env COLI_USAGE=g53.usage "${a[@]}" > /dev/null 2>&1 || true
+      else env STATS=$snap/.coli_usage "${a[@]}" > /dev/null 2>&1 || true; fi
+    fi
+    env ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 COLI_USAGE=g53.usage \
+      COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 "$@" > san.log 2>&1 || true
+    rm -f g53.usage; [ "$snap" = - ] || rm -f "$snap/.coli_usage"
+    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    [ "$(tier_count $eng san.log)" -gt 0 ] || { cat san.log; fail "$tag: no routed expert ran on the device"; }
+    echo "OK $tag: sanitizers clean, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' san.log | tail -1), $(grep -a -o 'evictions [0-9]*' san.log | tail -1)"
+  }
+  gsan colibri "asan colibri f32 cap=1" glm_tiny SNAP=glm_tiny REF=ref_glm.json ./colibri 1 16 16
+  HIST=1 gsan colibri "asan colibri prefill, warm" glm_tiny SNAP=glm_tiny REF=ref_glm.json TF=1 ./colibri 64 16 16
+  gsan colibri "asan colibri eviction" glm_tiny SNAP=glm_tiny REF=ref_glm.json COLI_VK_EXPERTS=2 ./colibri 64 16 16
+  HIST=1 gsan colibri "asan colibri int4-g64, trunk + attention on the device" glm_tiny_i4 SNAP=glm_tiny_i4 REF=glm_tiny_i4/ref_glm.json COLI_VK_DENSE=1 COLI_VK_ATTN=1 ./colibri 2 4 4
+  HIST=1 gsan colibri "asan colibri int3-g64 prefill" glm_tiny_i3 SNAP=glm_tiny_i3 REF=glm_tiny_i3/ref_glm.json TF=1 ./colibri 2 4 4
+  HIST=1 gsan colibri "asan colibri int3-g64 down, cap=1" glm_tiny_d3 SNAP=glm_tiny_d3 REF=glm_tiny_d3/ref_glm.json ./colibri 1 4 4
+  HIST=1 gsan colibri "asan colibri tier + COLI_VK_DEV2" glm_tiny_i4r SNAP=glm_tiny_i4r REF=glm_tiny_i4r/ref_glm.json COLI_VK_EXPERTS=4 COLI_VK_DEV2=0 ./colibri 64 4 4
+  gsan colibri "asan colibri int4 at load, PIPE=1" glm_tiny SNAP=glm_tiny REF=ref_glm.json PIPE=1 ./colibri 1 4 4
+  gsan colibri "asan colibri int8 at load, PILOT=1" glm_tiny SNAP=glm_tiny REF=ref_glm.json PILOT=1 ./colibri 2 8 8
+  local ids
+  ids=$($PY -c "print(','.join(str((i*37+5)%120+2) for i in range(100)))")
+  gsan glm53 "asan glm53 decode" - GLM53_BITS=32 ./glm53 --model glm53_stream-i4 --ids 5,7,9,11,13,17,19,23 --greedy 20
+  HIST=1 gsan glm53 "asan glm53 100-token prompt, warm" - GLM53_BITS=32 ./glm53 --model glm53_stream-i4 --ids $ids --greedy 4
+  HIST=1 gsan glm53 "asan glm53 one slot, trunk on the device" - GLM53_BITS=4 GLM53_EXPERT_GB=0.000001 COLI_VK_DENSE=1 ./glm53 --model glm53_stream-i4 --ids $ids --greedy 4
+  gsan glm53 "asan glm53 eviction" - GLM53_BITS=32 COLI_VK_TIER_GB=0.00006 ./glm53 --model glm53_stream-i4 --ids $ids --greedy 6
+  unset OMP_NUM_THREADS CAP_RAISE
+  make clean >/dev/null 2>&1 || true
 }
 
 case "${1:-}" in
@@ -471,7 +1147,13 @@ case "${1:-}" in
   qwen)           family_qwen ;;
   qwen-sanitize)  family_qwen_sanitize ;;
   inkling-olmoe)  family_inkling_olmoe ;;
+  inkling-olmoe-sanitize) family_inkling_olmoe_sanitize ;;
   mimo-qwenimage) family_mimo_qwenimage ;;
   deepseek)       family_deepseek ;;
-  *) echo "usage: $0 shader|qwen|qwen-sanitize|inkling-olmoe|mimo-qwenimage|deepseek" >&2; exit 2 ;;
+  deepseek-sanitize) family_deepseek_sanitize ;;
+  kimi)           family_kimi ;;
+  kimi-mimo-sanitize) family_kimi_mimo_sanitize ;;
+  glm)            family_glm ;;
+  glm-sanitize)   family_glm_sanitize ;;
+  *) echo "usage: $0 shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize" >&2; exit 2 ;;
 esac

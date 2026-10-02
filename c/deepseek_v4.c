@@ -4958,6 +4958,132 @@ unsigned long long g_v4_hyb_gpu_n, g_v4_hyb_cpu_n;
 unsigned long long g_v4_hyb_upload_n, g_v4_hyb_skip_n;
 #endif
 
+#if defined(COLI_VULKAN) && defined(COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER)
+/* ---- the Vulkan routed-expert tier (vk_tier.c) in the MoE ------------------------
+ * coli_v4_vk_tier (deepseek_v4_internal.h) is set when COLI_VULKAN=1 started the
+ * tier. A step then hands the device its routed experts first, rows rounded to E4M3
+ * per 128 as the CPU kernel rounds its input, with the route weights the device
+ * applies itself (DeepSeek V4's activation, VKT_ACT_SWIGLU_V4), and the store lends
+ * the CPU only the experts the device did not take. Every expert output then joins
+ * its position in the CPU path's own order -- ascending expert id, and rank within
+ * one expert -- the device's rows rounded to bf16 as the CPU expert rounds its
+ * output, so the sum's order never depends on what was resident. */
+const ColiV4VkTier *coli_v4_vk_tier;
+
+/* x[rows][d] rounded to E4M3 per 128, as coli_fp4_matvec_ref rounds its input. */
+static float *v4_vk_round_rows(const float *x, int rows, int d) {
+    float *xq = malloc((size_t)rows * d * sizeof(*xq));
+    uint8_t *scales = malloc((size_t)d / 128 + 2);
+    int ok = xq && scales;
+    for (int r = 0; ok && r < rows; r++)
+        ok = !coli_fp8_activation_qdq_ref(xq + (size_t)r * d, scales,
+                                          x + (size_t)r * d, (size_t)d, 128);
+    free(scales);
+    if (!ok) { free(xq); return NULL; }
+    return xq;
+}
+
+/* One decode position: the selected experts (ascending id, weights beside them)
+ * go to the tier; the ones the CPU still computes are compacted to the front of
+ * expert_ids / expert_weights and *selected says how many. */
+typedef struct {
+    int on;              /* the tier saw this step: the CPU's experts go to it as notes */
+    int n, full, joined; /* n: how many the device took */
+    int *ids;            /* the full selection, ascending, and its weights */
+    float *w;
+    uint8_t *taken;
+} V4VkToken;
+
+static void v4_vk_token_issue(V4VkToken *vk, ColiExpertStore *store, int layer,
+                              const float *input, int d, int *expert_ids,
+                              float *expert_weights, int *selected) {
+    memset(vk, 0, sizeof(*vk));
+    const ColiV4VkTier *tier = coli_v4_vk_tier;
+    if (!tier || tier->store != store || *selected < 1) return;
+    int full = *selected;
+    float *xq = v4_vk_round_rows(input, 1, d);
+    int *ids = malloc((size_t)full * sizeof(*ids));
+    float *w = malloc((size_t)full * sizeof(*w));
+    uint8_t *taken = malloc((size_t)full);
+    if (!xq || !ids || !w || !taken) { free(xq); free(ids); free(w); free(taken); return; }
+    int n = tier->issue(layer, xq, 1, full, expert_ids, expert_weights, taken);
+    free(xq);
+    memcpy(ids, expert_ids, (size_t)full * sizeof(*ids));
+    memcpy(w, expert_weights, (size_t)full * sizeof(*w));
+    int cpu = 0;
+    for (int k = 0; k < full; k++) {
+        if (taken[k]) {
+            if (tier->routed) tier->routed((ColiExpertKey){layer, ids[k]});
+            continue;
+        }
+        expert_ids[cpu] = expert_ids[k];
+        expert_weights[cpu] = expert_weights[k];
+        cpu++;
+    }
+    *selected = cpu;
+    vk->on = 1; vk->n = n > 0 ? n : 0; vk->full = full; vk->ids = ids; vk->w = w; vk->taken = taken;
+}
+
+/* The CPU's experts (views[0..cpu), weights beside them), the device's join, and
+ * output = bf16(sum in ascending id + shared). A failed join leaves the device's
+ * experts to the CPU, read from the store here. */
+static int v4_vk_token_finish(V4VkToken *vk, float *output, ColiExpertStore *store,
+                              int layer, ColiExpertView *views, const float *weights_cpu,
+                              int cpu, const float *input, const float *shared_output,
+                              int d, float limit) {
+    const ColiV4VkTier *tier = coli_v4_vk_tier;
+    float *rows = malloc(((size_t)cpu + 1) * d * sizeof(*rows));
+    const float **dev = malloc((size_t)vk->full * sizeof(*dev));
+    int result = rows && dev ? 0 : moe_fail("layer %d: out of memory for the device's experts", layer);
+    for (int c = 0; !result && c < cpu; c++) {
+        result = coli_v4_expert_forward_ref(rows + (size_t)c * d, &views[c], input,
+                                            weights_cpu[c], limit);
+        if (!result && tier && tier->note) tier->note(&views[c]);
+    }
+    int joined = !vk->n || (dev && tier && tier->join(dev));
+    vk->joined = 1;
+    float *redo = joined ? NULL : malloc((size_t)d * sizeof(*redo));
+    if (!result && !joined && !redo)
+        result = moe_fail("layer %d: out of memory recomputing the device's experts", layer);
+    if (!result) memset(output, 0, (size_t)d * sizeof(*output));
+    for (int k = 0, c = 0; !result && k < vk->full; k++) {
+        if (!vk->taken[k]) {
+            const float *src = rows + (size_t)c++ * d;
+            for (int i = 0; i < d; i++) output[i] += src[i];
+        } else if (joined) {
+            const float *src = dev[k];
+            for (int i = 0; i < d; i++) output[i] += coli_bf16_round(src[i]);
+        } else {   /* the batch failed and the tier stopped: this expert on the CPU */
+            ColiExpertView view;
+            if (coli_expert_lookup(store, (ColiExpertKey){layer, vk->ids[k]}, &view)) {
+                result = moe_fail("layer %d: reading expert %d from the expert store failed",
+                                  layer, vk->ids[k]);
+                break;
+            }
+            result = coli_v4_expert_forward_ref(redo, &view, input, vk->w[k], limit);
+            coli_expert_release(store, &view);
+            for (int i = 0; !result && i < d; i++) output[i] += redo[i];
+        }
+    }
+    if (!result)
+        for (int i = 0; i < d; i++) output[i] = coli_bf16_round(output[i] + shared_output[i]);
+    free(redo); free(dev); free(rows);
+    return result;
+}
+
+/* An error between issue and finish still joins the step: the tier keeps one
+ * step in flight and would take no other. */
+static void v4_vk_token_free(V4VkToken *vk) {
+    if (vk->n && !vk->joined && coli_v4_vk_tier) {
+        const float **dev = malloc((size_t)vk->full * sizeof(*dev));
+        if (dev) coli_v4_vk_tier->join(dev);
+        free(dev);
+    }
+    free(vk->ids); free(vk->w); free(vk->taken);
+    memset(vk, 0, sizeof(*vk));
+}
+#endif
+
 static int moe_token_pipeline(float *output,
                               const ColiDeepSeekV4LayerWeights *weights,
                               const ColiDeepSeekV4Config *config,
@@ -5048,6 +5174,14 @@ static int moe_token_pipeline(float *output,
     if (!result && selected != topk)
         result = moe_fail("layer %d: routing selected %d experts, wanted %d",
                           weights->plan.layer, selected, topk);
+#if defined(COLI_VULKAN) && defined(COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER)
+    /* the Vulkan tier first: what it takes is never read from the store */
+    V4VkToken vk_step;
+    memset(&vk_step, 0, sizeof(vk_step));
+    if (!result)
+        v4_vk_token_issue(&vk_step, store, weights->plan.layer, input, d,
+                          expert_ids, expert_weights, &selected);
+#endif
 
 #ifdef COLI_V4_EXPERIMENTAL_PREFETCH
     if (!result && expert_prefetch_enabled() && store->ops->prefetch) {
@@ -5107,7 +5241,7 @@ static int moe_token_pipeline(float *output,
     if (!result) memset(output, 0, (size_t)d * sizeof(*output));
 
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
-    ColiExpertView *views = malloc((size_t)selected * sizeof(*views));
+    ColiExpertView *views = malloc((size_t)(selected ? selected : 1) * sizeof(*views));
 #ifdef COLI_V4_GPU_TIER
     int gpu_compute = 0;
 #endif
@@ -5386,6 +5520,14 @@ static int moe_token_pipeline(float *output,
     } else
 #endif
     {
+#if defined(COLI_VULKAN) && defined(COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER)
+        if (vk_step.on) {
+            if (!result)
+                result = v4_vk_token_finish(&vk_step, output, store, weights->plan.layer,
+                                            views, expert_weights, selected, input,
+                                            shared_output, d, config->swiglu_limit);
+        } else {
+#endif
         for (int current = 0; !result && current < selected; current++) {
             if (!result) result = coli_v4_expert_forward_ref(
                 expert_output, &views[current], input,
@@ -5396,6 +5538,9 @@ static int moe_token_pipeline(float *output,
         if (!result)
             for (int i = 0; i < d; i++)
                 output[i] = coli_bf16_round(output[i] + shared_output[i]);
+#if defined(COLI_VULKAN) && defined(COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER)
+        }
+#endif
     }
 #ifdef COLI_V4_GPU_TIER
     /* If an error or the fused path skipped the hybrid branch while async
@@ -5407,6 +5552,9 @@ static int moe_token_pipeline(float *output,
     for (int current = 0; current < selected; current++)
         coli_expert_release(store, &views[current]);
     free(views);
+#if defined(COLI_VULKAN)
+    v4_vk_token_free(&vk_step);
+#endif
 #else
     for (int current = 0; current < selected && loader_active; current++) {
         if (profiled_expert_load_finish(&loader) != 0) {
@@ -5699,6 +5847,147 @@ static int v4_shared_expert_forward_batch_ref(
     return result ? -1 : 0;
 }
 
+#if defined(COLI_VULKAN) && defined(COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER)
+/* The prefill union with the Vulkan tier on (see the tier's note above
+ * moe_token_pipeline). The device takes its routes of the chunk first; the union
+ * then walks only the experts some route still needs from the CPU, each expert's
+ * output kept apart per route, and every position sums its routes in the union's
+ * own order -- ascending expert, ascending rank -- the device's rows rounded to
+ * bf16 as the CPU expert rounds its output. */
+typedef struct {
+    int on;              /* the tier saw this chunk: the CPU's experts go to it as notes */
+    int n, joined;       /* n: how many routes the device took */
+    uint8_t *taken;      /* [batch * topk] */
+    float *contrib;      /* [batch * topk][d]: each route's expert output */
+} V4VkBatch;
+
+static void v4_vk_batch_issue(V4VkBatch *vk, ColiExpertStore *store, int layer,
+                              const float *inputs, int batch, int d, int topk, int n,
+                              const int *indices, const float *route_weights,
+                              unsigned char *used) {
+    memset(vk, 0, sizeof(*vk));
+    const ColiV4VkTier *tier = coli_v4_vk_tier;
+    if (!tier || tier->store != store) return;
+    size_t routes = (size_t)batch * topk;
+    float *xq = v4_vk_round_rows(inputs, batch, d);
+    uint8_t *taken = malloc(routes);
+    float *contrib = malloc(routes * d * sizeof(*contrib));
+    if (!xq || !taken || !contrib) { free(xq); free(taken); free(contrib); return; }
+    int issued = tier->issue(layer, xq, batch, topk, indices, route_weights, taken);
+    free(xq);
+    if (issued > 0) {
+        memset(used, 0, (size_t)n);
+        for (size_t r = 0; r < routes; r++) {
+            if (!taken[r]) used[indices[r]] = 1;
+            else if (tier->routed) tier->routed((ColiExpertKey){layer, indices[r]});
+        }
+    }
+    vk->on = 1; vk->n = issued > 0 ? issued : 0; vk->taken = taken; vk->contrib = contrib;
+}
+
+static int v4_vk_flush(V4VkBatch *vk, ColiExpertStore *store, const ColiExpertView *view,
+                       const float *batch_inputs, const float *batch_weights,
+                       const int *batch_routes, float *batch_outputs, int count, int d,
+                       float limit) {
+    if (count < 1) return 0;
+    double began = v4_now_mono();
+    int result = count == 1
+        ? coli_v4_expert_forward_ref(batch_outputs, view, batch_inputs, batch_weights[0], limit)
+        : coli_v4_expert_forward_batch_ref(batch_outputs, view, batch_inputs, batch_weights,
+                                           count, limit);
+    coli_v4_expert_store_add_matmul(store, v4_now_mono() - began);
+    for (int m = 0; !result && m < count; m++)
+        memcpy(vk->contrib + (size_t)batch_routes[m] * d, batch_outputs + (size_t)m * d,
+               (size_t)d * sizeof(float));
+    return result ? -1 : 0;
+}
+
+/* v4_apply_expert_batch for the routes the device did not take, into contrib. */
+static int v4_vk_apply_expert(V4VkBatch *vk, ColiExpertStore *store, const ColiExpertView *view,
+                              const float *inputs, const int *indices,
+                              const float *route_weights, int batch, int topk, int d,
+                              float limit, float *batch_inputs, float *batch_weights,
+                              int *batch_routes, float *batch_outputs, int capacity) {
+    int count = 0, expert = view->key.expert;
+    for (int item = 0; item < batch; item++)
+        for (int rank = 0; rank < topk; rank++) {
+            size_t route = (size_t)item * topk + rank;
+            if (indices[route] != expert || vk->taken[route]) continue;
+            memcpy(batch_inputs + (size_t)count * d, inputs + (size_t)item * d,
+                   (size_t)d * sizeof(*batch_inputs));
+            batch_weights[count] = route_weights[route];
+            batch_routes[count++] = (int)route;
+            if (count == capacity) {
+                if (v4_vk_flush(vk, store, view, batch_inputs, batch_weights, batch_routes,
+                                batch_outputs, count, d, limit))
+                    return -1;
+                count = 0;
+            }
+        }
+    int result = v4_vk_flush(vk, store, view, batch_inputs, batch_weights, batch_routes,
+                             batch_outputs, count, d, limit);
+    if (!result && coli_v4_vk_tier && coli_v4_vk_tier->note) coli_v4_vk_tier->note(view);
+    return result;
+}
+
+/* The device's rows (or, after a failed join, the CPU's), then every position's
+ * routes summed into `outputs` (zeroed) in ascending (expert, rank). */
+static int v4_vk_batch_finish(V4VkBatch *vk, float *outputs, ColiExpertStore *store, int layer,
+                              const float *inputs, const int *indices,
+                              const float *route_weights, int batch, int topk, int d,
+                              float limit) {
+    size_t routes = (size_t)batch * topk;
+    const float **dev = malloc(routes * sizeof(*dev));
+    int joined = !vk->n || (dev && coli_v4_vk_tier && coli_v4_vk_tier->join(dev));
+    vk->joined = 1;
+    int result = 0;
+    for (size_t r = 0; !result && r < routes; r++) {
+        if (!vk->taken[r]) continue;
+        float *dst = vk->contrib + r * d;
+        if (joined) {
+            for (int i = 0; i < d; i++) dst[i] = coli_bf16_round(dev[r][i]);
+            continue;
+        }
+        ColiExpertView view;   /* the batch failed and the tier stopped: this route here */
+        if (coli_expert_lookup(store, (ColiExpertKey){layer, indices[r]}, &view)) {
+            result = moe_fail("layer %d: reading expert %d from the expert store failed",
+                              layer, indices[r]);
+            break;
+        }
+        result = coli_v4_expert_forward_ref(dst, &view, inputs + (r / topk) * d,
+                                            route_weights[r], limit);
+        coli_expert_release(store, &view);
+    }
+    free(dev);
+    int order[64];
+    for (int item = 0; !result && item < batch; item++) {
+        const int *idx = indices + (size_t)item * topk;
+        int k = 0;
+        for (int rank = 0; rank < topk && rank < 64; rank++) {   /* insertion: stable in rank */
+            int at = k++;
+            while (at > 0 && idx[order[at - 1]] > idx[rank]) { order[at] = order[at - 1]; at--; }
+            order[at] = rank;
+        }
+        float *out = outputs + (size_t)item * d;
+        for (int j = 0; j < k; j++) {
+            const float *src = vk->contrib + ((size_t)item * topk + order[j]) * d;
+            for (int i = 0; i < d; i++) out[i] += src[i];
+        }
+    }
+    return result;
+}
+
+static void v4_vk_batch_free(V4VkBatch *vk, int batch, int topk) {
+    if (vk->n && !vk->joined && coli_v4_vk_tier) {
+        const float **dev = malloc((size_t)batch * topk * sizeof(*dev));
+        if (dev) coli_v4_vk_tier->join(dev);
+        free(dev);
+    }
+    free(vk->taken); free(vk->contrib);
+    memset(vk, 0, sizeof(*vk));
+}
+#endif
+
 static int v4_moe_batch_union(
     float *outputs, const ColiDeepSeekV4LayerWeights *weights,
     const ColiDeepSeekV4Config *config, ColiExpertStore *store,
@@ -5790,6 +6079,14 @@ static int v4_moe_batch_union(
             }
     }
     free(logits);
+#if defined(COLI_VULKAN) && defined(COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER)
+    /* the Vulkan tier first: the union below reads only what it did not take */
+    V4VkBatch vk_batch;
+    memset(&vk_batch, 0, sizeof(vk_batch));
+    if (!result && topk <= 64)
+        v4_vk_batch_issue(&vk_batch, store, weights->plan.layer, inputs, batch, d, topk, n,
+                          indices, route_weights, used);
+#endif
 
     ColiTensorView w1, w2, w3;
     if (!result &&
@@ -5854,6 +6151,15 @@ static int v4_moe_batch_union(
             else
                 active[slot] = 1;
         }
+#if defined(COLI_VULKAN)
+        if (!result && vk_batch.on)
+            result = v4_vk_apply_expert(
+                &vk_batch, store, &view, inputs, indices, route_weights,
+                batch, topk, d, config->swiglu_limit, expert_inputs,
+                expert_weights, expert_items, expert_outputs,
+                expert_batch_capacity);
+        else
+#endif
         if (!result)
             result = v4_apply_expert_batch(
                 outputs, store, &view, inputs, indices, route_weights,
@@ -5867,6 +6173,13 @@ static int v4_moe_batch_union(
             profiled_expert_load_finish(&loaders[slot]);
             if (!jobs[slot].result) coli_expert_release(store, &jobs[slot].view);
         }
+#if defined(COLI_VULKAN)
+    if (!result && vk_batch.on)
+        result = v4_vk_batch_finish(&vk_batch, outputs, store, weights->plan.layer, inputs,
+                                    indices, route_weights, batch, topk, d,
+                                    config->swiglu_limit);
+    v4_vk_batch_free(&vk_batch, batch, topk);
+#endif
 #else
     for (int current = 0; !result && current < key_count; current++) {
         ColiExpertView view;
@@ -8991,6 +9304,76 @@ void coli_v4_expert_store_prefill_pool(ColiExpertStore *store, int layer) {
     pthread_mutex_unlock(&state->mutex);
 }
 
+#ifdef COLI_VULKAN
+/* The Vulkan routed-expert tier's side of the store (deepseek_v4_internal.h). A
+ * routing the device served never comes through lookup_hot, so it is counted here
+ * the way lookup_hot counts one -- the pin ranking, the dashboard's HITS and heat,
+ * the .coli_usage history -- and the history the next run reads stays the
+ * routing's, whichever side computed it. The store's hit and miss counters are not
+ * touched: they describe the RAM cache. */
+int (*coli_v4_expert_store_device_tier)(int layer, int expert);
+
+void coli_v4_expert_store_note_routed(ColiExpertStore *store, ColiExpertKey key) {
+    if (!store || !store->state) return;
+    V4ExpertStoreState *state = store->state;
+    V4HotPolicy *policy = hot_find(store);
+    if (!policy || !get_record(state, key)) return;
+    size_t index = (size_t)key.layer * state->experts_per_layer + key.expert;
+    pthread_mutex_lock(&state->mutex);
+    policy->usage[index]++;
+    if (state->ehit) {
+        state->ehit[index] = 1;
+        if (state->eheat && state->eheat[index] < 63) state->eheat[index]++;
+    }
+    rt_count(key.layer, &key.expert, 1);
+    uint64_t layer_requests = ++policy->layer_requests[key.layer];
+    if (policy->repin_interval && layer_requests % policy->repin_interval == 0)
+        hot_repin_locked(policy, state, key.layer);
+    pthread_mutex_unlock(&state->mutex);
+}
+
+uint32_t *const *coli_v4_expert_store_history(ColiExpertStore *store) {
+    return store && hot_find(store) ? rt_counts_all() : NULL;
+}
+
+int coli_v4_expert_store_in_ram(ColiExpertStore *store, ColiExpertKey key) {
+    if (!store || !store->state || !hot_find(store)) return 0;
+    V4ExpertStoreState *state = store->state;
+    if (!get_record(state, key)) return 0;
+    pthread_mutex_lock(&state->mutex);
+    V4ExpertSlot *slot = indexed_expert_slot(state, key);
+    int resident = slot && slot->slab && slot->expert == key.expert;
+    pthread_mutex_unlock(&state->mutex);
+    return resident;
+}
+
+uint64_t coli_v4_expert_store_record_bytes(ColiExpertStore *store) {
+    return store && store->state && hot_find(store)
+        ? ((V4ExpertStoreState *)store->state)->record_bytes : 0;
+}
+
+int coli_v4_expert_store_read_private(ColiExpertStore *store, ColiExpertKey key,
+                                      unsigned char *buffer, ColiExpertView *view) {
+    if (!store || !store->state || !buffer || !view || !hot_find(store)) return -1;
+    V4ExpertStoreState *state = store->state;
+    V4ExpertRecord *record = get_record(state, key);
+    if (!record) return -1;
+    V4ExpertSlot slot;
+    memset(&slot, 0, sizeof(slot));
+    slot.slab = buffer; slot.aligned_slab = 1;
+    slot.owner_layer = key.layer; slot.expert = key.expert; slot.loading_expert = -1;
+    if (v4_read_expert_record(state, record, &slot,
+                              coli_st_expert_route(key.layer, key.expert)))
+        return -1;
+    memset(view, 0, sizeof(*view));
+    view->key = key;
+    fill_tensor_view(&view->gate, record, &slot, V4_W1);
+    fill_tensor_view(&view->down, record, &slot, V4_W2);
+    fill_tensor_view(&view->up, record, &slot, V4_W3);
+    return 0;
+}
+#endif
+
 static void destroy_hot(ColiExpertStore *store) {
     pthread_mutex_lock(&hot_policies_mutex);
     V4HotPolicy **link = &hot_policies;
@@ -9202,6 +9585,11 @@ void coli_v4_expert_store_emit_emap(ColiExpertStore *store) {
         V4ExpertSlot *slot = indexed_expert_slot(
             state, (ColiExpertKey){layer, expert});
         int tier = slot && slot->slab && slot->expert == expert;
+#ifdef COLI_VULKAN
+        if (coli_v4_expert_store_device_tier &&
+            coli_v4_expert_store_device_tier(layer, expert))
+            tier = 2;   /* on the Vulkan device */
+#endif
         int heat = state->eheat ? state->eheat[i] : 0;
         if (heat > 63) heat = 63;
         int b = (tier << 6) | heat;
@@ -12098,13 +12486,160 @@ static int v4_vk_matmul_impl(int fmt, const void *data, const float *scales,
     if (!ok && !e->tensor) e->refused = 1;   /* no device room: CPU from now on */
     return ok ? 0 : -1;
 }
+
+/* ---- the routed-expert tier (vk_tier.c) ---------------------------------------
+ * The experts as the store reads them: fp4 with a ue8m0 scale per 32 inputs
+ * (MXFP4_E8M0, fmt 7 on the device), gate w1, up w3, down w2. The activation is
+ * DeepSeek V4's own (VKT_ACT_SWIGLU_V4): its CPU kernel rounds gate and up to
+ * bf16, applies the route weight before down and rounds that to bf16, and rounds
+ * down's input to E4M3 per 128, and the device does the same. The MoE units reach
+ * the tier through coli_v4_vk_tier, from this thread only (the issue declines any
+ * other). A hot expert the store keeps in the rows16 layout is unpacked to rows
+ * for the tier, and only when the tier will take it (vkt_wants). The history is
+ * the store's .coli_usage, and the warm start reads its experts outside the cache. */
+#include "vk_tier.h"
+static ColiV4VkTier g_v4_vkt;
+
+static int v4_vkt_thread(void) {
+    if (!pthread_equal(pthread_self(), g_v4_vk_thread)) return 0;
+#ifdef _OPENMP
+    if (omp_in_parallel()) return 0;
+#endif
+    return 1;
+}
+static int v4_vkt_issue(int layer, const float *x, int S, int K, const int *idx,
+                        const float *w, uint8_t *taken) {
+    if (!v4_vkt_thread()) { memset(taken, 0, (size_t)S * K); return 0; }
+    return vkt_issue_w(layer, x, S, K, idx, w, taken);
+}
+static int v4_vkt_join(const float **rows) { return vkt_join(rows); }
+static void v4_vkt_routed(ColiExpertKey key) { coli_v4_expert_store_note_routed(g_v4_vkt.store, key); }
+static int v4_vkt_in_ram(void *ctx, int layer, int expert) {
+    return coli_v4_expert_store_in_ram((ColiExpertStore *)ctx, (ColiExpertKey){layer, expert});
+}
+static int v4_vkt_device_tier(int layer, int expert) { return vkt_resident(layer, expert); }
+
+/* rows16 (coli_fp4_pack_rows16_v10) back to rows: byte `column` of row `row` sits
+ * at ((row / 16) * stride + column) * 16 + row % 16. */
+static void v4_vkt_unpack16(unsigned char *rows, const unsigned char *packed,
+                            size_t count, size_t stride) {
+    for (size_t row = 0; row < count; row++)
+        for (size_t column = 0; column < stride; column++)
+            rows[row * stride + column] =
+                packed[((row / 16) * stride + column) * 16 + row % 16];
+}
+static void v4_vkt_note(const ColiExpertView *view) {
+    if (!v4_vkt_thread()) return;
+    int layer = view->key.layer, expert = view->key.expert;
+    const ColiTensorView *m[3] = {&view->gate, &view->up, &view->down};
+    if (m[0]->block_rows != 16 && m[1]->block_rows != 16 && m[2]->block_rows != 16) {
+        VktExpertSrc src = {m[0]->data, m[1]->data, m[2]->data,
+                            m[0]->scales, m[1]->scales, m[2]->scales};
+        vkt_note(layer, expert, &src);
+        return;
+    }
+    if (!vkt_wants(layer, expert)) return;
+    size_t total = 0;
+    for (int k = 0; k < 3; k++) total += m[k]->data_bytes + m[k]->scale_bytes;
+    unsigned char *buffer = malloc(total), *at = buffer, *data[3], *scales[3];
+    if (!buffer) return;
+    for (int k = 0; k < 3; k++) {
+        size_t rows = (size_t)m[k]->rows;
+        data[k] = at; at += m[k]->data_bytes;
+        scales[k] = at; at += m[k]->scale_bytes;
+        if (m[k]->block_rows == 16) {
+            v4_vkt_unpack16(data[k], m[k]->data, rows, m[k]->data_bytes / rows);
+            v4_vkt_unpack16(scales[k], m[k]->scales, rows, m[k]->scale_bytes / rows);
+        } else {
+            memcpy(data[k], m[k]->data, m[k]->data_bytes);
+            memcpy(scales[k], m[k]->scales, m[k]->scale_bytes);
+        }
+    }
+    VktExpertSrc src = {data[0], data[1], data[2], scales[0], scales[1], scales[2]};
+    vkt_note(layer, expert, &src);
+    free(buffer);
+}
+
+static void v4_vk_tier_start(const ColiV4Engine *engine) {
+    const ColiDeepSeekV4Config *c = &engine->config;
+    ColiExpertStore *store = engine->experts;
+    if (!g_v4_vk_ready || !store || c->n_routed_experts < 1 || !vkt_wanted()) return;
+    if (store->gpu) {
+        fprintf(stderr, "[VK] tier deepseek_v4: the CUDA expert tier is on and wins; the Vulkan tier stays off\n");
+        return;
+    }
+    uint64_t record = coli_v4_expert_store_record_bytes(store);
+    if (!record || c->hidden_size % 128 || c->moe_intermediate_size % 128) return;
+    ColiExpertStoreStats st = {0};
+    if (store->ops && store->ops->stats) store->ops->stats(store, &st);
+    VktFmt f = {VKT_SRC_MXFP4_E8M0, 32};
+    VktConfig vc = {.engine = "deepseek_v4", .layers = c->num_hidden_layers,
+                    .experts = c->n_routed_experts, .hidden = c->hidden_size,
+                    .inter = c->moe_intermediate_size, .topk = c->num_experts_per_tok,
+                    .gate_up = f, .down = f, .act = VKT_ACT_SWIGLU_V4,
+                    .act_limit = c->swiglu_limit, .max_rows = 128 * c->num_experts_per_tok,
+                    .ram_reserve = st.capacity_bytes > st.resident_bytes
+                        ? (size_t)(st.capacity_bytes - st.resident_bytes) : 0,
+                    .dense_bytes = coli_vk_dense()
+                        ? (size_t)(engine->dense_resident.total_bytes + engine->head_cache.bytes) : 0,
+                    .in_ram = v4_vkt_in_ram, .ram_ctx = store};
+    /* The device goes before the drivers unload, after the tier's teardown (atexit runs
+     * last-registered first), and whether or not the tier starts: vkt_init makes the
+     * expert batch's pipelines before it can refuse (no room). */
+    atexit(coli_vk_shutdown);
+    if (!vkt_init(&vc, coli_v4_expert_store_history(store))) return;
+    atexit(vkt_shutdown);
+    g_v4_vkt = (ColiV4VkTier){store, v4_vkt_issue, v4_vkt_join, v4_vkt_note, v4_vkt_routed};
+    int all = c->num_hidden_layers * c->n_routed_experts;
+    int *pl = malloc((size_t)all * sizeof(int)), *pe = malloc((size_t)all * sizeof(int));
+    const char *warm = getenv("COLI_VK_TIER_WARM");   /* 0: no warm start, the tier fills as experts pass by */
+    int n = pl && pe && !(warm && *warm == '0') ? vkt_plan(pl, pe, all) : 0;
+    if (n > 0) {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (int i = 0; i < n; i++) {
+            unsigned char *buffer = NULL;
+            ColiExpertView view;
+            if (posix_memalign((void **)&buffer, 4096, (size_t)record + 8192u)) buffer = NULL;
+            if (buffer && !coli_v4_expert_store_read_private(
+                              store, (ColiExpertKey){pl[i], pe[i]}, buffer, &view)) {
+                VktExpertSrc src = {view.gate.data, view.up.data, view.down.data,
+                                    view.gate.scales, view.up.scales, view.down.scales};
+                vkt_put(pl[i], pe[i], &src);
+            } else vkt_put(pl[i], pe[i], NULL);   /* no read: the planned slot is given back */
+            free(buffer);
+        }
+        vkt_put_done();
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        fprintf(stderr, "[VK] tier deepseek_v4: warm start, %d experts from the history in %.1fs\n", n,
+                (double)(t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9);
+    }
+    free(pl); free(pe);
+    coli_v4_expert_store_device_tier = v4_vkt_device_tier;
+    coli_v4_vk_tier = &g_v4_vkt;
+}
+
+/* The tier's line for a run or a serve turn: RAM hits and disk loads from the
+ * store's counters over the same span. */
+static void v4_vk_tier_report(const char *scope, unsigned long long hits,
+                              unsigned long long misses) {
+    if (coli_v4_vk_tier) vkt_report(scope, hits, misses);
+}
 #endif
 
 static void v4_vk_open(const ColiV4Engine *engine) {
 #ifdef COLI_VULKAN
     g_v4_vk_thread = pthread_self();
     g_v4_vk_engine = engine;
-    g_v4_vk_ready = coli_vk_init_env("deepseek_v4");
+    /* the device opens knowing whether the routed-expert tier will be tried, so the
+     * dense matrices get their default place (coli_vk_dense_decide) */
+    int tier = vkt_wanted() && engine->experts && !engine->experts->gpu &&
+               engine->config.n_routed_experts > 0;
+    g_v4_vk_ready = coli_vk_init_env_tier("deepseek_v4", tier);
+    v4_vk_tier_start(engine);
+    if (g_v4_vk_ready && !vkt_ready() && !coli_vk_dense())
+        coli_vk_dense_decide("deepseek_v4", 0, 1);   /* no tier after all: the trunk to the device */
     if (g_v4_vk_ready && coli_vk_dense()) coli_v4_vk_matmul = v4_vk_matmul_impl;   /* COLI_VK_DENSE=0: no hook */
 #else
     (void)engine;
@@ -12116,6 +12651,14 @@ static void v4_vk_open(const ColiV4Engine *engine) {
 static void v4_vk_close(void) {
 #ifdef COLI_VULKAN
     if (!g_v4_vk_ready) return;
+    if (coli_v4_vk_tier) {   /* the tier's run line, then nothing reaches it any more */
+        ColiExpertStoreStats st = {0};
+        ColiExpertStore *store = coli_v4_vk_tier->store;
+        if (store && store->ops && store->ops->stats) store->ops->stats(store, &st);
+        v4_vk_tier_report("run", (unsigned long long)st.hits, (unsigned long long)st.misses);
+        coli_v4_vk_tier = NULL;
+        coli_v4_expert_store_device_tier = NULL;
+    }
     size_t bytes = 0, tensors = 0;
     coli_vk_mem_info(&bytes, &tensors);
     fprintf(stderr, "[VK] deepseek_v4: %llu matmuls on the GPU\n",
@@ -14832,6 +15375,9 @@ static int v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
                         "(cumulative)\n",
                 g_v4_hyb_gpu_n, g_v4_hyb_cpu_n, g_v4_hyb_upload_n,
                 g_v4_hyb_skip_n, g_v4_hyb_fill_bw, g_v4_hyb_host_bw);
+#endif
+#ifdef COLI_VULKAN
+    v4_vk_tier_report("turn", (unsigned long long)hits, (unsigned long long)misses);
 #endif
     coli_v4_expert_store_emit_hits(engine->experts);
     coli_v4_expert_store_emit_emap(engine->experts);
