@@ -6,7 +6,7 @@
 <title>colibri</title>
 <meta name="description" content="Run frontier open models on hardware you already own. A dependency-free C engine that streams mixture-of-experts weights from disk.">
 <meta property="og:title" content="colibri">
-<meta property="og:description" content="Run frontier open models on hardware you already own. Nine families, up to 2.8T parameters, pure C, zero dependencies.">
+<meta property="og:description" content="Run frontier open models on hardware you already own. Ten language-model families and an image model, up to 2.8T parameters, pure C, zero dependencies.">
 <meta property="og:type" content="website">
 <link rel="icon" type="image/svg+xml" href="colibri-icon.svg">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -259,7 +259,6 @@ footer{border-top:1px solid var(--line)}
     <figcaption>A real session, nothing staged: <code>coli chat</code> attached to a running
       server, then the same model in brio mode. The numbers are the ones it produced.</figcaption>
   </figure>
-</div>
 </div></section>
 
 <p class="trust">Measured today on machines people actually have</p>
@@ -272,23 +271,24 @@ footer{border-top:1px solid var(--line)}
      original checkpoint.</p>
   <div class="fbar"><button class="fp" data-f="vision">vision</button><button class="fp" data-f="audio">audio</button><button class="fp" data-f="tools">tools</button><button class="fp" data-f="int4">int4</button><button class="fp" data-f="mtp">mtp</button></div>
   <div id="mlist">
-      <article class="mrow" data-find="glm-5.2 glm-5.2 glm z.ai colibri.c moe int4 mla mtp" data-tags="moe int4 mla mtp">
-        <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/quickstart.md">glm-5.2</a></h3>
-        <p class="d">The model colibri was built around. 78 layers, 256 routed experts, streamed from disk on a machine that could never hold them.</p>
+      <article class="mrow" data-find="glm-5.2 glm-5.3 glm z.ai colibri.c moe int4 mla mtp" data-tags="moe int4 mla mtp">
+        <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/quickstart.md">glm-5.2 / glm-5.3</a></h3>
+        <p class="d">The model colibri was built around. 78 layers, 256 routed experts, streamed from disk on a machine that could never hold them. GLM-5.3 is the same base model on the same engine, from its own container, which has no MTP head.</p>
         <div class="tg"><span class="">MoE</span><span class="e">int4</span><span class="g">MLA</span><span class="a">MTP</span></div>
         <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>744B total</span><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>40B active</span>
-          <a href="https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>container, 372 GB</a><a href="https://huggingface.co/zai-org/GLM-5.2-FP8">upstream</a>
+          <a href="https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>container, 372 GB</a><a href="https://huggingface.co/Justvugg/GLM-5.3-colibri-int4-g64"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>GLM-5.3 container, 419 GB</a><a href="https://huggingface.co/zai-org/GLM-5.2-FP8">upstream</a>
           <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>colibri.c</span></div>
         <div class="mget"><code>hf download mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp --local-dir ~/Models/glm52_i4</code><button class="cp" type="button">copy</button></div>
+        <div class="mget"><code>hf download Justvugg/GLM-5.3-colibri-int4-g64 --local-dir ~/Models/glm53_i4</code><button class="cp" type="button">copy</button></div>
       </article>
-      <article class="mrow" data-find="glm-5.3-flash glm-5.3-flash glm53 z.ai glm53.c moe int4-gs64 vision" data-tags="moe int4-gs64 vision">
+      <article class="mrow" data-find="glm-5.3-flash glm-5.3-flash glm53 z.ai glm53.c moe int4-gs64 vision convert" data-tags="moe int4-gs64 vision">
         <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/glm53-flash.md">glm-5.3-flash</a></h3>
-        <p class="d">Natively multimodal. Routed experts convert to int4-gs64, the dense set stays BF16 and its precision is a load-time choice.</p>
+        <p class="d">Natively multimodal. Routed experts convert to int4-gs64, the dense set stays BF16 and its precision is a load-time choice. One resumable command downloads and converts it a shard at a time.</p>
         <div class="tg"><span class="">MoE</span><span class="e">int4-gs64</span><span class="b">vision</span></div>
         <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>320B total</span><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>18B active</span>
-          <a href="https://huggingface.co/Justvugg/GLM-5.3-colibri-int4-g64"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>container, 419 GB</a><a href="https://huggingface.co/zai-org/GLM-5.3-Flash">upstream</a>
+          <a href="https://huggingface.co/zai-org/GLM-5.3-Flash"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>convert, 195 GB int4</a>
           <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>glm53.c</span></div>
-        <div class="mget"><code>hf download Justvugg/GLM-5.3-colibri-int4-g64 --local-dir ~/Models/glm53_i4</code><button class="cp" type="button">copy</button></div>
+        <div class="mget"><code>python3 c/tools/convert_glm53.py --outdir ~/Models/glm53_flash_i4 --min-free-gb 30</code><button class="cp" type="button">copy</button></div>
       </article>
       <article class="mrow" data-find="deepseek v4.1 flash deepseek-v4.1-flash deepseek_v41 deepseek deepseek_v41.c moe fp4 vision tools dspark" data-tags="moe fp4 vision tools dspark">
         <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/deepseek-v41.md">deepseek-v4.1-flash</a></h3>
@@ -308,6 +308,24 @@ footer{border-top:1px solid var(--line)}
           <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>deepseek_v4.c</span></div>
         <div class="mget"><code>hf download deepseek-ai/DeepSeek-V4-Flash-0731 --local-dir ~/Models/DeepSeek-V4-Flash</code><button class="cp" type="button">copy</button></div>
       </article>
+      <article class="mrow" data-find="mimo-v2.6-flash mimo-v2.6 mimo xiaomi mimo.c moe mxfp4 vision tools" data-tags="moe mxfp4 vision tools">
+        <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/mimo.md">mimo-v2.6-flash</a></h3>
+        <p class="d">Xiaomi's hybrid: 39 of its 48 layers attend a 128-token window, so a long context costs the KV of 9. Experts stream as released in MXFP4, with no conversion. 2.34 to 3.37 tok/s on an 8-core Ryzen with 64 GB.</p>
+        <div class="tg"><span class="">MoE</span><span class="e">MXFP4</span><span class="b">vision</span><span class="b">tools</span></div>
+        <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>309B total</span><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>15B active</span>
+          <a href="https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-MOPD"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>official, no conversion</a>
+          <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>mimo.c</span></div>
+        <div class="mget"><code>hf download XiaomiMiMo/MiMo-V2.6-Flash-MOPD --local-dir ~/Models/MiMo-V2.6-Flash</code><button class="cp" type="button">copy</button></div>
+      </article>
+      <article class="mrow" data-find="mimo-v2.6-pro mimo-v2.6 mimo xiaomi mimo.c moe mxfp4 vision tools" data-tags="moe mxfp4 vision tools">
+        <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/mimo.md#pro">mimo-v2.6-pro</a></h3>
+        <p class="d">The same engine and architecture as Flash at 70 layers and 384 experts. Checked against Xiaomi's own modeling code on 32 of its 70 layers; 0.66 to 0.79 tok/s on the same 64 GB box.</p>
+        <div class="tg"><span class="">MoE</span><span class="e">MXFP4</span><span class="b">vision</span><span class="b">tools</span></div>
+        <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>1.02T total</span><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>42B active</span>
+          <a href="https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-MOPD"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>official, no conversion</a>
+          <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>mimo.c</span></div>
+        <div class="mget"><code>hf download XiaomiMiMo/MiMo-V2.6-Pro-MOPD --local-dir ~/Models/MiMo-V2.6-Pro --exclude "dflash/*" --exclude "audio_tokenizer/*" --exclude "model_mtp.safetensors"</code><button class="cp" type="button">copy</button></div>
+      </article>
       <article class="mrow" data-find="kimi k3 kimi-k3 kimi moonshot kimi_k3.c moe mxfp4 kda largest" data-tags="moe mxfp4 kda largest">
         <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/kimi_k3.md">kimi-k3</a></h3>
         <p class="d">The largest model colibri runs. 93 layers, 69 Kimi Delta Attention plus 24 gated MLA, and 16 of 896 experts per token. QAT-trained MXFP4 streams straight from the original shards.</p>
@@ -326,10 +344,10 @@ footer{border-top:1px solid var(--line)}
           <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>inkling.c</span></div>
         <div class="mget"><code>hf download nbeerbower/Inkling-colibri-int4 --local-dir ~/Models/inkling_i4</code><button class="cp" type="button">copy</button></div>
       </article>
-      <article class="mrow" data-find="qwen3.8-flash-next qwen3.8-flash-next qwen38 alibaba qwen38.c moe block-fp8 deltanet ple" data-tags="moe block-fp8 deltanet ple">
+      <article class="mrow" data-find="qwen3.8-flash-next qwen3.8-flash-next qwen38 alibaba qwen38.c moe block-fp8 int4-g64 deltanet ple mtp" data-tags="moe block-fp8 int4-g64 deltanet ple mtp">
         <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/qwen38.md">qwen3.8-flash-next</a></h3>
-        <p class="d">48 layers, 512 experts, 10 routed per token. 125B of backbone plus a 51B n-gram embedding that stays pageable and a 4B MTP head; the experts stay native block-FP8. CPU only for now.</p>
-        <div class="tg"><span class="">MoE</span><span class="e">block-FP8</span><span class="g">DeltaNet</span><span class="g">PLE</span></div>
+        <p class="d">48 layers, 512 experts, 10 routed per token. 125B of backbone plus a 51B n-gram embedding that stays pageable and a 4B MTP head. The experts stay native block-FP8, or run as int4-g64 from an optional sidecar: 1.4-1.5x the decode speed at the same cache. Opt-in MTP drafting gives the same output, 12-14% faster.</p>
+        <div class="tg"><span class="">MoE</span><span class="e">block-FP8</span><span class="e">int4-g64</span><span class="g">DeltaNet</span><span class="g">PLE</span><span class="a">MTP</span></div>
         <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>180B total</span><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>6B active</span>
           <a href="https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>official, no conversion</a>
           <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>qwen38.c</span></div>
@@ -344,6 +362,24 @@ footer{border-top:1px solid var(--line)}
           <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>qwen36.c</span></div>
         <div class="mget"><code>hf download Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64 --local-dir ~/Models/qwen36_i4_gs64</code><button class="cp" type="button">copy</button></div>
       </article>
+      <article class="mrow" data-find="qwen3.8-27b qwen3.8 qwen36 alibaba qwen36.c dense int8 int4 vision tools" data-tags="dense int8 vision tools">
+        <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/qwen36.md#the-dense-27b">qwen3.8-27b</a></h3>
+        <p class="d">Dense: one MLP per layer and no router, on the Qwen3.6 engine, text and images. Every weight is read for every token, so memory bandwidth sets the speed, not the disk. With every weight in int4 it needs 18.8 GB and decoded 3.45 tok/s on a 16-thread CPU server.</p>
+        <div class="tg"><span class="g">dense</span><span class="e">int8</span><span class="b">vision</span><span class="b">tools</span></div>
+        <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>27B total</span><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>dense, all active</span>
+          <a href="https://huggingface.co/Qwen/Qwen3.8-27B"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>convert, 51 GB f16</a>
+          <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>qwen36.c</span></div>
+        <div class="mget"><code>python3 c/tools/convert_qwen36.py --repo Qwen/Qwen3.8-27B --out ~/Models/qwen38_27b</code><button class="cp" type="button">copy</button></div>
+      </article>
+      <article class="mrow" data-find="qwen3-coder-30b-a3b qwen3-coder coder code alibaba qwen36.c moe int4-gs64 tools" data-tags="moe int4-gs64 tools">
+        <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/qwen36.md#qwen3-coder-30b-a3b">qwen3-coder-30b-a3b</a></h3>
+        <p class="d">Qwen3-Coder on the Qwen3.6 engine: 48 attention layers, 128 experts with 8 per token, tool calls in its own XML form and no thinking. With all 128 experts cached the int4 container decoded at 8.5 to 9.6 tok/s on an 8-core Ryzen, in 15.2 GB.</p>
+        <div class="tg"><span class="">MoE</span><span class="e">int4-gs64</span><span class="b">tools</span></div>
+        <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>30B total</span><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>3B active</span>
+          <a href="https://huggingface.co/Justvugg/Qwen3-Coder-30B-A3B-colibri-int4"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>container, 19 GB</a><a href="https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct">upstream</a>
+          <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>qwen36.c</span></div>
+        <div class="mget"><code>hf download Justvugg/Qwen3-Coder-30B-A3B-colibri-int4 --local-dir ~/Models/qwen3-coder-i4</code><button class="cp" type="button">copy</button></div>
+      </article>
       <article class="mrow" data-find="olmoe 1b-7b olmoe olmoe allen ai olmoe.c moe int8 open data small" data-tags="moe int8 open data small">
         <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/quickstart.md">olmoe</a></h3>
         <p class="d">Fully open weights and data, 16 layers and 64 experts. The one to learn the tooling on: the whole container is 7 GB.</p>
@@ -352,6 +388,15 @@ footer{border-top:1px solid var(--line)}
           <a href="https://huggingface.co/allenai/OLMoE-1B-7B-0125-Instruct"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>convert, 7 GB int8</a>
           <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>olmoe.c</span></div>
         <div class="mget"><code>python3 c/tools/convert_olmoe_merged.py --repo allenai/OLMoE-1B-7B-0125-Instruct --out ~/Models/olmoe_i8</code><button class="cp" type="button">copy</button></div>
+      </article>
+      <article class="mrow" data-find="qwen-image-2.1 qwen-image qwen image picture text to image alibaba qwenimage.c dit int8" data-tags="image int8 dit">
+        <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/qwen-image.md">qwen-image-2.1</a></h3>
+        <p class="d">Text to picture, read straight from the official diffusers checkpoint and quantized to int8 while loading. coli chat draws the image inside the terminal, coli serve answers the OpenAI images API. One 768x512 image peaks at 9.0 GB of RAM. Qwen Research License: non-commercial use only.</p>
+        <div class="tg"><span class="b">image</span><span class="e">int8</span><span class="g">DiT</span><span class="g">non-commercial</span></div>
+        <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>text to image</span>
+          <a href="https://huggingface.co/Qwen/Qwen-Image-2.1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>official, 33 GB, no conversion</a>
+          <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>qwenimage.c</span></div>
+        <div class="mget"><code>hf download Qwen/Qwen-Image-2.1 --local-dir ~/Models/Qwen-Image-2.1</code><button class="cp" type="button">copy</button></div>
       </article>
   </div>
   <p class="mnone" id="mnone" hidden>Nothing matches that.</p>
@@ -374,17 +419,23 @@ footer{border-top:1px solid var(--line)}
       <div class="chart"><div class="crow"><span class="cl">6x RTX 5090<s>full residency</s></span><span class="ct"><i style="width:100.0%"></i></span><span class="cv">9.0-9.2<s> tok/s</s></span></div><div class="crow"><span class="cl">AWS Graviton4<s>aarch64, CPU only</s></span><span class="ct"><i style="width:87.0%"></i></span><span class="cv">8.0<s> tok/s</s></span></div><div class="crow"><span class="cl">2x Xeon Gold 6430<s>1 TB DDR5</s></span><span class="ct"><i style="width:58.9%"></i></span><span class="cv">5.42<s> tok/s</s></span></div><div class="crow"><span class="cl">NVIDIA DGX Spark<s>121 GB unified</s></span><span class="ct"><i style="width:36.2%"></i></span><span class="cv">3.33<s> tok/s</s></span></div><div class="crow"><span class="cl">MacBook Pro M5 Max<s>Metal</s></span><span class="ct"><i style="width:21.7%"></i></span><span class="cv">2.0<s> tok/s</s></span></div><div class="crow"><span class="cl">Ryzen 9 9950X3D<s>RTX 5090 + NVMe</s></span><span class="ct"><i style="width:13.4%"></i></span><span class="cv">1.23<s> tok/s</s></span></div><div class="crow"><span class="cl">25 GB dev box<s>cold</s></span><span class="ct"><i style="width:1.1%"></i></span><span class="cv">0.05-0.1<s> tok/s</s></span></div></div>
       <p class="src">GLM-5.2 int4, decode speed reported by the people who ran it. The hardware
         changes where the experts live, not what the model answers.</p>
+      <p class="src">A GPU is optional on every engine. Any GPU with a Vulkan driver can hold an
+        engine's resident weights, opt-in, and the result is checked against the CPU. Correct is
+        not yet faster: on an integrated Radeon 780M it is slower than the CPU today.
+        <a href="https://github.com/JustVugg/colibri/blob/main/docs/vulkan.md" style="text-decoration:underline;text-underline-offset:3px">Vulkan notes</a></p>
       <a class="more" href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md">See the benchmarks &rarr;</a>
     </div>
 
     <div class="block" id="open">
       <h2>Frontier open models</h2>
-      <p class="sub">Nine families run today, one hand-written C file each. Not a wrapper around
-        someone else's runtime.</p>
-      <div class="chart"><div class="crow"><span class="cl">kimi-k3<s>104B active</s></span><span class="ct"><i style="width:100.0%"></i></span><span class="cv">2.8T</span></div><div class="crow"><span class="cl">inkling<s>41B active</s></span><span class="ct"><i style="width:34.8%"></i></span><span class="cv">975B</span></div><div class="crow"><span class="cl">glm-5.2<s>40B active</s></span><span class="ct"><i style="width:26.6%"></i></span><span class="cv">744B</span></div><div class="crow"><span class="cl">deepseek-v4.1-flash<s>16B active</s></span><span class="ct"><i style="width:19.7%"></i></span><span class="cv">552B</span></div><div class="crow"><span class="cl">mimo-v2.6-flash<s>15B active</s></span><span class="ct"><i style="width:11.0%"></i></span><span class="cv">309B</span></div><div class="crow"><span class="cl">glm-5.3-flash<s>18B active</s></span><span class="ct"><i style="width:11.4%"></i></span><span class="cv">320B</span></div><div class="crow"><span class="cl">deepseek-v4-flash<s>13B active</s></span><span class="ct"><i style="width:10.1%"></i></span><span class="cv">284B</span></div><div class="crow"><span class="cl">qwen3.8-flash-next<s>6B active</s></span><span class="ct"><i style="width:6.4%"></i></span><span class="cv">180B</span></div><div class="crow"><span class="cl">qwen3.6-35b-a3b<s>3B active</s></span><span class="ct"><i style="width:1.2%"></i></span><span class="cv">35B</span></div><div class="crow"><span class="cl">olmoe<s>1B active</s></span><span class="ct"><i style="width:0.8%"></i></span><span class="cv">7B</span></div></div>
+      <p class="sub">Ten language-model families and an image model run today, one hand-written
+        C file each. Not a wrapper around someone else's runtime.</p>
+      <div class="chart"><div class="crow"><span class="cl">kimi-k3<s>104B active</s></span><span class="ct"><i style="width:100.0%"></i></span><span class="cv">2.8T</span></div><div class="crow"><span class="cl">mimo-v2.6-pro<s>42B active</s></span><span class="ct"><i style="width:36.4%"></i></span><span class="cv">1.02T</span></div><div class="crow"><span class="cl">inkling<s>41B active</s></span><span class="ct"><i style="width:34.8%"></i></span><span class="cv">975B</span></div><div class="crow"><span class="cl">glm-5.2 / glm-5.3<s>40B active</s></span><span class="ct"><i style="width:26.6%"></i></span><span class="cv">744B</span></div><div class="crow"><span class="cl">deepseek-v4.1-flash<s>16B active</s></span><span class="ct"><i style="width:19.7%"></i></span><span class="cv">552B</span></div><div class="crow"><span class="cl">glm-5.3-flash<s>18B active</s></span><span class="ct"><i style="width:11.4%"></i></span><span class="cv">320B</span></div><div class="crow"><span class="cl">mimo-v2.6-flash<s>15B active</s></span><span class="ct"><i style="width:11.0%"></i></span><span class="cv">309B</span></div><div class="crow"><span class="cl">deepseek-v4-flash<s>13B active</s></span><span class="ct"><i style="width:10.1%"></i></span><span class="cv">284B</span></div><div class="crow"><span class="cl">qwen3.8-flash-next<s>6B active</s></span><span class="ct"><i style="width:6.4%"></i></span><span class="cv">180B</span></div><div class="crow"><span class="cl">qwen3.6-35b-a3b<s>3B active</s></span><span class="ct"><i style="width:1.2%"></i></span><span class="cv">35B</span></div><div class="crow"><span class="cl">qwen3-coder-30b-a3b<s>3B active</s></span><span class="ct"><i style="width:1.1%"></i></span><span class="cv">30B</span></div><div class="crow"><span class="cl">qwen3.8-27b<s>dense, all active</s></span><span class="ct"><i style="width:1.0%"></i></span><span class="cv">27B</span></div><div class="crow"><span class="cl">olmoe<s>1B active</s></span><span class="ct"><i style="width:0.8%"></i></span><span class="cv">7B</span></div></div>
       <p class="src">Total parameters. Only the active ones are computed per token, and only the
         routed experts move. The engines, by the names the docs use:
-        GLM-5.3-Flash, GLM-5.2/5.3, Inkling, Kimi K3, OLMoE, Qwen3.6-35B-A3B, Qwen3.8-Flash-Next, DeepSeek V4 Flash, DeepSeek V4.1 Flash, MiMo-V2.6 Flash.
+        GLM-5.3-Flash, GLM-5.2/5.3, Inkling, Kimi K3, OLMoE, Qwen3.6-35B-A3B (which also runs
+        Qwen3-Coder-30B-A3B and the dense Qwen3.8-27B), Qwen3.8-Flash-Next, DeepSeek V4 Flash,
+        DeepSeek V4.1 Flash, MiMo-V2.6 Flash (and Pro, on the same engine).
         And for images, Qwen-Image-2.1: text to picture, drawn inside the terminal.</p>
       <a class="more" href="#models">Browse all models &rarr;</a>
     </div>
