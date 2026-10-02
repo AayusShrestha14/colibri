@@ -512,6 +512,8 @@ Read **only** by `c/mimo.c` (and `MIMO_MAX_IMAGE_TOKENS` by the gateway). See [m
 | `MIMO_TRACE` | unset | MiMo, oracle: dump the residual after every sublayer of the first block. |
 | `MIMO_DIRS` | unset | MiMo: extra directories holding shards. |
 | `MIMO_STATS` | unset | MiMo: report the vision tower's time per picture. |
+| `COLI_VULKAN` | `0` | MiMo, `VK=1` build: the dense matrices of the trunk and of the vision tower run on the GPU in their `MIMO_DENSE_BITS` form (FP8 and BF16, int8 or f32). The router stays on the CPU. |
+| `MIMO_VK_EXPERTS` | `0` | MiMo, with `COLI_VULKAN=1`: keep up to this many routed experts (MXFP4) on the GPU once they have run from the RAM cache; never evicted, capped by the device's memory budget. |
 
 ## OLMoE engine (`olmoe`)
 
