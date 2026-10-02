@@ -2,7 +2,7 @@
 # Every engine's Vulkan path against its own CPU run, on Lavapipe (Mesa's software
 # Vulkan), one family per call so CI can run them side by side:
 #
-#   bash tests/vulkan_engines.sh qwen | inkling-olmoe | mimo-qwenimage | deepseek
+#   bash tests/vulkan_engines.sh qwen | qwen-sanitize | inkling-olmoe | mimo-qwenimage | deepseek
 #   bash tests/vulkan_engines.sh shader    # the qmatmul formats, the expert batch and the tier, no engine
 #
 # Needs libvulkan-dev, glslc and mesa-vulkan-drivers, plus the Python packages of
@@ -188,6 +188,50 @@ family_qwen() {
       tier_gate qwen38 "qwen38 tier MTP $fx batch=$batch" OMP_NUM_THREADS=2 Q38_MTP=1 Q38_PREFILL_BATCH=$batch SNAP=$fx -- 2 8 $fx/ref.json
     done
   done
+}
+
+# The routed-expert tier under ASan and UBSan: a sanitized VK=1 build of both qwen
+# engines, the tier's configurations on Lavapipe (formats, eviction, PILOT's worker
+# against the tier, MTP, the tier alone). Memory safety is the gate, not the tokens
+# (a sanitized build vectorizes differently); each run must still put experts on the
+# device, or the tier was never exercised.
+family_qwen_sanitize() {
+  make clean >/dev/null 2>&1 || true
+  make qwen36 qwen38 VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  $PY tools/make_qwen36_tiny.py --out qwen36_tiny --ref-mode full --emit-ref qwen36_tiny/ref_full.json
+  $PY tools/convert_qwen36.py --model qwen36_tiny --out qwen36_tiny_c --ebits 8
+  $PY tools/make_qwen36_tiny.py --out qwen36_tiny64 --ref-mode full --inter 64 --emit-ref qwen36_tiny64/ref_full.json
+  $PY tools/convert_qwen36.py --model qwen36_tiny64 --out qwen36_tiny64_c --ebits 4 --gs 64
+  $PY tools/convert_qwen36.py --model qwen36_tiny64 --out qwen36_tiny64_g8 --ebits 8 --gs 64
+  $PY tools/make_qwen38_tiny.py --out qwen38_tiny_fp8 --fp8-experts
+  $PY tools/make_qwen38_tiny.py --out qwen38_tiny_int4 --fp8-experts --int4-experts --expert-gain 3
+  $PY tools/make_qwen38_tiny.py --out qwen38_tiny_int4_mtp --fp8-experts --int4-experts --expert-gain 3 --mtp
+  san() {  # <engine> <tag> <env and argv...>
+    local eng=$1 tag=$2; shift 2
+    rm -f tier.usage
+    env ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2 \
+      COLI_USAGE=tier.usage COLI_VULKAN=1 "$@" > san.log 2>&1 || true
+    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    [ "$(tier_count "$eng" san.log)" -gt 0 ] || { cat san.log; fail "$tag: no routed expert ran on the device"; }
+    echo "OK $tag: sanitizers clean, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' san.log | tail -1)"
+  }
+  local cap
+  for cap in 1 8; do
+    san qwen36 "asan qwen36 int8 PILOT cap=$cap" COLI_DENSE_I8=0 PILOT=1 WIDE=2 SNAP=qwen36_tiny_c ./qwen36 $cap 8 qwen36_tiny/ref_full.json
+    san qwen36 "asan qwen36 int4-g64 PILOT cap=$cap" COLI_DENSE_I8=0 PILOT=1 WIDE=2 SNAP=qwen36_tiny64_c ./qwen36 $cap 4 qwen36_tiny64/ref_full.json
+    san qwen36 "asan qwen36 int8 gs64 cap=$cap" COLI_DENSE_I8=0 SNAP=qwen36_tiny64_g8 ./qwen36 $cap 8 qwen36_tiny64/ref_full.json
+  done
+  san qwen36 "asan qwen36 eviction" COLI_VK_TIER_GB=0.00002 COLI_DENSE_I8=0 PILOT=1 SNAP=qwen36_tiny_c ./qwen36 8 8 qwen36_tiny/ref_full.json
+  san qwen36 "asan qwen36 tier alone" COLI_VK_DENSE=0 SNAP=qwen36_tiny64_c ./qwen36 8 4 qwen36_tiny64/ref_full.json
+  local b
+  for b in 0 1; do
+    san qwen38 "asan qwen38 fp8 batch=$b" Q38_PREFILL_BATCH=$b SNAP=qwen38_tiny_fp8 ./qwen38 1 8 qwen38_tiny_fp8/ref.json
+    san qwen38 "asan qwen38 int4 batch=$b" Q38_PREFILL_BATCH=$b SNAP=qwen38_tiny_int4 ./qwen38 1 8 qwen38_tiny_int4/ref_int4.json
+  done
+  san qwen38 "asan qwen38 eviction" Q38_PREFILL_BATCH=0 COLI_VK_TIER_GB=0.0000065 SNAP=qwen38_tiny_fp8 ./qwen38 1 8 qwen38_tiny_fp8/ref.json
+  san qwen38 "asan qwen38 MTP" Q38_MTP=1 Q38_PREFILL_BATCH=0 SNAP=qwen38_tiny_int4_mtp ./qwen38 2 8 qwen38_tiny_int4_mtp/ref.json
+  san qwen38 "asan qwen38 tier alone" COLI_VK_DENSE=0 SNAP=qwen38_tiny_int4 ./qwen38 4 8 qwen38_tiny_int4/ref_int4.json
+  make clean >/dev/null 2>&1 || true
 }
 
 family_inkling_olmoe() {
@@ -381,8 +425,9 @@ PY
 case "${1:-}" in
   shader)         shader_formats ;;
   qwen)           family_qwen ;;
+  qwen-sanitize)  family_qwen_sanitize ;;
   inkling-olmoe)  family_inkling_olmoe ;;
   mimo-qwenimage) family_mimo_qwenimage ;;
   deepseek)       family_deepseek ;;
-  *) echo "usage: $0 shader|qwen|inkling-olmoe|mimo-qwenimage|deepseek" >&2; exit 2 ;;
+  *) echo "usage: $0 shader|qwen|qwen-sanitize|inkling-olmoe|mimo-qwenimage|deepseek" >&2; exit 2 ;;
 esac
