@@ -35,6 +35,8 @@ int  coli_vk_mem_budget(double *used_gb, double *budget_gb);
 
 /* y[S,O] = (x[S,I] @ dequant(W[O,I])^T) * scale[O].
  * fmt matches QT in glm.c: 1=int8, 2=int4. (0=f32,3=int2 fall back to CPU.)
+ * fmt 10 = plain f32 weights and 11 = bf16 weights (low half = even column): no
+ * scales, pass NULL. Numbered apart from QT's 0 (f32), which keeps falling back.
  * First call uploads W+scales; later calls reuse the resident copy.
  * Returns 1 on success, 0 if unavailable / unsupported fmt. */
 int  coli_vk_matmul(ColiVkTensor **tensor,
