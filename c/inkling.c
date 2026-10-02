@@ -2074,24 +2074,49 @@ static float *step_mm(Model *m, const int *ids, int S, int pos0, int *tf_out,
     /* Lettura del prefill: un passaggio di lm_head per posizione, pagato solo
      * da chi ha chiesto il canale. La posizione p predice il token p+1; il
      * primo token fresco e predetto dalla fotografia. */
-    if (g_echo_k > 0 && g_echo_id && S > 0) {
-        if (g_pin_use_logit && g_pin_logit)
-            ink_echo(g_echo_id, pos0, ids[0], g_pin_logit, c->unpad_vocab, g_echo_k);
-        for (int p = 0; p + 1 < S; p++) {
-            rmsnorm_row(last, x + (int64_t)p*D, m->final_norm, D, c->eps);
-            for (int d = 0; d < D; d++) last[d] /= c->mup;
-            matmul_w(logit, last, m->lm_head, 1, D, c->unpad_vocab);
-            ink_echo(g_echo_id, pos0 + p + 1, ids[p+1], logit, c->unpad_vocab, g_echo_k);
+    /* The per-position heads (the logprobs channel, teacher forcing) run over a
+     * block of positions at a time: one S-row lm_head call (a device GEMM) instead
+     * of one per position. Every kernel matmul_w uses computes a row as the one-row
+     * call does, so the logits are the same bits. */
+    int hb = (int)((64LL << 20) / ((int64_t)c->unpad_vocab * (int64_t)sizeof(float)));
+    hb = hb < 1 ? 1 : hb > 64 ? 64 : hb;
+    if ((g_echo_k > 0 && g_echo_id && S > 0) || tf_out) {
+        float *normed = falloc((int64_t)hb * D), *logits = falloc((int64_t)hb * c->unpad_vocab);
+        if (g_echo_k > 0 && g_echo_id && S > 0) {
+            if (g_pin_use_logit && g_pin_logit)
+                ink_echo(g_echo_id, pos0, ids[0], g_pin_logit, c->unpad_vocab, g_echo_k);
+            for (int base = 0; base + 1 < S; base += hb) {
+                int rows = S - 1 - base < hb ? S - 1 - base : hb;
+                for (int r = 0; r < rows; r++) {
+                    float *nr = normed + (int64_t)r*D;
+                    rmsnorm_row(nr, x + (int64_t)(base + r)*D, m->final_norm, D, c->eps);
+                    for (int d = 0; d < D; d++) nr[d] /= c->mup;
+                }
+                matmul_w(logits, normed, m->lm_head, rows, D, c->unpad_vocab);
+                for (int r = 0; r < rows; r++) {
+                    int p = base + r;
+                    ink_echo(g_echo_id, pos0 + p + 1, ids[p+1], logits + (int64_t)r * c->unpad_vocab,
+                             c->unpad_vocab, g_echo_k);
+                }
+            }
         }
-    }
-    if (tf_out) {
-        for (int s = 0; s < S; s++) {
-            rmsnorm_row(last, x + (int64_t)s*D, m->final_norm, D, c->eps);
-            for (int d = 0; d < D; d++) last[d] /= c->mup;
-            matmul_w(logit, last, m->lm_head, 1, D, c->unpad_vocab);
-            int best = 0; for (int i = 1; i < c->unpad_vocab; i++) if (logit[i] > logit[best]) best = i;
-            tf_out[pos0 + s] = best;
+        if (tf_out) {
+            for (int base = 0; base < S; base += hb) {
+                int rows = S - base < hb ? S - base : hb;
+                for (int r = 0; r < rows; r++) {
+                    float *nr = normed + (int64_t)r*D;
+                    rmsnorm_row(nr, x + (int64_t)(base + r)*D, m->final_norm, D, c->eps);
+                    for (int d = 0; d < D; d++) nr[d] /= c->mup;
+                }
+                matmul_w(logits, normed, m->lm_head, rows, D, c->unpad_vocab);
+                for (int r = 0; r < rows; r++) {
+                    const float *lr = logits + (int64_t)r * c->unpad_vocab;
+                    int best = 0; for (int i = 1; i < c->unpad_vocab; i++) if (lr[i] > lr[best]) best = i;
+                    tf_out[pos0 + base + r] = best;
+                }
+            }
         }
+        free(normed); free(logits);
     }
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
     for (int d = 0; d < D; d++) last[d] /= c->mup;
