@@ -1,4 +1,5 @@
 #include "qwen36_tier.h"   /* CUDA VRAM expert tier, shared with qwen36; CPU-only builds get the inline no-op stubs */
+#include "vk_tier.h"       /* Vulkan routed-expert tier (COLI_VULKAN=1); builds without VK=1 get inline no-op stubs */
 /* Native Qwen3.8-Flash-Next text core.
  *
  * This header is included once by qwen38.c after its tokenizer and protocol
@@ -16,6 +17,7 @@
 #ifdef COLI_VULKAN
 #include "backend_vulkan.h" /* COLI_VULKAN=1: the int8 trunk on a Vulkan device */
 static int g_vk_ready = 0;
+static int g_vk_dense = 1;  /* COLI_VK_DENSE=0: the trunk stays on the CPU, the expert tier alone uses the device */
 #endif
 
 #define Q38_MAX_LAYERS 512
@@ -499,7 +501,7 @@ static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
     if(S>1&&g_q38_rowwise&&weight&&
        (weight->gpu
 #ifdef COLI_VULKAN
-        ||(g_vk_ready&&q38_vk_eligible(weight))
+        ||(g_vk_ready&&g_vk_dense&&q38_vk_eligible(weight))
 #endif
        )){
         for(int s=0;s<S;s++)q38_weight_matmul(y+(int64_t)s*O,x+(int64_t)s*I,weight,1,I,O);
@@ -511,7 +513,7 @@ static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
     if(S==1&&weight&&weight->gpu&&weight->rows==O&&weight->cols==I&&
        qt_dense_matmul(weight->gpu-1,y,x,I,O))return;
 #ifdef COLI_VULKAN
-    if(g_vk_ready&&weight&&weight->rows==O&&weight->cols==I&&q38_vk_eligible(weight)&&
+    if(g_vk_ready&&g_vk_dense&&weight&&weight->rows==O&&weight->cols==I&&q38_vk_eligible(weight)&&
        q38_vk_matmul(y,x,weight,S,I,O))return;
 #endif
     if(weight&&weight->q8&&weight->rows==O&&weight->cols==I){
@@ -2572,10 +2574,31 @@ static void q38_tier_start(Model *m,int cap) {
     }
 }
 
+/* ---- Vulkan routed-expert tier (vk_tier.c) -------------------------------------
+ * The tier computes the resident experts of a step on the device while the CPU
+ * computes the rest; every expert's output then joins the row in rank order, the
+ * device's and the CPU's alike, so the sum's order is the CPU run's whatever was
+ * resident. The model's layers only: the MTP head's layer keeps its FP8 experts on
+ * the CPU (the sidecar's int4 covers the model's layers). A slot's bytes are what
+ * the tier reads when it promotes the expert: codes and scales of each matrix. */
+static VktExpertSrc q38_vk_src(const Slot *ex) {
+    VktExpertSrc s={ex->gate.data,ex->up.data,ex->down.data,ex->gate.scales,ex->up.scales,ex->down.scales};
+    return s;
+}
+static void q38_expert_row(Model *m,int layer,int eid,const float *xs,float *eg,float *eu,float *eh,float *eo) {
+    Cfg *c=&m->c;int H=c->hidden,I=c->inter;
+    Slot *ex=q38_expert_get(m,layer,eid);double started=now_s();
+    q38_weight_matmul(eg,xs,&ex->gate,1,H,I);q38_weight_matmul(eu,xs,&ex->up,1,H,I);
+    for(int j=0;j<I;j++)eh[j]=q38_silu(eg[j])*eu[j];q38_weight_matmul(eo,eh,&ex->down,1,I,H);
+    q38_tm_add(m,Q38_TM_ROUTED_EXPERT,started);
+}
+
 static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,float *out) {
     Cfg *c=&m->c;int H=c->hidden,E=c->experts,K=c->topk,I=c->inter,SI=c->shared_inter;
     float *logits=falloc(E),*sg=falloc(SI),*su=falloc(SI),*sh=falloc(SI),*shared=falloc(H);
     float *eg=falloc(I),*eu=falloc(I),*eh=falloc(I),*eo=falloc(H);
+    int vk=vkt_ready()&&layer<c->layers;      /* the Vulkan tier: outputs buffered per rank */
+    float *ebuf=vk?falloc((int64_t)K*H):NULL;
     for(int s=0;s<S;s++){
         const float *xs=x+(int64_t)s*H;float *ys=out+(int64_t)s*H;memset(ys,0,(size_t)H*sizeof(float));
         q38_dense_matmul(m,logits,xs,&l->router,1,H,E);float mx=logits[0];for(int e=1;e<E;e++)if(logits[e]>mx)mx=logits[e];
@@ -2590,9 +2613,12 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
          * CPU only loads and computes the rest, in route order. The tier
          * knows the model's layers only: the MTP head's stays on the CPU. */
         int tiered=layer<c->layers;
+        uint8_t taken[Q38_MAX_TOPK]={0};
+        int ndev=vk?vkt_issue(layer,xs,1,K,idx,taken):0;
+        for(int z=0;z<K;z++)if(taken[z])q38_ehit_mark(m,layer,idx[z]);   /* routed this turn, wherever it ran */
         uint32_t qmask=tiered?qt_issue(layer,idx,K,xs):0;
         int cpu_idx[Q38_MAX_TOPK],cpu_rank[Q38_MAX_TOPK],cpu_n=0;
-        for(int z=0;z<K;z++)if(!((qmask>>z)&1u)){cpu_idx[cpu_n]=idx[z];cpu_rank[cpu_n]=z;cpu_n++;}
+        for(int z=0;z<K;z++)if(!((qmask>>z)&1u)&&!taken[z]){cpu_idx[cpu_n]=idx[z];cpu_rank[cpu_n]=z;cpu_n++;}
         q38_prefetch_experts(m,layer,cpu_idx,cpu_n);
         double phase_started=now_s();
         q38_weight_matmul(sg,xs,&l->sh_g,1,H,SI);q38_weight_matmul(su,xs,&l->sh_u,1,H,SI);
@@ -2606,9 +2632,26 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
             Slot *ex=loaded_batch?selected[i]:q38_expert_get(m,layer,cpu_idx[i]);phase_started=now_s();
             q38_weight_matmul(eg,xs,&ex->gate,1,H,I);q38_weight_matmul(eu,xs,&ex->up,1,H,I);
             for(int j=0;j<I;j++)eh[j]=q38_silu(eg[j])*eu[j];q38_weight_matmul(eo,eh,&ex->down,1,I,H);
-            for(int d=0;d<H;d++)ys[d]+=route_gates[z]*eo[d];
+            if(vk){
+                memcpy(ebuf+(int64_t)z*H,eo,(size_t)H*sizeof(float));
+                VktExpertSrc src=q38_vk_src(ex); vkt_note(layer,cpu_idx[i],&src);
+            }
+            else for(int d=0;d<H;d++)ys[d]+=route_gates[z]*eo[d];
             q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);
             if(tiered)q38_tier_note(layer,cpu_idx[i],ex);
+        }
+        if(vk){
+            /* the device's experts, then every rank in order; a batch that failed is
+             * recomputed here (the tier has turned itself off) */
+            const float *dev[Q38_MAX_TOPK];
+            if(ndev&&!vkt_join(dev))
+                for(int z=0;z<K;z++)if(taken[z]){
+                    q38_expert_row(m,layer,idx[z],xs,eg,eu,eh,ebuf+(int64_t)z*H);taken[z]=0;
+                }
+            for(int z=0;z<K;z++){
+                const float *e=taken[z]?dev[z]:ebuf+(int64_t)z*H;
+                for(int d=0;d<H;d++)ys[d]+=route_gates[z]*e[d];
+            }
         }
         /* GPU experts land after the CPU ones: same values, one more group in
          * the float sum (that is the only ordering difference to a CPU run). */
@@ -2619,7 +2662,7 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
         for(int d=0;d<H;d++)ys[d]+=gate*shared[d];
     }
     rt_trace_end();
-    free(logits);free(sg);free(su);free(sh);free(shared);free(eg);free(eu);free(eh);free(eo);
+    free(logits);free(sg);free(su);free(sh);free(shared);free(eg);free(eu);free(eh);free(eo);free(ebuf);
 }
 
 typedef struct {
@@ -2648,6 +2691,26 @@ static int q38_moe_prefill_rows(const Cfg *c,int requested) {
     return q38_bounded_prefill_rows(requested,fixed,total_row);
 }
 
+/* With the Vulkan tier: n of an expert's assignments (positions pos[] in the
+ * grouped order, assignment ids in assign[]) gathered, run as one batch and their
+ * outputs scattered to their places in routed_out, where the reduction reads them.
+ * Row for row the same arithmetic as the grouped loop below. */
+static void q38_prefill_expert_rows(Model *m,Slot *expert,const float *xc,int K,const int *assign,
+                                    const int *pos,int n,float *in,float *gate,float *up,float *routed_out) {
+    if(n<1)return;
+    Cfg *c=&m->c;int H=c->hidden,I=c->inter;
+    for(int a=0;a<n;a++)memcpy(in+(int64_t)a*H,xc+(int64_t)(assign[pos[a]]/K)*H,(size_t)H*sizeof(float));
+    double started=now_s();
+    q38_weight_matmul(gate,in,&expert->gate,n,H,I);
+    q38_weight_matmul(up,in,&expert->up,n,H,I);
+    for(int a=0;a<n;a++)for(int j=0;j<I;j++)
+        gate[(int64_t)a*I+j]=q38_silu(gate[(int64_t)a*I+j])*up[(int64_t)a*I+j];
+    float *o=in;   /* the inputs are consumed: their rows hold the outputs, H wide each */
+    q38_weight_matmul(o,gate,&expert->down,n,I,H);
+    for(int a=0;a<n;a++)memcpy(routed_out+(int64_t)pos[a]*H,o+(int64_t)a*H,(size_t)H*sizeof(float));
+    q38_tm_add(m,Q38_TM_ROUTED_EXPERT,started);
+}
+
 /* Prefill MoE: route a bounded row chunk first, then execute each distinct
  * expert's assignments as one batched SwiGLU.  Grouping is an I/O optimization
  * only.  Expert outputs are placed back in assignment order and the final
@@ -2673,6 +2736,15 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
        !group_offsets||!group_cursor||!unique||!batch_slots){
         fprintf(stderr,"OOM Qwen3.8 MoE prefill metadata\n");exit(1);
     }
+
+    /* the Vulkan tier: per assignment, whether the device takes it and its output */
+    int vk=vkt_ready()&&layer<c->layers;
+    int *vk_idx=vk?(int*)malloc((size_t)max_assign*sizeof(int)):NULL;
+    uint8_t *vk_taken=vk?(uint8_t*)calloc((size_t)max_assign,1):NULL;
+    const float **vk_dev=vk?(const float**)malloc((size_t)max_assign*sizeof(*vk_dev)):NULL;
+    int *vk_cpu=vk?(int*)malloc((size_t)E*sizeof(int)):NULL;
+    int *vk_sub=vk?(int*)malloc((size_t)max_assign*sizeof(int)):NULL;
+    if(vk&&(!vk_idx||!vk_taken||!vk_dev||!vk_cpu||!vk_sub)){fprintf(stderr,"OOM Qwen3.8 MoE prefill metadata\n");exit(1);}
 
     float *logits=falloc((int64_t)rows_capacity*E);
     float *shared_gate=falloc(rows_capacity);
@@ -2747,8 +2819,27 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
             assignment_positions[assignment]=position;
         }
 
+        /* The Vulkan tier takes the chunk's assignments of its resident experts now,
+         * and computes them while the shared expert and the other experts run here.
+         * cpu_unique: the experts with an assignment the device did not take (all of
+         * them without the tier). */
+        int ndev=0;
+        int *cpu_unique=unique,cpu_count=unique_count;
+        if(vk){
+            for(int a=0;a<assignment_count;a++)vk_idx[a]=routes[a].expert;
+            ndev=vkt_issue(layer,x+(int64_t)base*H,rows,K,vk_idx,vk_taken);
+            for(int a=0;a<assignment_count;a++)if(vk_taken[a])q38_ehit_mark(m,layer,vk_idx[a]);
+            cpu_count=0;
+            for(int u=0;u<unique_count;u++){
+                int e=unique[u],left=0;
+                for(int a=0;a<group_counts[e];a++)left+=!vk_taken[assignments[group_offsets[e]+a]];
+                if(left)vk_cpu[cpu_count++]=e;
+            }
+            cpu_unique=vk_cpu;
+        }
+
         /* One advice range per distinct expert is enough for this chunk. */
-        q38_prefetch_experts(m,layer,unique,unique_count);
+        q38_prefetch_experts(m,layer,cpu_unique,cpu_count);
 
         /* Shared expert work is independent across rows and remains resident;
          * batching it here also keeps its cost out of the routed groups. */
@@ -2781,17 +2872,27 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
          * slots because the preceding outputs already live in routed_out. */
         int load_limit=m->cache[layer].cap;
         if(load_limit<1)load_limit=1;
-        for(int unique_base=0;unique_base<unique_count;) {
-            int load_count=unique_count-unique_base;
+        for(int unique_base=0;unique_base<cpu_count;) {
+            int load_count=cpu_count-unique_base;
             if(load_count>load_limit)load_count=load_limit;
             int loaded_batch=load_count>=2&&q38_expert_get_batch(
-                m,layer,unique+unique_base,load_count,batch_slots);
+                m,layer,cpu_unique+unique_base,load_count,batch_slots);
             for(int offset=0;offset<load_count;offset++) {
-                int e=unique[unique_base+offset];
+                int e=cpu_unique[unique_base+offset];
                 int count=group_counts[e];
                 Slot *expert=loaded_batch?batch_slots[offset]:
                                           q38_expert_get(m,layer,e);
                 int first=group_offsets[e];
+                if(vk){
+                    /* the assignments the device left (all of them, unless its
+                     * batch filled up mid-expert), computed and scattered */
+                    int n=0;
+                    for(int a=0;a<count;a++)if(!vk_taken[assignments[first+a]])vk_sub[n++]=first+a;
+                    q38_prefill_expert_rows(m,expert,x+(int64_t)base*H,K,assignments,vk_sub,n,
+                                            expert_input,expert_gate,expert_up,routed_out);
+                    VktExpertSrc src=q38_vk_src(expert); vkt_note(layer,e,&src);
+                    continue;
+                }
                 for(int a=0;a<count;a++) {
                     int assignment=assignments[first+a];
                     int row=assignment/K;
@@ -2813,6 +2914,18 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
             unique_base+=load_count;
         }
 
+        if(ndev&&!vkt_join(vk_dev)){
+            /* the batch failed (the tier has turned itself off): its experts here */
+            for(int u=0;u<unique_count;u++){
+                int e=unique[u],first=group_offsets[e],n=0;
+                for(int a=0;a<group_counts[e];a++)if(vk_taken[assignments[first+a]])vk_sub[n++]=first+a;
+                if(!n)continue;
+                q38_prefill_expert_rows(m,q38_expert_get(m,layer,e),x+(int64_t)base*H,K,assignments,vk_sub,n,
+                                        expert_input,expert_gate,expert_up,routed_out);
+                for(int a=0;a<n;a++)vk_taken[assignments[vk_sub[a]]]=0;
+            }
+        }
+
         /* The grouped execution above is intentionally not the reduction
          * order.  Replaying the original top-k sequence gives the same result
          * as the single-row implementation for F32, BF16 and block-FP8. */
@@ -2820,7 +2933,7 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
             float *ys=out+(int64_t)(base+s)*H;
             for(int rank=0;rank<K;rank++) {
                 int assignment=s*K+rank;
-                const float *expert_output=routed_out+
+                const float *expert_output=vk&&vk_taken[assignment]?vk_dev[assignment]:routed_out+
                     (int64_t)assignment_positions[assignment]*H;
                 float gate=routes[assignment].gate;
                 for(int d=0;d<H;d++)ys[d]+=gate*expert_output[d];
@@ -2836,6 +2949,7 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
     free(expert_up);free(routed_out);free(routes);free(assignments);
     free(assignment_positions);free(group_counts);free(group_offsets);
     free(group_cursor);free(unique);free(batch_slots);
+    free(vk_idx);free(vk_taken);free(vk_dev);free(vk_cpu);free(vk_sub);
 }
 
 static void q38_moe(Model *m,Layer *l,int layer,const float *x,int S,float *out) {
