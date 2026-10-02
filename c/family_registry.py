@@ -1351,9 +1351,11 @@ FAMILIES = (
         planner_id="olmoe_gqa",
         planner_geometry=_olmoe_geometry,
         planner_unsupported_reason="",
-        # CPU-only, and olmoe.c says so in its own serve telemetry: "CPU-only (no
-        # CUDA/Metal backend), so the GPU fields are always empty". The build rule
-        # links NOCUDA_LDFLAGS. Left at the default this advertised a VRAM tier.
+        # No VRAM tier to plan: olmoe.c has no CUDA/Metal backend ("CPU-only (no
+        # CUDA/Metal backend), so the GPU fields are always empty") and its build
+        # rule links NOCUDA_LDFLAGS. Since #1830 a VK=1 build can put its resident
+        # matrices on a Vulkan device (COLI_VULKAN=1), opt-in and outside the
+        # planner. Left at the default this advertised a VRAM tier.
         supports_accelerator=False,
         expert_inventory=_individual_expert_inventory(_GLM_EXPERT),
         # coli convert routes to convert_olmoe_merged.py (d4d11ef dispatch);
@@ -1518,9 +1520,11 @@ FAMILIES = (
         planner_id="deepseek_v41",
         planner_geometry=_dsv41_geometry,
         planner_unsupported_reason="",
-        # CPU-only: the engine links no CUDA/Metal/Vulkan path and its build rule
-        # carries no backend object, so the planner must not offer a VRAM tier it
-        # cannot execute. Left at the default True it wrote "VRAM 296.0 GB hot
+        # No VRAM tier to plan: the engine links no CUDA/Metal path. Since #1830 a
+        # VK=1 build can put its resident matrices on a Vulkan device
+        # (COLI_VULKAN=1), opt-in and outside the planner, which is why
+        # tests/test_registry_engine_agreement.py does not count VK_OBJ. The
+        # planner must not offer a VRAM tier it cannot execute. Left at the default True it wrote "VRAM 296.0 GB hot
         # tier ... 100% projected expert residency" into `coli plan` for this
         # model; resource_plan.py:945 is the gate and says the same thing in
         # words ("a CPU-only engine has no VRAM tier").
@@ -1569,8 +1573,10 @@ FAMILIES = (
         planner_id="mimo",
         planner_geometry=_mimo_geometry,
         planner_unsupported_reason="",
-        # CPU-only: mimo.c links no accelerator backend (see deepseek_v41 above for
-        # why the planner must not offer a VRAM tier the engine cannot use).
+        # No VRAM tier to plan: mimo.c links no CUDA/Metal backend. Its Vulkan path
+        # (#1830: the dense matrices, plus MIMO_VK_EXPERTS) is opt-in and outside
+        # the planner (see deepseek_v41 above for why the planner must not offer a
+        # VRAM tier the engine cannot use).
         supports_accelerator=False,
         expert_inventory=_mimo_expert_inventory,
         resident_inventory=_mimo_resident_inventory,
