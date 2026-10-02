@@ -321,7 +321,7 @@ static void matmul_res(float *y, const float *x, const float *W, void **vk, int 
 #ifdef _OPENMP
     serial = !omp_in_parallel();
 #endif
-    if (g_vk_ready && serial && *vk != (void *)&g_vk_refused) {
+    if (g_vk_ready && serial && *vk != (void *)&g_vk_refused && coli_vk_dense()) {
         if (coli_vk_matmul((ColiVkTensor **)vk, y, x, W, NULL, 10, S, I, O, 0)) return;
         if (!*vk) *vk = &g_vk_refused;
     }
@@ -718,7 +718,7 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
      * the CPU). The host copies stay: they are the fallback, so on a GPU that
      * shares RAM with the CPU the dense set is held twice. */
     if (!g_vk_ready) g_vk_ready = coli_vk_init_env("olmoe");
-    if (g_vk_ready)
+    if (g_vk_ready && coli_vk_dense())
         fprintf(stderr, "[VK] olmoe: %d resident f32 matrices (attention q/k/v/o, router, lm_head) "
                 "go to the GPU on first use; routed experts and the embedding lookup stay on the CPU\n",
                 5 * m->c.n_layers + 1);

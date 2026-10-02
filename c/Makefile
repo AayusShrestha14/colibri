@@ -527,7 +527,7 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 	test_edge_adapters_registration test_edge_adapters_real \
 	test_xdna_execution test_xdna_failure \
 	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41 test_st_f16_bf16_simd_sse41 test_qwen38_tier_engine \
-	test_e8x4g64_loader test_qwenimage_vae \
+	test_e8x4g64_loader test_qwenimage_vae test_vk_tier \
 	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
@@ -703,9 +703,11 @@ LDFLAGS  += -Wl,-Bdynamic -lvulkan-1 -Wl,-Bstatic
 else
 LDFLAGS  += -lvulkan
 endif
-VK_OBJ    = backend_vulkan.o
+# vk_tier.o: the routed-expert tier the MoE engines share (vk_tier.h); an engine
+# that does not call it links nothing from it.
+VK_OBJ    = backend_vulkan.o vk_tier.o
 VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/attention_absorb.spv shaders/rmsnorm.spv \
-            shaders/qmatmul_gemm.spv shaders/qmatmul_coop.spv
+            shaders/qmatmul_gemm.spv shaders/qmatmul_coop.spv shaders/expert_act.spv
 endif
 
 # Optional AMD XDNA2 (Ryzen AI NPU) lane, Windows. Same opt-in shape as VK=1:
@@ -839,6 +841,8 @@ colibri$(EXE): colibri.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) $(XDNA_OBJ
 # Vulkan backend object (plain C + vulkan headers) and its SPIR-V shaders.
 backend_vulkan.o: backend_vulkan.c .build-config
 	$(CC) $(CFLAGS) -c backend_vulkan.c -o $@
+vk_tier.o: vk_tier.c .build-config
+	$(CC) $(CFLAGS) -c vk_tier.c -o $@
 shaders/%.spv: shaders/%.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@
@@ -1937,6 +1941,22 @@ tests/test_sparse_attn$(EXE): tests/test_sparse_attn.c
 tests/test_expert_ffn$(EXE): tests/test_expert_ffn.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# The Vulkan weight pool's offset allocator (vk_alloc.h): bookkeeping only, no
+# device, so it is an ordinary gate.
+tests/test_vk_alloc$(EXE): tests/test_vk_alloc.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# The Vulkan routed-expert tier (vk_tier.c) against a CPU reference: every source
+# format, warm start, eviction, partial batches. It needs VK=1 and a Vulkan device
+# (CI: Lavapipe), so it stays out of `check` (TEST_EXCLUDE) and runs from
+# vk-tier-check.
+tests/test_vk_tier$(EXE): tests/test_vk_tier.c $(VK_OBJ) $(VK_SPV)
+	@[ "$(VK)" = 1 ] || { echo "tests/test_vk_tier needs VK=1" >&2; exit 1; }
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+.PHONY: vk-tier-check
+vk-tier-check: tests/test_vk_tier$(EXE)
+	./tests/test_vk_tier$(EXE) shaders/qmatmul.spv
+
 tests/test_rans$(EXE): tests/test_rans.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -2723,7 +2743,7 @@ AUTODEP_OWN_FLAGS = bench_cuda_resident_batch bench_load_tq_peak_rss \
 	bench_indexer_allocations
 ENGINE_RULES := $(foreach n,$(RULE_NAMES),$(if $(findstring /,$(n)),,$(if $(wildcard $(n).c),$(n))))
 AUTODEP_TESTS := $(patsubst tests/%,%,$(filter tests/%,$(RULE_NAMES)))
-AUTODEP_OBJS      = backend_vulkan.o backend_loader.o backend_xdna.o qwen36_tier.o \
+AUTODEP_OBJS      = backend_vulkan.o vk_tier.o backend_loader.o backend_xdna.o qwen36_tier.o \
 	tests/backend_xdna_lane.o tests/edge_runtime.o tests/edge_runtime_nocuda.o \
 	tests/segment_runtime.o tests/segment_runtime_nocuda.o \
 	tests/segment_conformance_fixtures.o tests/deepseek_v4_native_quant.o \

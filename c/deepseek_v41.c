@@ -425,7 +425,7 @@ static VkEntry *vk_entry(const void *data, int fmt, int O, int I) {
  * device wants them packed, so they are packed here. */
 static int vk_mul(int fmt, const void *data, const uint8_t *tiles, int O, int I,
                   float *y, int ystride, const float *x, int xstride, int rows) {
-    if (!g_vk_ready || rows < 1 || !pthread_equal(pthread_self(), g_vk_thread)) return 0;
+    if (!g_vk_ready || !coli_vk_dense() || rows < 1 || !pthread_equal(pthread_self(), g_vk_thread)) return 0;
 #ifdef _OPENMP
     if (omp_in_parallel()) return 0;
 #endif

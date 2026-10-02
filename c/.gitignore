@@ -55,6 +55,7 @@ qwenimage
 qwenimage.exe
 shaders/attention_absorb.spv
 shaders/qmatmul_gate_up.spv
+shaders/expert_act.spv
 shaders/rmsnorm.spv
 # Optional XDNA test scaffolding that the *.o / *.dll globs above do not cover.
 tests/xdna_exec_fixtures/

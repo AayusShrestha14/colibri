@@ -12105,7 +12105,7 @@ static void v4_vk_open(const ColiV4Engine *engine) {
     g_v4_vk_thread = pthread_self();
     g_v4_vk_engine = engine;
     g_v4_vk_ready = coli_vk_init_env("deepseek_v4");
-    if (g_v4_vk_ready) coli_v4_vk_matmul = v4_vk_matmul_impl;
+    if (g_v4_vk_ready && coli_vk_dense()) coli_v4_vk_matmul = v4_vk_matmul_impl;   /* COLI_VK_DENSE=0: no hook */
 #else
     (void)engine;
 #endif

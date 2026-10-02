@@ -996,7 +996,7 @@ static void ink_vk_mark(Wt *w, int views, int *by, int *cpu) {
 }
 static void ink_vk_init_model(Model *m, int layer_begin, int layer_end) {
     if (!g_vk_ready) g_vk_ready = coli_vk_init_env("inkling");
-    if (!g_vk_ready) return;
+    if (!g_vk_ready || !coli_vk_dense()) return;   /* COLI_VK_DENSE=0: nothing marked, the CPU computes */
     int by[13] = {0}, cpu = 0;
     ink_vk_mark(&m->lm_head, 1, by, &cpu);
     for (int i = layer_begin; i < layer_end; i++) {

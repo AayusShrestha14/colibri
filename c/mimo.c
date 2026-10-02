@@ -353,7 +353,7 @@ static int dw_upload(DW *d) {
 }
 
 static int dw_matmul_vk(float *y, const float *x, int S, const DW *d) {
-    if (!g_vk_ready || d->vk_off || !vk_main_thread()) return 0;
+    if (!g_vk_ready || !coli_vk_dense() || d->vk_off || !vk_main_thread()) return 0;
     DW *dev = (DW *)d;     /* the device copy is a cache inside a read-only matrix */
     if (!dw_upload(dev)) return 0;
     int gs; const float *sc;
@@ -1792,7 +1792,7 @@ int main(int argc, char **argv) {
 #ifdef COLI_VULKAN
     /* after the weights, so a missing device costs one line and nothing else */
     g_vk_ready = coli_vk_init_env("mimo");
-    if (g_vk_ready) {
+    if (g_vk_ready && coli_vk_dense()) {   /* COLI_VK_DENSE=0: the trunk stays on the CPU */
         int up = vk_dense_upload(m);
         size_t used = 0, count = 0;
         coli_vk_mem_info(&used, &count);

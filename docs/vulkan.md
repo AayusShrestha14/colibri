@@ -90,16 +90,32 @@ weights are loaded. Kimi K3 has its own expert tier (`K3_VK`, see
 [glm53-flash.md](glm53-flash.md). For the engines below, a missing device or missing
 shaders prints `[VK] <engine>: no usable Vulkan device ..., running on the CPU` and
 the run continues on the CPU. That differs from the GLM engine above, which exits.
+A device that opens prints `[VK] <engine>: device ready, dense matrices on the
+device` (or `on the CPU`), and why.
+
+**Where the dense matrices go** is one rule, the backend's `coli_vk_dense_decide()`,
+for every engine below. `COLI_VK_DENSE=1` puts them on the device, `COLI_VK_DENSE=0`
+keeps them on the CPU. Unset, they go to the device, except where the device shares
+the CPU's RAM (an integrated GPU, or a CPU device such as Lavapipe) and the engine
+runs the routed-expert tier ([below](#the-routed-expert-tier-vk_tierc)): there they
+stay on the CPU and the device takes the experts. On a Radeon 780M the dense matmuls,
+one synchronous call each at the GPU's 800 MHz floor, cost more than the tier gained
+(Qwen3.8 decode at 2.35 tok/s with them on the device, 3.80 without). Today that
+case is qwen36 and qwen38; an engine that moves to the tier inherits it. A discrete
+GPU keeps the dense matrices on the device by default. The GLM engine above reads
+the same variable through the same function with its own default, off.
 
 What these engines put on the device is their **resident** matrices, in the form
 they already hold in RAM, uploaded at the first multiply (MiMo uploads them at
-startup). Routed experts arrive from disk on every miss and stay on the CPU, with
-one opt-in exception for MiMo.
+startup). Routed experts arrive from disk on every miss; qwen36 and qwen38 keep a
+cache of them on the device with the shared expert tier
+([below](#the-routed-expert-tier-vk_tierc)), MiMo an opt-in one of its own, the
+others none yet.
 
 | Engine | On the device | Weight formats | Stays on the CPU |
 |---|---|---|---|
-| qwen36 (Qwen3.6, Qwen3-Coder, Qwen3.8-27B) | the dense trunk | int8 rows; int4-g64 with `COLI_DENSE_BITS=4`; f32 with `COLI_DENSE_I8=0` | DeltaNet `dn_a`/`dn_b`, vision tower, routed experts |
-| qwen38 (Qwen3.8 Flash Next) | the trunk | int8 trunk rows, bf16, f32 (`Q38_NATIVE_BF16=0`) | routed FP8 experts |
+| qwen36 (Qwen3.6, Qwen3-Coder, Qwen3.8-27B) | the dense trunk; routed experts on the expert tier | int8 rows; int4-g64 with `COLI_DENSE_BITS=4`; f32 with `COLI_DENSE_I8=0`; experts int4-g64, int4 per row, int8 per row or gs64 | DeltaNet `dn_a`/`dn_b`, vision tower, the experts the tier does not hold |
+| qwen38 (Qwen3.8 Flash Next) | the trunk; routed experts on the expert tier | int8 trunk rows, bf16, f32 (`Q38_NATIVE_BF16=0`); experts int4-g64 (sidecar), FP8 128x128 blocks, bf16 | the MTP head's experts, the experts the tier does not hold |
 | inkling | dense and shared-expert matrices | int8 and int4-g64 (dense-int4g64 container), f32, bf16 | routed experts, embedding and audio lookups, CUDA residents; bf16 on CPUs with the AVX512-BF16 dot (see below) |
 | olmoe | attention q/k/v/o, router, lm_head | f32 | routed experts, embedding |
 | deepseek_v41 | the trunk, vision included | fp8 in 32x32 ue8m0 tiles, bf16 | routed experts |
@@ -118,7 +134,9 @@ them by f32 activations.
 - Where the CPU kernel rounds activations first, the device result instead matches
   the CPU's f32-activation setting, so tokens can drift from the CPU default after
   a few steps. These kernels are:
-  - qwen36's int8 dot (`COLI_DENSE_IDOT`, on by default);
+  - qwen36's int8 dot (`COLI_DENSE_IDOT`, on by default) and its routed-expert
+    kernel (`QWEN_EXPERT_ACT`, int8 by default): the expert tier's experts match
+    `QWEN_EXPERT_ACT=f32`, to 2.5e-7 of the logits on the test fixture;
   - qwen38's int8 trunk;
   - qwenimage's `COLI_IMG_ACT8`.
 - Two engines keep the CPU's exact arithmetic instead:
@@ -129,8 +147,8 @@ them by f32 activations.
 
 **Memory.** The host copy stays as the CPU fallback. On an integrated GPU or APU,
 which shares RAM with the CPU, the resident set is therefore held twice: size
-`RAM_GB`/caps with that in mind. The weight arena does not return freed tensors'
-memory, which is also why MiMo's expert tier never evicts.
+`RAM_GB`/caps with that in mind. Freed tensors give their device memory back (see
+the expert tier's section); MiMo's expert tier still never evicts by its own design.
 
 **Status.** CI checks every engine above on Lavapipe (`tests/vulkan_engines.sh`, the
 `vulkan-engines` job): each configuration gives the CPU run's tokens, and its matmul
@@ -241,6 +259,296 @@ The CPU gains too where the block lets a matrix stay in cache across rows (Qwen3
 DeltaNet: 7.1 to 2.5 s). Qwen3.8's block saves its 0.9 s of PLE GEMVs, inside the
 run-to-run spread of its expert reads (cold page cache, about 2 s).
 
+## The routed-expert tier (`vk_tier.c`)
+
+The engines above keep their dense matrices on the device (on a discrete GPU; on
+one that shares the CPU's RAM they stay on the CPU while this tier is on, see
+[the other engines](#the-other-engines)); the routed experts are the other half of
+a MoE model, and the one that does not fit. The tier keeps a cache
+of them on the device the way a GPU-equipped PC should use its card:
+
+- **What is resident adapts while you chat.** At startup the tier fills its budget
+  from the expert history (`.coli_usage`, the hottest experts first, read from disk
+  in parallel). After that, every expert the CPU computes is a candidate: it is
+  promoted while there is room, or when it is hotter than the coldest resident by
+  `tier.h`'s LFRU margin (25% + 4 routings), which is evicted. Heat is one per
+  routing, halved every 1024 tokens; the history starts at 32 for a layer's hottest
+  expert and in proportion below, so an expert of a new workload displaces the
+  history's coldest residents after a few dozen routings of its own (it needs more
+  than 1.25 x their heat + 4). A promotion copies the expert's bytes once on the engine thread
+  (at most `COLI_VK_TIER_RATE` per token, 16) and an uploader thread writes it to
+  the device; it serves from the next layer step on.
+- **The device and the CPU compute at the same time.** For each MoE layer step the
+  routed (row, expert) pairs whose expert is resident go to the device as ONE
+  submit that nobody waits for: per expert, its rows run gate+up and the activation
+  then down, all experts in one command buffer, on a queue of their own when the
+  device has a second one (RADV's async compute, a second queue on NVIDIA and Intel),
+  so the dense matmuls of the same layer do not wait behind it. Meanwhile the CPU
+  loads and computes the other experts and the shared expert. Then the step joins.
+- **Neither side waits for the other more than it must.** When a join keeps
+  waiting (the device is the slower side: an integrated GPU at its floor clock),
+  the tier hands the CPU the step's resident experts that the CPU also holds in RAM,
+  beyond the device's share of the step's rows, and takes them back when the device
+  finishes early; an expert only the device holds stays there (the CPU would read
+  it from disk). A discrete card that finishes first keeps everything.
+- **The sum does not depend on what was resident.** Every expert's output joins its
+  row in routing (rank) order, the device's and the CPU's alike: the same order as a
+  CPU-only run, so the device's experts differ from the CPU's only by their own
+  summation order. A device row's bits do not depend on how many rows share its
+  dispatch either (up to 15 rows an expert takes the per-row GEMV route), so an MTP
+  verify's two rows get a decode step's bits. From 16 rows (prefill) an expert takes
+  the tiled GEMM for gate, up and down.
+- **Without `COLI_VULKAN`, nothing changes.** In a `VK=1` build with `COLI_VULKAN`
+  unset, and in a build without `VK=1`, the stdout and the last logits of every
+  qwen36 and qwen38 fixture configuration are the bytes of the build before the
+  tier (110 configurations: bf16, FP8, int4-g64, int8, the MTP head, every prefill
+  mode, both qwen36 expert kernels, the mixed container, four model geometries).
+
+Engines on the tier today: **qwen36** (Qwen3.6, Qwen3-Coder, the 2.4T geometry: int8
+per row or gs64, int4 per row or gs64 from either expert kernel, the mixed int4/int8
+container) and **qwen38** (Qwen3.8 Flash Next: the int4-g64 sidecar, the release's
+FP8 with 128x128 block scales, BF16). The MTP head's layer of qwen38 stays on the CPU
+(its experts are FP8 beside an int4 sidecar). GLM-5.2's `COLI_VK_EXPERTS`, Kimi K3's
+`K3_VK` and MiMo's `MIMO_VK_EXPERTS` are the older per-engine tiers; the others move
+to this one in the next phase, see [Adding an engine](#adding-an-engine-to-the-tier).
+
+With the CUDA expert tier built and on (`COLI_CUDA=1`) as well, **CUDA wins**: the
+Vulkan tier stays off and says so (`[VK] tier <engine>: the CUDA expert tier is on
+and wins`). The Vulkan dense trunk keeps running, on the device by default whatever
+the device, since no Vulkan tier runs.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `COLI_VK_TIER` | on with `COLI_VULKAN=1` | `0`: no tier, the routed experts stay on the CPU (the dense trunk still uses the device). |
+| `COLI_VK_TIER_GB` | measured | The tier's budget in GiB, within what the device can hold. Unset: below. |
+| `COLI_VK_TIER_RESERVE_GB` | `1` | Device memory left to everything else (scratch, KV mirrors, the driver) on top of the dense weights the engine still has to place. |
+| `COLI_VK_TIER_RATE` | `16` | Promotions per token at most (a prompt's forward gets this many per prompt token): each copies one expert on the engine thread. |
+| `COLI_VK_TIER_BALANCE` | on | `0`: the device takes every resident expert of a step even when it is the slower side (see below). |
+| `COLI_VK_TIER_WARM` | on | `0`: no warm start; the tier fills as experts pass by. |
+| `COLI_VK_TIER_SYNC` | `0` | `1`: each layer step first waits for the uploads staged so far: residency then follows the routing alone (with `COLI_VK_TIER_BALANCE=0`, the run is reproducible). For tests and debugging. |
+| `COLI_VK_TIER_GEMM_ROWS` | `16` | Rows from which an expert of a step takes the tiled GEMM instead of the per-row GEMV; `0` never. |
+| `COLI_VK_TIER_QUEUE` | a second queue | `0`: the tier shares the main queue (its batches and the dense matmuls then serialize). |
+| `COLI_VK_DENSE` | on, but off on a device sharing the CPU's RAM while the tier is on | `0`: the dense trunk stays on the CPU and the device takes the routed experts only; `1`: the trunk on the device whatever the device. Unset: on a discrete GPU, or with the tier off, on the device; on an integrated GPU or Lavapipe with the tier on, on the CPU. The startup line says which and why. (The GLM engine reads it through the same rule with its own default, off.) |
+| `COLI_USAGE` | `<snap>/.coli_usage` | The history the warm start reads. qwen38 always keeps it; qwen36 keeps it only while the tier is on, and saves it at the end of every run and serve turn. |
+
+**The budget.** On a discrete GPU: what `VK_EXT_memory_budget` says is free in
+device-local memory, less the reserve and the dense weights the engine is about to
+place there (Qwen3.8 puts 4.1 GiB of trunk on the device). On an integrated GPU (and on
+Lavapipe), device memory IS the CPU's RAM: RADV on the Radeon 780M reports a 21 GiB
+device-local heap and a 10.5 GiB host heap, together the 512 MiB carve-out and the
+31 GiB of system RAM the kernel lets the GPU map; an allocation in either takes RAM
+the CPU's cache and the page cache would otherwise have. There the default is a quarter of what
+`MemAvailable` leaves once the engine's expert cache has grown to its configured
+size (cap x layers x expert) and the dense weights are placed, less 2 GiB: the tier
+never takes what that cache needs. `COLI_VK_TIER_GB` sets it explicitly. The startup
+line says which rule applied:
+
+```
+[VK] tier qwen38: on, AMD Radeon 780M Graphics (RADV PHOENIX), budget 9.62 GiB = 3734 experts of 2.6 MiB (fmt 4 gs 64, down fmt 4 gs 64), shared RAM: a quarter of what the expert cache leaves, own queue, up to 16 promotions per token, balanced against the CPU
+[VK] tier qwen38: warm start, 3734 experts from the history in 2.6s
+```
+
+**Memory that is given back.** Weight tensors are VkBuffers bound at offsets inside
+256 MB device-memory blocks (one memory object per tensor makes every submit pay for
+thousands of referenced allocations). `vk_alloc.h` hands those offsets out best-fit
+and takes them back on free, coalesced; an emptied block goes back to the driver.
+The tier's experts live in a pool of their own whose limit is the budget, at the
+lower eviction priority (`VK_EXT_memory_priority`), so a pressed heap evicts experts,
+never scratch or the dense trunk. A free while a batch may still read the tensor
+waits for that batch's join.
+
+**One line per run and serve turn** (stderr, beside the engine's own `[VK]` line):
+
+```
+[VK] tier qwen38 run: device 29464 of 59520 routed experts (49.5%; this run 29464 of 59520) | CPU RAM hits 18619, disk loads 8513 | resident 3734 (budget 3734, 9.61 GiB of 9.62 GiB, 39 blocks, frag 0.54) | uploads 4756 (10.89 GiB, 3734 warm), evictions 1022, skipped 0 queue + 2242 rate, failed 0 | device 8686.4 ms, CPU share 11136.6 ms, waited 3031.6 ms (65% of device time hidden) | balance: device share 0.05, 3869 rows handed to the CPU
+```
+
+- *device / routed*: where each routed (row, expert) pair ran; the rest is split by
+  the engine's RAM cache into *RAM hits* and *disk loads*.
+- *resident*, *budget*, the pool's blocks and fragmentation (`1 - largest free
+  extent / free bytes`).
+- *uploads* (warm-start ones included), *evictions*, promotions *skipped* because
+  the upload queue was full or the per-forward rate was spent, uploads that
+  *failed* (the device refused memory: the planned residency shrinks to what is
+  there).
+- *device*: the batches' device time (timestamps); *CPU share*: what the engine did
+  between issue and join; *waited*: what the join then waited. The device time not
+  waited for was hidden behind the CPU.
+- *balance* (with the balancer on): the share of a step's resident rows the device
+  keeps at the moment when the CPU holds them too, and the rows handed to the CPU
+  since startup.
+
+The dashboard's expert map (`EMAP`) shows a device-resident expert as tier 2 (VRAM),
+the experts a device step served still light up in `HITS`, and qwen36's
+`CACHE_ROUTE` ranks them like CUDA-resident ones.
+
+### Measured on a Radeon 780M
+
+Same box as above (Ryzen 7 PRO 8700GE, 16 threads, 61 GiB DDR5, NVMe, RADV), one
+quiet run each after the model files were dropped from the page cache, the same
+binary for every arm, `OMP_NUM_THREADS=8`. Qwen3.8 runs the int4-g64 sidecar at
+cap 96, Qwen3.6 the int4 gs64 container at cap 64; decode is 100 tokens after a
+25-token prompt (prompt included, as above), prefill a 512-token prompt
+(`N_NEW=1`; Qwen3.8 with `Q38_PREFILL_BATCH_ROWS=512`).
+
+Each arm set `COLI_VK_DENSE` explicitly; the trunk on the CPU is now this device's
+default while the tier is on. Every tier arm starts from a history of one unrelated
+conversation (a 231-token
+prompt about planning a bakery's week, 100 tokens generated), as a user's would be;
+*no warm start* starts from nothing. A first round, run from histories that had
+seen the benchmark's own prompts, is at the end. Decode, 100 tokens (the rate the
+engine reports; in brackets the whole process, load and warm start included):
+
+| | Qwen3.8 Flash Next, int4 | Qwen3.6-35B-A3B |
+|---|---|---|
+| CPU | 3.51 tok/s (36.4 s) | 6.02 tok/s (23.6 s) |
+| tier, trunk on the CPU (`COLI_VK_DENSE=0`) | 3.80 tok/s (36.9 s) | 8.03 tok/s (22.5 s) |
+| the same, `COLI_VK_TIER_BALANCE=0` | 3.71 tok/s (37.6 s) | 7.86 tok/s (22.7 s) |
+| the same, no warm start | 3.45 tok/s (37.0 s) | 6.10 tok/s (23.4 s) |
+| tier and trunk on the device (`COLI_VK_DENSE=1`) | 2.35 tok/s (53.0 s) | 7.32 tok/s (23.7 s) |
+| trunk on the device, no tier (`COLI_VK_TIER=0`, first round) | 1.60 tok/s (70.4 s) | 3.22 tok/s (38.1 s) |
+
+Prefill of a 512-token prompt (time to the first token; in brackets the whole
+process):
+
+| | Qwen3.8 Flash Next, int4 | Qwen3.6-35B-A3B |
+|---|---|---|
+| CPU (first round) | 43.9 s (51.8 s) | 35.7 s (42.7 s) |
+| tier, trunk on the CPU | 38.3 s (48.9 s) | 12.3 s (22.4 s) |
+| the same, no warm start | 44.3 s (52.4 s) | 21.0 s (28.2 s) |
+| tier and trunk on the device | 38.4 s (48.8 s) | 12.5 s (22.7 s) |
+| trunk on the device, no tier (first round) | 43.2 s (51.2 s) | 37.1 s (44.1 s) |
+
+What the numbers say, and what they do not:
+
+- **The tier wins by the reads it saves.** At these caps the CPU's RAM cache misses
+  often and every miss is an NVMe read; an expert on the device is neither read nor
+  computed by the CPU. Qwen3.6's budget (12.5 GiB) holds 74% of its 10,240 experts
+  and served 91% of the decode's routed pairs and 75% of the prefill's; Qwen3.8's
+  (9.6 GiB) holds 15% of its 24,576 and served 50% of the decode's pairs and 16% of
+  the prefill's. Hence 1.33x on Qwen3.6's decode and 2.9x on its time to the first
+  token, against 1.08x and 1.15x on Qwen3.8.
+- **The warm start is paid at startup.** Reading the history's experts took 2.3 to
+  3.4 s (7.6 to 11.1 GiB) in every warm arm. The whole-process times include it, the
+  rates do not: over a 100-token run Qwen3.8's tier comes out even with the CPU
+  (36.9 s against 36.4 s), Qwen3.6's 1 s ahead. Without a history the tier fills as
+  experts pass, at most 16 per token: not enough over 100 tokens for Qwen3.8 (3.45
+  against 3.51 tok/s); Qwen3.6's prefill still gains (21.0 s against 35.7 s).
+- **The trunk on the device costs more than the tier gains, here.** The trunk's
+  synchronous matmuls at the 800 MHz floor (see above) make "trunk on the device, no
+  tier" the slowest arm, and "tier and trunk" sits between it and the tier alone.
+  Hence the default: on a device that shares the CPU's RAM, with the tier on, the
+  trunk stays on the CPU (`COLI_VK_DENSE=1` puts it back). A discrete card keeps it
+  on the device by default; nothing here measures one.
+- **Overlap.** On Qwen3.8's decode the device computed 8.7 s of experts and the
+  joins waited 3.0 s of it: 65% ran behind the CPU's share of the step. On Qwen3.6
+  the device is the slower side (6.8 s of device time against 1.9 s of CPU share);
+  the balancer moved the share to its floor, but the experts it holds are mostly not
+  in the CPU's 64-slot cache, so there was little to hand back. With the balancer off
+  the rates were 2% lower on both models, inside what one run to the next varies on
+  this box.
+- **The clock.** In the runs with the trunk on the CPU the GPU sat at its 800 MHz
+  floor in 97 to 100% of the samples, except Qwen3.6's prefill (72% warm, 87%
+  cold). Nothing here was run with the clock pinned.
+- **Memory.** On this APU the tier's device memory is RAM, and it does not show in
+  the process's RSS: the lowest `MemAvailable` during a decode fell from 52 to
+  42 GiB (Qwen3.6) and from 40 to 31 GiB (Qwen3.8) with the tier on.
+- **The text.** Qwen3.6 printed the CPU's text in every arm, decode and prefill.
+  Qwen3.8 with the trunk on the CPU printed the CPU's 100 decode tokens in two of four
+  runs; in the other two (balancer off, no warm start) the text left the CPU's at the
+  72nd word. Its first token after the 512-token prompt was the CPU's in four of five
+  runs. Its experts compute in f32 on both sides, so the device's and the CPU's
+  differ only in summation order, about 1e-7 of the logits on the test fixtures. Over
+  48 layers of top-10-of-512 routing and 512 tokens such differences flip routing
+  near-ties and grow: after that prompt the logits differ from the CPU's by 0.36 on
+  average (KL 0.10), and by as much between the tier's own two routes for prefill
+  rows (the GEMM against the per-row GEMV: 0.34, KL 0.07). The trunk on the device
+  moves them further (0.76, KL 0.49) through its int8 trunk (see Arithmetic above).
+  A run with the tier is also not bit-reproducible by default: which experts a step
+  finds resident depends on when the uploader finished, and the balancer on measured
+  times (`COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0` removes both).
+
+The first round (histories that had seen the benchmark's prompts: Qwen3.8's own
+`.coli_usage` from earlier work, and for Qwen3.6 a run on the prefill prompt):
+Qwen3.8 with the trunk on the CPU decoded at 3.70 tok/s with 56% of the pairs on the
+device and reached the first token of the 512-token prompt in 32.9 s with 63% (the
+second round's 38.3 s had 16%); Qwen3.6 decoded at 8.04 tok/s and prefilled in
+12.8 s. A history that has seen the prompt helps Qwen3.8 and hardly matters for
+Qwen3.6, whose budget holds most of its experts anyway.
+
+### What was not measured
+
+No discrete GPU was available. On one, the tier's experts sit in VRAM and the device
+reads them at VRAM bandwidth, several times what the CPU gets from DDR; that is the
+case the design is for, and nothing above is a prediction of it. What the 780M does
+not have and a discrete card does: its own memory (here the device's experts and
+the CPU's cache share the same DDR5 channels and the same 61 GiB), a clock that
+leaves its floor under bursty work (the 780M's mostly did not), and PCIe uploads
+(here an upload is a RAM copy). What the 780M does show is that the machinery
+holds: the batches overlap the CPU, the history fills the budget in a few seconds,
+eviction keeps the budget, and the fixtures' tokens are the CPU's.
+
+### Integrated GPUs: reading the RAM cache in place
+
+`VK_EXT_external_memory_host` lets the device read host memory where it is, with no
+second copy: on an APU that would make the tier's experts the RAM cache's own slots.
+The harness measures it (`COLI_VK_TEST_HOSTMEM=1 ./vk_test`): batches of 10
+experts of Qwen3.8's shape (int4-g64, 2.76 MB each) cycling over 48 distinct
+experts, once from the tier's device memory and once from page-aligned host memory
+imported in place. On the 780M, three runs:
+
+| | device time per batch |
+|---|---|
+| experts in the tier's device memory | 2.57 to 2.59 ms |
+| experts in imported host memory | 3.24 to 3.77 ms (same bits) |
+
+The copy the import would save costs 0.095 ms per expert into the tier's memory
+(29 GB/s; 0.063 ms into ordinary memory), on the uploader thread, off the engine's
+path. Reading in place is slower on every batch to save a copy paid once per
+promotion, so the tier copies, on APUs too. Serving the RAM cache's own slots would
+also need slots that are page-aligned, slots held against the cache's LRU while a
+batch reads them, and slots laid out the way the shaders read them (today the copy
+converts `expert_ffn.h`'s planar int4 and spreads Qwen3.8's FP8 block scales). The
+backend enables the extension when the device has it; nothing outside the harness
+uses it.
+
+## Adding an engine to the tier
+
+The integration steps are in [`c/vk_tier.h`](../c/vk_tier.h); in short:
+
+1. **Describe the experts** (`VktConfig`): geometry, how RAM holds gate/up and down
+   (`VktSrc`: int8 per row or grouped, the int8 copy of an int4 container, int4
+   pairs signed or `v+8`, `expert_ffn.h`'s planar int4-g64, int3-g64, MXFP4 with f32
+   or ue8m0 scales, fp8 per group or in square blocks, bf16, f32), the activation
+   (`VKT_ACT_SWIGLU` with an optional clamp, `VKT_ACT_SITU`), the most assignments a
+   step carries, the RAM the expert cache may still take and the dense bytes still to
+   come to the device. `vkt_init(&cfg, rt_counts_all())` after the device and the
+   history; then `atexit(coli_vk_shutdown)` and `atexit(vkt_shutdown)`, in that
+   order, so that at exit the tier lets go of its experts and the device is
+   destroyed before the drivers unload.
+2. **Warm start** (optional): `vkt_plan`, read each planned expert into a buffer of
+   the loader's own (any number of threads), `vkt_put`, then `vkt_put_done`.
+3. **Every MoE step**: `vkt_issue(layer, x, S, K, idx, taken)`; compute the pairs not
+   taken on the CPU into rows of their own, and `vkt_note` every expert whose bytes
+   are in RAM; the shared expert; `vkt_join` (when the issue took any); then add
+   every rank of every row in order, the device's row where `taken`. A failed join
+   (device lost) leaves the taken pairs to the CPU and turns the tier off.
+4. **Report**: `vkt_report("run"|"turn", ram_hits, disk_loads)` beside the engine's
+   `[VK]` line; `vkt_resident(l, e)` gives EMAP its tier 2.
+
+What each remaining engine needs, from reading its code:
+
+| Engine | Experts in RAM (`VktSrc`) | Activation | Where | To watch |
+|---|---|---|---|---|
+| colibri.c (GLM-5.2) | int4 per row `I4U_PAIRS_ROW`, int4-gs `I4U_PAIRS_GS`, int3-g64 `I3_G64`; gate, up, down separate | SwiGLU | `moe()`'s Vulkan block replaces the `COLI_VK_EXPERTS` registry | sums per expert in union order today: move to rank order; fmt 6 (E8/IQ3, rotated input) stays on the CPU; the MTP layer is int8 (another format); the block now serves only S <= 4 |
+| glm53 | int4 gs64 `I4U_PAIRS_GS` 64 | SwiGLU with `swiglu_limit` | `ffn_layer` | its CPU clamps even at limit 0 (no guard), the shader treats 0 as no clamp: pass the config's value and check `L > 0` on the CPU side first; shared expert written first |
+| inkling | one `gate_up` tensor [2I, D], rows 0..I-1 gate: pass `g = p13`, `u = p13 + I rows`; int4 per row `I4U_PAIRS_ROW` or int8 `I8_ROW` | SwiGLU | `moe` | routed and shared weights normalized together, `route_scale x rgs` already in the weights |
+| kimi_k3 | MXFP4 `MXFP4_E8M0` 32, gate `w1`, up `w3`, down `w2` | SiTU-GLU, a = 4, b = 25 (`VKT_ACT_SITU`) | `moe_forward` / `expert_apply` (experts in the latent space) | replaces `K3_VK` (synchronous, never evicts); the CPU's `K3_IDOT` rounds activations to int8 |
+| deepseek_v41 | MXFP4 `MXFP4_E8M0` 32 | SwiGLU with limit | `moe_run_at` (already sums per (row, rank) in rank order) | DSpark stages have caches of their own |
+| deepseek_v4 | FP4 + ue8m0/32 = `MXFP4_E8M0` 32; pinned experts are repacked rows16 | SwiGLU with limit, **plus** bf16 rounding of gate/up, the route weight applied before down and bf16 rounding of the output | `moe_token_pipeline` (ascending expert id), `v4_moe_batch_union` | needs an activation variant with those roundings and the host's E4M3 rounding of x (as its fp8 dense path does); undo rows16 or keep pinned experts off the tier; hash-routed layers |
+| mimo | MXFP4 `MXFP4_E8M0` 32, stored down, ds, gate, gs, up, us | SwiGLU | `moe` | replaces `MIMO_VK_EXPERTS` (synchronous, never evicts) |
+| olmoe | int8 per row `I8_ROW`, one merged tensor g, u, d | SwiGLU | `moe` | history only with `COLI_USAGE` |
+
 ## Correctness
 
 - `gcc -O3 -DVK_TEST backend_vulkan.c -o test_vk -lvulkan -lm && ./test_vk
@@ -254,6 +562,15 @@ run-to-run spread of its expert reads (cold page cache, about 2 s).
   order). `COLI_VK_TEST_MATMUL_ONLY=1` stops after the GEMV and GEMM format cases.
 - Engine-level: greedy decode with the full stack matches the pure-CPU
   engine token-for-token on the validation prompt.
+- The expert tier: `tests/test_vk_alloc` (in `make check`) runs the sub-allocator
+  against a byte map, 40,000 random steps included; `make vk-tier-check VK=1` runs
+  `vk_tier.c` against a CPU reference for every expert source format, the warm
+  start, adaptation with eviction and partial batches; the harness runs the expert
+  batch for every weight format and both activations, a row's bits checked
+  independent of the batch, and the tier pool's budget with frees while a batch is
+  in flight. `tests/vulkan_engines.sh qwen` gives the CPU's tokens with the tier on
+  in every qwen36 and qwen38 expert format, under eviction, with MTP and with the
+  trunk on the CPU; `qwen-sanitize` runs the same under ASan and UBSan.
 - int4 weights decode as offset-binary (nibble−8), byte-identical layout to
   the CPU path — no repacking.
 - Khronos validation layers: the backend never enables them, so the loader
@@ -303,8 +620,13 @@ hit-rate line is the tier-effectiveness number.
 
 ## Limits and future work
 
-- Decode-focused: the expert tier and attention core serve `S<=4`; prefill
-  uses the CPU/batched paths (dense projections do run on VK at prefill).
+- GLM-5.2 (this section's engine): decode-focused, its `COLI_VK_EXPERTS` tier and the
+  attention core serve `S<=4`; prefill uses the CPU/batched paths (dense projections
+  do run on VK at prefill). The shared expert tier serves prefill too; GLM moves to
+  it in the next phase.
+- The expert tier's uploads are host writes into host-visible device memory: a
+  discrete card needs Resizable BAR for them (above). A staging copy on a transfer
+  queue, for cards without it, is not written.
 - DSA top-k selection, ragged multi-slot serving, and quantized-KV caches
   fall back to the CPU attention path.
 - Not yet done: a fully resident-layer pipeline, Polaris/gfx803 validation on real

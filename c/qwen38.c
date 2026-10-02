@@ -1647,7 +1647,7 @@ static void serve_emap(Model *m){
         LCache *lc=&m->cache[i];
         for(int e=0;e<E;e++){
             int si=lc->by_expert?lc->by_expert[e]:-1;
-            int b=(si>=0&&si<lc->n&&lc->slots[si].eid==e?1:0)<<6;
+            int b=(vkt_resident(i,e)?2:si>=0&&si<lc->n&&lc->slots[si].eid==e?1:0)<<6;   /* 2 = on the Vulkan device */
             hex[w++]="0123456789abcdef"[b>>4]; hex[w++]="0123456789abcdef"[b&15];
         }
     }
@@ -1900,6 +1900,7 @@ static void serve_loop(Model *m){
             int status=serve_one(m,&q);free(q.payload);
 #ifdef COLI_VULKAN
             q38_vk_report();   /* stderr: the wire protocol on stdout is untouched */
+            vkt_report("turn", m->hits, m->miss);
 #endif
             if(status<0){q38_prefix_cache_release(m);return;}
             serve_emap(m);
@@ -1914,6 +1915,9 @@ static int q38_reference_mode(const char *path,int serve_mode){
 }
 
 static void q38_expert_report(Model *m, int cap);   /* below, beside the expert layout accounting */
+#ifdef COLI_VULKAN
+static void q38_vk_tier_start(Model *m, int cap);   /* below: the Vulkan routed-expert tier */
+#endif
 
 #ifndef QWEN38_TEST_SERVE
 int main(int argc, char **argv) {
@@ -2038,7 +2042,8 @@ int main(int argc, char **argv) {
 #ifdef COLI_VULKAN
     /* After the trunk is int8: those rows upload at their first matmul. No
      * device (or COLI_VULKAN unset) leaves g_vk_ready 0, the CPU path. */
-    g_vk_ready=coli_vk_init_env("qwen38");
+    g_vk_ready=coli_vk_init_env_tier("qwen38",vkt_wanted()&&m.c.experts>0&&!qt_ready());
+    g_vk_dense=coli_vk_dense();   /* COLI_VK_DENSE; unset, off on a device sharing the CPU's RAM with the tier on */
 #endif
     if(is_ref)ref_logits=read_reference_logits(ref_root,m.c.vocab);
     g_capture_last_logit=ref_logits!=NULL||getenv("DUMP")!=NULL;
@@ -2048,6 +2053,10 @@ int main(int argc, char **argv) {
         if(!g_q38_mtp_dump){perror(getenv("Q38_MTP_DUMP"));return 1;}
     }
     q38_telemetry_init(snap, &m);
+#ifdef COLI_VULKAN
+    q38_vk_tier_start(&m, cap);   /* COLI_VULKAN=1: hot routed experts on the device (vk_tier.c) */
+    if(g_vk_ready&&!vkt_ready()&&!g_vk_dense)g_vk_dense=coli_vk_dense_decide("qwen38",0,1);   /* no tier after all */
+#endif
     fprintf(stderr, "resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
 
     /* coli serve mode: speak the gateway wire protocol instead of argv
@@ -2076,6 +2085,7 @@ int main(int argc, char **argv) {
         printf("Speed: %.2f tok/s (%.1fs for %d tokens) | PEAK RSS: %.2f GB\n", scored/dt, dt, scored, rss_gb());
 #ifdef COLI_VULKAN
         q38_vk_report();
+        vkt_report("run", m.hits, m.miss);
 #endif
         rt_save(g_q38_usage,0);
         q38_model_free(&m); free(prompt); free(full); json_free(ref_root);
@@ -2157,6 +2167,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Speed: %.2f tok/s (%.1fs for %d tokens)\n", n_new/dt, dt, n_new);
 #ifdef COLI_VULKAN
     q38_vk_report();
+    vkt_report("run", m.hits, m.miss);
 #endif
     rt_save(g_q38_usage, 0);
     free(g_last_logit); g_last_logit=NULL;
@@ -2380,6 +2391,143 @@ static void q38_expert_report(Model *m, int cap) {
     }
     fprintf(stderr, "\n");
 }
+
+/* ---- the Vulkan routed-expert tier (vk_tier.c) ---------------------------------
+ * After the dense trunk is int8, the device is open and the history is read: tell
+ * the tier how this snapshot's experts sit in RAM, what else will live on the
+ * device, and how much RAM the expert cache may still take; then fill it from the
+ * history, reading the planned experts straight from the files (not through the
+ * LRU, which keeps its own working set). The MTP head's layer is not offered. */
+#ifdef COLI_VULKAN
+static void q38_vk_dense_add(const Q38Weight *w,size_t *bytes){
+    if(!w||!q38_vk_eligible(w))return;
+    *bytes+=w->q8?(size_t)w->rows*w->cols+(size_t)w->rows*sizeof(float):(size_t)q38_weight_bytes(w);
+}
+static size_t q38_vk_dense_bytes(Model *m){
+    size_t b=0;
+    if(!g_vk_dense)return 0;
+    q38_vk_dense_add(&m->lm_head,&b);
+    const GatedResidual *f=&m->final_gr;
+    q38_vk_dense_add(&f->down,&b);q38_vk_dense_add(&f->up,&b);q38_vk_dense_add(&f->inject,&b);
+    for(int i=0;i<q38_layer_rows(m);i++){
+        const Layer *L=&m->L[i];
+        const Q38Weight *w[]={&L->router,&L->sh_g,&L->sh_u,&L->sh_d,&L->q,&L->k,&L->v,&L->o,&L->idx_qk,
+                              &L->dn_qkv,&L->dn_z,&L->dn_b,&L->dn_a,&L->dn_out,&L->ple_key,&L->ple_value,
+                              &L->attn_gr.down,&L->attn_gr.up,&L->attn_gr.inject,
+                              &L->mlp_gr.down,&L->mlp_gr.up,&L->mlp_gr.inject};
+        for(size_t k=0;k<sizeof w/sizeof *w;k++)q38_vk_dense_add(w[k],&b);
+    }
+    if(m->mtp){
+        q38_vk_dense_add(&m->mtp_fc_emb,&b);q38_vk_dense_add(&m->mtp_fc_hid,&b);
+        q38_vk_dense_add(&m->mtp_mixer.down,&b);q38_vk_dense_add(&m->mtp_mixer.up,&b);
+    }
+    return b;
+}
+/* One planned expert read without the LRU: the int4 record, or the native FP8
+ * ranges with the layer's scale bank. buf holds the bytes; 0 when this layout has
+ * no direct read (the caller loads it through a temporary slot instead). */
+static int q38_vk_read_direct(Model *m,int layer,int e,uint8_t *buf,int64_t cap,VktExpertSrc *src){
+    Cfg *c=&m->c;
+    if(q38_layer_int4(m,layer)){
+        Q38Int4Experts *x=m->x4;
+        if(x->record_bytes>cap)return 0;
+        st_read_range_raw_cap(&x->S,x->fd[layer],x->off[(int64_t)layer*c->experts+e],x->record_bytes,buf,cap,1,
+                              "pread Qwen3.8 int4 expert (Vulkan tier)");
+        const float *sc=(const float*)(buf+x->scale_off);
+        *src=(VktExpertSrc){buf,buf+x->code_bytes[0],buf+x->code_bytes[0]+x->code_bytes[1],
+                            sc,sc+x->scale_count[0],sc+x->scale_count[0]+x->scale_count[1]};
+        return 1;
+    }
+    st_tensor *w[3];
+    if(!q38_native_fp8_expert_tensors(m,layer,e,w)||m->expert_scales[layer].ready!=1)return 0;
+    int64_t pair=w[0]->nbytes+w[1]->nbytes;
+    if(pair+w[2]->nbytes>cap)return 0;
+    st_read_range_raw_cap(&m->S,w[0]->fd,w[0]->off,pair,buf,cap,1,"pread Qwen3.8 gate/up expert (Vulkan tier)");
+    st_read_range_raw_cap(&m->S,w[2]->fd,w[2]->off,w[2]->nbytes,buf+pair,cap-pair,1,"pread Qwen3.8 down expert (Vulkan tier)");
+    const Q38ExpertScaleCache *bank=&m->expert_scales[layer];
+    const float *sc=bank->values+(int64_t)e*3*bank->scale_count;
+    *src=(VktExpertSrc){buf,buf+w[0]->nbytes,buf+pair,sc,sc+bank->scale_count,sc+2*bank->scale_count};
+    return 1;
+}
+/* Is the expert in this layer's RAM cache now (the tier's balance asks)? */
+static int q38_vk_in_ram(void *ctx,int layer,int e){
+    Model *m=(Model*)ctx; LCache *lc=&m->cache[layer];
+    int si=lc->by_expert?lc->by_expert[e]:-1;
+    return si>=0&&si<lc->n&&lc->slots[si].eid==e;
+}
+static void q38_vk_tier_start(Model *m,int cap){
+    if(!g_vk_ready||qt_ready()){
+        if(g_vk_ready&&qt_ready())
+            fprintf(stderr,"[VK] tier qwen38: the CUDA expert tier is on and wins; the Vulkan tier stays off\n");
+        return;
+    }
+    Cfg *c=&m->c;int H=c->hidden,F=c->inter;
+    uint64_t per_capacity=0,fixed=0;unsigned kinds=0;
+    VktFmt f={VKT_SRC_NONE,0};size_t ram_expert=0;
+    if(m->x4){ f.kind=VKT_SRC_I4U_PLANAR64; f.gs=64; ram_expert=(size_t)m->x4->record_bytes; }
+    else if(!q38_segment_expert_layout(m,0,(uint32_t)c->layers,&per_capacity,&fixed,&kinds)){
+        if(kinds==Q38_EXPERT_FP8_BLOCK&&m->native_fp8){
+            for(int l=0;l<c->layers;l++)
+                if(!q38_prepare_expert_scale_bank(m,l)){ kinds=0; break; }
+            if(kinds){ f.kind=VKT_SRC_FP8_BLOCK; f.gs=FP8_BLOCK; ram_expert=(size_t)3*H*F; }
+        } else if(kinds==Q38_EXPERT_BF16&&m->native_bf16){ f.kind=VKT_SRC_BF16; ram_expert=(size_t)3*H*F*2; }
+        else if(kinds==Q38_EXPERT_BF16||kinds==Q38_EXPERT_F16||kinds==Q38_EXPERT_F32||kinds==Q38_EXPERT_FP8_EXPANDED){
+            f.kind=VKT_SRC_F32; ram_expert=(size_t)3*H*F*4;
+        }
+    }
+    if(f.kind==VKT_SRC_NONE){
+        fprintf(stderr,"[VK] tier qwen38: the routed experts mix formats; they stay on the CPU\n");
+        return;
+    }
+    VktConfig vc={.engine="qwen38",.layers=c->layers,.experts=c->experts,.hidden=H,.inter=F,.topk=c->topk,
+                  .gate_up=f,.down=f,.act=VKT_ACT_SWIGLU,
+                  .max_rows=q38_moe_prefill_rows(c,q38_prefill_batch_rows())*c->topk,
+                  .ram_reserve=ram_expert*(size_t)cap*(size_t)c->layers,
+                  .dense_bytes=q38_vk_dense_bytes(m),
+                  .in_ram=q38_vk_in_ram,.ram_ctx=m};
+    if(vc.max_rows<64)vc.max_rows=64;
+    uint32_t **heat=rt_counts_all();
+    if(!vkt_init(&vc,heat))return;
+    atexit(coli_vk_shutdown);   /* runs after the tier's teardown: the device goes before the drivers unload */
+    atexit(vkt_shutdown);
+    /* the warm start: the history's hottest experts, read in parallel */
+    int all=c->layers*c->experts,*pl=(int*)malloc((size_t)all*sizeof(int)),*pe=(int*)malloc((size_t)all*sizeof(int));
+    if(!pl||!pe){free(pl);free(pe);return;}
+    const char *warm=getenv("COLI_VK_TIER_WARM");   /* 0: no warm start, the tier fills as experts pass by */
+    int n=warm&&*warm=='0'?0:vkt_plan(pl,pe,all);
+    if(n>0){
+        double t0=now_s();
+        int64_t bufb=m->x4?m->x4->record_bytes:(int64_t)3*H*F;
+        int direct=m->x4||f.kind==VKT_SRC_FP8_BLOCK;
+        if(direct){
+            #pragma omp parallel
+            {
+                uint8_t *buf=(uint8_t*)malloc((size_t)bufb);
+                #pragma omp for schedule(dynamic,4)
+                for(int i=0;i<n;i++){
+                    VktExpertSrc src;
+                    if(buf&&q38_vk_read_direct(m,pl[i],pe[i],buf,bufb,&src))vkt_put(pl[i],pe[i],&src);
+                    else vkt_put(pl[i],pe[i],NULL);
+                }
+                free(buf);
+            }
+        } else {
+            /* BF16/f32 experts (the small fixtures): through a temporary slot, serially */
+            for(int i=0;i<n;i++){
+                Slot tmp; memset(&tmp,0,sizeof tmp);
+                q38_load_expert(m,pl[i],pe[i],&tmp);
+                VktExpertSrc src=q38_vk_src(&tmp); vkt_put(pl[i],pe[i],&src);
+                q38_weight_free(&tmp.gate);q38_weight_free(&tmp.up);q38_weight_free(&tmp.down);
+                free(tmp.fp8_slab);free(tmp.int4_slab);
+            }
+        }
+        vkt_put_done();
+        fprintf(stderr,"[VK] tier qwen38: warm start, %d experts from the history in %.1fs\n",n,now_s()-t0);
+    }
+    free(pl);free(pe);
+}
+#endif
+
 
 static int q38_segment_cache_capacity(uint64_t bytes_per_capacity,
                                       uint64_t fixed_scale_bytes,int experts,
