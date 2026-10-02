@@ -1394,7 +1394,7 @@ qwen38-tiny-int4-check: qwen38-tiny-int4-generate qwen38-tiny-fp8-generate qwen3
 # "the MTP head"). The fixtures are the three above plus an MTP head (--mtp:
 # random head weights from their own seed under the release's mtp.* names; the
 # model and its references do not change) and a byte tokenizer for the text
-# and serve gates. tests/test_qwen38_mtp.py checks:
+# and serve gates. tests/qwen38_mtp_harness.py checks:
 #  (a) the head's draft logits equal tools/qwen38_mtp_ref.py's float32
 #      reference for the default wiring b and the diagnostic a, through the
 #      one-row and the two-row (after an accepted draft) paths, on BF16 and
@@ -1416,7 +1416,7 @@ qwen38-tiny-mtp-generate:
 		$(PYTHON) tools/make_edge_tiny_tokenizer.py --vocab-size 64 ./$$d || exit $$?; done
 
 qwen38-tiny-mtp-check: qwen38-tiny-mtp-generate qwen38$(EXE)
-	$(PYTHON) tests/test_qwen38_mtp.py --engine ./qwen38$(EXE) --bf16 ./qwen38_tiny_mtp \
+	$(PYTHON) tests/qwen38_mtp_harness.py --engine ./qwen38$(EXE) --bf16 ./qwen38_tiny_mtp \
 		--fp8 ./qwen38_tiny_fp8_mtp --int4 ./qwen38_tiny_int4_mtp
 
 # Context-size gates: KV layout, growth across requests, and the attention

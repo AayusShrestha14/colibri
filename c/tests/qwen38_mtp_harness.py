@@ -21,7 +21,7 @@ serve). Gates:
   serve     a multi-turn serve session (prefix reuse, a pinned prefix,
             logprobs, a sampled turn) gives the same frames MTP on and off.
 
-    python tests/test_qwen38_mtp.py --engine ./qwen38 --bf16 ./qwen38_tiny_mtp \\
+    python tests/qwen38_mtp_harness.py --engine ./qwen38 --bf16 ./qwen38_tiny_mtp \\
         --fp8 ./qwen38_tiny_fp8_mtp --int4 ./qwen38_tiny_int4_mtp
 """
 import argparse
