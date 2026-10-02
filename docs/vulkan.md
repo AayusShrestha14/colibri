@@ -90,6 +90,20 @@ weights are loaded. Kimi K3 has its own expert tier (`K3_VK`, see
 [glm53-flash.md](glm53-flash.md). For the engines below, a missing device or missing
 shaders prints `[VK] <engine>: no usable Vulkan device ..., running on the CPU` and
 the run continues on the CPU. That differs from the GLM engine above, which exits.
+A device that opens prints `[VK] <engine>: device ready, dense matrices on the
+device` (or `on the CPU`), and why.
+
+**Where the dense matrices go** is one rule, the backend's `coli_vk_dense_decide()`,
+for every engine below. `COLI_VK_DENSE=1` puts them on the device, `COLI_VK_DENSE=0`
+keeps them on the CPU. Unset, they go to the device, except where the device shares
+the CPU's RAM (an integrated GPU, or a CPU device such as Lavapipe) and the engine
+runs the routed-expert tier ([below](#the-routed-expert-tier-vk_tierc)): there they
+stay on the CPU and the device takes the experts. On a Radeon 780M the dense matmuls,
+one synchronous call each at the GPU's 800 MHz floor, cost more than the tier gained
+(Qwen3.8 decode at 2.35 tok/s with them on the device, 3.80 without). Today that
+case is qwen36 and qwen38; an engine that moves to the tier inherits it. A discrete
+GPU keeps the dense matrices on the device by default. The GLM engine above reads
+the same variable through the same function with its own default, off.
 
 What these engines put on the device is their **resident** matrices, in the form
 they already hold in RAM, uploaded at the first multiply (MiMo uploads them at
@@ -247,8 +261,10 @@ run-to-run spread of its expert reads (cold page cache, about 2 s).
 
 ## The routed-expert tier (`vk_tier.c`)
 
-The engines above keep their dense matrices on the device; the routed experts are
-the other half of a MoE model, and the one that does not fit. The tier keeps a cache
+The engines above keep their dense matrices on the device (on a discrete GPU; on
+one that shares the CPU's RAM they stay on the CPU while this tier is on, see
+[the other engines](#the-other-engines)); the routed experts are the other half of
+a MoE model, and the one that does not fit. The tier keeps a cache
 of them on the device the way a GPU-equipped PC should use its card:
 
 - **What is resident adapts while you chat.** At startup the tier fills its budget
@@ -298,7 +314,8 @@ to this one in the next phase, see [Adding an engine](#adding-an-engine-to-the-t
 
 With the CUDA expert tier built and on (`COLI_CUDA=1`) as well, **CUDA wins**: the
 Vulkan tier stays off and says so (`[VK] tier <engine>: the CUDA expert tier is on
-and wins`). The Vulkan dense trunk keeps running.
+and wins`). The Vulkan dense trunk keeps running, on the device by default whatever
+the device, since no Vulkan tier runs.
 
 | Variable | Default | Effect |
 |---|---|---|
@@ -308,9 +325,10 @@ and wins`). The Vulkan dense trunk keeps running.
 | `COLI_VK_TIER_RATE` | `16` | Promotions per token at most (a prompt's forward gets this many per prompt token): each copies one expert on the engine thread. |
 | `COLI_VK_TIER_BALANCE` | on | `0`: the device takes every resident expert of a step even when it is the slower side (see below). |
 | `COLI_VK_TIER_WARM` | on | `0`: no warm start; the tier fills as experts pass by. |
+| `COLI_VK_TIER_SYNC` | `0` | `1`: each layer step first waits for the uploads staged so far: residency then follows the routing alone (with `COLI_VK_TIER_BALANCE=0`, the run is reproducible). For tests and debugging. |
 | `COLI_VK_TIER_GEMM_ROWS` | `16` | Rows from which an expert of a step takes the tiled GEMM instead of the per-row GEMV; `0` never. |
 | `COLI_VK_TIER_QUEUE` | a second queue | `0`: the tier shares the main queue (its batches and the dense matmuls then serialize). |
-| `COLI_VK_DENSE` | `1` in qwen36/qwen38 | `0`: the dense trunk stays on the CPU and the device takes the routed experts only. (In the GLM engine this variable turns its dense path *on* and defaults to `0`.) |
+| `COLI_VK_DENSE` | on, but off on a device sharing the CPU's RAM while the tier is on | `0`: the dense trunk stays on the CPU and the device takes the routed experts only; `1`: the trunk on the device whatever the device. Unset: on a discrete GPU, or with the tier off, on the device; on an integrated GPU or Lavapipe with the tier on, on the CPU. The startup line says which and why. (The GLM engine reads it through the same rule with its own default, off.) |
 | `COLI_USAGE` | `<snap>/.coli_usage` | The history the warm start reads. qwen38 always keeps it; qwen36 keeps it only while the tier is on, and saves it at the end of every run and serve turn. |
 
 **The budget.** On a discrete GPU: what `VK_EXT_memory_budget` says is free in
@@ -373,7 +391,9 @@ cap 96, Qwen3.6 the int4 gs64 container at cap 64; decode is 100 tokens after a
 25-token prompt (prompt included, as above), prefill a 512-token prompt
 (`N_NEW=1`; Qwen3.8 with `Q38_PREFILL_BATCH_ROWS=512`).
 
-Every tier arm starts from a history of one unrelated conversation (a 231-token
+Each arm set `COLI_VK_DENSE` explicitly; the trunk on the CPU is now this device's
+default while the tier is on. Every tier arm starts from a history of one unrelated
+conversation (a 231-token
 prompt about planning a bakery's week, 100 tokens generated), as a user's would be;
 *no warm start* starts from nothing. A first round, run from histories that had
 seen the benchmark's own prompts, is at the end. Decode, 100 tokens (the rate the
@@ -385,7 +405,7 @@ engine reports; in brackets the whole process, load and warm start included):
 | tier, trunk on the CPU (`COLI_VK_DENSE=0`) | 3.80 tok/s (36.9 s) | 8.03 tok/s (22.5 s) |
 | the same, `COLI_VK_TIER_BALANCE=0` | 3.71 tok/s (37.6 s) | 7.86 tok/s (22.7 s) |
 | the same, no warm start | 3.45 tok/s (37.0 s) | 6.10 tok/s (23.4 s) |
-| tier and trunk on the device (`COLI_VULKAN=1` alone) | 2.35 tok/s (53.0 s) | 7.32 tok/s (23.7 s) |
+| tier and trunk on the device (`COLI_VK_DENSE=1`) | 2.35 tok/s (53.0 s) | 7.32 tok/s (23.7 s) |
 | trunk on the device, no tier (`COLI_VK_TIER=0`, first round) | 1.60 tok/s (70.4 s) | 3.22 tok/s (38.1 s) |
 
 Prefill of a 512-token prompt (time to the first token; in brackets the whole
@@ -416,9 +436,10 @@ What the numbers say, and what they do not:
   against 3.51 tok/s); Qwen3.6's prefill still gains (21.0 s against 35.7 s).
 - **The trunk on the device costs more than the tier gains, here.** The trunk's
   synchronous matmuls at the 800 MHz floor (see above) make "trunk on the device, no
-  tier" the slowest arm, and "tier and trunk" sits between it and the tier alone. On
-  this APU `COLI_VK_DENSE=0` is the setting to use. The default keeps the trunk on the
-  device because that is the design for a discrete card; nothing here measures one.
+  tier" the slowest arm, and "tier and trunk" sits between it and the tier alone.
+  Hence the default: on a device that shares the CPU's RAM, with the tier on, the
+  trunk stays on the CPU (`COLI_VK_DENSE=1` puts it back). A discrete card keeps it
+  on the device by default; nothing here measures one.
 - **Overlap.** On Qwen3.8's decode the device computed 8.7 s of experts and the
   joins waited 3.0 s of it: 65% ran behind the CPU's share of the step. On Qwen3.6
   the device is the slower side (6.8 s of device time against 1.9 s of CPU share);
@@ -443,8 +464,9 @@ What the numbers say, and what they do not:
   average (KL 0.10), and by as much between the tier's own two routes for prefill
   rows (the GEMM against the per-row GEMV: 0.34, KL 0.07). The trunk on the device
   moves them further (0.76, KL 0.49) through its int8 trunk (see Arithmetic above).
-  A run with the tier is also not bit-reproducible: which experts a step finds
-  resident depends on when the uploader finished, and the balancer on measured times.
+  A run with the tier is also not bit-reproducible by default: which experts a step
+  finds resident depends on when the uploader finished, and the balancer on measured
+  times (`COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0` removes both).
 
 The first round (histories that had seen the benchmark's prompts: Qwen3.8's own
 `.coli_usage` from earlier work, and for Qwen3.6 a run on the prefill prompt):

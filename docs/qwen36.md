@@ -87,8 +87,11 @@ while you chat, computed by the device while the CPU computes the rest of the
 layer step, every expert's output joining its row in rank order. It takes every
 container this engine reads: the shared kernel's planar int4-g64 slots, the int8
 copy of an int4 container (packed back to int4 on the device), int8 per row or gs64,
-and the mixed int4 gate/up + int8 down layout. `COLI_VK_DENSE=0` keeps the trunk on
-the CPU and gives the device the experts only; `COLI_VK_TIER=0` the other way round.
+and the mixed int4 gate/up + int8 down layout. On an integrated GPU (or Lavapipe) the
+trunk stays on the CPU by default while the tier is on, where it costs more on the
+device than the tier gains; a discrete GPU takes both. `COLI_VK_DENSE=0` keeps the
+trunk on the CPU anywhere and `COLI_VK_DENSE=1` puts it on the device anywhere;
+`COLI_VK_TIER=0` turns the tier off (the trunk then goes to the device).
 
 This engine kept no expert history before; with the tier on it keeps route_trace.h's
 `.coli_usage` beside the container (`COLI_USAGE` moves it), saved at the end of

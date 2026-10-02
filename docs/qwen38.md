@@ -366,9 +366,13 @@ expert's output joins its row in rank order, device or not.
 
 ```bash
 make -C c qwen38 VK=1
-COLI_VULKAN=1 SNAP=<checkpoint> ./c/qwen38 96 8 prompt.txt    # trunk + experts
+COLI_VULKAN=1 SNAP=<checkpoint> ./c/qwen38 96 8 prompt.txt    # experts; the trunk too on a discrete GPU
 COLI_VULKAN=1 COLI_VK_DENSE=0 ...                              # experts only, trunk on the CPU
+COLI_VULKAN=1 COLI_VK_DENSE=1 ...                              # trunk on the device on any GPU
 ```
+
+On a GPU that shares the CPU's RAM (an integrated GPU, Lavapipe) the trunk stays on
+the CPU by default while the tier is on; the startup line says where it went and why.
 
 On an integrated Radeon 780M the tier with the trunk on the CPU decoded at
 3.80 tok/s against the CPU's 3.51 and reached the first token of a 512-token prompt
