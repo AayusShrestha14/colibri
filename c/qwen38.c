@@ -2042,8 +2042,8 @@ int main(int argc, char **argv) {
 #ifdef COLI_VULKAN
     /* After the trunk is int8: those rows upload at their first matmul. No
      * device (or COLI_VULKAN unset) leaves g_vk_ready 0, the CPU path. */
-    g_vk_ready=coli_vk_init_env("qwen38");
-    { const char *vd=getenv("COLI_VK_DENSE"); g_vk_dense=!(vd&&vd[0]=='0'); }
+    g_vk_ready=coli_vk_init_env_tier("qwen38",vkt_wanted()&&m.c.experts>0&&!qt_ready());
+    g_vk_dense=coli_vk_dense();   /* COLI_VK_DENSE; unset, off on a device sharing the CPU's RAM with the tier on */
 #endif
     if(is_ref)ref_logits=read_reference_logits(ref_root,m.c.vocab);
     g_capture_last_logit=ref_logits!=NULL||getenv("DUMP")!=NULL;
@@ -2055,6 +2055,7 @@ int main(int argc, char **argv) {
     q38_telemetry_init(snap, &m);
 #ifdef COLI_VULKAN
     q38_vk_tier_start(&m, cap);   /* COLI_VULKAN=1: hot routed experts on the device (vk_tier.c) */
+    if(g_vk_ready&&!vkt_ready()&&!g_vk_dense)g_vk_dense=coli_vk_dense_decide("qwen38",0,1);   /* no tier after all */
 #endif
     fprintf(stderr, "resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
 

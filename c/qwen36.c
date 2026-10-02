@@ -4692,8 +4692,8 @@ int main(int argc, char **argv) {
 #ifdef COLI_VULKAN
     /* After the weights: the dense matrices upload at their first matmul_d.
      * No device (or COLI_VULKAN unset) leaves g_vk_ready 0, the CPU path. */
-    g_vk_ready = coli_vk_init_env("qwen36");
-    { const char *vd = getenv("COLI_VK_DENSE"); g_vk_dense = !(vd && vd[0] == '0'); }
+    g_vk_ready = coli_vk_init_env_tier("qwen36", vkt_wanted() && m.c.n_experts > 0 && !qq_active());
+    g_vk_dense = coli_vk_dense();   /* COLI_VK_DENSE; unset, off on a device sharing the CPU's RAM with the tier on */
 #endif
     if (ref_image && ref_image->t == J_OBJ) {
         jval *gh = json_get(ref_image, "grid_h"), *gw = json_get(ref_image, "grid_w");
@@ -4878,6 +4878,7 @@ int main(int argc, char **argv) {
 
 #ifdef COLI_VULKAN
     vk_tier_start(&m, snap, cap, expert_is_int4, expert_mixed);   /* COLI_VULKAN=1: hot routed experts on the device */
+    if (g_vk_ready && !vkt_ready() && !g_vk_dense) g_vk_dense = coli_vk_dense_decide("qwen36", 0, 1);   /* no tier after all */
 #endif
 
     /* coli serve mode: speak the gateway wire protocol instead of argv

@@ -1194,17 +1194,47 @@ const char *coli_vk_shader_path(char *buf, size_t n) {
     return "shaders/qmatmul.spv";
 }
 
-int coli_vk_init_env(const char *engine) {
+/* The dense matrices' place (coli_vk_dense_decide): the last decision, and the one
+ * last printed (-1 none). */
+static int g_dense_on = 1, g_dense_said = -1;
+static int dense_choice(int tier_on, int def, char *why, size_t n) {
+    const char *e = getenv("COLI_VK_DENSE");
+    if (e && *e) { snprintf(why, n, "COLI_VK_DENSE=%s", e); return atoi(e) != 0; }
+    if (def && tier_on && coli_vk_device_shares_ram()) {
+        snprintf(why, n, "%s shares the CPU's RAM and the expert tier is on; COLI_VK_DENSE=1 puts them on the device",
+                 coli_vk_device_integrated() ? "an integrated GPU" : "a CPU device");
+        return 0;
+    }
+    snprintf(why, n, "default");
+    return def != 0;
+}
+int coli_vk_dense_decide(const char *engine, int tier_on, int def) {
+    char why[192];
+    g_dense_on = dense_choice(tier_on, def, why, sizeof why);
+    if (engine && g_dense_on != g_dense_said) {
+        fprintf(stderr, "[VK] %s: dense matrices on the %s (%s)\n", engine, g_dense_on ? "device" : "CPU", why);
+        g_dense_said = g_dense_on;
+    }
+    return g_dense_on;
+}
+int coli_vk_dense(void) { return g_dense_on; }
+
+int coli_vk_init_env_tier(const char *engine, int tier_on) {
     const char *on = getenv("COLI_VULKAN");
     if (!on || !atoi(on)) return 0;
     char buf[1024];
     const char *spv = coli_vk_shader_path(buf, sizeof buf);
     int ok = coli_vk_init(spv) && coli_vk_available();
-    if (ok) fprintf(stderr, "[VK] %s: device ready\n", engine);
-    else fprintf(stderr, "[VK] %s: no usable Vulkan device (shaders %s), running on the CPU\n",
-                 engine, spv);
+    if (ok) {
+        char why[192];
+        g_dense_on = g_dense_said = dense_choice(tier_on, 1, why, sizeof why);
+        fprintf(stderr, "[VK] %s: device ready, dense matrices on the %s (%s)\n", engine,
+                g_dense_on ? "device" : "CPU", why);
+    } else fprintf(stderr, "[VK] %s: no usable Vulkan device (shaders %s), running on the CPU\n",
+                   engine, spv);
     return ok;
 }
+int coli_vk_init_env(const char *engine) { return coli_vk_init_env_tier(engine, 0); }
 
 /* Fused first half of the expert MLP: hidden = silu(gate(x)) * up(x), computed in ONE
  * dispatch that reads x once for both projections. gate/up are resident (uploaded on

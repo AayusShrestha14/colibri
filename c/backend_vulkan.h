@@ -207,9 +207,23 @@ size_t coli_vk_device_local_bytes(void);
 const char *coli_vk_device_name(void);
 
 /* For engines: COLI_VULKAN=1 opens the device with the shaders found by
- * coli_vk_shader_path() and prints one line naming the engine; 0 (and one line) when
- * Vulkan is not asked for or no device is usable, so the engine stays on the CPU. */
+ * coli_vk_shader_path() and prints one line naming the engine and where its dense
+ * matrices go (coli_vk_dense_decide below); 0 (and one line) when Vulkan is not asked
+ * for or no device is usable, so the engine stays on the CPU. tier_on: the engine is
+ * about to start the routed-expert tier (vk_tier.c); coli_vk_init_env(engine) is
+ * coli_vk_init_env_tier(engine, 0). */
 int coli_vk_init_env(const char *engine);
+int coli_vk_init_env_tier(const char *engine, int tier_on);
+/* Where an engine's dense (resident, non-expert) matrices run, the one rule every
+ * engine follows. COLI_VK_DENSE set and non-empty: 0 keeps them on the CPU, any other
+ * number puts them on the device. Unset: the engine's default `def`, except that with
+ * the routed-expert tier on (tier_on) a device that shares the CPU's RAM (an
+ * integrated GPU, or a CPU device such as Lavapipe) keeps them on the CPU: there the
+ * dense matmuls, one synchronous call each, cost more than the tier gains (measured
+ * on a Radeon 780M, docs/vulkan.md). The decision is kept for coli_vk_dense(); with
+ * an engine name it is printed as a [VK] line when it changes (NULL: silent). */
+int coli_vk_dense_decide(const char *engine, int tier_on, int def);
+int coli_vk_dense(void);   /* the last decision; 1 before any */
 /* COLI_VK_SHADERS (the .spv or its directory), else shaders/ next to the binary, else
  * shaders/ in the working directory. buf holds the result when it is not a literal. */
 const char *coli_vk_shader_path(char *buf, size_t n);

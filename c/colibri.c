@@ -12324,7 +12324,7 @@ int main(int argc, char **argv){
         /* 320 = sweep optimum on a 16 GB card (256-384 measured flat, 320 best median;
          * ~6 GB tier + ~8 GB dense leaves headroom for the long-context KV mirror). */
         g_vk_budget = getenv("COLI_VK_EXPERTS") ? atoi(getenv("COLI_VK_EXPERTS")) : 320;
-        g_vk_dense = getenv("COLI_VK_DENSE") ? atoi(getenv("COLI_VK_DENSE")) : 0;
+        g_vk_dense = coli_vk_dense_decide(NULL, g_vk_budget > 0, 0);   /* COLI_VK_DENSE; this engine's default is off */
         g_vk_attn = getenv("COLI_VK_ATTN") ? atoi(getenv("COLI_VK_ATTN")) : 0;
         fprintf(stderr,"[VK] expert tier active: routed quantized experts on the GPU (budget %d)%s%s\n",
                 g_vk_budget, g_vk_dense ? " + dense projections + shared expert" : "",

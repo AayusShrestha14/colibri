@@ -625,10 +625,14 @@ static double env_gb(const char *name, double def) {
     return e && *e ? atof(e) : def;
 }
 
+int vkt_wanted(void) {
+    const char *on = getenv("COLI_VK_TIER");
+    return !(on && *on == '0');
+}
+
 int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     if (T.on || !cfg) return 0;
-    const char *on = getenv("COLI_VK_TIER");
-    if (on && *on == '0') return 0;
+    if (!vkt_wanted()) return 0;
     if (!coli_vk_available()) return 0;
     const char *eng = cfg->engine ? cfg->engine : "engine";
     memset(&T, 0, sizeof T);

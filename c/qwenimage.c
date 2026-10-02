@@ -173,7 +173,7 @@ static float *vec_load(shards *S, const char *name, int n){
  * quantize its activations. 0 when the product stays on the CPU. */
 static int qi_vk_linear(float *y, const float *x, int M, const Lin *l){
 #ifdef COLI_VULKAN
-    if (!g_vk_ready || !l->gpu || l->vk_off || l->m.ld || M < 1) return 0;
+    if (!g_vk_ready || !coli_vk_dense() || !l->gpu || l->vk_off || l->m.ld || M < 1) return 0;
 #ifdef _OPENMP
     if (omp_in_parallel()) return 0;
 #endif

@@ -21,6 +21,16 @@
  * VK=1 (the inline stubs below), nothing here runs and the engine is unchanged.
  *
  * ---- integrating an engine (the phase-2 guide) -------------------------------
+ * 0. Open the device saying whether the tier will be tried, so the dense matrices
+ *    get their default place (on a device that shares the CPU's RAM they stay on
+ *    the CPU while the tier is on; COLI_VK_DENSE decides when set):
+ *
+ *        ready = coli_vk_init_env_tier("glm53", vkt_wanted() && E > 0 && !cuda_tier);
+ *        dense = coli_vk_dense();          // the engine's dense hook checks this
+ *        ...                               // step 1
+ *        if (ready && !vkt_ready() && !dense)
+ *            dense = coli_vk_dense_decide("glm53", 0, 1);   // no tier after all
+ *
  * 1. Describe the experts once, after the model and the dense trunk are loaded and
  *    after the engine's history is read (rt_load), before the first token:
  *
@@ -141,6 +151,9 @@ typedef struct {
 } VktExpertSrc;
 
 #ifdef COLI_VULKAN
+/* 1 unless COLI_VK_TIER=0: whether an engine with routed experts will try the tier
+ * (for coli_vk_init_env_tier, before the engine knows whether vkt_init succeeds). */
+int  vkt_wanted(void);
 /* 1 = the tier is on. heat: [layers][experts] routing counts, or NULL. */
 int  vkt_init(const VktConfig *cfg, uint32_t *const *heat);
 int  vkt_ready(void);
@@ -156,6 +169,7 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
 /* Sizing helpers for engines: bytes one expert takes on the device in a source format. */
 size_t vkt_expert_bytes(int hidden, int inter, VktFmt gate_up, VktFmt down);
 #else
+static inline int  vkt_wanted(void){return 0;}
 static inline int  vkt_init(const VktConfig *c, uint32_t *const *h){(void)c;(void)h;return 0;}
 static inline int  vkt_ready(void){return 0;}
 static inline void vkt_shutdown(void){}
