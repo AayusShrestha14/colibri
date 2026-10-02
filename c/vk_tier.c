@@ -45,6 +45,7 @@ static struct {
     VSlot *s;
     uint32_t tick, decay_at;          /* tokens seen (rows of the forward's first layer) */
     int last_layer, first_layer, promos, promo_cap;
+    int begin;                         /* vkt_begin_forward: the next issue starts a forward */
     /* uploader */
     pthread_t th; int th_on, stop;
     pthread_mutex_t mx; pthread_cond_t cv, cv_room, cv_done;
@@ -490,7 +491,7 @@ int vkt_issue(int layer, const float *x, int S, int K, const int *idx, uint8_t *
         if (T.on) { fprintf(stderr, "[VK] tier %s: the device stopped answering, the experts stay on the CPU\n", T.engine); T.on = 0; }
         return 0;
     }
-    if (layer < T.last_layer) { T.first_layer = layer; new_forward(); }
+    if (layer < T.last_layer || T.begin) { T.begin = 0; T.first_layer = layer; new_forward(); }
     if (layer == T.first_layer) {   /* COLI_VK_TIER_RATE promotions per token of the forward */
         T.tick += (uint32_t)S;
         long cap = (long)T.promo_cap + (long)T.rate * S;
@@ -608,6 +609,7 @@ int vkt_join(const float **rows) {
     return 1;
 }
 
+void vkt_begin_forward(void) { if (T.on) T.begin = 1; }
 int vkt_resident(int layer, int eid) {
     return T.on && layer >= 0 && layer < T.c.layers && eid >= 0 && eid < T.c.experts &&
            slot(layer, eid)->state == VS_RESIDENT;

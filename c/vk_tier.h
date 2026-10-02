@@ -168,6 +168,10 @@ void vkt_note(int layer, int eid, const VktExpertSrc *src);
 int  vkt_issue(int layer, const float *x, int S, int K, const int *idx, uint8_t *taken);
 int  vkt_join(const float **rows);
 int  vkt_resident(int layer, int eid);
+/* The next vkt_issue starts a forward (promotion rate, decay, eviction candidates).
+ * Optional: the tier tells forwards apart by the layer index going back, which a model
+ * with a single MoE layer never does; such an engine calls this at its first MoE layer. */
+void vkt_begin_forward(void);
 void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long long disk_loads);
 /* Sizing helpers for engines: bytes one expert takes on the device in a source format. */
 size_t vkt_expert_bytes(int hidden, int inter, VktFmt gate_up, VktFmt down);
@@ -183,6 +187,7 @@ static inline void vkt_note(int l,int e,const VktExpertSrc *s){(void)l;(void)e;(
 static inline int  vkt_issue(int l,const float *x,int S,int K,const int *i,uint8_t *t){(void)l;(void)x;(void)S;(void)K;(void)i;(void)t;return 0;}
 static inline int  vkt_join(const float **r){(void)r;return 0;}
 static inline int  vkt_resident(int l,int e){(void)l;(void)e;return 0;}
+static inline void vkt_begin_forward(void){}
 static inline void vkt_report(const char *s,unsigned long long r,unsigned long long d){(void)s;(void)r;(void)d;}
 static inline size_t vkt_expert_bytes(int h,int i,VktFmt a,VktFmt b){(void)h;(void)i;(void)a;(void)b;return 0;}
 #endif
