@@ -3,6 +3,12 @@
 </p>
 
 <p align="center">
+  <a href="https://justvugg.github.io/colibri"><img src="https://img.shields.io/badge/website-justvugg.github.io%2Fcolibri-1f6feb" alt="Website"></a>
+  <a href="https://github.com/JustVugg/colibri/releases"><img src="https://img.shields.io/github/v/release/JustVugg/colibri?color=2ea043" alt="Latest release"></a>
+</p>
+
+<p align="center">
+  <a href="https://justvugg.github.io/colibri"><b>網站</b></a> ·
   <a href="https://discord.gg/RXV83nSZdk"><b>Discord</b></a> ·
   <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · 繁體中文 · <a href="README.it.md">Italiano</a> · <a href="README.ja.md">日本語</a>
 </p>
@@ -10,20 +16,25 @@
 **小巧引擎，龐大模型。**在消費級與異質硬體上執行**前沿 MoE 模型——從 744B 到
 2.8T 參數**——以引擎零相依套件的純 C 實作，將儲存、RAM 與 VRAM 視為統一的推論階層。
 
-目前可執行十個模型家族：**GLM-5.2/5.3**（744B）、**GLM-5.3-Flash**（321B，含視覺）、
-**Inkling**（975B）、**Kimi K3**（2.8T）、**DeepSeek V4 Flash**（284B）、**DeepSeek V4.1 Flash**（552B，含視覺）、**MiMo-V2.6 Flash**（309B，含視覺）、
-**Qwen3.8-Flash-Next**（125B + 51B n-gram）、**Qwen3.6**（35B-A3B）與 **OLMoE**（7B）
-——各自一個 C 檔案，共用同一套 `coli chat` / `coli serve` / `coli web` 前端。[完整清單](README.md#other-supported-models)
-也能生成圖像：**Qwen-Image-2.1** 依據文字生成圖片，`coli chat` 直接在終端機中顯示，
+目前可執行十個語言模型家族。這裡按引擎計數，而不是按 checkpoint：各自一個 C 檔案，
+共用同一套 `coli chat` / `coli serve` / `coli web` 前端，部分引擎可執行不只一個模型。
+**GLM-5.2/5.3**（744B）、**GLM-5.3-Flash**（321B，含視覺）、**Inkling**（975B）、
+**Kimi K3**（2.8T）、**DeepSeek V4 Flash**（284B）、**DeepSeek V4.1 Flash**（552B，含視覺）、
+**MiMo-V2.6 Flash**（309B，含視覺；同一引擎也執行 **MiMo-V2.6 Pro**，1.02T）、
+**Qwen3.8-Flash-Next**（125B + 51B n-gram）、**Qwen3.6**（35B-A3B；同一引擎也執行
+**Qwen3-Coder-30B-A3B** 與稠密的 **Qwen3.8-27B**，含視覺）以及 **OLMoE**（7B）。
+也能生成圖像：第十一個引擎執行 **Qwen-Image-2.1**，依據文字生成圖片，`coli chat` 直接在終端機中顯示，
 `coli serve` 透過 `POST /v1/images/generations` 提供（[qwen-image.md](docs/qwen-image.md)）。
+[完整清單 ↓](#other-supported-models)
 
 > **Colibrì 既是今天就能執行的推論引擎，也是一個開放的研究平台。**它的首要目標是在
 > 完整的軟硬體邊界上追求推論側效能——模型格式、記憶體階層、儲存 I/O、配置、排程、核心、
 > 推測解碼以及 CPU/GPU 重疊執行——讓大型模型減少對稀缺硬體的依賴，並降低執行成本。
 
-Colibrì 刻意用於驗證激進的系統構想——因此**對速度不作 SLA 承諾，對語意則給出硬性保證**：
-實驗必須透過可重現的端到端測量證明價值；預設策略**絕不會在未告知的情況下改變模型精度或
-路由語意**。高速記憶體不足可以降低速度，但不能悄悄重新定義模型。
+Colibrì 將 VRAM、RAM 與儲存視為統一的多層階層，並刻意用於驗證激進的系統構想，因此
+**對速度不作 SLA 承諾，對語意則給出硬性保證**：實驗必須透過可重現的端到端測量證明價值；
+預設策略**絕不會在未告知的情況下改變模型精度或路由語意**。高速記憶體不足可以降低速度，
+但不能悄悄重新定義模型。
 
 ```
 $ ./coli chat
@@ -69,21 +80,22 @@ Brain 頁面和效能分析，支援淺色與深色主題。圖中是 Qwen3.6 �
 
 ## 研究使命
 
-前沿模型推論不該預設要求資料中心級硬體。Colibrì 的研究目標很簡單：
-**最佳化證據顯示受限的每一段推論路徑，降低推論的硬體依賴與總成本**。
+有了 Colibrì，私有部署的前沿模型不再受限於能否取得超大規模雲端業者等級的硬體。
 
-這包括改變權重的表示與移動方式，決定哪些內容常駐 VRAM、RAM 或儲存，重疊異質運算，
+憑藉多層階層（multitiering）特性，Colibrì **透過積極最佳化推論引擎的各條功能管線，消除對專有硬體的依賴**。
+
+我們的具體使命包括：改變權重的表示與移動方式，決定哪些內容常駐 VRAM、RAM 或儲存，重疊異質運算，
 降低啟動與同步開銷，利用稀疏性與重用，並驗證新的解碼演算法。傳統做法不是免責理由，
 微基準快也不是採用理由；最終依據是在真實機器上的端到端推論，同時測量正確性、品質、
 吞吐、延遲、記憶體與成本。
 
-它最終帶來的是可及性：在既有硬體上執行 744B 模型，即時觀察每個專家，並直接修改實作。
-不是從 API 租用智慧，而是持有、探測、測量和改進它。引擎刻意維持足夠小，讓任何願意測量
+它帶來的實際結果是**可及性**：在既有硬體上執行 744B 模型，即時觀察每個專家，並直接修改實作。
+不是從 API 租用智慧，而是*持有*它：探測、測量和改進它。引擎刻意維持足夠小，讓任何願意測量
 的人都可能貢獻下一項有效最佳化。
 
 ## 核心技術與實測結論
 
-- **統一階層，而非單一記憶體門檻。**VRAM、RAM 與 NVMe 是同一份權重的不同配置階層；
+- **統一階層，不受單一層級容量限制。**VRAM、RAM 與 NVMe 是同一份權重的不同配置階層；
   高速記憶體不足只影響速度，不改變模型語意。
 - **權重的 JIT。**實測路由熱度驅動逐層 LRU、學習型熱門專家固定區和提前一層的預先載入，
   無需載入所有專家。它在可重複負載上有收益，但歷史可能過度擬合，預先載入在部分主機上
@@ -106,7 +118,7 @@ Brain 頁面和效能分析，支援淺色與深色主題。圖中是 Qwen3.6 �
 | 猜想 | 目前證據 | 仍需完成的實驗 |
 |---|---|---|
 | 路由歷史能比普通 LRU 更好地配置專家 | 學習型固定區能改善重複負載，但也會對 prompt 過度擬合 | 在程式碼、對話、多語言和長上下文負載上做留出集、跨會話 A/B |
-| 多顆 SSD 能將獨立頻寬轉化為解碼速度 | 加權鏡像／分片路由已實作並通過驗證，頻寬模型成立 | 在獨立控制器的真實磁碟上做冷快取、單碟與雙碟 GLM-5.2 對照 |
+| 多顆 SSD 能將獨立頻寬轉化為解碼速度 | 兩顆獨立 NVMe 實測解碼 +37.5%；經加權分流後，較慢的第三顆硬碟影響持平（[測量數據](docs/multidisk.md#what-has-been-measured)） | 在不同硬碟速度、控制器配置與快取狀態下重現 |
 | 硬體感知規劃器能自動接近每台機器的最佳配置 | 目前已偵測 RAM/VRAM 預算與多個後端 | 將自動方案與參數掃描對比，涵蓋筆電、工作站、NUMA 和多 GPU 主機 |
 | 無損或品質受控的表示能充分減少權重搬運 | 已有格式與量化消融，並設置正確性／品質門檻 | 同時重現品質、搬運位元組、延遲和每個有效 token 成本，而非只看壓縮率 |
 | 路由感知推測能在接近全常駐前獲利 | MTP 與文法草稿可用，但 MTP 在約 85% expert hit 時也實測過 -32% | 繪製接受率、命中率、批次聯集與草稿深度的盈虧邊界 |
@@ -114,8 +126,8 @@ Brain 頁面和效能分析，支援淺色與深色主題。圖中是 Qwen3.6 �
 
 想參與就任選一行，負結果也請公開。請記錄硬體、commit、模型容器、完整指令、prompt、
 快取狀態、吞吐、TTFT、expert hit、讀取位元組數與品質檢查；每次只改一個變數，重複執行並附上
-原始日誌。先閱讀 [CONTRIBUTING.md](CONTRIBUTING.md) 和
-[benchmark 協議](docs/benchmarks.md)，然後
+原始日誌。先閱讀 [CONTRIBUTING.md](CONTRIBUTING.md)，對照
+[benchmark 協議](docs/benchmarking.md)，然後
 [建立實驗 issue](https://github.com/JustVugg/colibri/issues/new)。
 在這裡，一個受控的失敗比一個無法解釋的高數字更有價值。
 
@@ -136,8 +148,46 @@ Brain 頁面和效能分析，支援淺色與深色主題。圖中是 Qwen3.6 �
   **存放在硬碟**（約 370 GB），並**隨需串流載入**，搭配逐層 LRU 快取、
   會學習的熱門專家固定儲存區，以及選用的 VRAM 層級。
 
+可以把核心演算法理解為**權重的 JIT**。編譯器的 JIT 從不編譯整個程式：它觀察實際執行的部分，
+及時編譯熱點路徑。colibrì 對 744B 的參數空間下了同樣的賭注：參數不是需要一直持有的常駐狀態，
+而是**需要分級調度的資料**，在路由器證明需要它們的那一刻，於異質儲存階層（VRAM / RAM / NVMe）
+之間就位。實測路由熱度決定哪些專家進入哪一層級，路由器提前一層執行，讓預先載入隱藏調度延遲；
+而且像 JIT 一樣，引擎會學習你的工作負載：執行得越多，正確的專家就越熱。之所以可行，是因為
+路由具有可測量的結構（見[專家圖譜](https://github.com/JustVugg/colibri/issues/175)），
+而結構是可以快取的。
+
 引擎由主 C 檔（`c/colibri.c`）與多個標頭檔模組組成。不需要 BLAS，
 執行階段不需要 Python，也不需要 GPU。
+
+### 本機叢集模式
+
+協調節點（coordinator）在本機保留 token 生成、路由與 KV 狀態，而以硬碟為後端的專家 worker
+在其他 Mac 上執行被路由的 FFN。一層的路由批次聯集以一個持久 TCP 請求傳送，因此一個 token
+不會為每個專家各付出一次往返。
+
+啟動選用的註冊服務：
+
+```bash
+./coli cluster coordinator --host 0.0.0.0 --port 8765
+```
+
+在每個 worker 上，本機需有同一個已轉換的模型：
+
+```bash
+./coli cluster worker --model /nvme/glm52_i4 --port 9100 \
+  --coordinator http://COORDINATOR:8765 --advertise-host WORKER_IP
+```
+
+以探索模式執行協調節點，或為靜態部署提供 `--cluster-workers
+HOST:PORT,...`：
+
+```bash
+./coli serve --model /nvme/glm52_i4 \
+  --cluster-coordinator http://127.0.0.1:8765
+```
+
+除非設定了 worker，否則傳輸層保持關閉，現有的單機路徑不受影響。稠密層分片與
+瀏覽器／WebGPU worker 是另行跟進的擴充點。
 
 ## 運作方式
 
@@ -156,6 +206,27 @@ Brain 頁面和效能分析，支援淺色與深色主題。圖中是 Qwen3.6 �
   <img src="docs/media/tiers.png" width="880" alt="VRAM／RAM／NVMe 三層專家常駐架構">
 </p>
 
+<a id="dual-ssd-two-copies-of-the-model-twice-the-read-bandwidth"></a>
+
+### 多顆 SSD：從不只一顆硬碟串流讀取模型副本
+
+當解碼受硬碟限制時，**第二顆 SSD** 會有幫助：在上面放一份模型副本，讓引擎同時從兩顆硬碟讀取。
+以 GLM-5.2 為例，在原始碼 checkout 的 `c/` 目錄下（或在解壓後的發布套件中）：
+
+```bash
+COLI_MODEL_MIRROR=/second/glm52_i4 python3 ./coli chat --model /fast/glm52_i4
+```
+
+引擎會在啟動時測量各顆硬碟，以決定讀取分配的權重。緩衝讀取採用確定性的專家路由；符合條件的
+直接讀取可以把一個專家條帶化分布到多個副本上。獨立的硬碟提供的是頻寬餘裕，而不是有保證的
+token 速率倍數：共用控制器、快取命中與運算都可能限制收益。Bash 與 PowerShell 範例、實測收益
+與限制，以及與單碟的對比，請見[多磁碟指南](docs/multidisk.md)。值得了解的細節：
+
+- 鏡像會在**啟動時驗證**（每個檔案的大小與 safetensors 標頭必須與主副本逐位元組一致）；不一致或缺少的檔案仍由主副本提供，因此**部分鏡像也可以**：較小的第二顆 SSD 可以提供它所持有的 shard；
+- 鏡像**從不寫入**：`.coli_usage`、`.coli_kv` 與所有 sidecar 都保留在主副本上；
+- 鏡像讀取出錯時會退回主副本（一條警告，不會當機），因此執行中拔掉第二顆硬碟只會降級，不會讓伺服器結束；
+- 路由從不改變 token：兩份副本逐位元組相同；啟用 `PROF=1` 可看到 `MIRROR:` 效能計數器，顯示每顆硬碟提供了多少 GB。
+
 同一套引擎涵蓋完整硬體範圍：在 25 GB 筆電上，一切都從硬碟串流載入
 （慢，但結果正確）；在大型主機上，則可讓整組專家常駐
 （`CUDA_EXPERT_GB=auto PIN_GB=all`），讓硬碟完全退出解碼路徑。
@@ -163,6 +234,22 @@ Brain 頁面和效能分析，支援淺色與深色主題。圖中是 Qwen3.6 �
 （`.coli_usage`，每輪更新），並自動固定最熱門的專家——colibrì 確實會越用越快。
 在多插槽主機上，`COLI_NUMA=1` 會將常駐權重交錯分配到各記憶體控制器
 （[#82](https://github.com/JustVugg/colibri/issues/82)）。
+
+對於放不下整個模型的第二顆硬碟，Colibri 可以根據它已經學到的專家歷史，為部分鏡像排序。
+先執行幾個有代表性的 prompt，讓 `.coli_usage` 反映實際負載，然後規劃、暫存並驗證鏡像：
+
+```bash
+./c/coli mirror plan  --model /fast/glm52_i4 --mirror /second/glm52_i4 \
+  --budget-gib 200 --reserve-gib 20
+./c/coli mirror stage --model /fast/glm52_i4 --mirror /second/glm52_i4 \
+  --budget-gib 200 --reserve-gib 20
+./c/coli mirror verify --model /fast/glm52_i4 --mirror /second/glm52_i4
+```
+
+規劃器直接讀取 safetensors 標頭，依循 `COLI_MODEL_DIRS` 中的分割模型目錄，並優先選擇能服務
+最熱路由專家的 shard。暫存從不改動主模型：它透過暫存檔複製，保留所要求的剩餘空間，
+以 SHA-256 驗證每個 shard，從不刪除既有的鏡像 shard，並且只在所選鏡像就緒後才以不可分割
+（atomic）的方式發布回執。
 
 ### 絕不為同一次硬碟讀取等待兩遍
 
@@ -173,7 +260,18 @@ Brain 頁面和效能分析，支援淺色與深色主題。圖中是 Qwen3.6 �
 實測顯示，路由結果提前一層時有 **71.6% 的可預測性**。
 在 GPU 上，常駐管線（`COLI_CUDA_PIPE=2`）讓殘差流跨層保留在裝置端，
 使 CPU 專家迴圈不中斷；在 Apple Silicon 上，實驗性的
-[Metal 後端](docs/metal.md)會用統一記憶體 GPU 執行批次專家運算。
+[Metal 後端](docs/metal.md)會用統一記憶體 GPU 執行批次專家運算；
+[Vulkan 後端](docs/vulkan.md)則把專家層級、稠密投影與 MLA 注意力核心帶到任何具有
+Vulkan 1.2 驅動程式的 GPU 上，包括透過 Mesa/RADV 的 AMD 顯示卡（對於廠商軟體堆疊已不再支援的
+顯示卡，例如 RX 580，它是唯一的後端；在 RDNA4 上與 ROCm 不相上下，請見[基準測試說明](docs/vulkan.md)）。
+其餘所有引擎現在也會在 `VK=1` 建置中透過 `COLI_VULKAN=1` 使用同一後端放置常駐矩陣；
+CI 會將其與 CPU 的 token 對照檢查，但在它們首次實測的真實 GPU（內建顯示晶片 Radeon 780M）上，
+目前比 CPU 慢（[其他引擎](docs/vulkan.md#the-other-engines)）。
+
+> **在真實 NVMe 上，請實測 `DIRECT=1`。** O_DIRECT 繞過頁面快取，在帶 DRAM 快取且頻寬有餘裕
+> 的硬碟上往往有顯著收益（在一台 Blackwell/Windows 機器上搭配 `PIPE=1` 實測解碼 +34%；
+> 在 GB10 上 iobench 為 4.25→9.69 GB/s），但它取決於硬碟：QLC／無 DRAM 或虛擬化的磁碟
+> 可能沒有收益甚至變慢。先試一試，保留你的硬體真正受益的設定。
 
 ### 忠實模型，壓縮狀態
 
@@ -196,6 +294,13 @@ MTP head 必須是 **int8**（int4 head 的接受率會崩落到 0–4%，見
 文法強制草稿（[`GRAMMAR=file.gbnf`](docs/grammar-draft.md)）可在受限 JSON 輸出中，
 以近乎免費的成本提高接受率。推測式解碼是否帶來淨收益取決於快取熱度——請實測，
 若不划算就使用 `DRAFT=0`。
+
+驗證批次還可以透過 `COLI_EXACT_VERIFY=1` 選用**精確注意力核心**
+（[#689](https://github.com/JustVugg/colibri/issues/689)）：CPU 上 MLA-absorb 的 score 與
+context 內積改為累加整數乘積並只捨入一次，因此驗證列中的近似平手在每台主機上都會得到相同的
+結果；在 tiny oracle 上速度約為 0.6x tok/s（內積本身約為浮點迴圈的 5–7x）。需要了解兩點
+限制：使用量化 KV 快取（`tq1`、TQ 或 int8 KV）時，context 內積仍走浮點路徑，因此那裡不提供
+精確性；而真正的近似平手翻轉目前只是推論，尚未在 GLM-5.2 的 n=64 上實際捕捉到。
 
 ## 實際成果
 
@@ -257,8 +362,8 @@ Hugging Face 上已有預先轉換的 **GLM-5.2 int4** 容器——請務必使�
 
 **https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp**
 
-**GLM-5.3** 屬於同一家族,使用同一引擎載入。它有自己的 group-scaled(gs64)容器,
-約 **419 GB**,且**不含** MTP head,因此推測解碼保持關閉:
+**GLM-5.3** 屬於同一家族，使用同一引擎載入。它有自己的 group-scaled（gs64）容器，
+約 **419 GB**，且**不含** MTP head，因此推測解碼保持關閉：
 
 **https://huggingface.co/Justvugg/GLM-5.3-colibri-int4-g64**
 
@@ -268,7 +373,9 @@ Hugging Face 上已有預先轉換的 **GLM-5.2 int4** 容器——請務必使�
 > gs64 修復了受控的 per-row A/B 問題，但不是通用的重複或 EOS starvation 防護。
 > MTP head 也必須是 **int8，而非 int4**（int4 的草稿接受率為 0%，
 > [#8](https://github.com/JustVugg/colibri/issues/8)）：
-> `ls -l <model>/out-mtp-*`——正確的 int8 大小為 `3527131672 / 5366238584 / 1065950496`。
+> `ls -l <model>/out-mtp-*`：正確的 int8 是三個檔案，大小為 `3527131672 / 5366238584 / 1065950496`，
+> 或單一 `out-mtp-00000.safetensors`，大小為 `9959321520` 位元組（推薦容器目前的上傳版本就是單一檔案：
+> 同樣的 int8 張量，共 777 個，每個元素一個位元組）。
 
 你也可以自行從 FP8 來源轉換——只需一條可續傳的指令，且任何時候都不需要
 在硬碟上同時存放完整的 756 GB：
@@ -277,22 +384,109 @@ Hugging Face 上已有預先轉換的 **GLM-5.2 int4** 容器——請務必使�
 ./coli convert --model /nvme/glm52_i4     # 逐 shard 下載並轉換（僅此一次需要 python）
 ```
 
+<a id="other-supported-models"></a>
+#### 其他支援的模型
+
+GLM-5.2 是參考模型，但同樣的串流方法還能執行另外九個語言模型家族，另有一個引擎用於生成圖像。
+每個都是一個**同級引擎**：一個 C 檔案、自己的架構、同一套 `coli chat` / `coli serve` /
+`coli web` 前端（啟動器根據模型的 `config.json` 選擇二進位檔，圖像模型則根據
+`model_index.json`）：
+
+> **各自需要什麼。** 這些模型差別很大，有人把其中兩個放在一起讀，誤以為要求互相矛盾
+> （[#191](https://github.com/JustVugg/colibri/issues/191)）。它們並不矛盾，只是不同的模型。
+> **它們都不需要 GPU。**
+>
+> | 模型 | 權重所需硬碟空間 | RAM | GPU |
+> |---|---|---|---|
+> | **OLMoE** | 約 7 GB（int8 容器） | 8 GB | 不需要；可選用 Vulkan |
+> | **GLM-5.2/5.3** | 約 372 GB（5.2）／約 419 GB（5.3） | 最低 16 GB，舒適 24 GB | 不需要；可選用 Vulkan |
+> | **GLM-5.3-Flash** | 轉換後約 195 GB | 25 GB（int4 權重 12 GB + 專家快取） | 不需要；可選用 Vulkan |
+> | **Inkling** | 約 469 GB | 使用 int4 稠密容器時 25 GB，不使用時約 120 GB | 不需要；可選用 Vulkan |
+> | **Kimi K3** | 約 1.6 TB | 32 GB 以上 | 不需要；可選用 Vulkan |
+> | **DeepSeek V4 Flash** | 約 167 GB（REAP 150B：約 85 GB） | 最低 16 GB，舒適 32 GB | 選用；GTX 10 系列以上的任何 NVIDIA 顯示卡（Pascal/Turing 透過 `CUDA_ARCH=portable-pre-ampere NO_TC=1`，RTX 50 上效果最佳）可使 prefill 快 5-10 倍、解碼快約 2.5 倍；可選用 Vulkan |
+> | **DeepSeek V4.1 Flash** | 約 510 GB（官方 checkpoint；其中 203 GB 是每次只讀取幾百位元組的 n-gram 記憶） | 約 18 GB 常駐（稠密部分、嵌入、視覺），加上由 `--ram` 決定大小的專家快取；cap 8 時實測峰值 RSS 24.8 GB | 不需要；可選用 Vulkan |
+> | **MiMo-V2.6 Flash** | 約 178 GB（官方 checkpoint） | 每層快取 32 個專家時實測常駐 30.1 GB，64 個時 49.8 GB；快取大小由 `--ram` 決定 | 不需要；可選用 Vulkan |
+> | **MiMo-V2.6 Pro** | 約 574 GB（不含引擎從不載入的三個檔案時約 564 GB） | 稠密部分按發布格式為 30.2 GiB，int8 下為 21.7 GiB；每層快取 12 個專家時實測常駐 48.0 GB（稠密部分按發布格式），20 個時 50.7 GB（稠密部分為 int8） | 不需要；可選用 Vulkan |
+> | **Qwen3.8-Flash-Next** | 約 185.5 GB（官方 FP8 checkpoint），選用的 int4-g64 專家 sidecar 另需 68.0 GB | 使用 FP8 專家、預設上下文時舒適為 24 GB（cap 32；16 GB 低於下限）；使用 int4-g64 sidecar 時 cap 32 實測 RSS 11.6 GB | 選用；CUDA VRAM 專家層級（僅限 FP8 專家），稠密主幹在 VRAM 中量化為 int8；可選用 Vulkan |
+> | **Qwen3.8-27B**（稠密，文字與圖像） | 轉換後約 51 GB（f16） | 稠密權重為 int4 時 20 GB，int8 時 30 GB | 不需要；尚無 CUDA 層級；可選用 Vulkan |
+> | **Qwen3.6-35B-A3B** | 約 20 GB（int4-gs64 容器） | 24 GB（需要完全常駐 RAM） | 選用；CUDA VRAM 專家層級在兩張 8 GB 顯示卡上實測 **1.44 -> 10.05 tok/s（7.0x）**，輸出與 CPU 逐位元一致；可選用 Vulkan |
+> | **Qwen3-Coder-30B-A3B** | 約 19 GB（int4-gs64 容器；int8 為 30 GB） | 每層快取 32 個專家時實測常駐 6.5 GB，全部 128 個時 15.2 GB | 不需要；可選用 Vulkan |
+> | **Qwen-Image-2.1**（文字生成圖像） | 約 33 GB（官方 diffusers checkpoint） | 全部常駐 16.0 GB；每個 prompt 載入文字編碼器時峰值 8.5 GB，另加工作緩衝區（生成一張 768x512 圖像實測峰值 9.0 GB） | 不需要；可選用 Vulkan，尚未在 GPU 上計時 |
+>
+> GPU 從不改變模型的回答，只改變運算在哪裡進行。速度由你的硬碟決定，因為專家是從硬碟
+> 串流讀取的：慢速硬碟上每秒不到一個 token，快速硬碟在快取預熱後每秒幾個 token。
+>
+> **可選用 Vulkan** 指的是 `VK=1` 建置。以 `COLI_VULKAN=1` 執行時，引擎會把常駐矩陣放到任何
+> 具有 Vulkan 1.2 驅動程式的 GPU 上（GLM-5.2 在那裡有完整的解碼路徑，Kimi K3 有自己的專家層級
+> `K3_VK`），CI 在軟體驅動程式上將這些引擎與 CPU 的 token 對照檢查
+> （[vulkan.md](docs/vulkan.md#the-other-engines)）。正確還不等於更快。在這些引擎首次實測的
+> 真實 GPU，即內建顯示晶片 Radeon 780M（Ryzen 7 PRO 8700GE，同樣的二進位檔，冷頁面快取）上，
+> 目前比 CPU 慢：Qwen3.6-35B-A3B 解碼 3.06 tok/s，CPU 為 5.97，輸出完全相同；使用 int4 專家的
+> Qwen3.8-Flash-Next 為 1.53，CPU 為 3.55。每次矩陣乘法都是一次同步提交，每個 token 約 726 次，
+> 而內建顯示晶片讀取的是與 CPU 相同的 RAM。
+
+| 家族 | 總參數 / 啟用參數 | 權重 | 建置 | 文件 |
+|---|---|---|---|---|
+| **GLM-5.2/5.3** | 744B / 40B | [`mastouri/…-int4-g64-with-int8-mtp`](https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp)（372 GB）或 [`Justvugg/GLM-5.3-colibri-int4-g64`](https://huggingface.co/Justvugg/GLM-5.3-colibri-int4-g64)（419 GB） | `make -C c glm` | 本頁 |
+| **Inkling**（Thinking Machines） | 975B / 41B | [`nbeerbower/Inkling-colibri-int4`](https://huggingface.co/nbeerbower/Inkling-colibri-int4)（469 GB） | `make -C c inkling` | [inkling.md](docs/inkling.md) |
+| **GLM-5.3-Flash**（Z.ai） | 321B / 18B | [`zai-org/GLM-5.3-Flash`](https://huggingface.co/zai-org/GLM-5.3-Flash)，路由專家轉換為 **int4-gs64**，稠密部分保持 BF16，精度在載入時選擇；含視覺 | `make -C c glm53` | [glm53-flash.md](docs/glm53-flash.md) |
+| **Kimi K3**（Moonshot） | 2.8T / 104B | [`moonshotai/Kimi-K3`](https://huggingface.co/moonshotai/Kimi-K3)，原始 checkpoint，路由專家保持**原生 MXFP4** | `make -C c kimi_k3` | [kimi_k3.md](docs/kimi_k3.md) |
+| **DeepSeek V4 Flash** | 284B / 13B | 官方分片 checkpoint，路由專家保持**原生 fp4**，稠密部分保持 fp8-e4m3；**REAP 剪枝的 150B**（[`puwaer/DeepSeek-V4-Flash-0731-reap-150b`](https://huggingface.co/puwaer/DeepSeek-V4-Flash-0731-reap-150b)，85 GB，256 個專家中保留 132 個）用同一引擎載入，無需轉換 | `make -C c deepseek-v4` | [deepseek-v4.md](docs/deepseek-v4.md) |
+| **DeepSeek V4.1 Flash** | 552B / 16B | 官方 checkpoint，**無需轉換**：專家本身已是 fp4，稠密部分為 fp8-e4m3。其中 203 GB 是每次只從硬碟讀取幾百位元組的 n-gram 記憶，路由專家**每個 token 4.5 GB**，而 GLM-5.2 為 12.7 GB。視覺、工具呼叫與 DSpark 草稿 head 全部啟用 | `make -C c deepseek_v41` | [deepseek-v41.md](docs/deepseek-v41.md) |
+| **MiMo-V2.6 Flash**（Xiaomi） | 309B / 15B | [`XiaomiMiMo/MiMo-V2.6-Flash-MOPD`](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-MOPD)（178 GB），官方 checkpoint，**無需轉換**：路由專家保持**原生 MXFP4**，稠密部分保持 FP8/BF16。48 層中有 39 層只關注 128 個 token 的視窗，因此長上下文只需 9 層的 KV。支援視覺與工具呼叫 | `make -C c mimo` | [mimo.md](docs/mimo.md) |
+| **MiMo-V2.6 Pro**（Xiaomi） | 1.02T / 42B | [`XiaomiMiMo/MiMo-V2.6-Pro-MOPD`](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-MOPD)（573.5 GB），官方 checkpoint，**無需轉換**，執行在 MiMo 引擎上：同一架構，70 層、384 個專家。已在 70 層中的前 32 層上與 Xiaomi 自己的建模程式碼對照驗證。支援視覺與工具呼叫 | `make -C c mimo` | [mimo.md](docs/mimo.md#pro) |
+| **Qwen3.8-Flash-Next**（Alibaba） | 125B + 51B n-gram / 6B | [`Qwen/Qwen3.8-Flash-Next-FP8`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8)，原始 checkpoint；PLE 保持可分頁，專家保持**原生 block-FP8**，或從選用的 sidecar 以 **int4-g64** 讀取（見下文）。可選用 MTP 草稿（`Q38_MTP=1`） | `make -C c qwen38`（VRAM 專家層級需 `CUDA=1`） | [qwen38.md](docs/qwen38.md) |
+| **Qwen3.6**（Alibaba） | 35B / 3B | [`Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64`](https://huggingface.co/Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64)（約 20 GB，**推薦**），Gated Attention + Gated DeltaNet 混合架構 | `make -C c qwen36`（VRAM 專家層級需 `CUDA=1`） | [qwen36.md](docs/qwen36.md) |
+| **Qwen3.8-27B**（Alibaba） | 27B，稠密 | 以 `c/tools/convert_qwen36.py` 將 [`Qwen/Qwen3.8-27B`](https://huggingface.co/Qwen/Qwen3.8-27B) 轉換為 f16 容器（51 GB）；引擎在載入時將其量化為 int8，設定 `COLI_DENSE_BITS=4` 時量化為 int4。每層一個 MLP，沒有路由器，執行在 Qwen3.6 引擎上。支援文字與圖像 | `make -C c qwen36` | [qwen36.md](docs/qwen36.md#the-dense-27b) |
+| **Qwen3-Coder-30B-A3B**（Alibaba） | 30B / 3B | [`Justvugg/Qwen3-Coder-30B-A3B-colibri-int4`](https://huggingface.co/Justvugg/Qwen3-Coder-30B-A3B-colibri-int4)（19 GB，int4-gs64），由 [`Qwen/Qwen3-Coder-30B-A3B-Instruct`](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct) 轉換而來。執行在 Qwen3.6 引擎上的全注意力 Qwen3 MoE，128 個專家 top-8，有自己的 XML 工具呼叫格式，不帶思考；在 teacher forcing 下，int4 容器在 96.9% 的位置上選出與 bf16 發布版相同的 top-1 token | `make -C c qwen36` | [qwen36.md](docs/qwen36.md#qwen3-coder-30b-a3b) |
+| **OLMoE**（AI2） | 7B / 1B | 以 `c/tools/convert_olmoe_merged.py` 轉換，**int8** 容器，約 7 GB | `make -C c olmoe` | 無 |
+| **Qwen-Image-2.1**（Alibaba） | 圖像模型 | [`Qwen/Qwen-Image-2.1`](https://huggingface.co/Qwen/Qwen-Image-2.1)（約 33 GB），官方 diffusers checkpoint，**無需轉換**：文字編碼器與擴散 transformer 在載入時量化為 int8。`coli chat` 中直接顯示圖片，`coli serve` 提供 `POST /v1/images/generations`。Qwen Research License：僅限非商業用途 | `make -C c qwenimage` | [qwen-image.md](docs/qwen-image.md) |
+
+Qwen3.6 提供三個預先轉換的容器：**int4-gs64**（推薦：與 per-row 相比，對 int8 基準的餘弦相似度
+實測從 0.98777 提升到 0.99313，KL 從 0.109 降到 0.080，即量化誤差減少約 44%）、作為 A/B 基準的
+[int4 per-row](https://huggingface.co/Kreuzzelg/qwen36-35b-a3b-colibri-i4)，以及
+[KAT-Coder v2.5](https://huggingface.co/Kreuzzelg/kat-coder-v2.5-dev-colibri-i4-gs64)，同一引擎可以
+直接執行它：任何架構相同的 checkpoint 都無需專屬的程式碼路徑。使用 `CUDA=1` 時，VRAM 專家層級
+**在兩張 8 GB 顯示卡上實測 1.44 → 10.05 tok/s（7.0×）**，輸出與 CPU 路徑逐位元一致。
+
+Qwen3.8-Flash-Next 按發布格式以 block-FP8 讀取路由專家。選用的 **int4-g64 sidecar**
+（`c/tools/convert_qwen38_experts_int4.py`，在 FP8 shard 旁寫入 68.0 GB）讓每次未命中只讀取
+56% 的位元組。在 Ryzen 7 PRO 8700GE（16 執行緒，61 GiB，NVMe）上實測，相同快取大小下解碼快
+1.4-1.5 倍，相同 RAM 下快 1.56 倍，困惑度平均每個 token 增加 +0.017 nats
+（[qwen38.md](docs/qwen38.md#routed-experts-as-int4-g64)）。使用 checkpoint 內建 MTP head 的
+推測解碼為選用功能（`Q38_MTP=1`），輸出與一般解碼完全相同。在同一台機器上使用 int4 專家時，
+94-96% 的草稿被接受，每次前向傳遞 1.94 個 token，tok/s 提升 +12-14%（cap 96 時從 3.57 到 4.01，
+cap 170 時從 4.15 到 4.74）。在那台機器上收益不大，因為從硬碟讀取專家的量並沒有減少
+（[qwen38.md](docs/qwen38.md)）。
+
+Kimi K3 無需轉換：其 QAT 訓練的 MXFP4 專家直接從原始 Hugging Face shard 串流讀取，bf16 稠密部分
+在載入時量化。長時間的 agent 工作階段可以選用循環狀態檢查點（RAM 中 `COLI_K3_CKPT=N` 個 slot，或用
+`COLI_K3_CKPT_DIR` 存到硬碟）：編輯過的或後續的 prompt 會恢復仍然保留的最深檢查點，只對尾端重新
+prefill，而不是讓整個對話重新經過 SSM 層回放。在 Vulkan 主機上，`K3_VK_UP=auto` 根據實測頻寬
+決定專家層級的上傳量。引擎的 KDA 與 MLA 路徑在 CI 中與廠商實作逐 token 對照驗證。
+
+Inkling 提供 int4 專家，但稠密權重為 **bf16**（常駐 49.4 GB）；對於放不下這些權重的主機，
+[inkling.md](docs/inkling.md) 提供一個單次處理工具，把稠密部分降到 15.3 GB，讓 975B 能在
+25 GB 的機器上執行，並如實寫明了其中的取捨。
+
 ### 3. 執行
 
 ```bash
 COLI_MODEL=/nvme/glm52_i4 ./coli chat     # 自動偵測 RAM 預算、快取與 MTP
 COLI_MODEL=/nvme/glm52_i4 ./coli plan     # 檢視規劃的 VRAM／RAM／硬碟配置
 COLI_MODEL=/nvme/glm52_i4 ./coli doctor   # 唯讀就緒檢查
-./coli web  --model /nvme/glm52_i4        # 在同一個連接埠提供 API 與網頁儀表板
-./coli serve --model /nvme/glm52_i4       # 僅提供 OpenAI 相容 API
+COLI_MODEL=/nvme/glm52_i4 ./coli doctor --deep  # 嚴格的張量／shard／索引／鏡像預檢
+COLI_MODEL=/nvme/glm52_i4 ./coli tune     # 測量並儲存本機最快且安全的執行設定檔
+./coli web  --model /nvme/glm52_i4        # API + 儀表板，並開啟瀏覽器
+./coli serve --model /nvme/glm52_i4       # API + 儀表板，不開啟瀏覽器（headless）
 ```
 
 #### Brio 模式：問一個封閉式問題
 
 人們向模型提出的大多數請求是一次選擇，而不是一段文字：哪個佇列、哪個結論、某個欄位應取四個值中的哪一個。
-Brio 模式把允許的選項交給引擎，讀出每個選項的機率，而不是生成文字：`completion_tokens` 为 0，
+Brio 模式把允許的選項交給引擎，讀出每個選項的機率，而不是生成文字：`completion_tokens` 為 0，
 答案不可能落在你的清單之外，並且每個答案都附帶一個熵，"模型沒有把握"因此成為一個可以設門檻的數字。
-它在全部九個模型家族上可用，執行在同一個伺服器上，且按請求可選：不請求它的聊天，輸出逐位元組保持不變。
+它在全部十個模型家族上可用，執行在同一個伺服器上，且按請求可選：不請求它的聊天，輸出逐位元組保持不變。
 
 ```bash
 # 在 TUI 中：同一個模型，只是不再讓它寫
@@ -314,22 +508,98 @@ curl -s http://127.0.0.1:8000/v1/brio -H 'Content-Type: application/json' -d '{
 儀表板中也有 Brio 頁面。
 
 
-在 Windows 上同樣使用這些指令，寫作 `python coli chat --model D:\glm52_i4`。
-引擎執行階段是純 C——python 只供單次轉換工具與選用的 API gateway 使用。
+在 Windows 上，發布壓縮檔附帶 `coli.cmd`：按兩下即可快速開始，或在 cmd 或 PowerShell 中執行
+`coli.cmd chat --model D:\glm52_i4`。在原始碼 checkout 中，同樣的指令寫作 `python coli chat --model
+D:\glm52_i4`。`.exe` 檔是引擎，不是啟動器：單獨啟動時沒有可載入的模型，會立即結束。
+引擎執行階段是純 C，python 只供單次轉換工具與選用的 API gateway 使用。
+
+#### 同樣的指令可執行任何模型
+
+`coli` 會讀取模型的 `config.json`，選出對應的引擎二進位檔，並套用該家族的聊天範本，因此
+**換模型時命令列無需任何改變**。只需建置一次想用的引擎，然後把 `COLI_MODEL` 指向正確的目錄：
+
+```bash
+make -C c glm                                     # GLM-5.2
+make -C c inkling                                 # Inkling
+make -C c kimi_k3                                 # Kimi K3
+
+COLI_MODEL=/nvme/glm52_i4      ./coli chat        # TUI
+COLI_MODEL=/nvme/inkling_i4    ./coli chat
+COLI_MODEL=/nvme/kimi_k3       ./coli chat
+
+./coli web --model /nvme/inkling_i4               # API + dashboard, opens a browser
+./coli web --model /nvme/kimi_k3
+./coli serve --model /nvme/inkling_i4             # API + dashboard, no browser
+```
+
+對於非 GLM 引擎，`coli chat` 會在本機啟動 gateway 並把 TUI 連接上去，因此 TUI、API 與儀表板
+都經過同一個感知架構的聊天範本，你無需自己傳入範本。
+
+有兩點因模型而異，都記錄在各模型的頁面中：
+
+- **RAM 吃緊主機上的 Inkling** 需要 int4 稠密容器和較小的專家快取：
+  `./coli chat --model /nvme/inkling_i4 --cap 2`（見 [inkling.md](docs/inkling.md)：預設的
+  `--cap 8` 在常駐集之外還需要約 14 GB 快取）。
+- **Kimi K3** 直接從原始 checkpoint 串流讀取其 MXFP4 專家，因此無需轉換，但快照約為 1.6 TB
+  （見 [kimi_k3.md](docs/kimi_k3.md)）。
 
 ### 4. 深入了解
 
 | 主題 | 文件 |
 |---|---|
 | Benchmark、社群實測數據、品質測量 | [docs/benchmarks.md](docs/benchmarks.md) |
+| 可重現的 benchmark 協議與最低報告要求 | [docs/benchmarking.md](docs/benchmarking.md) |
 | 調校選項、策略、學習型快取、預先載入 | [docs/tuning.md](docs/tuning.md) |
 | Windows 11 原生建置（含 CUDA DLL） | [docs/windows.md](docs/windows.md) |
 | CUDA 後端、VRAM 專家層級、全部常駐 | [docs/cuda.md](docs/cuda.md) |
+| Vulkan 後端（任何 GPU：透過 RADV 支援 AMD，包括 ROCm 已放棄的顯示卡） | [docs/vulkan.md](docs/vulkan.md) |
 | Apple Silicon Metal 後端 | [docs/metal.md](docs/metal.md) |
 | OpenAI 相容 API、KV slots、網頁儀表板 | [docs/api.md](docs/api.md) |
 | Brio 模式：對封閉的選項集評分而不是生成 | [docs/brio.md](docs/brio.md) |
+| 實驗性的層分段嵌入 ABI | [docs/segment-runtime.md](docs/segment-runtime.md) |
+| 實驗性的 tokenizer／嵌入／head Edge ABI | [docs/edge-runtime.md](docs/edge-runtime.md) |
 | 文法強制草稿（結構化輸出） | [docs/grammar-draft.md](docs/grammar-draft.md) |
 | 環境變數完整清單 | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) |
+
+## DeepSeek V4
+
+**DeepSeek V4 Flash** 直接串流讀取官方 checkpoint，無需轉換：路由專家保持**原生 fp4**，
+稠密部分保持帶 UE8M0 區塊縮放的 **fp8-e4m3**。MLA + DSA 稀疏注意力，43 層，256 個路由專家
+加 1 個共享專家，top-6。支援 x86-64／aarch64 Linux 與 Windows／MSYS2（CPU），並提供選用的
+CUDA 層級（Windows 執行階段 DLL；Linux 透過 `CUDA=1` 直接連結，已在 WSL2 下驗證），每個階段都以
+CPU 結果為準，並可逐階段退回。
+
+```bash
+cd c
+make deepseek-v4
+python ./coli chat --model /path/to/DeepSeek-V4-Flash --ram 32
+# also: coli run / coli serve / coli web
+# Windows CUDA tier: make cuda-dsv4-dll CUDA_ARCH=portable  (+ make cuda-dsv4-dg-dll on RTX 50)
+```
+
+兩個選用的 GPU 調整選項是新增的，正在徵集社群實測數據，兩者預設關閉，未設定時輸出逐位元組不變：
+`DSV4_HYBRID=1` 根據執行階段測得的頻寬，把 VRAM 層級的未命中分配給 GPU 填充分支和 CPU 分支；
+`COLI_CUDA_MOE_DOUBLE=1`（在 `COLI_CUDA_MOE_BATCH=1` 之上）在目前層運算時，把下一層的完整專家集
+預先載入到第二個 VRAM 儲存區，VRAM 不足時退回單一儲存區。CUDA 層級現在也能在 Pascal 與 Turing
+顯示卡（GTX 10／RTX 20 系列）上執行：使用 `CUDA_ARCH=portable-pre-ampere NO_TC=1` 建置。
+
+貪婪解碼，一個 KV slot。工具呼叫透過 HTTP gateway 接入，使用 V4 原生的 prompt 與 DSML 呼叫區塊；
+不支援文法約束。請見[各引擎 API 矩陣](docs/api.md#tool-calling-support)。前綴檢查點（記憶體中與
+硬碟上）讓 agent 工作階段和後續輪次在系統 prompt 首次 prefill 之後幾秒內即可開始。在 RTX 5080 +
+2 顆 NVMe 上實測：3324 個 token 的 prefill 90 秒，8.3k token 的首輪約 4 分鐘（僅一次），之後的
+工作階段／輪次 6-9 秒，3k 上下文時解碼約 1.6 tok/s，請見 [docs/deepseek-v4.md](docs/deepseek-v4.md)。
+
+**給它 RAM。** 43 × 256 個路由專家在硬碟上約 137 GiB，一個 token 會觸及其中 301 個，因此專家快取
+命中率決定了 tok/s：`--ram` 是最有價值的單一調整選項，而且它只改變速度，從不改變輸出。
+
+**推測草稿已實作，但預設關閉。** DSpark 的 markov 草稿器與完整 MTP 都已實作並驗證：草稿可以節省
+前向傳遞，但絕不會改變 token，因為每個被接受的 token 仍是目標模型自己的 argmax。在真實的多輪
+對話中實測，它們分別只接受了 15 個中的 1 個和 24 個中的 10 個，而本引擎為被拒絕的後綴回放循環
+注意力狀態所花的成本，超過了草稿節省的時間：一個 14 個 token 的回答用了 495 秒。因此 `V4_DRAFT`
+與 `V4_MTP` 預設為 `0`，程式碼連同這些數據一起保留，留給在更快的儲存裝置上重試的人。
+
+CUDA 層級（建置、DLL 選擇、GPU 涵蓋範圍）、環境變數參考、效能數據、checkpoint 驗證以及動態產生的
+tiny 獨立 oracle，請見 [docs/deepseek-v4.md](docs/deepseek-v4.md)。
 
 ## 下一步
 
@@ -337,9 +607,10 @@ curl -s http://127.0.0.1:8000/v1/brio -H 'Content-Type: application/json' -d '{
   配置、排程、I/O、CPU/GPU 核心、異質重疊、KV 狀態與路由感知推測。目標是降低硬體要求
   和每個有效 token 的成本，所有成果都以端到端測量為準、經審查並公開開發。
 - **支援更多開放模型。**階層演算法與模型無關，任何帶路由專家的 MoE 都能用相同方式分層。
-  目前已有十個模型家族可用（GLM-5.2、GLM-5.3-Flash、Inkling、Kimi K3、DeepSeek V4 Flash、DeepSeek V4.1 Flash、MiMo-V2.6 Flash、
-  Qwen3.8-Flash-Next、Qwen3.6、OLMoE）；更多開放權重家族（候選包括 **MiniMax**）將沿用同樣的
-  規則獲得引擎支援：有人完成端到端實測之後。
+  目前已有十個語言模型家族可用（GLM-5.2/5.3、GLM-5.3-Flash、Inkling、Kimi K3、DeepSeek V4 Flash、
+  DeepSeek V4.1 Flash、MiMo-V2.6、Qwen3.8-Flash-Next、Qwen3.6、OLMoE），另有用於圖像的
+  Qwen-Image-2.1；更多開放權重家族（候選包括 **MiniMax**）將沿用同樣的規則獲得引擎支援：
+  有人完成端到端實測之後。
 
 ## 支持專案
 
@@ -356,26 +627,49 @@ colibrì 最初是由一人使用 12 核心、25 GB RAM 的筆電開發；
 ```
 Makefile                  根目錄建置／檢查入口
 c/
-├── colibri.c                 GLM 引擎主檔
-├── quant.h                量化 matmul kernel
-├── sample.h               取樣與 stop-set
-├── kv_persist.h           .coli_kv 磁碟持久化
-├── telemetry.h            儀表板協定、統計
-├── st.h, tok.h, json.h   執行階段標頭檔
-├── backend_cuda.*        選用的 CUDA 層級
+├── colibri.c             GLM-5.2 引擎  (make glm)
+├── inkling.c             Inkling 引擎  (make inkling)
+├── kimi_k3.c             Kimi K3 引擎  (make kimi_k3)
+├── glm53.c               GLM-5.3-Flash 引擎  (make glm53)
+├── deepseek_v4.c         DeepSeek V4 Flash 引擎  (make deepseek-v4)
+├── deepseek_v41.c        DeepSeek V4.1 Flash 引擎  (make deepseek_v41)
+├── mimo.c                MiMo-V2.6 Flash 與 Pro 引擎  (make mimo)
+├── qwen38.c              Qwen3.8-Flash-Next 引擎  (make qwen38)
+├── qwen36.c              Qwen3.6、Qwen3-Coder、Qwen3.8-27B 引擎  (make qwen36)
+├── olmoe.c               OLMoE 引擎  (make olmoe)
+├── qwenimage.c           Qwen-Image-2.1 引擎  (make qwenimage)
+│
+├── st.h                  safetensors 索引與範圍讀取
+├── quant.h               標準的容器解碼器
+├── expert_ffn.h          各 MoE 引擎共用的路由專家 FFN kernel（planar int4、層執行器）
+├── tok.h, json.h         tokenizer 與 JSON 剖析器
+├── compat.h              Windows/macOS 相容層（POSIX 名稱集中在一處）
+├── expert_store.h        串流專家快取
+├── route_trace.h         路由遙測與 .coli_usage，與引擎無關
+├── kv_prefix.h           跨輪次的 KV 前綴重用
+│
+├── backend_cuda.*        選用的 CUDA 層級   (CUDA=1)
+├── backend_metal.*       選用的 Metal 層級  (METAL=1)
+├── backend_vulkan.*      選用的 Vulkan 層級 (VK=1)
+│
 ├── Makefile              建置與本機檢查
 ├── coli                  使用者介面 CLI
 ├── openai_server.py      OpenAI 相容 HTTP gateway
-├── setup.sh              單一指令完成本機設定
+├── resource_plan.py      `coli plan` 與 `coli doctor` 背後的 RAM/VRAM 規劃器
 ├── tools/                離線轉換、fixtures 與 benchmarks
 ├── scripts/              長時間轉換輔助工具
 └── tests/                零相依套件的 C 與 Python 測試
 web/                      瀏覽器 UI（純 OpenAI API client）
 desktop/                  包裝網頁 UI 的 Tauri v2 桌面 shell
+docker/                   容器映像檔
 docs/                     參考文件、實驗與媒體檔
 ```
 
-執行階段路徑刻意維持扁平、易讀：`colibri.c` 加上模組化標頭檔。
+**每個模型家族一個 `.c`，建立在共用的單一標頭檔之上。** 一個引擎只負責自己的架構；兩個引擎都
+需要的東西（safetensors 讀取器、容器解碼器、tokenizer、專家快取）都放在它們共同引入的標頭檔裡，
+這樣一個修正能同時涵蓋所有引擎。這條規則不是裝飾：這裡反覆出現的缺陷，正是某個機制只落在一個
+引擎裡、從未傳到同級引擎的那些。
+
 在儲存庫根目錄執行 `make`、`make check` 與 `make clean`，
 都會轉交給引擎的 Makefile。
 
@@ -384,6 +678,48 @@ docs/                     參考文件、實驗與媒體檔
 蜂鳥只有幾公克重，能在原地懸停，並在一天內造訪上千朵花。
 這套引擎只用蜂鳥般的配給，就能讓 744B 參數的巨人運轉：
 25 GB RAM、十二個 CPU 核心，以及對硬碟的大量耐心。
+
+## 致謝
+
+colibrì 是一個引擎；它執行的智慧是一份饋贈。感謝以開放方式發布前沿級權重的團隊：**Z.ai**
+（GLM）、**Moonshot AI**（Kimi）、**Alibaba Qwen**、**MiniMax** 與 **Allen AI**（OLMoE），也感謝
+每一位做過 benchmark、二分定位問題、重現圖譜執行或提交修補的貢獻者。這個專案證明了開放權重
+能夠帶來什麼。
+
+本專案在專家配置、壓縮與路由方面的實驗，也建立在以下開放研究與系統工作的構想和證據之上：
+
+- [REAP](https://github.com/CerebrasResearch/reap) 與
+  [EASY-EP](https://github.com/RUCAIBox/EASYEP)：輸出感知的與特定領域的專家重要性。
+- [SERE](https://github.com/JL-Cheng/SERE)：基於相似度的專家重新路由；
+  [ReMoE](https://github.com/BUAA-OSCAR/ReMoE)：感知快取區域性的路由器微調。
+- [MC-SMoE](https://github.com/UNITES-Lab/MC-SMoE)：路由引導的專家合併與壓縮。
+- [MoBE](https://github.com/inclusionAI/MoBE) 與
+  [D²-MoE](https://github.com/lliai/D2MoE)：共享專家基底與低秩專家增量。
+- [HybriMoE](https://github.com/PKU-SEC-Lab/HybriMoE)：CPU/GPU 混合專家排程；
+  [ScMoE](https://arxiv.org/abs/2404.05019)：專家通訊與運算的重疊；
+  [OD-MoE](https://arxiv.org/abs/2512.03927)：分散式隨需專家載入。
+- [vLLM](https://github.com/vllm-project/vllm)、
+  [llama.cpp](https://github.com/ggml-org/llama.cpp) 與
+  [kTransformers](https://github.com/kvcache-ai/ktransformers)：開放的推論系統與專家卸載工作，
+  讓比較得以重現。
+
+引擎也建立在具體的工程成果之上，而不只是構想。以下每一項如今都在程式碼樹中被使用或重新實作：
+
+- [safetensors](https://github.com/huggingface/safetensors)：每個引擎讀取的容器格式
+  （`c/st.h`），包括其 fp8 與 I64 資料型別。
+- [tiktoken](https://github.com/openai/tiktoken)：`c/tok.h` 精確地重新實作了它的
+  `byte_pair_encode`，合併串接後詞彙 id 最小的相鄰對，因此源自 tiktoken 的詞彙表不需要 merges 清單。
+- [llama.cpp](https://github.com/ggml-org/llama.cpp)：`c/grammar.h` 中的 GBNF 文法子集遵循它的
+  語法與 set-of-stacks PDA，Metal 路徑也借用了它的 `newBufferWithBytesNoCopy` 常駐技巧。
+- [vLLM](https://github.com/vllm-project/vllm)：引擎逐位置對齊的輸出語意參考（例如最終 norm
+  相對於 LM head 的位置）。
+- [transformers](https://github.com/huggingface/transformers)：oracle；CI 以它為基準逐 token
+  重現一個隨機初始化的模型。
+- [DietGPU](https://github.com/facebookresearch/dietgpu)：實驗性壓縮專家層級（`COLI_ANS`）背後的
+  GPU ANS 編解碼器。
+- [rocWMMA](https://github.com/ROCm/rocWMMA)：HIP 後端把 CUDA 的 `nvcuda::wmma`
+  fragment/mma_sync API 對應到它之上（`c/backend_gpu_compat.h`），這讓同一份 .cu 原始碼可以為
+  兩家廠商編譯。
 
 ## 授權條款
 

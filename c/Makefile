@@ -1290,6 +1290,14 @@ mimo-tiny-generate:
 mimo-tiny-check: mimo-tiny-generate mimo$(EXE)
 	$(PYTHON) tests/mimo_tiny_harness.py --binary ./mimo$(EXE) --fixture ./mimo_tiny
 
+# The same fixture served: KV prefix reuse, Brio photos (the windowed layers' rings,
+# pictures, nested and stale photos), and /v1/brio and chat logprobs through the
+# gateway. Every comparison is against a cold engine, to the last printed digit.
+.PHONY: mimo-tiny-serve-check
+mimo-tiny-serve-check: mimo-tiny-generate mimo$(EXE)
+	$(PYTHON) -m unittest -v tests.test_mimo_prefix_serve tests.test_brio_serve.MimoBrioServe \
+		tests.test_brio_api.MimoBrioEndToEnd
+
 # Qwen3.8-Flash-Next text-only sibling. qwen38.c owns the direct checkpoint
 # loader and SERVE=1 protocol. With CUDA=1 it links the same expert tier as
 # qwen36 (fp8 streaming mode: hot experts get VRAM copies, the RAM LRU stays);
@@ -1397,6 +1405,35 @@ qwen38-tiny-int4-check: qwen38-tiny-int4-generate qwen38-tiny-fp8-generate qwen3
 	done; \
 	echo "qwen38 int4-g64 experts: ref_int4.json reproduced in $$n configurations, last logits identical across paths; FP8 control ok"
 	./tests/test_qwen38_tier_engine$(EXE) ./qwen38_tiny_int4
+
+# Speculative decoding with the checkpoint's MTP head (Q38_MTP=1; qwen38_core.h,
+# "the MTP head"). The fixtures are the three above plus an MTP head (--mtp:
+# random head weights from their own seed under the release's mtp.* names; the
+# model and its references do not change) and a byte tokenizer for the text
+# and serve gates. tests/qwen38_mtp_harness.py checks:
+#  (a) the head's draft logits equal tools/qwen38_mtp_ref.py's float32
+#      reference for the default wiring b and the diagnostic a, through the
+#      one-row and the two-row (after an accepted draft) paths, on BF16 and
+#      FP8 experts;
+#  (b) decoding with drafts is byte-identical to Q38_MTP=0 (stdout and last
+#      logits) at caps 1/2/8, prefill batching on and off, BF16 and int8
+#      trunk, on BF16, FP8 and int4-g64 experts, in the normal mode and with
+#      Q38_MTP_FORCE=reject (a rollback at every token), accept and mixed,
+#      whose acceptance and tokens/forward must be the loop's own count;
+#  (c) a 40-token text decode and a five-turn serve session (prompt cache,
+#      pin, logprobs, a sampled turn) are byte-identical with drafts, and the
+#      head's drafts after a restored prefix or pin equal a fresh session's.
+.PHONY: qwen38-tiny-mtp-generate qwen38-tiny-mtp-check
+qwen38-tiny-mtp-generate:
+	$(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny_mtp --mtp
+	$(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny_fp8_mtp --fp8-experts --mtp
+	$(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny_int4_mtp --fp8-experts --int4-experts --expert-gain 3 --mtp
+	@for d in qwen38_tiny_mtp qwen38_tiny_fp8_mtp qwen38_tiny_int4_mtp; do \
+		$(PYTHON) tools/make_edge_tiny_tokenizer.py --vocab-size 64 ./$$d || exit $$?; done
+
+qwen38-tiny-mtp-check: qwen38-tiny-mtp-generate qwen38$(EXE)
+	$(PYTHON) tests/qwen38_mtp_harness.py --engine ./qwen38$(EXE) --bf16 ./qwen38_tiny_mtp \
+		--fp8 ./qwen38_tiny_fp8_mtp --int4 ./qwen38_tiny_int4_mtp
 
 # Context-size gates: KV layout, growth across requests, and the attention
 # capacity. Includes qwen36.c directly, so no model file is needed.

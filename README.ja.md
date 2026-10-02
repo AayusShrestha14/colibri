@@ -17,13 +17,17 @@
 （AI メモリのマルチティア化）ことで、**744B から 2.8T パラメータのフロンティア MoE モデル**を、
 コンシューマー向けや異種混在のハードウェア上で、エンジン依存ゼロの純粋な C で実行します。
 
-現在動作するのは 10 のファミリーです: **GLM-5.2/5.3**（744B）、**GLM-5.3-Flash**（321B、
-ビジョン対応）、**Inkling**（975B）、**Kimi K3**（2.8T）、**DeepSeek V4 Flash**（284B）、**DeepSeek V4.1 Flash**（552B、ビジョン対応）、**MiMo-V2.6 Flash**（309B、ビジョン対応）、
-**Qwen3.8-Flash-Next**（125B + 51B n-gram）、**Qwen3.6**（35B-A3B）、そして
-**OLMoE**（7B）——
-それぞれが C ファイル 1 つで、同じ `coli chat` / `coli serve` / `coli web` フロントエンドを共有します。
-画像生成も可能です: **Qwen-Image-2.1** がテキストから画像を生成し、`coli chat` はそれをターミナル内に
-直接表示、`coli serve` は `POST /v1/images/generations` で提供します（[qwen-image.md](docs/qwen-image.md)）。
+現在動作するのは 10 の言語モデルファミリーです。数えているのはチェックポイントではなくエンジンです:
+それぞれが C ファイル 1 つで、同じ `coli chat` / `coli serve` / `coli web` フロントエンドを共有し、
+複数のモデルを動かすエンジンもあります。**GLM-5.2/5.3**（744B）、**GLM-5.3-Flash**（321B、
+ビジョン対応）、**Inkling**（975B）、**Kimi K3**（2.8T）、**DeepSeek V4 Flash**（284B）、
+**DeepSeek V4.1 Flash**（552B、ビジョン対応）、**MiMo-V2.6 Flash**（309B、ビジョン対応。同じエンジンで
+**MiMo-V2.6 Pro**、1.02T も動作）、**Qwen3.8-Flash-Next**（125B + 51B n-gram）、**Qwen3.6**（35B-A3B。
+同じエンジンで **Qwen3-Coder-30B-A3B** と、ビジョン対応の密モデル **Qwen3.8-27B** も動作）、そして
+**OLMoE**（7B）。
+画像生成も可能です: 11 番目のエンジンが **Qwen-Image-2.1** を動かし、テキストから画像を生成します。
+`coli chat` はそれをターミナル内に直接表示し、`coli serve` は `POST /v1/images/generations` で提供します
+（[qwen-image.md](docs/qwen-image.md)）。
 [全モデル一覧 ↓](#other-supported-models)
 
 > **Colibrì は今日すぐに動かせる推論エンジンであり、同時にオープンな研究
@@ -52,9 +56,16 @@ $ ./coli chat
 <p align="center">
   <img src="docs/media/colibri-dashboard.png" width="900" alt="colibrì Web ダッシュボード — ライブメトリクス、ハードウェアパネル、エキスパートのティア">
 </p>
-<p align="center"><em>Web ダッシュボード（<code>./coli web</code>）: 744B モデルが <strong>4 tok/s、TTFT 1.6 秒、ディスク 0</strong> で動作 —
-6× RTX 5090 上でエキスパートを完全常駐させ、ライブのトークンメトリクス、ターンごとの時間内訳、
-VRAM/RAM/ディスクのティアバー、隅にはライブのミニ脳を表示しています。</em></p>
+<p align="center"><em>Web ダッシュボード（<code>./coli web</code>）。1.12.0 で再設計され、チャット、Brio モード、Brain ページ、
+Profiling のためのドックを備えたワークスペースになりました。ライトテーマとダークテーマに対応します。ここでは CPU マシン上の
+Qwen3.6 が、ディスクからストリーミングされるエキスパートで応答しています。</em></p>
+
+<p align="center">
+  <img src="docs/media/colibri-brio.png" width="900" alt="Brio ページ: 1 回だけ読まれる文書、許可された各回答の確率、そしてエントロピー">
+</p>
+<p align="center"><em><strong>Brio モード</strong>: 同じモデルに、書くのをやめるよう指示したものです。文書と、選んでよい回答だけを渡すと、
+各回答の確率を読み取り、何も生成せず、確信がないときにそれを示すエントロピーを報告します。ここでは
+<strong>request changes が 99.9%</strong>、エントロピー 0.005、読み取り 4 トークン、生成 0 トークンです。</em></p>
 
 <p align="center">
   <img src="docs/media/colibri-brain.png" width="900" alt="Brain ページ — GLM-5.2 の計測されたエキスパートアトラスを皮質として描画、入れる 10 の領域">
@@ -129,7 +140,7 @@ Colibrì は、制御されたエンドツーエンドの A/B が示すまで、
 | 仮説 | これまでのエビデンス | まだ必要な実験 |
 |---|---|---|
 | ルーティング履歴は単純な LRU よりもうまくエキスパートを配置できる | 学習されたピンは繰り返しのワークロードを改善するが、プロンプトに過学習し得る | コーディング、チャット、多言語、長コンテキストのワークロードにわたる、ホールドアウトかつセッション横断の A/B |
-| 複数の SSD は独立した帯域幅をデコード速度に変えられる | 重み付きミラー/分割ルーティングは実装・検証済みで、帯域幅モデルは妥当 | 実際に独立したコントローラ上での、コールドキャッシュ状態の 1 ドライブ対 2 ドライブによる GLM-5.2 実行 |
+| 複数の SSD は独立した帯域幅をデコード速度に変えられる | 独立した NVMe ドライブ 2 台でデコード +37.5% を計測。より遅い 3 台目のドライブは、重み付きストライピングの後では効果が中立だった（[計測結果](docs/multidisk.md#what-has-been-measured)） | ドライブ速度、コントローラ構成、キャッシュ状態を変えて再現する |
 | ハードウェアを考慮したプランナーは、各マシンの最適構成に自動で近づける | RAM/VRAM の予算といくつかのバックエンドは現在すでに検出される | 生成されたプランを、ラップトップ、ワークステーション、NUMA ホスト、マルチ GPU システムにわたる制御されたパラメータスイープと比較する |
 | ロスレスまたは品質上限付きの表現で、重みの移動を意味のあるほど減らせる | 正しさ/品質ゲート付きのフォーマットと量子化のアブレーションが存在する | 圧縮率だけでなく、品質、移動バイト数、レイテンシ、有用トークンあたりのコストを同時に再現する |
 | ルーティングを考慮した投機的デコードは、ほぼ完全常駐に達する前でも元が取れる | MTP と文法ドラフトは動作するが、MTP はエキスパートヒット率約 85% 付近で 32% の損失も計測されている | 受理率、エキスパートヒット率、バッチの和集合、ドラフト深さにわたる損益分岐面をマッピングする |
@@ -225,21 +236,29 @@ HOST:PORT,...` を指定します:
   <img src="docs/media/tiers.png" width="880" alt="VRAM / RAM / NVMe の 3 ティアによるエキスパート常駐">
 </p>
 
-### デュアル SSD: モデルのコピー 2 つで、読み込み帯域幅を 2 倍に
+<a id="dual-ssd-two-copies-of-the-model-twice-the-read-bandwidth"></a>
 
-ほとんどのマシンでデコードはディスク律速であり、エキスパートの読み込みは読み取り専用です。そこで **2 台目の SSD** があるなら、そこにモデルの完全なコピーを置き、エンジンに両方のドライブから同時にストリーミングさせましょう:
+### 複数の SSD: 2 台以上のドライブからモデルのコピーをストリーミング
+
+デコードがディスク律速のときは、**2 台目の SSD** が役立ちます: そこにモデルのコピーを置き、エンジンに両方の
+ドライブから読ませます。GLM-5.2 の場合、ソースのチェックアウトの `c/` から（または展開したリリースから）
+次のように実行します:
 
 ```bash
-COLI_MODEL=/fast/glm52_i4 COLI_MODEL_MIRROR=/second/glm52_i4 ./coli chat
-COLI_DISK_WEIGHTS=9,3 ...   # オプション: プライマリ,ミラーの帯域幅比（未指定なら起動時に計測）
+COLI_MODEL_MIRROR=/second/glm52_i4 python3 ./coli chat --model /fast/glm52_i4
 ```
 
-各エキスパートは、2 台のドライブの計測された（または宣言された）帯域幅で重み付けされた決定論的ハッシュによって一方のドライブに割り当てられます。そのため readahead/PILOT のプリフェッチと要求時の読み込みは常に同じドライブに当たり、二重にキャッシュされることはありません。合計帯域幅は両ドライブの和になります — 9 GB/s + 3 GB/s の組み合わせでは、高速なドライブ単体よりもエキスパートの読み込みが約 33% 速くなり、OMP 並列のピン留め/ウォームアップのロードも両方からストリーミングされます。知っておくべき詳細:
+エンジンは起動時にドライブを計測し、読み込みの配分に重みを付けます。バッファ付きの読み込みは決定論的な
+エキスパートルーティングを使い、条件を満たすダイレクト読み込みは 1 つのエキスパートを複数のレプリカに
+またがってストライプできます。独立したドライブがもたらすのは帯域幅の余裕であり、トークンレートの倍率が
+保証されるわけではありません: 共有コントローラ、キャッシュヒット、計算が効果を制限することがあります。
+Bash と PowerShell の例、計測された効果と限界、単一ドライブとの比較は
+[マルチディスクガイド](docs/multidisk.md) を参照してください。知っておくべき詳細:
 
-- ミラーは **起動時に検証** されます（ファイルごとのサイズと safetensors ヘッダがプライマリとバイト単位で一致する必要があります）。一致しない、または欠けているファイルは黙ってプライマリのままになるので、**部分的なミラーでも問題ありません** — 一部のシャードしか置けない小さめの 2 台目 SSD でも効果があります。
+- ミラーは **起動時に検証** されます（ファイルごとのサイズと safetensors ヘッダがプライマリとバイト単位で一致する必要があります）。一致しない、または欠けているファイルはプライマリのままになるので、**部分的なミラーでも問題ありません**。小さめの 2 台目 SSD でも、置いているシャードを提供できます。
 - ミラーには **一切書き込まれません**: `.coli_usage`、`.coli_kv` およびすべてのサイドカーファイルはプライマリに残ります。
 - ミラーでの読み込みエラーはプライマリにフォールバックします（警告 1 回、クラッシュなし）。そのため実行中に 2 台目のドライブを抜いても、サーバーが落ちるのではなく性能が低下するだけです。
-- ルーティングがトークンを変えることはありません — 両コピーはバイト単位で同一であり、実行ごとの `MIRROR:` 統計行にはドライブごとに提供した GB 数が表示されます。
+- ルーティングがトークンを変えることはありません。両コピーはバイト単位で同一です。`PROF=1` を有効にすると、ドライブごとに提供した GB 数を示す `MIRROR:` プロファイルカウンタが表示されます。
 
 同じエンジンがあらゆる規模をカバーします。25 GB のラップトップではすべてがディスクから
 ストリーミングされ（遅いが正しい）、大きなホストではエキスパート全体が常駐し
@@ -283,6 +302,9 @@ GPU では、常駐パイプライン（`COLI_CUDA_PIPE=2`）が残差ストリ�
 Vulkan 1.2 ドライバを持つあらゆる GPU にもたらします — Mesa/RADV 経由の AMD カードも含まれます
 （RX 580 のようにベンダーのスタックがサポートを終了したカードでは唯一のバックエンドであり、
 RDNA4 では ROCm と互角です — [ベンチマークに関するメモ](docs/vulkan.md) を参照）。
+他のすべてのエンジンも、`VK=1` ビルドで `COLI_VULKAN=1` を指定すると、常駐行列のために同じバックエンドを
+使うようになりました。CI では CPU のトークンと照合されていますが、最初に計測した実 GPU である内蔵
+Radeon 780M では、現時点では CPU より遅くなっています（[その他のエンジン](docs/vulkan.md#the-other-engines)）。
 
 > **実際の NVMe では `DIRECT=1` を計測してください。** O_DIRECT はページキャッシュをバイパスし、
 > DRAM キャッシュと帯域幅に余裕のあるドライブでは大きな改善になることが多いです（Blackwell/Windows
@@ -311,6 +333,14 @@ GLM-5.2 のネイティブ MTP ヘッドがトークンをドラフトし、メ�
 文法強制ドラフト（[`GRAMMAR=file.gbnf`](docs/grammar-draft.md)）は、制約付き JSON 出力で
 ほぼタダで受理率を上げます。投機的デコードが正味でプラスになるかはキャッシュの温まり具合に
 依存します — 計測し、効果がなければ `DRAFT=0` を使ってください。
+
+検証バッチでは、`COLI_EXACT_VERIFY=1` で **厳密なアテンションコア** をオプトインすることもできます
+（[#689](https://github.com/JustVugg/colibri/issues/689)）。CPU の MLA-absorb のスコアとコンテキストの内積は
+整数の積を累積して 1 回だけ丸めるため、検証行でのほぼ同値はどのホストでも同じように決着します。代償は
+小さなオラクルで約 0.6 倍の tok/s です（内積自体は浮動小数点ループの約 5〜7 倍）。知っておくべき制限が
+2 つあります: 量子化された KV キャッシュ（`tq1`、TQ、int8 KV）ではコンテキストの内積は浮動小数点の経路の
+ままなので、そこでの厳密性は提供されません。また、実際のほぼ同値による反転はまだ論じられただけで、
+n=64 の GLM-5.2 ではまだ捕捉されていません。
 
 ## 何を実現しているか
 
@@ -372,6 +402,11 @@ git clone https://github.com/JustVugg/colibri && cd colibri/c
 
 **https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp**
 
+**GLM-5.3** は同じファミリーで、同じエンジンでロードできます。専用のコンテナがあり、こちらもグループスケール
+（gs64）で、約 **419 GB** です。MTP ヘッドは **含まれていない** ため、投機的デコードはオフのままです:
+
+**https://huggingface.co/Justvugg/GLM-5.3-colibri-int4-g64**
+
 > ⚠️ 古い行単位 int4 のミラー（`mateogrgic/…`、`jlnsrk/…`）ではなく、上記の **gs64** コンテナを
 > 使ってください。それらは品質が約 9 ポイント劣ることが計測されており、
 > [#455](https://github.com/JustVugg/colibri/issues/455) で報告された当初の思考モードのループや
@@ -394,10 +429,10 @@ git clone https://github.com/JustVugg/colibri && cd colibri/c
 <a id="other-supported-models"></a>
 #### その他の対応モデル
 
-GLM-5.2 がリファレンスモデルですが、同じストリーミング手法でさらに 6 つのファミリーが動作します。
-それぞれが **兄弟エンジン** です — C ファイル 1 つで独自のアーキテクチャを持ち、同じ
-`coli chat` / `coli serve` / `coli web` フロントエンドを使います（ランチャーはモデルの
-`config.json` からバイナリを選びます）:
+GLM-5.2 がリファレンスモデルですが、同じストリーミング手法でさらに 9 つの言語モデルファミリーが動作し、
+画像を生成するエンジンも 1 つあります。それぞれが **兄弟エンジン** です: C ファイル 1 つで独自の
+アーキテクチャを持ち、同じ `coli chat` / `coli serve` / `coli web` フロントエンドを使います（ランチャーは
+モデルの `config.json`、画像モデルでは `model_index.json` からバイナリを選びます）:
 
 > **それぞれに必要なもの。** これらは大きく異なり、2 つを並べて読んだ人が要件が矛盾していると
 > 誤解したこともあります（[#191](https://github.com/JustVugg/colibri/issues/191)）。矛盾してはいません —
@@ -405,31 +440,51 @@ GLM-5.2 がリファレンスモデルですが、同じストリーミング手
 >
 > | モデル | 重み用のディスク | RAM | GPU |
 > |---|---|---|---|
-> | **OLMoE** | 約 7 GB（int8 コンテナ） | 8 GB | 不要 |
-> | **GLM-5.2/5.3** | 約 372 GB | 最低 16 GB、快適には 24 GB | 不要 |
-> | **GLM-5.3-Flash** | 変換後 約 195 GB | 25 GB（int4 の重み 12 GB + エキスパートキャッシュ） | 不要 |
-> | **Inkling** | 約 469 GB | int4 密コンテナ使用時 25 GB、未使用時 約 120 GB | 不要 |
-> | **Kimi K3** | 約 1.6 TB | 32 GB 以上 | 不要 |
-> | **DeepSeek V4 Flash** | 約 167 GB（REAP 150B: 約 85 GB） | 最低 16 GB、快適には 32 GB | オプション。GTX 10 シリーズ以降の任意の NVIDIA カード（Pascal/Turing は `CUDA_ARCH=portable-pre-ampere NO_TC=1` で、RTX 50 で最良）により、プリフィルが 5〜10 倍、デコードが約 2.5 倍高速化 |
-> | **Qwen3.8-Flash-Next** | 約 185.5 GB（公式 FP8 チェックポイント） | 最低 16 GB、デフォルトのコンテキストで快適には 24 GB | 非対応。CPU のみ |
-> | **Qwen3.6-35B-A3B** | 約 20 GB（int4-gs64 コンテナ） | 24 GB（RAM への完全常駐が必要） | オプション。CUDA VRAM エキスパートティアは 8 GB カード 2 枚で **1.44 -> 10.05 tok/s（7.0 倍）** を計測、出力は CPU とビット単位で同一 |
+> | **OLMoE** | 約 7 GB（int8 コンテナ） | 8 GB | 不要。Vulkan はオプトイン |
+> | **GLM-5.2/5.3** | 約 372 GB（5.2）/ 約 419 GB（5.3） | 最低 16 GB、快適には 24 GB | 不要。Vulkan はオプトイン |
+> | **GLM-5.3-Flash** | 変換後 約 195 GB | 25 GB（int4 の重み 12 GB + エキスパートキャッシュ） | 不要。Vulkan はオプトイン |
+> | **Inkling** | 約 469 GB | int4 密コンテナ使用時 25 GB、未使用時 約 120 GB | 不要。Vulkan はオプトイン |
+> | **Kimi K3** | 約 1.6 TB | 32 GB 以上 | 不要。Vulkan はオプトイン |
+> | **DeepSeek V4 Flash** | 約 167 GB（REAP 150B: 約 85 GB） | 最低 16 GB、快適には 32 GB | オプション。GTX 10 シリーズ以降の任意の NVIDIA カード（Pascal/Turing は `CUDA_ARCH=portable-pre-ampere NO_TC=1` で、RTX 50 で最良）により、プリフィルが 5〜10 倍、デコードが約 2.5 倍高速化。Vulkan はオプトイン |
+> | **DeepSeek V4.1 Flash** | 約 510 GB（公式チェックポイント。うち 203 GB は一度に数百バイトずつ読まれる n-gram メモリ） | 常駐 約 18 GB（密部分、埋め込み、ビジョン）+ `--ram` で決まるエキスパートキャッシュ。cap 8 でピーク RSS 24.8 GB を計測 | 不要。Vulkan はオプトイン |
+> | **MiMo-V2.6 Flash** | 約 178 GB（公式チェックポイント） | レイヤーあたり 32 エキスパートをキャッシュして常駐 30.1 GB、64 で 49.8 GB を計測。キャッシュは `--ram` で決まる | 不要。Vulkan はオプトイン |
+> | **MiMo-V2.6 Pro** | 約 574 GB（エンジンが読み込まない 3 ファイルを除くと約 564 GB） | 密部分はリリースのままで 30.2 GiB、int8 で 21.7 GiB。レイヤーあたり 12 エキスパート（密部分はリリースのまま）で常駐 48.0 GB、20（密部分は int8）で 50.7 GB を計測 | 不要。Vulkan はオプトイン |
+> | **Qwen3.8-Flash-Next** | 約 185.5 GB（公式 FP8 チェックポイント）、オプションの int4-g64 エキスパートサイドカーに追加で 68.0 GB | FP8 エキスパートならデフォルトのコンテキストで快適には 24 GB（cap 32。16 GB では足りない）。int4-g64 サイドカー使用時は cap 32 で RSS 11.6 GB を計測 | オプション。CUDA VRAM エキスパートティア（FP8 エキスパートのみ）、密なトランクは VRAM 上で int8 に量子化。Vulkan はオプトイン |
+> | **Qwen3.8-27B**（密モデル、テキストと画像） | 変換後 約 51 GB（f16） | int4 の密な重みで 20 GB、int8 で 30 GB | 不要。CUDA ティアはまだなし。Vulkan はオプトイン |
+> | **Qwen3.6-35B-A3B** | 約 20 GB（int4-gs64 コンテナ） | 24 GB（RAM への完全常駐が必要） | オプション。CUDA VRAM エキスパートティアは 8 GB カード 2 枚で **1.44 -> 10.05 tok/s（7.0 倍）** を計測、出力は CPU とビット単位で同一。Vulkan はオプトイン |
+> | **Qwen3-Coder-30B-A3B** | 約 19 GB（int4-gs64 コンテナ。int8 では 30 GB） | レイヤーあたり 32 エキスパートをキャッシュして常駐 6.5 GB、128 個すべてで 15.2 GB を計測 | 不要。Vulkan はオプトイン |
+> | **Qwen-Image-2.1**（テキストから画像） | 約 33 GB（公式 diffusers チェックポイント） | すべて常駐で 16.0 GB、テキストエンコーダをプロンプトごとに読み込むとピーク 8.5 GB、これに作業バッファが加わる（768x512 の画像 1 枚でピーク 9.0 GB を計測） | 不要。Vulkan はオプトイン、GPU での計時はまだなし |
 >
-> GPU はあくまで速くするだけです。エキスパートはディスクからストリーミングされるため、速度は
-> ディスクで決まります — 遅いドライブでは 1 秒あたり 1 トークン未満、高速なドライブでキャッシュが
-> 温まっていれば 1 秒あたり数トークンを想定してください。
+> GPU はモデルの答えを変えません。変わるのは処理がどこで走るかだけです。エキスパートはディスクから
+> ストリーミングされるため、速度はディスクで決まります。遅いドライブでは 1 秒あたり 1 トークン未満、
+> 高速なドライブでキャッシュが温まっていれば 1 秒あたり数トークンを想定してください。
+>
+> **Vulkan はオプトイン** とは `VK=1` ビルドのことです。`COLI_VULKAN=1` で実行すると、エンジンは常駐行列を
+> Vulkan 1.2 ドライバを持つ任意の GPU に置きます（GLM-5.2 はそこに完全なデコード経路を持ち、Kimi K3 は
+> 独自のエキスパートティア `K3_VK` を持ちます）。CI はそれらのエンジンをソフトウェアドライバ上で CPU の
+> トークンと照合しています（[vulkan.md](docs/vulkan.md#the-other-engines)）。正しいことと速いことはまだ
+> 別です。これらのエンジンで最初に計測した実 GPU である内蔵 Radeon 780M（Ryzen 7 PRO 8700GE、同じ
+> バイナリ、コールドなページキャッシュ）では、現時点では CPU より遅くなっています: Qwen3.6-35B-A3B の
+> デコードは CPU の 5.97 tok/s に対して 3.06 tok/s（出力は同一）、int4 エキスパートの Qwen3.8-Flash-Next は
+> 3.55 に対して 1.53 でした。すべての行列積が同期的な submit で 1 トークンあたり約 726 回あり、内蔵 GPU は
+> CPU と同じ RAM を読むためです。
 
 | ファミリー | 総数 / アクティブ | 重み | ビルド | ドキュメント |
 |---|---|---|---|---|
-| **GLM-5.2/5.3** | 744B / 40B | [`mastouri/…-int4-g64-with-int8-mtp`](https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp)（372 GB） | `make -C c glm` | このページ |
+| **GLM-5.2/5.3** | 744B / 40B | [`mastouri/…-int4-g64-with-int8-mtp`](https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp)（372 GB）または [`Justvugg/GLM-5.3-colibri-int4-g64`](https://huggingface.co/Justvugg/GLM-5.3-colibri-int4-g64)（419 GB） | `make -C c glm` | このページ |
 | **Inkling**（Thinking Machines） | 975B / 41B | [`nbeerbower/Inkling-colibri-int4`](https://huggingface.co/nbeerbower/Inkling-colibri-int4)（469 GB） | `make -C c inkling` | [inkling.md](docs/inkling.md) |
-| **GLM-5.3-Flash**（Z.ai） | 321B / 40B | [`zai-org/GLM-5.3-Flash`](https://huggingface.co/zai-org/GLM-5.3-Flash) — ルーティングエキスパートを **int4-gs64** に変換、密部分は BF16 のままで精度はロード時に選択。ビジョン対応 | `make -C c glm53` | [glm53-flash.md](docs/glm53-flash.md) |
+| **GLM-5.3-Flash**（Z.ai） | 321B / 18B | [`zai-org/GLM-5.3-Flash`](https://huggingface.co/zai-org/GLM-5.3-Flash)。ルーティングエキスパートを **int4-gs64** に変換、密部分は BF16 のままで精度はロード時に選択。ビジョン対応 | `make -C c glm53` | [glm53-flash.md](docs/glm53-flash.md) |
 | **Kimi K3**（Moonshot） | 2.8T / 104B | [`moonshotai/Kimi-K3`](https://huggingface.co/moonshotai/Kimi-K3) — オリジナルのチェックポイント、ルーティングエキスパートは **ネイティブ MXFP4** のまま | `make -C c kimi_k3` | [kimi_k3.md](docs/kimi_k3.md) |
 | **DeepSeek V4 Flash** | 284B / 13B | 公式のシャード化チェックポイント — ルーティングエキスパートは **ネイティブ fp4**、密部分は fp8-e4m3 のまま。**REAP で枝刈りした 150B**（[`puwaer/DeepSeek-V4-Flash-0731-reap-150b`](https://huggingface.co/puwaer/DeepSeek-V4-Flash-0731-reap-150b)、85 GB、256 個中 132 個のエキスパート）も同じエンジンで変換なしにロード可能 | `make -C c deepseek-v4` | [deepseek-v4.md](docs/deepseek-v4.md) |
 | **MiMo-V2.6 Flash**（Xiaomi） | 309B / 15B | [`XiaomiMiMo/MiMo-V2.6-Flash-MOPD`](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-MOPD)（178 GB）、公式チェックポイント、**変換不要**: ルーティングエキスパートは **ネイティブ MXFP4** のまま、密部分は FP8/BF16。48 層のうち 39 層は 128 トークンのウィンドウを参照するため、長いコンテキストでも KV は 9 層分だけ。ビジョンとツール呼び出しに対応 | `make -C c mimo` | [mimo.md](docs/mimo.md) |
+| **MiMo-V2.6 Pro**（Xiaomi） | 1.02T / 42B | [`XiaomiMiMo/MiMo-V2.6-Pro-MOPD`](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-MOPD)（573.5 GB）、公式チェックポイント、**変換不要**、MiMo エンジンで動作: 同じアーキテクチャで 70 層、384 エキスパート。全 70 層のうち最初の 32 層について Xiaomi 自身のモデリングコードと照合済み。ビジョンとツール呼び出しに対応 | `make -C c mimo` | [mimo.md](docs/mimo.md#pro) |
 | **DeepSeek V4.1 Flash** | 552B / 16B | 公式チェックポイント、**変換不要**: エキスパートはすでに fp4、密部分は fp8-e4m3。そのうち 203 GB は一度に数百バイトずつディスクから読まれる n-gram メモリで、ルーティングエキスパートのコストは GLM-5.2 の 12.7 GB に対して **1 トークンあたり 4.5 GB**。ビジョン、ツール呼び出し、DSpark ドラフトヘッドはすべて有効 | `make -C c deepseek_v41` | [deepseek-v41.md](docs/deepseek-v41.md) |
-| **Qwen3.8-Flash-Next**（Alibaba） | 125B + 51B n-gram / 6B | [`Qwen/Qwen3.8-Flash-Next-FP8`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8) — オリジナルのチェックポイント。PLE はページング可能なまま、エキスパートは **ネイティブのブロック FP8** のまま | `make -C c qwen38`（CPU のみ） | [qwen38.md](docs/qwen38.md) |
+| **Qwen3.8-Flash-Next**（Alibaba） | 125B + 51B n-gram / 6B | [`Qwen/Qwen3.8-Flash-Next-FP8`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8)、オリジナルのチェックポイント。PLE はページング可能なまま、エキスパートは **ネイティブのブロック FP8** のまま、またはオプションのサイドカーから **int4-g64** として読み込み（下記参照）。MTP ドラフトはオプトイン（`Q38_MTP=1`） | `make -C c qwen38`（VRAM エキスパートティアには `CUDA=1`） | [qwen38.md](docs/qwen38.md) |
 | **Qwen3.6**（Alibaba） | 35B / 3B | [`Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64`](https://huggingface.co/Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64)（約 20 GB、**推奨**）— Gated Attention + Gated DeltaNet のハイブリッド | `make -C c qwen36`（VRAM エキスパートティアには `CUDA=1`） | [qwen36.md](docs/qwen36.md) |
+| **Qwen3.8-27B**（Alibaba） | 27B、密モデル | [`Qwen/Qwen3.8-27B`](https://huggingface.co/Qwen/Qwen3.8-27B) を `c/tools/convert_qwen36.py` で f16 コンテナ（51 GB）に変換。エンジンはロード時に int8、`COLI_DENSE_BITS=4` なら int4 に量子化。レイヤーごとに MLP が 1 つでルーターはなく、Qwen3.6 エンジンで動作。テキストと画像に対応 | `make -C c qwen36` | [qwen36.md](docs/qwen36.md#the-dense-27b) |
+| **Qwen3-Coder-30B-A3B**（Alibaba） | 30B / 3B | [`Justvugg/Qwen3-Coder-30B-A3B-colibri-int4`](https://huggingface.co/Justvugg/Qwen3-Coder-30B-A3B-colibri-int4)（19 GB、int4-gs64）、[`Qwen/Qwen3-Coder-30B-A3B-Instruct`](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct) から変換。Qwen3.6 エンジンで動く全層アテンションの Qwen3 MoE で、128 エキスパートの top-8、独自の XML 形式のツール呼び出しを持ち、思考モードはなし。teacher forcing で、int4 コンテナは 96.9% の位置で bf16 リリースと同じ top-1 トークンを選ぶ | `make -C c qwen36` | [qwen36.md](docs/qwen36.md#qwen3-coder-30b-a3b) |
 | **OLMoE**（AI2） | 7B / 1B | `c/tools/convert_olmoe_merged.py` で変換 — **int8** コンテナ、約 7 GB | `make -C c olmoe` | — |
+| **Qwen-Image-2.1**（Alibaba） | 画像モデル | [`Qwen/Qwen-Image-2.1`](https://huggingface.co/Qwen/Qwen-Image-2.1)（約 33 GB）、公式 diffusers チェックポイント、**変換不要**: テキストエンコーダと拡散トランスフォーマーはロード時に int8 に量子化。`coli chat` では画像をインライン表示し、`coli serve` では `POST /v1/images/generations` で提供。Qwen Research License: 非商用利用のみ | `make -C c qwenimage` | [qwen-image.md](docs/qwen-image.md) |
 
 Qwen3.6 には変換済みコンテナが 3 つあります: **int4-gs64**（推奨 — int8 のアンカーに対するコサイン類似度は
 行単位と比べて 0.98777 → 0.99313、KL は 0.109 → 0.080 と計測されており、量子化誤差が約 44% 少ない）、
@@ -438,6 +493,16 @@ A/B のベースラインとしての [int4 行単位](https://huggingface.co/Kr
 KAT-Coder は同じエンジンでそのまま動きます — アーキテクチャが同一のチェックポイントであれば、
 専用のコードパスなしで動作します。`CUDA=1` を使うと、VRAM エキスパートティアは
 **8 GB カード 2 枚で 1.44 → 10.05 tok/s（7.0 倍）** を計測し、出力は CPU の経路とビット単位で同一でした。
+
+Qwen3.8-Flash-Next はルーティングエキスパートをリリースどおりのブロック FP8 で読み込みます。オプションの
+**int4-g64 サイドカー**（`c/tools/convert_qwen38_experts_int4.py`、FP8 シャードの隣に 68.0 GB を書き込む）を
+使うと、ミス 1 回あたりの読み込みバイト数は 56% になります。Ryzen 7 PRO 8700GE（16 スレッド、61 GiB、NVMe）
+での計測では、同じキャッシュサイズでデコードが 1.4〜1.5 倍、同じ RAM では 1.56 倍速くなり、パープレキシティの
+増加は平均で 1 トークンあたり +0.017 nats でした（[qwen38.md](docs/qwen38.md#routed-experts-as-int4-g64)）。
+チェックポイント自身の MTP ヘッドによる投機的デコードはオプトイン（`Q38_MTP=1`）で、出力は通常のデコードと
+同一です。同じマシンで int4 エキスパートを使った場合、ドラフトの 94〜96% が受理され、1 フォワードあたり
+1.94 トークン、tok/s は +12〜14%（cap 96 で 3.57 → 4.01、cap 170 で 4.15 → 4.74）でした。そこで伸びが
+小さいのは、ディスクからのエキスパート読み込みが減らないためです（[qwen38.md](docs/qwen38.md)）。
 
 Kimi K3 は変換不要です。QAT で学習された MXFP4 エキスパートはオリジナルの Hugging Face シャードから
 直接ストリーミングされ、bf16 の密な重みセットはロード時に量子化されます。長いエージェントセッションでは、
@@ -463,6 +528,35 @@ COLI_MODEL=/nvme/glm52_i4 ./coli tune     # このマシンで最速かつ安全
 ./coli web  --model /nvme/glm52_i4        # API + ダッシュボード、ブラウザを開く
 ./coli serve --model /nvme/glm52_i4       # API + ダッシュボード、ブラウザなし（ヘッドレス）
 ```
+
+#### Brio モード: クローズドな質問をする
+
+人がモデルに求めることの多くは、段落ではなく選択です: どのキューか、どの判定か、あるフィールドが取り得る
+4 つの値のどれか。Brio モードはエンジンに選択肢を渡し、生成する代わりにそれぞれの確率を読み取ります:
+`completion_tokens` は 0 で、どの回答もリストの外に出ることはなく、すべての回答にエントロピーが付くため、
+「モデルに確信がない」ことが閾値を設定できる数値になります。10 のファミリーすべてで、同じサーバー上で
+動作し、リクエストごとのオプトインです: 求めない人にとって、チャットはバイト単位で同一のままです。
+
+```bash
+# in the TUI: the same model, told to stop writing
+./coli chat --model /nvme/qwen36_i4_gs64
+> /brio merge | request changes | close
+> 340 lines, 8 files, no tests. CI is green but nothing covers that path.
+
+# from anywhere: one JSON request on the running server
+curl -s http://127.0.0.1:8000/v1/brio -H 'Content-Type: application/json' -d '{
+  "model": "qwen36",
+  "state": "340 lines, 8 files, no tests. CI is green but nothing covers that path.",
+  "question": "What should the reviewer do?",
+  "options": ["merge", "request changes", "close"]}'
+```
+
+`questions` は 1 回だけ読んだ 1 つの文書について多くのことを尋ね、`schema` は JSON オブジェクトを
+1 フィールドずつ埋めるため、構造上必ず妥当になります。Qwen3.6 で、同じ CPU マシン上で同じ回答を
+生成する場合と比べて計測したところ、4 フィールドのスキーマで 2.4 倍、1 つの文書に対する 4 つの質問で
+5.7 倍でした。モード全体、リクエストとレスポンスの形、そして役に立たない場面については
+[docs/brio.md](docs/brio.md) を参照してください。ダッシュボードにも Brio ページがあります。
+
 
 Windows ではリリースアーカイブに `coli.cmd` が同梱されています。ダブルクリックでクイックスタート、
 または cmd や PowerShell から `coli.cmd chat --model D:\glm52_i4` を実行してください。
@@ -518,6 +612,7 @@ GLM 以外のエンジンでは、`coli chat` がローカルでゲートウェ�
 | Vulkan バックエンド（任意の GPU: RADV 経由の AMD、ROCm がサポートを終了したカードを含む） | [docs/vulkan.md](docs/vulkan.md) |
 | Apple Silicon Metal バックエンド | [docs/metal.md](docs/metal.md) |
 | OpenAI 互換 API、KV スロット、Web ダッシュボード | [docs/api.md](docs/api.md) |
+| Brio モード: 生成する代わりに、閉じた選択肢の集合をスコアリング | [docs/brio.md](docs/brio.md) |
 | 実験的なレイヤーセグメント埋め込み ABI | [docs/segment-runtime.md](docs/segment-runtime.md) |
 | 実験的なトークナイザ/埋め込み/ヘッドの Edge ABI | [docs/edge-runtime.md](docs/edge-runtime.md) |
 | 文法強制ドラフト（構造化出力） | [docs/grammar-draft.md](docs/grammar-draft.md) |
@@ -582,11 +677,11 @@ CUDA ティア（ビルド、DLL の選択、GPU の対応範囲）、環境変�
   目的はハードウェア要件と有用トークンあたりのコストを下げることです。すべてはこのプロジェクトの
   やり方で取り込まれます: エンドツーエンドで計測され、レビューされ、オープンに開発されます。
 - **より多くのオープンモデル。** ティアリングアルゴリズムはモデルに依存しません。ルーティング
-  エキスパートを持つ MoE であれば、どれも同じ方法でステージングできます。現在 10 のファミリーが
-  動作しています（GLM-5.2、GLM-5.3-Flash、Inkling、Kimi K3、DeepSeek V4 Flash、DeepSeek V4.1 Flash、MiMo-V2.6 Flash、
-  Qwen3.8-Flash-Next、Qwen3.6、OLMoE）。さらなるオープンウェイトのファミリー — 候補には
-  **MiniMax** も含まれます — は、最初の 8 つと同じ方法でエンジンを獲得します:
-  誰かがエンドツーエンドで計測したときにです。
+  エキスパートを持つ MoE であれば、どれも同じ方法でステージングできます。現在 10 の言語モデル
+  ファミリーが動作しています（GLM-5.2/5.3、GLM-5.3-Flash、Inkling、Kimi K3、DeepSeek V4 Flash、
+  DeepSeek V4.1 Flash、MiMo-V2.6、Qwen3.8-Flash-Next、Qwen3.6、OLMoE）。加えて画像用に Qwen-Image-2.1 が
+  あります。さらなるオープンウェイトのファミリー（候補には **MiniMax** も含まれます）は、これらと同じ方法で
+  エンジンを獲得します: 誰かがエンドツーエンドで計測したときにです。
 
 ## プロジェクトへの支援
 
@@ -608,10 +703,14 @@ c/
 ├── colibri.c             GLM-5.2 エンジン  (make glm)
 ├── inkling.c             Inkling エンジン  (make inkling)
 ├── kimi_k3.c             Kimi K3 エンジン  (make kimi_k3)
+├── glm53.c               GLM-5.3-Flash エンジン  (make glm53)
 ├── deepseek_v4.c         DeepSeek V4 Flash エンジン  (make deepseek-v4)
-├── qwen38.c              Qwen3.8-Flash-Next テキストエンジン  (make qwen38)
-├── qwen36.c              Qwen3.6 エンジン  (make qwen36)
+├── deepseek_v41.c        DeepSeek V4.1 Flash エンジン  (make deepseek_v41)
+├── mimo.c                MiMo-V2.6 Flash と Pro のエンジン  (make mimo)
+├── qwen38.c              Qwen3.8-Flash-Next エンジン  (make qwen38)
+├── qwen36.c              Qwen3.6、Qwen3-Coder、Qwen3.8-27B エンジン  (make qwen36)
 ├── olmoe.c               OLMoE エンジン  (make olmoe)
+├── qwenimage.c           Qwen-Image-2.1 エンジン  (make qwenimage)
 │
 ├── st.h                  safetensors のインデックスと範囲読み込み
 ├── quant.h               正規のコンテナデコーダ
@@ -624,7 +723,7 @@ c/
 │
 ├── backend_cuda.*        オプションの CUDA ティア   (CUDA=1)
 ├── backend_metal.*       オプションの Metal ティア  (METAL=1)
-├── backend_vulkan.*      オプションの Vulkan ティア (VULKAN=1)
+├── backend_vulkan.*      オプションの Vulkan ティア (VK=1)
 │
 ├── Makefile              ビルドとローカルチェック
 ├── coli                  ユーザー向け CLI
@@ -707,4 +806,4 @@ colibrì はエンジンにすぎず、それが動かす知性は贈り物で�
 
 ## ライセンス
 
-Apache 2.0。GLM-5.2 の重みは Z.ai により MIT ライセンスで公開されています。
+Apache 2.0、Copyright 2026 Vincenzo Fornaro。[LICENSE](LICENSE) と [NOTICE](NOTICE) を参照してください。GLM-5.2 の重みは Z.ai により MIT ライセンスで公開されています。

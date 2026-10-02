@@ -1010,10 +1010,10 @@ def _parse_arch_tool_calls(reply, tools, tool_reply, track_spans):
     """parse_arch_tool_calls plus the tool-call stage's maps: `(content, tool_calls,
     box_map, content_map)`.
 
-    Only the glm/default parser reports maps; the others return None for both. A request
-    that opted into the numeric logprobs channel is refused with a named 400 on any other
-    architecture, so no reply reaching those branches can carry a logprobs object for a
-    map to align."""
+    Only the glm/default and mimo parsers report maps; the others return None for both. A
+    request that opted into the numeric logprobs channel is refused with a named 400 on any
+    other architecture, so no reply reaching those branches can carry a logprobs object for
+    a map to align."""
     if ARCH == "deepseek_v4":
         return parse_dsv4_tool_calls(reply) + (None, None)
     if ARCH == "deepseek_v41":
@@ -1026,7 +1026,7 @@ def _parse_arch_tool_calls(reply, tools, tool_reply, track_spans):
     if chat_flavor() in ("qwen36", "qwen38", "qwen3_coder"):
         return parse_qwen_tool_calls(reply, tools) + (None, None)
     if ARCH == "mimo":
-        return parse_mimo_tool_calls(reply, tools) + (None, None)
+        return _parse_mimo_tool_calls(reply, tools, track_spans)
     return _parse_tool_calls(reply, tools, track_spans)
 
 
@@ -2281,7 +2281,14 @@ MIMO_PARAM_RE = re.compile(r"<parameter=([^>\n]+)>(.*?)</parameter>", re.S)
 
 
 def parse_mimo_tool_calls(reply, tools=None):
-    """MiMo's calls back into OpenAI `tool_calls`.
+    """MiMo's calls back into OpenAI `tool_calls`: `(content, tool_calls)`."""
+    content, calls, _box_map, _content_map = _parse_mimo_tool_calls(reply, tools, False)
+    return content, calls
+
+
+def _parse_mimo_tool_calls(reply, tools, track_spans):
+    """MiMo's calls back into OpenAI `tool_calls`, with the stage's maps: `(content,
+    tool_calls, box_map, content_map)`, both maps None unless `track_spans`.
 
     Parameters are inline (`<parameter=K>V</parameter>`); a value that arrives on its own
     lines, Qwen-style, loses exactly one newline on each side. Types come from the declared
@@ -2320,12 +2327,22 @@ def parse_mimo_tool_calls(reply, tools=None):
                 "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}
 
     text = reply or ""
-    calls = [make_call(m.group(1).strip(), m.group(2)) for m in MIMO_CALL_RE.finditer(text)]
+    matches = list(MIMO_CALL_RE.finditer(text))
+    calls = [make_call(m.group(1).strip(), m.group(2)) for m in matches]
     if not calls and tools and ("<tool_call>" in text or "<function=" in text):
         sys.stderr.write("[api] mimo tool markers present but no call parsed -- "
                          "possibly truncated or mangled output\n")
         sys.stderr.flush()
-    return MIMO_CALL_RE.sub("", text).strip(), calls
+    if not track_spans:
+        return MIMO_CALL_RE.sub("", text).strip(), calls, None, None
+    # The same two deletions as the line above -- every call block, then the surrounding
+    # whitespace -- found as ranges, so logprobs.content can describe the content returned
+    # rather than the raw reply with the call syntax in it.
+    content, box_map = _apply_cuts(text, [(m.start(), m.end()) for m in matches])
+    head = len(content) - len(content.lstrip())
+    kept = len(content.strip())
+    content, step = _apply_cuts(content, [(0, head), (head + kept, len(content))])
+    return content, calls, box_map, _compose_span_maps(box_map, step)
 
 
 def render_chat_qwen38(messages, enable_thinking=True, reasoning_effort=None, tools=None,
@@ -4925,8 +4942,14 @@ class Engine:
         # accepted-but-ignored opt-in is a silently wrong answer rather than an error. Two
         # flags, not one -- the numeric logprobs/echo channel (`logprobs=`) and
         # pre-tokenized token-id intake (`ids=`) are unrelated capabilities with separate
-        # coli_submit_ext keys, set from one arch check only because one engine has both.
-        self.supports_logprobs_echo = (arch == "glm")
+        # coli_submit_ext keys. The numeric channel is opened to an engine that keeps the
+        # whole of its contract: a DATA tail on every generated token, and an ECHO frame
+        # for EVERY prompt position (" nan 0" at position 0) unless a pin photo covers the
+        # prefix -- which means never resuming a read-out from a live prefix. colibri.c
+        # (glm) and mimo.c do; the engines that score /v1/brio options but resume
+        # read-outs from a live prefix would answer `echo` with a hole. Token-id intake
+        # is glm's alone: serve_codec.h, which mimo reads its frames with, has no `ids=`.
+        self.supports_logprobs_echo = arch in ("glm", "mimo")
         self.supports_tok_ids = (arch == "glm")
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))

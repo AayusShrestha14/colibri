@@ -374,6 +374,40 @@ Send `pin=1` wherever you want a return point. The engine matches by token ids, 
 nothing needs to be declared in advance, and it refuses a snapshot whose attention
 rows the state no longer holds.
 
+## What a snapshot holds
+
+A snapshot is not always just token ids. It must hold everything a layer carries from one
+token to the next, or the option that resumes from it starts from a state that never
+existed, and the numbers stay plausible. What that is depends on the model:
+
+- **Attention rows indexed by position** (every full-attention layer) stay where they
+  are. Nothing written after the snapshot lands below it, so the snapshot holds only
+  the ids, and the engine checks that the state still holds those ids before it trusts
+  the rows. An unrelated prompt in between rewrites them; the snapshot is then
+  released and the option is computed from the start.
+- **Recurrent state** (the DeltaNet layers of Qwen3.6 and Qwen3.8) is copied into the
+  snapshot, because a recurrence cannot be rewound.
+- **Sliding-window rings** (MiMo-V2.6: 39 of its 48 layers attend the last 128
+  positions) are copied too. A windowed layer keeps position p in slot p mod 128, so
+  the first option writes its own tokens over the slots of the snapshot's last
+  positions. Without the copy, the second option would read the first one's keys.
+  On MiMo-V2.6 Flash that is about 50 MB per snapshot.
+
+A prompt with a **picture** never takes a snapshot and never resumes from one. Its ids
+describe where the picture goes, not what it shows.
+
+**The read-out starts where the snapshot ends**, not where the shared text ends. Two
+options share the text before them, and stopping there would leave the first option
+token without the logits that predict it. On MiMo and GLM a prompt read out with no
+snapshot to resume from is read out from position 0, never from a live prefix. That
+is what `echo` on `/v1/completions` needs.
+
+The serve tests hold an engine to both halves on its tiny fixture
+(`tests/test_brio_serve.py`, and `tests/test_mimo_prefix_serve.py` for MiMo's rings and
+pictures). An option read through the snapshot must give the numbers a cold engine gives,
+to the last printed digit. It must also **process only its own tokens**: checking the
+numbers alone would pass on an engine that quietly recomputed everything.
+
 ## Cost, measured
 
 qwen36 (22 GB, 40 layers) over the gateway, one KV slot:
@@ -398,6 +432,9 @@ Note that these are on a disk-streaming engine, where the prefill costs about
   indistinguishable.
 - **The snapshot lives in the engine process.** Restart the server and the first
   request pays the full prefill again.
+- **Snapshots cost memory where they carry state.** `COLI_PIN_SLOTS` (default 4) bounds
+  how many the engine keeps: about 50 MB each on MiMo-V2.6 Flash, tens of MB on Qwen3.6,
+  only the ids and the final logits on engines with nothing else to keep.
 - **One KV slot means one conversation at a time.** With several slots, requests
   sharing a `state` are routed to the same slot so they share the snapshot; with one,
   interleaved clients evict each other.

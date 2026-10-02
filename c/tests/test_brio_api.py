@@ -12,15 +12,29 @@ must see the value chosen for the field before, and nothing is ever generated.
 The fake engine tokenises on whitespace and scores an option by a table, so
 every answer here is chosen by the test, not by chance. It records every
 call: prompt, max_tokens and pin, which is what the assertions read.
+
+MimoBrioEndToEnd puts the real MiMo engine behind the same server, on the tiny
+fixture (`make mimo mimo-tiny-generate`; skipped without them): the endpoint
+reaches it, every option after the photo reads only its own tokens, the scores
+equal a cold engine's, and chat logprobs pass the gateway's gate.
 """
 import json
 import math
+import os
+import subprocess
+import sys
+import threading
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-import openai_server
-from openai_server import APIServer
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import mimo_serve_fixture  # noqa: E402
+import openai_server  # noqa: E402
+from family_registry import family_by_id  # noqa: E402
+from openai_server import APIServer  # noqa: E402
 
 STATE = "340 lines across 8 files, no tests. CI is green but nothing covers that path."
 
@@ -285,6 +299,142 @@ class BrioApi(unittest.TestCase):
                                       "schema": {'bad"name': ["a", "b"]}})
         self.assertEqual(code, 400)
         self.assertIn("quotes", body["error"]["message"])
+
+
+class _Recorder:
+    """The real engine, with every call it is given written down: the prompt, the
+    pin, the ACCEPT count and the ECHO positions -- what the saving is read from."""
+
+    def __init__(self, engine):
+        self.engine = engine
+        self.kv_slots = engine.kv_slots
+        self.calls = []
+
+    def generate(self, prompt, *args, on_echo=None, on_accept=None, pin=False, **kwargs):
+        call = {"prompt": prompt, "pin": bool(pin), "echo": [], "accept": None}
+        self.calls.append(call)
+
+        def echo(record):
+            call["echo"].append(record["pos"])
+            if on_echo:
+                on_echo(record)
+
+        def accept(value):
+            call["accept"] = value.get("prompt_tokens")
+            if on_accept:
+                on_accept(value)
+
+        return self.engine.generate(prompt, *args, on_echo=echo, on_accept=accept,
+                                    pin=pin, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self.engine, name)
+
+
+def _cold_option_score(prefix, option):
+    """What one option scores on a fresh engine that reads the whole prompt: the sum
+    of the ECHO log-probabilities past the prefix, from the frames themselves."""
+    env = dict(os.environ, **mimo_serve_fixture.engine_env())
+    p = subprocess.Popen([str(mimo_serve_fixture.ENGINE), "8"], env=env,
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL)
+    try:
+        while b"READY" not in p.stdout.readline():
+            pass
+        n_prefix, values = None, []
+        for rid, text in ((1, prefix), (2, prefix + " " + option)):
+            data = text.encode()
+            p.stdin.write(f"SUBMIT {rid} 0 {len(data)} 0 0 1 logprobs=1\n".encode()
+                          + data + b"\n")
+            p.stdin.flush()
+            while True:
+                fields = p.stdout.readline().split()
+                if fields[0] == b"ECHO":
+                    p.stdout.read(int(fields[2]) + 1)
+                    if rid == 2 and int(fields[3]) >= n_prefix and fields[4] != b"nan":
+                        values.append(float(fields[4]))
+                elif fields[0] == b"ACCEPT" and rid == 1:
+                    n_prefix = int(fields[2])
+                elif fields[0] in (b"DONE", b"ERROR"):
+                    break
+        # sum(), as the endpoint adds them: on Python 3.12 it is compensated, and a
+        # plain running total differs from it in the last bits
+        return sum(values), len(values)
+    finally:
+        p.stdin.close()
+        p.wait(timeout=30)
+        p.stdout.close()
+
+
+@unittest.skipUnless(mimo_serve_fixture.available(),
+                     "mimo is not built or the tiny MiMo fixture is absent "
+                     "(make mimo mimo-tiny-generate)")
+class MimoBrioEndToEnd(unittest.TestCase):
+    STATE = ("The release is late, the tests are red and the changelog is empty. "
+             "Two reviewers approved it last week.")
+    OPTIONS = ["ship it", "wait", "wait until the tests pass and the changelog is written"]
+
+    def setUp(self):
+        engine = openai_server.Engine(
+            mimo_serve_fixture.ENGINE, mimo_serve_fixture.served_fixture(), cap=8,
+            env=dict(os.environ, **mimo_serve_fixture.engine_env()),
+            family=family_by_id("mimo"))
+        self.addCleanup(engine.process.stdout.close)
+        self.addCleanup(engine.close)
+        self.engine = _Recorder(engine)
+        self.server = APIServer(("127.0.0.1", 0), self.engine, "mimo-tiny")
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+
+    def post(self, path, body):
+        request = Request(self.base + path, data=json.dumps(body).encode(),
+                          headers={"Content-Type": "application/json"})
+        with urlopen(request, timeout=120) as response:
+            return json.loads(response.read())
+
+    def test_options_read_only_their_own_tokens_and_score_like_a_cold_engine(self):
+        out = self.post("/v1/brio", {"model": "mimo-tiny", "state": self.STATE,
+                                     "question": "What should we do?",
+                                     "options": self.OPTIONS})
+        self.assertEqual(out["object"], "brio.choice")
+        self.assertIn(out["answer"], self.OPTIONS)
+        self.assertEqual(out["usage"]["completion_tokens"], 0)
+        self.assertAlmostEqual(sum(c["p"] for c in out["choices"]), 1.0, places=9)
+
+        calls = self.engine.calls
+        state, prefix, options = calls[0], calls[1], calls[2:]
+        self.assertTrue(state["pin"] and prefix["pin"])
+        self.assertEqual(len(options), len(self.OPTIONS))
+        # The question resumes from the state's photo, every option from the
+        # question's: each read-out starts exactly where the photo ends and covers
+        # nothing before it. A fallback to a full recompute would read from 0.
+        self.assertEqual(min(prefix["echo"]), state["accept"])
+        for call in options:
+            self.assertEqual(sorted(call["echo"]),
+                             list(range(prefix["accept"], call["accept"])),
+                             f"{call['prompt']!r} did not resume from the photo")
+        prompt = prefix["prompt"]
+        by_option = {c["option"]: c for c in out["choices"]}
+        for option in self.OPTIONS:
+            total, rows = _cold_option_score(prompt, option)
+            self.assertEqual(by_option[option]["tokens"], rows)
+            self.assertEqual(by_option[option]["logprob"], total,
+                             f"{option!r}: the photo scored differently from a cold engine")
+
+    def test_chat_logprobs_reach_the_engine(self):
+        with patch("openai_server.ARCH", "mimo"):
+            out = self.post("/v1/chat/completions", {
+                "model": "mimo-tiny", "max_tokens": 6, "logprobs": True,
+                "top_logprobs": 2, "enable_thinking": False,
+                "messages": [{"role": "user", "content": "Ship it?"}]})
+        choice = out["choices"][0]
+        entries = choice["logprobs"]["content"]
+        self.assertTrue(entries, "no per-token logprobs came back")
+        for entry in entries:
+            self.assertLessEqual(entry["logprob"], 0.0)
+            self.assertEqual(len(entry["top_logprobs"]), 2)
 
 
 if __name__ == "__main__":

@@ -57,6 +57,7 @@
 #include "quant.h"
 #include "omp_tune.h"
 #include "kv_prefix.h"
+#include "pin_pool.h"
 #include "tok.h"
 #include "serve_codec.h"
 #include "serve_poll.h"
@@ -1032,10 +1033,15 @@ static void moe(Model *m, int li, const float *xn, int n, float *out) {
      * up of every expert, then down of every expert -- split in row blocks, instead
      * of three OpenMP regions per expert (a thousand a token on Flash, and every
      * barrier costs a scheduling round on a busy machine). The kernel inside a
-     * task is the same matmul_mxfp4 on the same rows, so the numbers do not move. */
+     * task is the same matmul_mxfp4 on the same rows, so the numbers do not move.
+     *
+     * Every (row, choice) pair has its own slot in the buffers below, across all
+     * the groups of the block, so the weighted sum can wait for the last group
+     * and run row by row in that row's own routing order. */
     int cap = m->cache[li].cap;
     int *row = xmalloc((size_t)n * K * sizeof(int), "expert rows index");
     float *rw = xmalloc((size_t)n * K * sizeof(float), "expert row weights");
+    int *pair = xmalloc((size_t)n * K * sizeof(int), "expert pair of a choice");
     int *first = xmalloc((size_t)(cap + 1) * sizeof(int), "expert row offsets");
     float *xg = xmalloc((size_t)n * K * H * sizeof(float), "expert inputs");
     float *g = xmalloc((size_t)n * K * MI * sizeof(float), "expert gate");
@@ -1045,20 +1051,25 @@ static void moe(Model *m, int li, const float *xn, int n, float *out) {
         = m->idot ? matmul_mxfp4_i8 : matmul_mxfp4;
     const int BLOCK_ROWS = 256;
     Slot *slots[4096];
+    int total = 0;                   /* pairs placed so far, over every group */
     for (int b = 0; b < nu; b += cap) {
         int nb = nu - b < cap ? nu - b : cap;
         experts_ensure(m, li, uni + b, nb, slots);
         double t0 = now_s();
-        int total = 0;
+        int from = total;
         for (int j = 0; j < nb; j++) {
             int e = uni[b + j];
             first[j] = total;
             for (int t = 0; t < n; t++)
                 for (int q = 0; q < K; q++)
-                    if (sel[(size_t)t * K + q] == e) { row[total] = t; rw[total] = wt[(size_t)t * K + q]; total++; }
+                    if (sel[(size_t)t * K + q] == e) {
+                        row[total] = t; rw[total] = wt[(size_t)t * K + q];
+                        pair[(size_t)t * K + q] = total;
+                        total++;
+                    }
         }
         first[nb] = total;
-        for (int i = 0; i < total; i++) memcpy(xg + (size_t)i * H, xn + (size_t)row[i] * H, (size_t)H * sizeof(float));
+        for (int i = from; i < total; i++) memcpy(xg + (size_t)i * H, xn + (size_t)row[i] * H, (size_t)H * sizeof(float));
         int up_blocks = (MI + BLOCK_ROWS - 1) / BLOCK_ROWS, down_blocks = (H + BLOCK_ROWS - 1) / BLOCK_ROWS;
         int rb_mi = MI / 2, gb_mi = MI / 32, rb_h = H / 2, gb_h = H / 32;
 #ifdef COLI_VULKAN
@@ -1088,7 +1099,7 @@ static void moe(Model *m, int li, const float *xn, int n, float *out) {
                 memcpy(dst + (size_t)i * MI + o0, scratch + (size_t)i * rows, (size_t)rows * sizeof(float));
             if (scratch != tmp) free(scratch);
         }
-        for (size_t i = 0; i < (size_t)total * MI; i++) g[i] = silu(g[i]) * u[i];
+        for (size_t i = (size_t)from * MI; i < (size_t)total * MI; i++) g[i] = silu(g[i]) * u[i];
 #ifdef COLI_VULKAN
         vk_experts_down(m, li, uni + b, nb, first, g, y, vk_gu, vk_dn);
 #endif
@@ -1111,16 +1122,27 @@ static void moe(Model *m, int li, const float *xn, int n, float *out) {
                 memcpy(dst + (size_t)i * H + o0, scratch + (size_t)i * rows, (size_t)rows * sizeof(float));
             if (scratch != tmp) free(scratch);
         }
-        /* the weighted sum, expert by expert in the order they were chosen */
-        for (int j = 0; j < nb; j++)
-            for (int i = first[j]; i < first[j + 1]; i++) {
-                float *o = out + (size_t)row[i] * H;
-                const float *yy = y + (size_t)i * H;
-                for (int d = 0; d < H; d++) o[d] += rw[i] * yy[d];
-            }
         m->t_expert += now_s() - t0;
     }
-    free(first);
+    /* The weighted sum, row by row, each row's experts in the order ITS router
+     * chose them. A row's sum used to follow the block's first-use order, which
+     * depends on the rows that happen to share the block: the same position
+     * came out with different low bits in a 64-row prefill block and in a
+     * one-row resume, so a prompt resumed from a prefix was not the prompt
+     * computed cold. Now a row is a function of its own inputs and nothing else,
+     * whatever the block boundaries. One row (a decode step) adds in the same
+     * order as before: its first-use order IS its routing order. */
+    double t1 = now_s();
+    for (int t = 0; t < n; t++) {
+        float *o = out + (size_t)t * H;
+        for (int q = 0; q < K; q++) {
+            int i = pair[(size_t)t * K + q];
+            const float *yy = y + (size_t)i * H;
+            for (int d = 0; d < H; d++) o[d] += rw[i] * yy[d];
+        }
+    }
+    m->t_expert += now_s() - t1;
+    free(first); free(pair);
     free(xg); free(g); free(u); free(y); free(row); free(rw); free(uni); free(sel); free(wt);
 }
 
@@ -1186,19 +1208,69 @@ static void forward(Model *m, const int *ids, int n, float *logits, int all_rows
     free(h); free(xn); free(tmp);
 }
 
+/* The read-out of a prefill, for the logprobs channel (SUBMIT logprobs=k): one
+ * ECHO frame per prompt position this prefill feeds, in position order, before
+ * any DATA. The logits at position p predict the token at p + 1, so the frame
+ * of a position carries the log-probability of the token that is actually
+ * there, over the whole vocabulary, and not only when it is among the top k:
+ * that is what scores an option the model would never have written.
+ *
+ * The first position fed has no predictor among the rows computed here. On a
+ * cold prompt it is position 0, which has nothing to condition on, and its
+ * frame carries " nan 0". Resumed from a photo, `first` is the photo's own last
+ * logits, which predict exactly that token. There is no third case: a prompt
+ * read out never resumes from a live prefix, because the positions before it
+ * would have no frame at all (see the serve loop).
+ *
+ * This is its own argument and not a mode of something else: it asks for every
+ * row's logits and changes nothing about how the rows are computed. */
+typedef struct {
+    const char *id;
+    int k;
+    Tok *tok;
+    const float *first;
+} Echo;
+
+static void echo_frame(const Echo *e, int pos, int token, const float *lo, int vocab) {
+    char tail[1024], piece[512];
+    coli_logprob_tail(tail, sizeof(tail), lo, vocab, token, e->k);
+    int n = tok_decode(e->tok, &token, 1, piece, (int)sizeof(piece));
+    if (n < 0) n = 0;
+    printf("ECHO %s %d %d%s\n", e->id, n, pos, tail);
+    if (n > 0) fwrite(piece, 1, (size_t)n, stdout);
+    fputc('\n', stdout);
+    fflush(stdout);
+}
+
 /* A prompt in blocks of MIMO_CHUNK rows (default 64): the last block's last
- * row (or every row, for the teacher-forcing dump) comes back in `logits`. */
+ * row (or every row, for the teacher-forcing dump) comes back in `logits`.
+ * With `echo`, every row of every block goes through the head and is read out
+ * as it comes; only one block of logits is ever held, not the prompt's. */
 static void prefill(Model *m, const int *ids, int n, float *logits, float *all_logits,
-                    const ImageRows *img) {
+                    const ImageRows *img, const Echo *echo) {
     int chunk = env_int("MIMO_CHUNK", 64);
     if (chunk < 1) chunk = 1;
-    int used = 0;
+    int used = 0, V = m->c.vocab;
+    float *rows = NULL;
+    if (echo && !all_logits) {
+        rows = xmalloc((size_t)(n < chunk ? n : chunk) * V * sizeof(float), "read-out logits");
+        echo_frame(echo, m->pos, ids[0], echo->first, V);
+    }
     for (int b = 0; b < n; b += chunk) {
         int nb = n - b < chunk ? n - b : chunk;
-        if (all_logits) forward(m, ids + b, nb, all_logits + (size_t)b * m->c.vocab, 1, img, &used);
+        if (all_logits) forward(m, ids + b, nb, all_logits + (size_t)b * V, 1, img, &used);
+        else if (rows) {
+            int p0 = m->pos;
+            forward(m, ids + b, nb, rows, 1, img, &used);
+            for (int t = 0; t < nb; t++) {
+                if (b + t + 1 < n) echo_frame(echo, p0 + t + 1, ids[b + t + 1], rows + (size_t)t * V, V);
+                else if (logits) memcpy(logits, rows + (size_t)t * V, (size_t)V * sizeof(float));
+            }
+        }
         else forward(m, ids + b, nb, b + nb == n ? logits : NULL, 0, img, &used);
     }
-    if (all_logits && logits) memcpy(logits, all_logits + (size_t)(n - 1) * m->c.vocab, (size_t)m->c.vocab * sizeof(float));
+    free(rows);
+    if (all_logits && logits) memcpy(logits, all_logits + (size_t)(n - 1) * V, (size_t)V * sizeof(float));
 }
 
 /* ----------------------------------------------------------------- vision ---- */
@@ -1267,14 +1339,150 @@ static int sample(const float *logits, int vocab, float temperature, float top_p
     return pick;
 }
 
+/* ---------------------------------------------------------------- photos ---- */
+
+/* SUBMIT pin=1: a photo of the state at the end of this prompt, so that the
+ * prompts that begin with it (the options of a closed question) resume from
+ * there instead of computing it again. pin_pool.h keeps several, nested, and
+ * restores the deepest one that is a strict prefix of the new prompt.
+ *
+ * WHAT A LAYER CARRIES BETWEEN TOKENS, and so what the photo must hold:
+ *
+ *   full attention   K/V rows indexed by position. Nothing after the photo
+ *                    writes below it, so they stay where they are, and the
+ *                    photo holds only the token ids; kv_prefix_holds() is what
+ *                    says they are still the photo's rows (an unrelated prompt
+ *                    in between rewrites them from position 0).
+ *   sliding window   a RING of `rows` slots, position p in slot p % rows, and
+ *                    the position each slot holds. Every option overwrites the
+ *                    ring slots of the photo's last positions -- its own token at
+ *                    P lands where P - rows was -- so after one option the ring
+ *                    no longer describes the photo. The ring, keys, values and
+ *                    positions, is copied into the photo and copied back.
+ *   the position     m->pos, which is the photo's length.
+ *
+ * Nothing else carries over: the sinks are weights, the router has no state,
+ * and the expert cache changes the time, never the numbers. On Flash the rings
+ * of the 39 windowed layers are 128 x 8 x (192 + 128) floats each, about 50 MB
+ * a photo, so COLI_PIN_SLOTS (default 4) is what bounds the memory. */
+typedef struct {
+    int n_layers;
+    int rows[MIMO_MAX_LAYERS];               /* 0: a full-attention layer */
+    size_t kd[MIMO_MAX_LAYERS], vd[MIMO_MAX_LAYERS];
+    float *K[MIMO_MAX_LAYERS], *V[MIMO_MAX_LAYERS];
+    int *ring_pos[MIMO_MAX_LAYERS];
+} PinState;
+
+static ColiPinPool g_pins;
+
+static void pin_state_free(void *v) {
+    PinState *st = (PinState *)v;
+    if (!st) return;
+    for (int li = 0; li < st->n_layers; li++) { free(st->K[li]); free(st->V[li]); free(st->ring_pos[li]); }
+    free(st);
+}
+
+/* Copies the rings into `st` (allocated on first use). NULL when memory runs
+ * out: a photo is an optimisation and never the reason a request fails. */
+static PinState *pin_state_save(Model *m, PinState *st) {
+    Cfg *c = &m->c;
+    if (st && st->n_layers != c->n_layers) { pin_state_free(st); st = NULL; }
+    if (!st) {
+        st = calloc(1, sizeof(*st));
+        if (!st) return NULL;
+        st->n_layers = c->n_layers;
+        for (int li = 0; li < c->n_layers; li++) {
+            if (!c->swa[li]) continue;
+            Layer *l = &m->L[li];
+            st->rows[li] = l->rows;
+            st->kd[li] = (size_t)l->rows * c->kv_heads[1] * c->head_dim[1];
+            st->vd[li] = (size_t)l->rows * c->kv_heads[1] * c->v_dim[1];
+            st->K[li] = malloc(st->kd[li] * sizeof(float));
+            st->V[li] = malloc(st->vd[li] * sizeof(float));
+            st->ring_pos[li] = malloc((size_t)l->rows * sizeof(int));
+            if (!st->K[li] || !st->V[li] || !st->ring_pos[li]) { pin_state_free(st); return NULL; }
+        }
+    }
+    for (int li = 0; li < c->n_layers; li++) {
+        if (!st->rows[li]) continue;
+        Layer *l = &m->L[li];
+        memcpy(st->K[li], l->K, st->kd[li] * sizeof(float));
+        memcpy(st->V[li], l->V, st->vd[li] * sizeof(float));
+        memcpy(st->ring_pos[li], l->ring_pos, (size_t)l->rows * sizeof(int));
+    }
+    return st;
+}
+
+static int pin_state_load(Model *m, const PinState *st) {
+    Cfg *c = &m->c;
+    if (!st || st->n_layers != c->n_layers) return 0;
+    for (int li = 0; li < c->n_layers; li++)
+        if (st->rows[li] != (c->swa[li] ? m->L[li].rows : 0)) return 0;
+    for (int li = 0; li < c->n_layers; li++) {
+        if (!st->rows[li]) continue;
+        Layer *l = &m->L[li];
+        memcpy(l->K, st->K[li], st->kd[li] * sizeof(float));
+        memcpy(l->V, st->V[li], st->vd[li] * sizeof(float));
+        memcpy(l->ring_pos, st->ring_pos[li], (size_t)l->rows * sizeof(int));
+    }
+    return 1;
+}
+
+/* Only a request that asks for it takes a photo, and it goes into the pool,
+ * where no other request writes: an ordinary prompt can make a photo stale
+ * (it rewrites the rows the photo stands on), never replace it. */
+static void pin_save(Model *m, const int *ids, int n, const float *logits) {
+    coli_pin_pool_init(&g_pins, m->c.vocab);
+    ColiPin *k = coli_pin_store(&g_pins, ids, n, logits);
+    if (!k) return;
+    PinState *st = pin_state_save(m, (PinState *)k->state);
+    if (!st) { k->state = NULL; k->len = 0; return; }   /* without its rings it would lie */
+    k->state = st;
+    fprintf(stderr, "[PIN] photo of %d tokens\n", n);
+    fflush(stderr);
+}
+
+/* The deepest photo that is a strict prefix of this prompt and whose rows the
+ * state still holds, put back: the rings, the position and the record. Returns
+ * its length and its logits (the predictor of the first fresh token), or 0.
+ * A photo whose rows are gone cannot help any more: it is released, memory and
+ * all, and the next deepest is tried instead of giving up. */
+static int pin_restore(Model *m, const int *ids, int n, const float **logit) {
+    *logit = NULL;
+    int s = coli_pin_best(&g_pins, ids, n);
+    while (s >= 0) {
+        ColiPin *k = &g_pins.slot[s];
+        if (k->logit && kv_prefix_holds(&m->kvp, k->ids, k->len) &&
+            pin_state_load(m, (const PinState *)k->state)) {
+            m->pos = k->len;
+            kv_prefix_clear(&m->kvp);
+            kv_prefix_record(&m->kvp, k->ids, 0, k->len);
+            *logit = k->logit;
+            coli_pin_touch(&g_pins, s);
+            return k->len;
+        }
+        fprintf(stderr, "[PIN] released the photo of %d tokens: the state no longer holds it\n", k->len);
+        k->len = 0;
+        pin_state_free(k->state);
+        k->state = NULL;
+        s = coli_pin_best(&g_pins, ids, n);
+    }
+    return 0;
+}
+
 /* ------------------------------------------------------------------ serve ---- */
 
+/* The 7th numeric field (the byte count of a payload extension) is accepted, but
+ * only as 0: the gateway puts it ahead of the logprobs= key on chat requests, and
+ * this engine takes no grammar, so any other value is still a bad header. */
 static const ColiServeWireProfile mimo_wire = {
     .max_header_bytes = 511,
     .max_payload_bytes = 1u << 26,
+    .max_extension_bytes = 0,
     .max_tokens = 1 << 20,
     .require_exact_lf = 1,
     .require_finite_sampling = 1,
+    .allow_extension_bytes = 1,
 };
 
 static void serve_line(const char *format, ...) {
@@ -1327,12 +1535,14 @@ static void serve_hits(Model *m) {
     free(hex); free(bitmap);
 }
 
-/* max_tokens is a ceiling; generation needs at least one free position */
-static int serve_budget(int prompt, int requested, int context) {
+/* max_tokens is a ceiling; generation needs at least one free position. A
+ * read-only request (max_tokens=0, legal only with logprobs) generates nothing,
+ * so its prompt may fill the context. */
+static int serve_budget(int prompt, int requested, int context, int logprobs) {
     if (prompt < 1 || prompt > context) return -1;
-    int budget = requested > 0 ? requested : 256;
+    int budget = requested > 0 ? requested : (logprobs > 0 ? 0 : 256);
     int room = context - prompt;
-    if (room == 0) return -1;
+    if (budget > 0 && room == 0) return -1;
     return budget < room ? budget : room;
 }
 
@@ -1388,7 +1598,7 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *dir) {
         uint64_t hits0 = m->hits, miss0 = m->miss, fw0 = m->forwards;
         int n_prompt = tok_encode(tokenizer, (const char *)command.payload, (int)command.payload_bytes,
                                   ids, m->ctx + 1);
-        int budget = serve_budget(n_prompt, command.max_tokens, m->ctx);
+        int budget = serve_budget(n_prompt, command.max_tokens, m->ctx, command.logprobs);
         if (budget < 0) {
             char message[160];
             snprintf(message, sizeof(message), "CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d",
@@ -1417,13 +1627,38 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *dir) {
                 continue;
             }
         }
-        /* A chat client resends the whole transcript: if this prompt begins with
-         * the ids the state was built from, only the tail is fed. An image
-         * refuses it -- the pad ids do not describe the picture. */
+        /* Where this prompt starts. A chat client resends the whole transcript:
+         * if this prompt begins with the ids the state was built from, only the
+         * tail is fed (COLI_KV_PREFIX=0 turns that off). A photo (SUBMIT pin=1
+         * earlier) resumes a prompt that begins with it.
+         *
+         * With the read-out on (logprobs=k) only a photo will do. The read-out
+         * owes a frame to every position it does not inherit a predictor for,
+         * and a live prefix comes with none: the frames before it would simply
+         * be missing. So such a prompt resumes from the deepest photo, which
+         * carries the logits that predict its first fresh token, or is read out
+         * from position 0. It resumes at the photo even when the live state
+         * shares more: two options share the text before them, and stopping at
+         * that would leave the first option token without its predictor.
+         *
+         * An image refuses both: the pad ids do not describe the picture. */
         int prefix_on = env_int("COLI_KV_PREFIX", 1) != 0;
-        int reuse = (!pending && prefix_on) ? kv_prefix_reuse(&m->kvp, ids, n_prompt) : 0;
+        int reuse = 0;
+        const float *pin_logit = NULL;
+        if (!pending) {
+            if (command.logprobs > 0) reuse = pin_restore(m, ids, n_prompt, &pin_logit);
+            else {
+                reuse = prefix_on ? kv_prefix_reuse(&m->kvp, ids, n_prompt) : 0;
+                if (!reuse) reuse = pin_restore(m, ids, n_prompt, &pin_logit);
+            }
+        }
         if (getenv("COLI_PREFIX_LOG"))
-            fprintf(stderr, "[PREFIX] %s %d of %d prompt tokens\n", reuse ? "reusing" : "no reuse,", reuse, n_prompt);
+            fprintf(stderr, "[PREFIX] %s %d of %d prompt tokens%s\n", reuse ? "reusing" : "no reuse,", reuse,
+                    n_prompt, pin_logit ? " (photo)" : "");
+        if (pin_logit) {
+            fprintf(stderr, "[PIN] resumed from the photo of %d tokens, %d to prefill\n", reuse, n_prompt - reuse);
+            fflush(stderr);
+        }
         if (!reuse) model_reset(m);
         coli_serve_write_accept(stdout, command.id, n_prompt);
         if (pending) {
@@ -1431,8 +1666,16 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *dir) {
             free(pending); pending = NULL;
         }
         ImageRows img = { image, image_rows };
-        prefill(m, ids + reuse, n_prompt - reuse, logits, NULL, image ? &img : NULL);
-        if (image) { kv_prefix_taint(&m->kvp); free(image); }
+        Echo echo = { command.id, command.logprobs, tokenizer, pin_logit };
+        prefill(m, ids + reuse, n_prompt - reuse, logits, NULL, image ? &img : NULL,
+                command.logprobs > 0 ? &echo : NULL);
+        if (image) kv_prefix_taint(&m->kvp);
+        if (command.pin) {
+            /* a photo is described by its ids, and these do not describe the picture */
+            if (image) fprintf(stderr, "[PIN] no photo: the prompt carries a picture\n");
+            else pin_save(m, ids, n_prompt, logits);
+        }
+        free(image);
         int emitted = 0, limited = 1, cancelled = 0, done_early = 0;
         char piece[512];
         while (emitted < budget && !cancelled && !done_early) {
@@ -1441,7 +1684,14 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *dir) {
             for (int i = 0; i < n_eos; i++) if (token == eos[i]) stop = 1;
             if (stop) { limited = 0; break; }
             int written = tok_decode(tokenizer, &token, 1, piece, (int)sizeof(piece));
-            if (written > 0) coli_serve_write_data(stdout, command.id, piece, (size_t)written);
+            if (written > 0) {
+                if (command.logprobs > 0) {
+                    /* the distribution the token was drawn from: sample() only reads it */
+                    char tail[1024];
+                    coli_logprob_tail(tail, sizeof(tail), logits, c->vocab, token, command.logprobs);
+                    coli_serve_write_data_lp(stdout, command.id, piece, (size_t)written, tail);
+                } else coli_serve_write_data(stdout, command.id, piece, (size_t)written);
+            }
             emitted++;
             while (coli_serve_stdin_ready()) {
                 ColiServeCommand control;
@@ -1453,7 +1703,7 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *dir) {
                 coli_serve_command_dispose(&control);
             }
             if (cancelled || done_early || emitted >= budget) break;
-            prefill(m, &token, 1, logits, NULL, NULL);
+            prefill(m, &token, 1, logits, NULL, NULL, NULL);
         }
         if (cancelled) {
             coli_serve_write_error(stdout, command.id, "CANCELLED");
@@ -1610,7 +1860,7 @@ int main(int argc, char **argv) {
     }
     ImageRows img = { image, image_rows };
     double tp = now_s();
-    prefill(m, ids, n, logits, all, image ? &img : NULL);
+    prefill(m, ids, n, logits, all, image ? &img : NULL, NULL);
     double prefill_s = now_s() - tp;
     if (dump) {
         FILE *f = fopen(dump, "wb");
@@ -1635,7 +1885,7 @@ int main(int argc, char **argv) {
         fflush(stdout);
         produced++;
         if (stop && have_tok && !ids_text) break;
-        if (g + 1 < ngen) prefill(m, &token, 1, logits, NULL, NULL);
+        if (g + 1 < ngen) prefill(m, &token, 1, logits, NULL, NULL, NULL);
     }
     printf("\n");
     fflush(stdout);

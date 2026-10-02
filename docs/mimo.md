@@ -94,6 +94,43 @@ first. `coli chat` starts with thinking off, because at about 1 tok/s the templa
 default reasoning is minutes of tokens before the answer; `coli chat --think` turns it
 on (the web has its own reasoning toggle).
 
+## Brio mode and prompt reuse
+
+[Brio mode](brio.md) works on MiMo as on the other engines. `POST /v1/brio` scores a
+closed set of options instead of generating, and `logprobs` on `/v1/chat/completions` and
+`/v1/completions` (with `echo`) is served too. What is particular to MiMo is what a
+snapshot (`SUBMIT pin=1`) has to hold:
+
+- the **9 full-attention layers** keep their K/V rows by position, and nothing after the
+  snapshot writes below it, so they stay in place. The snapshot holds the token ids, and
+  the engine checks that the state still holds them before resuming. A prompt that
+  diverged in between has rewritten them, and the snapshot is released;
+- the **39 sliding-window layers** keep a ring of 128 slots, position p in slot p mod 128,
+  with the position each slot holds. The first option overwrites the slots of the
+  snapshot's last positions, so the ring is copied into the snapshot and back: about
+  50 MB per snapshot on Flash (39 x 128 x 8 heads x (192 + 128) floats), bounded by
+  `COLI_PIN_SLOTS` (default 4);
+- the position, which is the snapshot's length. Nothing else carries over from one
+  token to the next: the sinks are weights and the router has no state.
+
+A prompt with a picture takes no snapshot and resumes from nothing, neither a snapshot
+nor the previous turn's state: its ids do not describe the image.
+
+A read-out (`logprobs=k`) resumes only from a snapshot, whose saved logits predict the
+first fresh token. With no snapshot it reads every position from 0, the first one
+carrying `nan`. It never resumes from the live state of the previous turn, because the
+positions before it would have no frame. A chat turn without `logprobs` keeps the
+ordinary prefix reuse.
+
+Resuming is exact to the bit, and that needed one change to the forward. The MoE output
+of a row used to be summed in the order its experts first appeared **in the prefill
+block**, which depends on the other rows of the block. The same position came out with
+different low bits in a 64-row block than in a one-row resume, up to 1.2e-4 on the
+fixture's logits. Each row's experts are now added in the order its own router chose
+them, so a row depends on its own inputs only. A decode step adds in the same order as
+before. A prefill now gives the bits that feeding the prompt one token at a time always
+gave.
+
 ## Correctness
 
 `make -C c mimo-tiny-check` generates a tiny checkpoint (numpy, deterministic) stored
@@ -102,7 +139,16 @@ Xiaomi's own `modeling_mimo_v2.py` (vendor files pinned by SHA-256,
 `tools/make_mimo_ref.py`): greedy and teacher-forced, with and without a picture,
 every exact configuration of the engine (native dense, an expert cache that evicts
 at every layer, prefill in blocks of 1 and 3), and checks that corrupting an expert
-scale, the qkv scale grid or the picture changes the answer. The gateway's patches
+scale, the qkv scale grid or the picture changes the answer. It also requires the logits
+to be the same **bytes** whatever the prefill blocks and the expert cache, text and
+picture: that is what lets a prompt resumed from a prefix or a snapshot equal the same
+prompt computed cold.
+
+`make -C c mimo-tiny-serve-check` serves the same fixture and compares against a cold
+engine, frame by frame: prefix reuse across turns, Brio options that slide the window
+past the snapshot, nested snapshots and a sibling question, a snapshot made stale by an
+unrelated prompt, prompts with a picture, and `/v1/brio` and chat logprobs through the
+gateway. Every option must process only its own tokens. The gateway's patches
 match the official Qwen2-VL processor bit for bit on the fixture's picture.
 
 On the real checkpoint, `tools/mimo_real_check.py` builds Xiaomi's model from the
