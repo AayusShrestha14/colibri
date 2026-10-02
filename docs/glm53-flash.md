@@ -101,7 +101,7 @@ That is also why the Vulkan path is offered for machines with enough VRAM to
 hold experts rather than as an accelerator here.
 
 **Vulkan.** In a `make VK=1 glm53` build, `COLI_VULKAN=1` gives the routed experts
-the shared expert tier (`c/vk_tier.c`, the one qwen36, qwen38 and GLM-5.2 use): a
+the shared expert tier (`c/vk_tier.c`, the one every MoE engine uses): a
 budget of experts kept on the device, warm from the history (`.coli_usage`) at
 startup and adapting while you chat, so a hot expert is neither read from disk nor
 computed by the CPU. Each MoE step sends the resident experts' rows to the device as
