@@ -137,6 +137,74 @@ memory, which is also why MiMo's expert tier never evicts.
 count is above zero. That proves correctness, not speed. None of these engines has
 been measured on a real GPU yet.
 
+## Prefill: the tiled GEMMs
+
+`qmatmul.comp` is a GEMV per activation row: at S rows every weight is fetched and
+decoded S times, which holds a Radeon 780M at 80 GFLOP/s whatever S is. From S = 2,
+`coli_vk_matmul` (the resident-matrix path of every engine) takes a tiled GEMM
+instead, so the API and the callers are unchanged:
+
+- `qmatmul_gemm.comp`, fp32, every format: a workgroup owns a BM-output x BN-row tile
+  of y, decodes its weight rows into shared memory once per 32-input step and runs
+  them against BN activation rows staged beside them, a TM x TN block per thread.
+  Group scales fold into the decoded weight; each step sums into a fresh partial
+  (blocked summation), which keeps the error at the GEMV's level.
+- `qmatmul_coop.comp`, where the device has `VK_KHR_cooperative_matrix` with a
+  16x16x16 fp16 x fp16 -> fp32 subgroup shape and a settable subgroup size: the
+  formats whose weights decode exactly to fp16 (int8, int4, int3-g64, MXFP4, fp8;
+  grouped ones with gs % 32 == 0). Nothing is rounded to fp16: each activation row is
+  scaled by a power of two the host computes during the upload, split into an fp16
+  high part (top 11 bits) and an fp16 low part, and the MMA runs on both; every
+  16-input product then joins fp32 accumulators, times the group scale. The harness
+  holds it to the fp32 GEMM's bound.
+- Each shader is built at a few tile widths (BN 32 for a 32-row prefill chunk, 64,
+  128); a call takes the narrowest that covers its S. The threshold, measured on the
+  780M: S >= 2 and S*O >= 4096 (a 48-output matrix stays on the GEMV up to S = 32).
+  `COLI_VK_GEMM_MIN_S` overrides it, `COLI_VK_COOP=0` keeps the fp32 GEMM.
+
+Measured on a Radeon 780M (RDNA3, RADV, Mesa 26.0) sharing DDR5 with a Ryzen 7 PRO
+8700GE, `OMP_NUM_THREADS=8`. One matrix, I = 2560, O = 6144, S = 512, back to back
+(the harness, `COLI_VK_TEST_GEMM_BENCH=1`; the CPU column is the kernel an engine
+runs for that storage, `-march=native`):
+
+| fmt | GEMV | tiled GEMM (fp32) | cooperative matrix | CPU, 8 threads |
+|---|---|---|---|---|
+| 1 int8 | 82 GFLOP/s | 1431 | 1909 | 841 (int8 activations, VNNI) |
+| 2 int4 | 104 | 1486 | 2164 | 224 |
+| 4 int4-g64 | 86 | 1406 | 2026 | 488 (int8 activations, VNNI) |
+| 5 int3-g64 | 86 | 1441 | 2039 | 125 |
+| 7 MXFP4 | 64 | 1390 | 1928 | 199 |
+| 10 f32 | 29 | 948 | | 224 |
+| 11 bf16 | 51 | 1222 | | 25 |
+| 12 fp8 | 43 | 1259 | 1735 | 33 |
+
+End to end, prefill of 512 tokens (`N_NEW=1`, cold page cache, same binaries):
+
+| | CPU | Vulkan, GEMV | Vulkan, tiled GEMM |
+|---|---|---|---|
+| Qwen3.8 Flash Next (int8 trunk, bf16) | 50.7 s | 111.1 s | 53.8 s |
+| same, `Q38_PREFILL_BATCH_ROWS=512` | 44.7 s | | 44.3 s |
+| Qwen3.6-35B-A3B (int8 dense) | 40.9 s | 62.0 s | 56.3 s |
+
+On this APU the GEMM brings Qwen3.8's Vulkan prefill from 111 s to the CPU's
+level: level with it with 512-row prefill chunks (44.3 against 44.7 s), 6% behind
+at the default 32-row chunks; the generated token is the CPU's on both models.
+`VK_PROF=1` shows where the time goes. Qwen3.8 at the default chunks spends 8.4 s in
+resident matmuls on the device against the CPU's 6.5 s: 6.8 s in 5,052
+cooperative-matrix GEMMs (the DeltaNet projections at S = 32, 3.1 s; shared experts
+and router, 1.7 s; attention and gated residuals at S = 512, 2.0 s) and 1.6 s in
+2,273 GEMVs (1,024 one-token PLE projections, 0.86 s; matrices too narrow for the
+GEMM, 0.7 s). Two things measured there hold it at parity:
+- A clock stuck at 800 MHz. The engines call the device synchronously, one matrix
+  at a time between CPU phases, and with `power_dpm_force_performance_level=auto`
+  the GPU stays at its 800 MHz floor through those millisecond bursts (over 97% of
+  the samples during the Qwen3.8 runs): a GEMM that takes 1.1 ms back to back takes
+  2.3 ms after a 3 ms CPU gap. Fewer, larger calls (512-row chunks) are what lift
+  it to parity.
+- Per-token calls. Qwen3.6 without the CUDA tier projects its DeltaNet inputs one
+  token at a time (`deltanet()` in qwen36.c): 46,081 of its 46,281 device matmuls
+  are S = 1 and stay on the GEMV (20 s of its 56).
+
 ## Correctness
 
 - `gcc -O3 -DVK_TEST backend_vulkan.c -o test_vk -lvulkan -lm && ./test_vk
@@ -144,7 +212,10 @@ been measured on a real GPU yet.
   primitive (GEMV int4/int8 across shapes incl. the long-row o-projection,
   fused gate+up, the full expert group sync and async, the matmul pair, and
   the absorb attention core incl. causal S=2, kv_start windows, int8, and
-  long-context cases). Typical maxrel ~1e-5..2e-3 (fp32 reduction order).
+  long-context cases), and both tiled GEMMs for every weight format at S = 16, 64
+  and 512 with odd I and O, tail groups and odd group sizes; a GEMM case fails if the
+  call did not take the GEMM it names. Typical maxrel ~1e-5..2e-3 (fp32 reduction
+  order). `COLI_VK_TEST_MATMUL_ONLY=1` stops after the GEMV and GEMM format cases.
 - Engine-level: greedy decode with the full stack matches the pure-CPU
   engine token-for-token on the validation prompt.
 - int4 weights decode as offset-binary (nibble−8), byte-identical layout to
@@ -200,6 +271,6 @@ hit-rate line is the tier-effectiveness number.
   uses the CPU/batched paths (dense projections do run on VK at prefill).
 - DSA top-k selection, ragged multi-slot serving, and quantized-KV caches
   fall back to the CPU attention path.
-- Not yet done: cooperative-matrix (coopmat) prefill kernels, a fully
-  resident-layer pipeline, Polaris/gfx803 validation on real hardware (the
-  shaders use dynamic subgroup sizes and are wave64-safe by construction).
+- Not yet done: a fully resident-layer pipeline, Polaris/gfx803 validation on real
+  hardware (the shaders use dynamic subgroup sizes and are wave64-safe by
+  construction). The cooperative-matrix GEMM is measured on RDNA3 only.
