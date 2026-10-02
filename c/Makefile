@@ -1285,6 +1285,14 @@ laya-tiny-generate:
 laya-tiny-check: laya-tiny-generate laya$(EXE)
 	LAYA_TINY_REQUIRED=1 $(PYTHON) -m unittest -v tests.test_laya_tiny tests.test_decision_serve
 
+# TypeSafe's own SDKs (Python and TypeScript), unmodified, against `coli serve`
+# on a language model (tiny MiMo) and a decision engine (tiny Laya): switching
+# from Jev is a base-URL change. Needs the pinned SDKs first:
+#   pip install -r tools/requirements-jev-sdk.txt && (cd tools/jev-sdk && npm ci)
+.PHONY: jev-sdk-check
+jev-sdk-check: mimo$(EXE) laya$(EXE) mimo-tiny-generate laya-tiny-generate
+	JEV_SDK_REQUIRED=1 $(PYTHON) -m unittest -v tests.test_jev_sdk
+
 # In make check: every format and ragged edges against the naive product, and
 # the int8 x int8 VNNI path against the exact integer sum.
 tests/test_qi_gemm$(EXE): tests/test_qi_gemm.c

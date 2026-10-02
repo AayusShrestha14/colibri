@@ -4962,7 +4962,7 @@ def systemone_decision_record(body):
                         "text": None if text is None or text == "" else decision_text(text)}
                        for label, text in criteria.items()]
         elif kind == "score":
-            options = [{"label": str(i + 1), "text": decision_text(text)}
+            options = [{"label": str(i), "text": decision_text(text)}
                        for i, text in enumerate(criteria)]
         else:
             given = {str(key).lower(): text for key, text in (criteria or {}).items()}
@@ -5845,6 +5845,17 @@ class APIServer(ThreadingHTTPServer):
             entry["capabilities"] = ["decision"]
         return entry
 
+    def jev_model_card(self):
+        """The served model as Jev's GET /v1/models lists it. colibri does not know a
+        model's release date; it gives the day this server started."""
+        try:
+            name = family_by_id(ARCH).display_name
+        except Exception:
+            name = self.model_id
+        return {"name": self.model_id,
+                "description": f"{name}, served by colibri; POST /v1/systemone answers typed questions.",
+                "release_date": time.strftime("%Y-%m-%d", time.gmtime(self.created))}
+
     def input_modalities(self):
         """What a request to this server may carry: text, plus image when BOTH the
         family has a placeholder expansion and the engine said it loaded its tower.
@@ -6072,6 +6083,8 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         if request_id:
             self.send_header("x-request-id", request_id)
+            # what the TypeSafe SDKs read as `request_id` (an error carries it too)
+            self.send_header("x-typesafe-request-id", request_id)
         for name, value in (headers or {}).items():
             self.send_header(name, value)
         self.send_cors_headers()
@@ -6084,9 +6097,10 @@ class APIHandler(BaseHTTPRequestHandler):
             return
         self.send_header("Access-Control-Allow-Origin", "*" if "*" in self.server.cors_origins else origin)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, x-api-key, anthropic-version")
+        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, x-api-key, anthropic-version, "
+                         "X-TypeSafe-SDK, X-TypeSafe-Runtime, X-TypeSafe-Retry-Count")
         self.send_header("Access-Control-Expose-Headers",
-                         "x-request-id, x-colibri-queue-wait-ms, Retry-After")
+                         "x-request-id, x-typesafe-request-id, x-colibri-queue-wait-ms, Retry-After")
         self.send_header("Access-Control-Max-Age", "600")
         if "*" not in self.server.cors_origins:
             self.send_header("Vary", "Origin")
@@ -6283,7 +6297,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 return
             self.require_auth()
             if path == "/v1/models":
-                self.send_json(200, {"object": "list", "data": [self.server.model_entry()]},
+                # `data` is OpenAI's list; `models` is Jev's (name, description,
+                # release_date), which the TypeSafe SDKs' models.list() reads.
+                self.send_json(200, {"object": "list", "data": [self.server.model_entry()],
+                                     "models": [self.server.jev_model_card()]},
                                request_id)
             elif path.startswith("/v1/models/") and unquote(path[11:]) == self.server.model_id:
                 self.send_json(200, self.server.model_entry(), request_id)
@@ -6479,7 +6496,7 @@ class APIHandler(BaseHTTPRequestHandler):
             state = "\n".join(parts)
         if not state and not question and form == "options":
             raise APIError(400, "Provide `state`, `messages` or `question`.", "state")
-        if not state and form != "options":
+        if not state and form != "options" and not body.get("_empty_state_ok"):
             raise APIError(400, f"`{form}` needs a `state` (or `messages`) to decide on.", "state")
         # "sum" (the joint log-probability of the option as a continuation)
         # is the default: "mean" compares per-token averages, which silently
@@ -6688,16 +6705,24 @@ class APIHandler(BaseHTTPRequestHandler):
     @staticmethod
     def _systemone_confidence(probabilities):
         """(n * peak - 1) / (n - 1): 1 when all the mass is on one label, 0 when flat."""
-        values = list(probabilities)
+        values = [float(v) for v in probabilities]
         n = len(values)
         if n < 2:
             return 1.0
         return round(max(0.0, (n * max(values) - 1.0) / (n - 1)), 6)
 
+    @staticmethod
+    def _systemone_legend(value, index):
+        """A score level as the reply's `legend` gives it back: the criterion the
+        caller sent (text, object or array), or `level <n>` for one sent as null."""
+        return value if isinstance(value, (str, dict, list)) else f"level {index}"
+
     def systemone(self, body, request_id):
-        state = self._systemone_text(body.get("state"), "state")
-        if state is None:
+        if body.get("state") is None:
             raise APIError(422, "`state` is required: the content the questions are about.", "state")
+        # Text, an object or an array; an empty text is a state with nothing in it,
+        # which the Jev schema allows, and the questions are asked without context.
+        state = self._systemone_text(body.get("state"), "state")
         raw = body.get("questions")
         if not isinstance(raw, dict) or not raw:
             raise APIError(422, "`questions` must be a non-empty object of id: question.", "questions")
@@ -6740,47 +6765,70 @@ class APIHandler(BaseHTTPRequestHandler):
                     labels.append(label)
                     text = self._systemone_text(description, f"{where}.criteria.{label}")
                     lines.append(f"- {label}: {text}" if text else f"- {label}")
-                if len(labels) < 2:
-                    raise APIError(422, f"`{where}.criteria` needs at least two labels.", f"{where}.criteria")
                 text = (instructions or "Which of the following applies?") + "\nOptions:\n" + "\n".join(lines)
                 plan.append((qid, "choice", text + "\nAnswer with one of the options.", labels, None))
             elif kind == "score":
-                if not isinstance(criteria, list) or not 2 <= len(criteria) <= 10:
-                    raise APIError(422, f"`{where}.criteria` must be an array of 2 to 10 level descriptions.",
+                # Jev numbers the levels from zero, in the order given (its OpenAPI
+                # schema: "Each description's position determines its score,
+                # starting at zero"). The model reads them as 1..n, the numbering a
+                # rubric is usually written in, and the reply maps them back.
+                if not isinstance(criteria, list) or not 1 <= len(criteria) <= 255:
+                    raise APIError(422, f"`{where}.criteria` must be an array of 1 to 255 level descriptions.",
                                    f"{where}.criteria")
-                levels = [self._systemone_text(c, f"{where}.criteria[{i}]") or f"level {i + 1}"
+                levels = [self._systemone_text(c, f"{where}.criteria[{i}]") or f"level {i}"
                           for i, c in enumerate(criteria)]
                 text = (instructions or "Rate this on the scale below.") + "\nScale:\n" + \
                     "\n".join(f"{i + 1}: {d}" for i, d in enumerate(levels))
                 plan.append((qid, "score", text + "\nAnswer with the number.",
-                             [str(i + 1) for i in range(len(levels))], levels))
+                             [str(i + 1) for i in range(len(levels))],
+                             [self._systemone_legend(c, i) for i, c in enumerate(criteria)]))
             else:
                 raise APIError(422, f"`{where}.type` must be \"noul\", \"choice\" or \"score\".", f"{where}.type")
         if engine_decides(self.server.engine):
             self._systemone_decide(body, plan, request_id)
             return
-        inner = {"state": state, "_max_options": 255,
-                 "questions": [{"question": text, "options": options} for _, _, text, options, _ in plan]}
-        result = self.brio(inner, request_id, send=False)
+        # A question with one option has its answer already: nothing to score.
+        asked = [entry for entry in plan if len(entry[3]) > 1]
+        result = {"answers": [], "usage": {"prompt_tokens": 0, "read_tokens": 0}}
+        if asked:
+            inner = {"state": state or "", "_max_options": 255, "_empty_state_ok": True,
+                     "questions": [{"question": text, "options": options}
+                                   for _, _, text, options, _ in asked]}
+            result = self.brio(inner, request_id, send=False)
+        scored = iter(result["answers"])
         answers = {}
-        for (qid, kind, _, options, levels), got in zip(plan, result["answers"]):
-            p = {c["option"]: c["p"] for c in got["choices"]}
+        for qid, kind, _, options, levels in plan:
+            if len(options) > 1:
+                got = next(scored)
+                p = {c["option"]: c["p"] for c in got["choices"]}
+            else:
+                p = {options[0]: 1.0}
             if kind == "noul":
-                answers[qid] = {"type": "noul", "noul": round(p.get("yes", 0.0), 6)}
+                answers[qid] = {"type": "noul", "noul": round(float(p.get("yes", 0.0)), 6)}
             elif kind == "choice":
-                answers[qid] = {"type": "choice", "choice": got["answer"],
-                                "probabilities": {o: round(p[o], 6) for o in options},
+                answers[qid] = {"type": "choice", "choice": max(options, key=lambda o: p[o]),
+                                "probabilities": {o: round(float(p[o]), 6) for o in options},
                                 "confidence": self._systemone_confidence(p.values())}
             else:
+                values = [float(p[o]) for o in options]
                 answers[qid] = {"type": "score",
-                                "score": round(sum(int(k) * v for k, v in p.items()), 6),
-                                "legend": {str(i + 1): d for i, d in enumerate(levels)},
-                                "probabilities": {o: round(p[o], 6) for o in options},
-                                "confidence": self._systemone_confidence(p.values())}
-        reply = {"model": self.server.model_id, "answers": answers,
-                 "usage": {"input_tokens": result["usage"]["prompt_tokens"],
-                           "output_tokens": result["usage"]["read_tokens"]}}
-        self.send_json(200, reply, request_id, result.get("_headers"))
+                                "score": round(sum(i * v for i, v in enumerate(values)), 6),
+                                "legend": {str(i): legend for i, legend in enumerate(levels)},
+                                "probabilities": {str(i): round(v, 6) for i, v in enumerate(values)},
+                                "confidence": self._systemone_confidence(values)}
+        self.send_json(200, self._systemone_reply(answers, request_id,
+                                                  result["usage"]["prompt_tokens"],
+                                                  result["usage"]["read_tokens"]),
+                       request_id, result.get("_headers"))
+
+    def _systemone_reply(self, answers, request_id, input_tokens, output_tokens):
+        """The reply both paths send, in the Jev shape: `model` is the served
+        model, `provider` says who answered, and `usage.cost` is what this server
+        charges, nothing."""
+        return {"id": request_id, "model": self.server.model_id, "provider": "colibri",
+                "answers": answers,
+                "usage": {"input_tokens": int(input_tokens), "output_tokens": int(output_tokens),
+                          "cost": 0}}
 
     def _systemone_decide(self, body, plan, request_id):
         """The native path: the request as one DECIDE record, the engine's
@@ -6812,21 +6860,19 @@ class APIHandler(BaseHTTPRequestHandler):
                                None, "engine_error", "server_error")
             best = max(range(n), key=lambda i: (probs[i], -i))
             if kind == "noul":
-                answers[qid] = {"type": "noul", "noul": round(probs[1], 6)}
+                answers[qid] = {"type": "noul", "noul": round(float(probs[1]), 6)}
             elif kind == "choice":
                 labels = [option["label"] for option in question["options"]]
                 answers[qid] = {"type": "choice", "choice": labels[best],
-                                "probabilities": {label: round(p, 6) for label, p in zip(labels, probs)},
+                                "probabilities": {label: round(float(p), 6) for label, p in zip(labels, probs)},
                                 "confidence": self._systemone_confidence(probs)}
             else:
                 answers[qid] = {"type": "score",
-                                "score": round(sum((i + 1) * p for i, p in enumerate(probs)), 6),
-                                "legend": {str(i + 1): d for i, d in enumerate(levels)},
-                                "probabilities": {str(i + 1): round(p, 6) for i, p in enumerate(probs)},
+                                "score": round(sum(i * float(p) for i, p in enumerate(probs)), 6),
+                                "legend": {str(i): legend for i, legend in enumerate(levels)},
+                                "probabilities": {str(i): round(float(p), 6) for i, p in enumerate(probs)},
                                 "confidence": self._systemone_confidence(probs)}
-        reply = {"model": self.server.model_id, "answers": answers,
-                 "usage": {"input_tokens": int(decision.get("input_tokens") or 0),
-                           "output_tokens": 0}}
+        reply = self._systemone_reply(answers, request_id, decision.get("input_tokens") or 0, 0)
         headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000)),
                    "x-colibri-elapsed-ms": str(round((time.time() - started) * 1000))}
         engine_ms = decision.get("engine_ms")
@@ -7027,8 +7073,21 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_json(error.status, self.error_body(error), request_id, error.headers)
 
     def error_body(self, error):
-        """Anthropic clients parse a different error envelope; the OpenAI one is unchanged."""
-        if urlsplit(self.path).path != "/v1/messages":
+        """Anthropic clients parse a different error envelope; the OpenAI one is unchanged.
+        A /v1/systemone validation error also carries Jev's `detail` list (FastAPI's
+        form: loc, msg, type), which a client written for Jev may read."""
+        path = urlsplit(self.path).path
+        if path == "/v1/systemone" and error.status == 422:
+            body = error_object(error)
+            loc = ["body"]
+            for part in re.split(r"\.(?![^\[]*\])", error.param or ""):
+                match = re.fullmatch(r"(.*?)((?:\[\d+\])*)", part)
+                if match.group(1):
+                    loc.append(match.group(1))
+                loc.extend(int(i) for i in re.findall(r"\[(\d+)\]", match.group(2)))
+            body["detail"] = [{"loc": loc, "msg": error.message, "type": "value_error"}]
+            return body
+        if path != "/v1/messages":
             return error_object(error)
         return {"type": "error", "error": {"type": error.error_type, "message": error.message}}
 

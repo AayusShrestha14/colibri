@@ -108,20 +108,63 @@ class SystemOneApi(unittest.TestCase):
         self.assertIn("- a\n- b", self.pins()[1])
 
     def test_score_expected_value_legend_and_confidence(self):
+        # Jev numbers the levels from zero ("Each description's position determines
+        # its score, starting at zero", its OpenAPI schema); the model reads 1..n.
         self.serve({"4": -0.1, "1": -5.0, "2": -5.0, "3": -5.0, "5": -5.0})
         levels = ["not urgent", "low", "moderate", "high", "critical"]
         out = self.post({"model": "jev-latest", "state": STATE, "questions": {
             "urgency": {"type": "score", "instructions": "How urgent is this?", "criteria": levels}}})
         answer = out["answers"]["urgency"]
         self.assertEqual(answer["type"], "score")
-        self.assertEqual(answer["legend"], {str(i + 1): d for i, d in enumerate(levels)})
-        self.assertEqual(list(answer["probabilities"]), ["1", "2", "3", "4", "5"])
+        self.assertEqual(answer["legend"], {str(i): d for i, d in enumerate(levels)})
+        self.assertEqual(list(answer["probabilities"]), ["0", "1", "2", "3", "4"])
         ps = answer["probabilities"]
         self.assertAlmostEqual(sum(ps.values()), 1.0, places=5)
         self.assertAlmostEqual(answer["score"], sum(int(k) * v for k, v in ps.items()), places=5)
-        self.assertGreater(answer["score"], 3.9)             # the mass sits on level 4
+        self.assertGreater(answer["score"], 2.9)             # the mass sits on level 3, "high"
         self.assertAlmostEqual(answer["confidence"], confidence(list(ps.values())), places=5)
         self.assertIn("4: high", self.pins()[1])
+
+    def test_legend_gives_back_the_criteria_as_sent(self):
+        self.serve({"1": -0.1, "2": -3.0})
+        rubric = [{"level": "calm", "examples": ["thanks"]}, "angry"]
+        out = self.post({"model": "jev-latest", "state": STATE, "questions": {
+            "tone": {"type": "score", "criteria": rubric}}})
+        self.assertEqual(out["answers"]["tone"]["legend"], {"0": rubric[0], "1": "angry"})
+
+    def test_reply_carries_the_fields_the_jev_sdks_read(self):
+        self.serve({"yes": -0.1, "no": -2.0})
+        request = Request(self.base + "/v1/systemone",
+                          data=json.dumps({"model": "jev-latest", "state": STATE, "questions": {
+                              "q": {"type": "noul", "instructions": "Urgent?"}}}).encode(),
+                          headers={"Content-Type": "application/json"})
+        with urlopen(request, timeout=10) as response:
+            out = json.loads(response.read())
+            request_id = response.headers["x-typesafe-request-id"]
+        self.assertEqual(out["id"], request_id)
+        self.assertTrue(request_id.startswith("req_"))
+        self.assertEqual(out["provider"], "colibri")
+        self.assertEqual(out["model"], "test-model")
+        self.assertEqual(out["usage"]["cost"], 0)
+        self.assertIsInstance(out["answers"]["q"]["noul"], float)
+
+    def test_one_label_or_one_level_is_answered_without_the_engine(self):
+        self.serve({"yes": -0.1, "no": -2.0})
+        out = self.post({"model": "jev-latest", "state": STATE, "questions": {
+            "only": {"type": "choice", "criteria": {"billing": "payments"}},
+            "flat": {"type": "score", "criteria": ["the one level"]}}})
+        self.assertEqual(out["answers"]["only"], {"type": "choice", "choice": "billing",
+                                                  "probabilities": {"billing": 1.0}, "confidence": 1.0})
+        self.assertEqual(out["answers"]["flat"]["probabilities"], {"0": 1.0})
+        self.assertEqual(out["answers"]["flat"]["score"], 0.0)
+        self.assertEqual(self.engine.calls, [])
+
+    def test_an_empty_text_state_is_a_state(self):
+        self.serve({"yes": -0.1, "no": -2.0})
+        out = self.post({"model": "jev-latest", "state": "", "questions": {
+            "q": {"type": "noul", "instructions": "Is there anything here?"}}})
+        self.assertIn("noul", out["answers"]["q"])
+        self.assertFalse(any(c["prompt"].startswith("Context:") for c in self.engine.calls))
 
     def test_structured_state_and_instructions_are_serialized(self):
         self.serve({"yes": -0.1, "no": -2.0})
@@ -144,7 +187,7 @@ class SystemOneApi(unittest.TestCase):
         pins = self.pins()
         self.assertEqual(len(pins), 4, pins)               # the state, then each question once
         self.assertEqual(pins[0], f"Context:\n{STATE}\n\n")
-        self.assertEqual(set(out["usage"]), {"input_tokens", "output_tokens"})
+        self.assertEqual(set(out["usage"]), {"input_tokens", "output_tokens", "cost"})
         self.assertGreater(out["usage"]["input_tokens"], 0)
         self.assertGreater(out["usage"]["output_tokens"], 0)
 
@@ -161,11 +204,30 @@ class SystemOneApi(unittest.TestCase):
                                       "questions": {"q": {"type": "choice", "criteria": ["a", "b"]}}})
         self.assertEqual(code, 422)
         code, body = self.post_error({"model": "jev-latest", "state": STATE,
-                                      "questions": {"q": {"type": "score", "criteria": ["only one"]}}})
+                                      "questions": {"q": {"type": "score", "criteria": []}}})
         self.assertEqual(code, 422)
-        self.assertIn("2 to 10", body["error"]["message"])
+        self.assertIn("1 to 255", body["error"]["message"])
         code, body = self.post_error({"model": "jev-latest", "state": STATE, "questions": []})
         self.assertEqual(code, 422)
+
+    def test_validation_errors_carry_jevs_detail_list(self):
+        self.serve({})
+        code, body = self.post_error({"model": "jev-latest", "state": STATE, "questions": {
+            "q": {"type": "score", "criteria": ["fine", 3]}}})
+        self.assertEqual(code, 422)
+        self.assertEqual(body["error"]["param"], "questions.q.criteria[1]")
+        self.assertEqual(body["detail"], [{"loc": ["body", "questions", "q", "criteria", 1],
+                                           "msg": body["error"]["message"], "type": "value_error"}])
+
+    def test_models_lists_the_jev_card_beside_the_openai_one(self):
+        self.serve({})
+        with urlopen(self.base + "/v1/models", timeout=10) as response:
+            listing = json.loads(response.read())
+        self.assertEqual(listing["data"][0]["id"], "test-model")
+        card = listing["models"][0]
+        self.assertEqual(set(card), {"name", "description", "release_date"})
+        self.assertEqual(card["name"], "test-model")
+        self.assertRegex(card["release_date"], r"^\d{4}-\d{2}-\d{2}$")
 
     def test_brio_route_still_checks_the_model_name(self):
         self.serve({"a": -0.1, "b": -1.0})

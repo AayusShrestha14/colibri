@@ -202,11 +202,12 @@ class DecisionGateway(unittest.TestCase):
         self.assertAlmostEqual(department["confidence"], (4 * 0.7 - 1) / 3, places=6)
         urgency = out["answers"]["urgency"]
         self.assertEqual(set(urgency), {"type", "score", "legend", "probabilities", "confidence"})
-        self.assertEqual(urgency["legend"], {"1": "not urgent", "2": "soon",
-                                             "3": "critical deadline or blocking issue"})
-        self.assertEqual(list(urgency["probabilities"]), ["1", "2", "3"])
-        self.assertAlmostEqual(urgency["score"], 1 * 0.2 + 2 * 0.3 + 3 * 0.5, places=6)
-        self.assertEqual(out["usage"], {"input_tokens": 40, "output_tokens": 0})
+        self.assertEqual(urgency["legend"], {"0": "not urgent", "1": "soon",
+                                             "2": "critical deadline or blocking issue"})
+        self.assertEqual(list(urgency["probabilities"]), ["0", "1", "2"])
+        self.assertAlmostEqual(urgency["score"], 0 * 0.2 + 1 * 0.3 + 2 * 0.5, places=6)
+        self.assertEqual(out["usage"], {"input_tokens": 40, "output_tokens": 0, "cost": 0})
+        self.assertEqual(out["provider"], "colibri")
         self.assertEqual(headers["x-colibri-engine-ms"], "12.5")
 
     def test_the_record_carries_what_the_reference_reads(self):
@@ -232,8 +233,8 @@ class DecisionGateway(unittest.TestCase):
         self.assertEqual(c["instructions"], "  Which?  ")                  # exactly as sent
         self.assertEqual(c["options"], [{"label": "a", "text": None},
                                         {"label": "b", "text": '{"desc": "structured"}'}])
-        self.assertEqual(s["options"], [{"label": "1", "text": "low"},
-                                        {"label": "2", "text": '{"n": 2}'}])
+        self.assertEqual(s["options"], [{"label": "0", "text": "low"},
+                                        {"label": "1", "text": '{"n": 2}'}])
         self.assertEqual(s["instructions"], "Rate this on the scale below.")
         self.assertEqual(d["instructions"], "Is this true?")
 
@@ -271,7 +272,7 @@ class DecisionGateway(unittest.TestCase):
         for body, param in (({"questions": {"q": {"type": "noul"}}}, "state"),
                             ({"state": "x", "questions": {}}, "questions"),
                             ({"state": "x", "questions": {"q": {"type": "maybe"}}}, "questions.q.type"),
-                            ({"state": "x", "questions": {"q": {"type": "score", "criteria": ["one"]}}},
+                            ({"state": "x", "questions": {"q": {"type": "score", "criteria": []}}},
                              "questions.q.criteria")):
             with self.subTest(param=param):
                 status, error = self.post_error("/v1/systemone", body)
