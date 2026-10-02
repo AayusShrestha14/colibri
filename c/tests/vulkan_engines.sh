@@ -14,7 +14,10 @@
 #   - the Vulkan run gives the tokens of the CPU run with the same snapshot and
 #     settings (and, where the engine has one, passes its own oracle);
 #   - its "[VK] <engine>: N matmuls on the GPU" line has N > 0, because a hook that
-#     declines every matrix would otherwise pass the first gate trivially.
+#     declines every matrix would otherwise pass the first gate trivially. A
+#     configuration of the routed-expert tier with the dense trunk on the CPU (the
+#     default on Lavapipe while the tier is on, see dense_where) gates on its count of
+#     routed experts the device served instead.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export VK_ICD_FILENAMES=${VK_ICD_FILENAMES:-/usr/share/vulkan/icd.d/lvp_icd.json}
@@ -63,23 +66,50 @@ tier_evictions() {
   echo "${n:-0}"
 }
 
+# dense_where <engine> <log> <tag> <env...>: where the run put the dense trunk, checked
+# against what it asked for. "[VK] <engine>: device ready, dense matrices on the
+# device|CPU" must agree with the matmul count; COLI_VK_DENSE=1 must put the trunk on
+# the device; with COLI_VK_DENSE unset and the tier on, Lavapipe (a CPU device, its
+# memory the CPU's RAM) must keep it on the CPU, as an integrated GPU does.
+dense_where() {
+  local eng=$1 log=$2 tag=$3 where; shift 3
+  if grep -qa "^\[VK\] $eng: device ready, dense matrices on the device" "$log"; then
+    need_gpu "$eng" "$log" "$tag"; where=device
+  else
+    [ "$(vk_count "$eng" "$log")" = 0 ] || { cat "$log"; fail "$tag: dense matmuls ran on the device with the trunk on the CPU"; }
+    where=CPU
+  fi
+  case " $* " in
+    *" COLI_VK_DENSE=1 "*) [ $where = device ] || { cat "$log"; fail "$tag: COLI_VK_DENSE=1 left the trunk on the CPU"; } ;;
+    *" COLI_VK_DENSE="*) ;;
+    *) if grep -qa '^\[VK\] ready: llvmpipe' "$log" && grep -qa "^\[VK\] tier $eng: on" "$log"; then
+         [ $where = CPU ] || { cat "$log"; fail "$tag: Lavapipe with the tier on kept the trunk on the device"; }
+       fi ;;
+  esac
+  echo $where
+}
+
 # tier_gate <engine> <tag> <env...> -- <argv...>
 # The routed-expert tier (vk_tier.c) against the CPU: the same tokens as the CPU run
-# with the same settings, and the device served some of the routed experts. With
-# EVICT=1 the run must also have evicted (its budget is set below the hot set).
-# COLI_USAGE points at a fresh file: no warm start from an earlier run's history.
+# with the same settings, the device served some of the routed experts, and the dense
+# trunk ran where it was asked to (dense_where). With EVICT=1 the run must also have
+# evicted (its budget is set below the hot set). COLI_USAGE points at a fresh file: no
+# warm start from an earlier run's history. COLI_VK_TIER_SYNC=1: a fixture's whole run
+# can end before the uploader thread is first scheduled (it did in 5 of 40 runs with
+# the trunk on the CPU), so the gate waits for each staged upload at the next step.
 tier_gate() {
   local eng=$1 tag=$2; shift 2
   local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
   rm -f tier.usage
   env "${envs[@]}" ./"$eng" "$@" > cpu.log 2>&1 || true
-  env "${envs[@]}" COLI_USAGE=tier.usage COLI_VULKAN=1 ./"$eng" "$@" > vk.log 2>&1 || true
+  env "${envs[@]}" COLI_USAGE=tier.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 ./"$eng" "$@" > vk.log 2>&1 || true
   same_tokens cpu.log vk.log "$tag"
   [ "$(tier_count "$eng" vk.log)" -gt 0 ] || { cat vk.log; fail "$tag: no routed expert ran on the device"; }
   if [ "${EVICT:-0}" = 1 ]; then
     [ "$(tier_evictions "$eng" vk.log)" -gt 0 ] || { grep '\[VK\] tier' vk.log; fail "$tag: the budget forced no eviction"; }
   fi
-  echo "OK $tag: tokens = CPU, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' vk.log | tail -1), $(grep -a -o 'evictions [0-9]*' vk.log | tail -1)"
+  local where; where=$(dense_where "$eng" vk.log "$tag" "${envs[@]}") || { echo "$where"; exit 1; }
+  echo "OK $tag: tokens = CPU, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' vk.log | tail -1), $(grep -a -o 'evictions [0-9]*' vk.log | tail -1), trunk on the $where"
 }
 
 # vk_gate <engine> <placed-regex> <tag> <env...> -- <argv...>
@@ -105,6 +135,9 @@ family_qwen() {
   $PY tools/make_qwen36_tiny.py --geometry qwen38-27b-dense --out qwen38_27b_tiny --ref-mode full --emit-ref qwen38_27b_tiny/ref_full.json
   $PY tools/make_qwen36_tiny.py --geometry qwen38-2p4t --seed 3 --out qwen38_2p4t_tiny --ref-mode full --emit-ref qwen38_2p4t_tiny/ref_full.json
   local fx cap caps
+  # These arms test the dense trunk's formats: COLI_VK_DENSE=1, because on Lavapipe (a
+  # CPU device sharing the CPU's RAM) the trunk otherwise stays on the CPU while the
+  # expert tier is on; the tier runs beside it.
   for fx in qwen36_tiny qwen3_coder_tiny qwen38_27b_tiny qwen38_2p4t_tiny; do
     $PY tools/convert_qwen36.py --model $fx --out ${fx}_c --ebits 8
     # cap=1 evicts on every routed expert; on the 92-layer 2.4T geometry that costs
@@ -113,13 +146,13 @@ family_qwen() {
     for cap in $caps; do
       # the CPU job's own configuration: f32 dense weights (fmt 10), token-exact
       # against transformers and equal to the CPU run
-      vk_gate qwen36 'f32 [1-9]' "qwen36 $fx f32 cap=$cap" COLI_DENSE_I8=0 SNAP=${fx}_c -- $cap 8 $fx/ref_full.json
+      vk_gate qwen36 'f32 [1-9]' "qwen36 $fx f32 cap=$cap" COLI_VK_DENSE=1 COLI_DENSE_I8=0 SNAP=${fx}_c -- $cap 8 $fx/ref_full.json
     done
     # int8 dense rows (fmt 1). int8 weights alone miss the torch oracle on some
     # fixtures, CPU or GPU alike, so this arm gates on the CPU's tokens only, with
     # COLI_DENSE_IDOT=0 giving the CPU the shader's f32 activations.
     COLI_DENSE_IDOT=0 SNAP=${fx}_c ./qwen36 8 8 $fx/ref_full.json > cpu.log 2>&1 || true
-    COLI_DENSE_IDOT=0 COLI_VULKAN=1 SNAP=${fx}_c ./qwen36 8 8 $fx/ref_full.json > vk.log 2>&1 || true
+    COLI_DENSE_IDOT=0 COLI_VK_DENSE=1 COLI_VULKAN=1 SNAP=${fx}_c ./qwen36 8 8 $fx/ref_full.json > vk.log 2>&1 || true
     same_tokens cpu.log vk.log "qwen36 $fx int8"
     grep -qE '\[VK\] qwen36: [1-9][0-9]* matmuls on the GPU.*placed int8 [1-9]' vk.log || { cat vk.log; fail "qwen36 $fx int8: nothing placed"; }
     echo "OK qwen36 $fx int8: tokens = CPU, $(grep -o '[0-9]* matmuls on the GPU.*' vk.log | tail -1)"
@@ -128,35 +161,40 @@ family_qwen() {
   # The routed-expert tier on every expert container qwen36 reads (COLI_VULKAN=1 turns
   # it on; the runs above already had it): int8 per row (fmt 1), the shared kernel's
   # planar int4-g64 (fmt 4), int4 per row from the unpacked slots (fmt 2), int8 gs64
-  # (fmt 13) and the mixed int4 gate/up + int8 down container; the tier alone with the
-  # dense trunk on the CPU (COLI_VK_DENSE=0); and a budget of two experts, which must
-  # evict as the routing moves.
+  # (fmt 13) and the mixed int4 gate/up + int8 down container, at cap=1 with the trunk
+  # where the default puts it (on the CPU here) and at cap=8 with the trunk on the
+  # device (COLI_VK_DENSE=1); the tier alone (COLI_VK_DENSE=0); and a budget of two
+  # experts, which must evict as the routing moves.
   $PY tools/make_qwen36_tiny.py --out qwen36_tiny64 --ref-mode full --inter 64 --emit-ref qwen36_tiny64/ref_full.json
   $PY tools/convert_qwen36.py --model qwen36_tiny64 --out qwen36_tiny64_c --ebits 4 --gs 64
   $PY tools/convert_qwen36.py --model qwen36_tiny64 --out qwen36_tiny64_g8 --ebits 8 --gs 64
   $PY tools/convert_qwen36.py --model qwen36_tiny64 --out qwen36_tiny64_d8 --ebits 4 --gs 64 --down-bits 8
   $PY tools/convert_qwen36.py --model qwen36_tiny --out qwen36_tiny_i4r --ebits 4
+  local D
   for cap in 1 8; do
-    tier_gate qwen36 "qwen36 tier int8 cap=$cap" COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- $cap 8 qwen36_tiny/ref_full.json
-    tier_gate qwen36 "qwen36 tier int4-g64 planar cap=$cap" COLI_DENSE_I8=0 SNAP=qwen36_tiny64_c -- $cap 4 qwen36_tiny64/ref_full.json
-    tier_gate qwen36 "qwen36 tier int4 per row cap=$cap" COLI_DENSE_I8=0 SNAP=qwen36_tiny_i4r -- $cap 4 qwen36_tiny/ref_full.json
-    tier_gate qwen36 "qwen36 tier int8 gs64 cap=$cap" COLI_DENSE_I8=0 SNAP=qwen36_tiny64_g8 -- $cap 8 qwen36_tiny64/ref_full.json
-    tier_gate qwen36 "qwen36 tier mixed int4/int8 cap=$cap" COLI_DENSE_I8=0 SNAP=qwen36_tiny64_d8 -- $cap 4 qwen36_tiny64/ref_full.json
+    D=; [ $cap = 8 ] && D=COLI_VK_DENSE=1
+    tier_gate qwen36 "qwen36 tier int8 cap=$cap" $D COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- $cap 8 qwen36_tiny/ref_full.json
+    tier_gate qwen36 "qwen36 tier int4-g64 planar cap=$cap" $D COLI_DENSE_I8=0 SNAP=qwen36_tiny64_c -- $cap 4 qwen36_tiny64/ref_full.json
+    tier_gate qwen36 "qwen36 tier int4 per row cap=$cap" $D COLI_DENSE_I8=0 SNAP=qwen36_tiny_i4r -- $cap 4 qwen36_tiny/ref_full.json
+    tier_gate qwen36 "qwen36 tier int8 gs64 cap=$cap" $D COLI_DENSE_I8=0 SNAP=qwen36_tiny64_g8 -- $cap 8 qwen36_tiny64/ref_full.json
+    tier_gate qwen36 "qwen36 tier mixed int4/int8 cap=$cap" $D COLI_DENSE_I8=0 SNAP=qwen36_tiny64_d8 -- $cap 4 qwen36_tiny64/ref_full.json
   done
   tier_gate qwen36 "qwen36 tier alone (COLI_VK_DENSE=0)" COLI_VK_DENSE=0 COLI_DENSE_I8=0 SNAP=qwen36_tiny64_c -- 8 4 qwen36_tiny64/ref_full.json
   EVICT=1 tier_gate qwen36 "qwen36 tier, a budget of two experts" COLI_VK_TIER_GB=0.00002 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
-  # COLI_VK_TIER=0: the dense trunk alone, as before the tier
+  # COLI_VK_TIER=0: the dense trunk alone, as before the tier; with no tier the default
+  # puts the trunk on the device, Lavapipe included
   COLI_VK_TIER=0 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c ./qwen36 8 8 qwen36_tiny/ref_full.json > cpu.log 2>&1 || true
   COLI_VK_TIER=0 COLI_VULKAN=1 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c ./qwen36 8 8 qwen36_tiny/ref_full.json > vk.log 2>&1 || true
   same_tokens cpu.log vk.log "qwen36 COLI_VK_TIER=0"
   ! grep -q '^\[VK\] tier' vk.log || { cat vk.log; fail "qwen36 COLI_VK_TIER=0: the tier started"; }
-  echo "OK qwen36 COLI_VK_TIER=0: tokens = CPU, no tier"
+  need_gpu qwen36 vk.log "qwen36 COLI_VK_TIER=0"
+  echo "OK qwen36 COLI_VK_TIER=0: tokens = CPU, no tier, $(grep -o '[0-9]* matmuls on the GPU' vk.log | tail -1)"
 
   # qwen38: one fixture, every resident format, with and without prefill batching
   $PY tools/make_qwen38_tiny.py --out qwen38_tiny
   local batch O
   for batch in 0 1; do
-    O="OMP_NUM_THREADS=2 SNAP=qwen38_tiny Q38_PREFILL_BATCH=$batch"
+    O="OMP_NUM_THREADS=2 SNAP=qwen38_tiny Q38_PREFILL_BATCH=$batch COLI_VK_DENSE=1"   # the trunk's formats, see qwen36 above
     # the default: every fixture matrix is under 1 MiB, so the trunk stays BF16 (fmt 11)
     vk_gate qwen38 'bf16 [1-9]' "qwen38 bf16 batch=$batch" $O -- 1 8 qwen38_tiny/ref.json
     # Q38_TRUNK_MIN_KB=0: the int8 trunk (fmt 1); what stays outside it is BF16
@@ -167,16 +205,19 @@ family_qwen() {
 
   # The routed-expert tier on qwen38's three expert forms: BF16 (fmt 11), the release's
   # FP8 with 128x128 block scales (fmt 12, gs 128), the experts-int4g64 sidecar's planar
-  # int4 (fmt 4); decode one row at a time and prefill batched; with the MTP head
-  # drafting (its verify rows take the device's per-row route); the tier alone; and a
-  # budget of two experts, which must evict.
+  # int4 (fmt 4); decode one row at a time and prefill batched; at cap=1 with the trunk
+  # where the default puts it (the CPU here), at cap=4 with the trunk on the device;
+  # with the MTP head drafting (its verify rows take the device's per-row route; the
+  # batched one with the trunk on the device); the tier alone; and a budget of two
+  # experts, which must evict.
   $PY tools/make_qwen38_tiny.py --out qwen38_tiny_fp8 --fp8-experts
   $PY tools/make_qwen38_tiny.py --out qwen38_tiny_int4 --fp8-experts --int4-experts --expert-gain 3
   local fx ref
   for fx in qwen38_tiny qwen38_tiny_fp8 qwen38_tiny_int4; do
     ref=$fx/ref.json; [ $fx = qwen38_tiny_int4 ] && ref=$fx/ref_int4.json
     for batch in 0 1; do for cap in 1 4; do
-      tier_gate qwen38 "qwen38 tier $fx batch=$batch cap=$cap" OMP_NUM_THREADS=2 Q38_PREFILL_BATCH=$batch SNAP=$fx -- $cap 8 $ref
+      D=; [ $cap = 4 ] && D=COLI_VK_DENSE=1
+      tier_gate qwen38 "qwen38 tier $fx batch=$batch cap=$cap" OMP_NUM_THREADS=2 $D Q38_PREFILL_BATCH=$batch SNAP=$fx -- $cap 8 $ref
     done; done
   done
   tier_gate qwen38 "qwen38 tier alone (COLI_VK_DENSE=0)" OMP_NUM_THREADS=2 COLI_VK_DENSE=0 SNAP=qwen38_tiny_int4 -- 4 8 qwen38_tiny_int4/ref_int4.json
@@ -185,14 +226,15 @@ family_qwen() {
   $PY tools/make_qwen38_tiny.py --out qwen38_tiny_int4_mtp --fp8-experts --int4-experts --expert-gain 3 --mtp
   for fx in qwen38_tiny_fp8_mtp qwen38_tiny_int4_mtp; do
     for batch in 0 1; do
-      tier_gate qwen38 "qwen38 tier MTP $fx batch=$batch" OMP_NUM_THREADS=2 Q38_MTP=1 Q38_PREFILL_BATCH=$batch SNAP=$fx -- 2 8 $fx/ref.json
+      D=; [ $batch = 1 ] && D=COLI_VK_DENSE=1
+      tier_gate qwen38 "qwen38 tier MTP $fx batch=$batch" OMP_NUM_THREADS=2 $D Q38_MTP=1 Q38_PREFILL_BATCH=$batch SNAP=$fx -- 2 8 $fx/ref.json
     done
   done
 }
 
 # The routed-expert tier under ASan and UBSan: a sanitized VK=1 build of both qwen
 # engines, the tier's configurations on Lavapipe (formats, eviction, PILOT's worker
-# against the tier, MTP, the tier alone). Memory safety is the gate, not the tokens
+# against the tier, MTP, the tier alone, the trunk on the device or on the CPU). Memory safety is the gate, not the tokens
 # (a sanitized build vectorizes differently); each run must still put experts on the
 # device, or the tier was never exercised.
 family_qwen_sanitize() {
@@ -210,26 +252,28 @@ family_qwen_sanitize() {
     local eng=$1 tag=$2; shift 2
     rm -f tier.usage
     env ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2 \
-      COLI_USAGE=tier.usage COLI_VULKAN=1 "$@" > san.log 2>&1 || true
+      COLI_USAGE=tier.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 "$@" > san.log 2>&1 || true
     if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
     [ "$(tier_count "$eng" san.log)" -gt 0 ] || { cat san.log; fail "$tag: no routed expert ran on the device"; }
-    echo "OK $tag: sanitizers clean, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' san.log | tail -1)"
+    echo "OK $tag: sanitizers clean, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' san.log | tail -1), $(grep -a -o 'dense matrices on the [a-zA-Z]*' san.log | head -1)"
   }
-  local cap
+  local cap D   # cap=8 and batch=1 with the trunk on the device, the others where the default puts it
   for cap in 1 8; do
-    san qwen36 "asan qwen36 int8 PILOT cap=$cap" COLI_DENSE_I8=0 PILOT=1 WIDE=2 SNAP=qwen36_tiny_c ./qwen36 $cap 8 qwen36_tiny/ref_full.json
-    san qwen36 "asan qwen36 int4-g64 PILOT cap=$cap" COLI_DENSE_I8=0 PILOT=1 WIDE=2 SNAP=qwen36_tiny64_c ./qwen36 $cap 4 qwen36_tiny64/ref_full.json
-    san qwen36 "asan qwen36 int8 gs64 cap=$cap" COLI_DENSE_I8=0 SNAP=qwen36_tiny64_g8 ./qwen36 $cap 8 qwen36_tiny64/ref_full.json
+    D=; [ $cap = 8 ] && D=COLI_VK_DENSE=1
+    san qwen36 "asan qwen36 int8 PILOT cap=$cap" $D COLI_DENSE_I8=0 PILOT=1 WIDE=2 SNAP=qwen36_tiny_c ./qwen36 $cap 8 qwen36_tiny/ref_full.json
+    san qwen36 "asan qwen36 int4-g64 PILOT cap=$cap" $D COLI_DENSE_I8=0 PILOT=1 WIDE=2 SNAP=qwen36_tiny64_c ./qwen36 $cap 4 qwen36_tiny64/ref_full.json
+    san qwen36 "asan qwen36 int8 gs64 cap=$cap" $D COLI_DENSE_I8=0 SNAP=qwen36_tiny64_g8 ./qwen36 $cap 8 qwen36_tiny64/ref_full.json
   done
   san qwen36 "asan qwen36 eviction" COLI_VK_TIER_GB=0.00002 COLI_DENSE_I8=0 PILOT=1 SNAP=qwen36_tiny_c ./qwen36 8 8 qwen36_tiny/ref_full.json
   san qwen36 "asan qwen36 tier alone" COLI_VK_DENSE=0 SNAP=qwen36_tiny64_c ./qwen36 8 4 qwen36_tiny64/ref_full.json
   local b
   for b in 0 1; do
-    san qwen38 "asan qwen38 fp8 batch=$b" Q38_PREFILL_BATCH=$b SNAP=qwen38_tiny_fp8 ./qwen38 1 8 qwen38_tiny_fp8/ref.json
-    san qwen38 "asan qwen38 int4 batch=$b" Q38_PREFILL_BATCH=$b SNAP=qwen38_tiny_int4 ./qwen38 1 8 qwen38_tiny_int4/ref_int4.json
+    D=; [ $b = 1 ] && D=COLI_VK_DENSE=1
+    san qwen38 "asan qwen38 fp8 batch=$b" $D Q38_PREFILL_BATCH=$b SNAP=qwen38_tiny_fp8 ./qwen38 1 8 qwen38_tiny_fp8/ref.json
+    san qwen38 "asan qwen38 int4 batch=$b" $D Q38_PREFILL_BATCH=$b SNAP=qwen38_tiny_int4 ./qwen38 1 8 qwen38_tiny_int4/ref_int4.json
   done
   san qwen38 "asan qwen38 eviction" Q38_PREFILL_BATCH=0 COLI_VK_TIER_GB=0.0000065 SNAP=qwen38_tiny_fp8 ./qwen38 1 8 qwen38_tiny_fp8/ref.json
-  san qwen38 "asan qwen38 MTP" Q38_MTP=1 Q38_PREFILL_BATCH=0 SNAP=qwen38_tiny_int4_mtp ./qwen38 2 8 qwen38_tiny_int4_mtp/ref.json
+  san qwen38 "asan qwen38 MTP" COLI_VK_DENSE=1 Q38_MTP=1 Q38_PREFILL_BATCH=0 SNAP=qwen38_tiny_int4_mtp ./qwen38 2 8 qwen38_tiny_int4_mtp/ref.json
   san qwen38 "asan qwen38 tier alone" COLI_VK_DENSE=0 SNAP=qwen38_tiny_int4 ./qwen38 4 8 qwen38_tiny_int4/ref_int4.json
   make clean >/dev/null 2>&1 || true
 }
