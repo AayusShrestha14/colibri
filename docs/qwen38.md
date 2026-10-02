@@ -184,8 +184,37 @@ w / scale, clamped to [-8, 7]. The codes are stored as v+8 in `expert_ffn.h`'s
 planar layout and multiplied by its f32 kernel, activations staying f32 as on
 the FP8 path. On synthetic Gaussian weights at the release's geometry the
 relative L2 error is 10.9% per matrix; the converter prints the mean and the
-worst per layer on the real weights. What that costs the model in perplexity
-or answers has not been measured yet.
+worst per layer on the real weights, where it measured 11-12% per layer and
+17.5% for the worst single matrix.
+
+Measured on the release (Ryzen 7 PRO 8700GE, 16 threads, 61 GiB, NVMe; the
+same binary with `Q38_EXPERT_INT4=0` and `=1`, `OMP_NUM_THREADS=8`). Perplexity,
+teacher-forced over four 504-token chunks at cap 96:
+
+| chunk | FP8 | int4-g64 |
+|---|---|---|
+| 0 | 4.23 | 4.20 |
+| 1 | 11.64 | 11.74 |
+| 2 | 10.94 | 11.04 |
+| 3 | 16.04 | 16.97 |
+
+On average +0.017 nats per token. Three chunks move by under 1%; chunk 3 moves
+by 5.8%. Greedy answers stay on the same reasoning with a few words changed.
+
+Decode, 100 tokens of one prompt, the model's files dropped from the page cache
+before every run, load average under 2.5:
+
+| cap | FP8 | int4-g64 |
+|---|---|---|
+| 32 | 1.91 tok/s, 14.4 GB RSS, 45.8% hits | 2.87 tok/s, 11.6 GB, 46.4% |
+| 64 | 2.27 tok/s, 21.4 GB, 59.1% | 3.25 tok/s, 15.2 GB, 59.4% |
+| 96 | 2.56 tok/s, 28.5 GB, 68.0% | 3.55 tok/s, 19.2 GB, 67.8% |
+| 170 | | 3.99 tok/s, 28.0 GB, 79.2% |
+
+At the same cap int4 is 1.4-1.5x faster, because each miss reads 56% of the
+bytes and the routed-expert compute halves (55 to 31 ms per decode forward at
+cap 96). At the same RAM, FP8 at cap 96 (28.5 GB) against int4 at cap 170
+(28.0 GB), it is 1.56x faster: the RAM that held 96 experts per layer holds 170.
 
 The converter streams: one expert per worker in flight, so peak RAM is a few
 hundred MB for the writer (records queue there while the disk catches up; at
