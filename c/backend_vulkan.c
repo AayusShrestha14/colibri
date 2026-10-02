@@ -1219,6 +1219,46 @@ int coli_vk_dense_decide(const char *engine, int tier_on, int def) {
 }
 int coli_vk_dense(void) { return g_dense_on; }
 
+/* Where a layer's dense chain runs (vk_chain.c): the whole layer recorded into one
+ * submission with the residual stream and the recurrent/KV state on the device, the
+ * alternative to one synchronous coli_vk_matmul per matrix. Returns COLI_VK_CHAIN_OFF,
+ * _ON (every forward) or _PREFILL (forwards of more than two rows: prompts, not decode
+ * steps or an MTP verify).
+ *   COLI_VK_CHAIN set and non-empty: 0 off, 2 prefill only, any other number on.
+ *   Unset, a discrete GPU: on.
+ *   Unset, an integrated GPU: `igpu` when the engine runs the expert tier (tier_on),
+ *   else off. `igpu` is what the engine measured on one (a Radeon 780M, docs/vulkan.md,
+ *   "The dense chain"): qwen36 passes ON (its chain won decode, 9.9 against 8.0 tok/s,
+ *   and prefill, 9.5 against 12.2 s); qwen38 OFF (its chain won prefill, 30.1 against
+ *   38.7 s, and lost decode, 3.2 against 3.8 tok/s: the device's GEMV at the GPU's
+ *   800 MHz floor is slower than the CPU's int8 one on a 4.3 GB trunk; prompts only
+ *   still lost 5% of decode, the trunk's device copy taking from the tier's budget).
+ *   Unset, a CPU device (Lavapipe): off.
+ * Printed as a [VK] line with an engine name (NULL: silent). */
+int coli_vk_chain_decide(const char *engine, int tier_on, int igpu) {
+    const char *e = getenv("COLI_VK_CHAIN");
+    char why[192];
+    int on;
+    if (e && *e) {
+        int v = atoi(e);
+        on = v == 0 ? COLI_VK_CHAIN_OFF : v == 2 ? COLI_VK_CHAIN_PREFILL : COLI_VK_CHAIN_ON;
+        snprintf(why, sizeof why, "COLI_VK_CHAIN=%s", e);
+    } else if (coli_vk_device_integrated()) {
+        on = tier_on ? igpu : COLI_VK_CHAIN_OFF;
+        snprintf(why, sizeof why, "an integrated GPU%s: %s; COLI_VK_CHAIN=0 off, 1 on, 2 prompts only",
+                 tier_on ? " with the expert tier" : " without the expert tier",
+                 on == COLI_VK_CHAIN_ON ? "measured faster on decode and prefill"
+                 : on == COLI_VK_CHAIN_PREFILL ? "measured faster on prefill, slower on decode"
+                 : tier_on ? "measured slower on decode" : "not measured");
+    } else if (coli_vk_device_shares_ram()) {
+        on = COLI_VK_CHAIN_OFF;
+        snprintf(why, sizeof why, "a CPU device; COLI_VK_CHAIN=1 turns it on");
+    } else { on = COLI_VK_CHAIN_ON; snprintf(why, sizeof why, "a discrete GPU%s", tier_on ? ", beside the expert tier" : ""); }
+    if (engine) fprintf(stderr, "[VK] %s: dense chain %s (%s)\n", engine,
+                        on == COLI_VK_CHAIN_ON ? "on" : on == COLI_VK_CHAIN_PREFILL ? "on for prompts" : "off", why);
+    return on;
+}
+
 int coli_vk_init_env_tier(const char *engine, int tier_on) {
     const char *on = getenv("COLI_VULKAN");
     if (!on || !atoi(on)) return 0;
@@ -2674,6 +2714,38 @@ void coli_vk_shutdown(void) {
     vkDestroyInstance(G.inst, NULL);
     memset(&G, 0, sizeof(G));
 }
+
+/* ---- the dense chain's view of the device (vk_chain.c) -------------------------
+ * The chain records its own command buffers on the main queue, from the engine
+ * thread, with pipelines of its own built from the same shader directory; it reads
+ * the resident tensors the engines already uploaded (their VkBuffers below). */
+int coli_vk_core(ColiVkCore *o) {
+    if (!G.ready || !o) return 0;
+    memset(o, 0, sizeof *o);
+    o->instance = (void *)G.inst; o->phys = (void *)G.phys; o->device = (void *)G.dev;
+    o->queue = (void *)G.queue; o->qfam = G.qfam;
+    o->memtype_host = G.memtype; o->memtype_cached = G.memtype_cached; o->memtype_dev = G.memtype_dev;
+    o->ssbo_align = G.ssbo_align; o->ssbo_range = G.ssbo_range; o->spv_path = G.spv_path;
+    o->has_prio = G.has_prio;
+    for (int k = 0; k < VK_GEMM_SLOTS && k < 4; k++) {
+        if (!G.pipe_gemm[k]) break;
+        VkGemmTile t = G.gemm_t[k];
+        o->gemm_tile[k][0] = t.bm; o->gemm_tile[k][1] = t.bn; o->gemm_tile[k][2] = t.bk;
+        o->gemm_tile[k][3] = t.tm; o->gemm_tile[k][4] = t.tn; o->gemm_tile[k][5] = t.pf;
+        o->gemm_tiles = k + 1;
+    }
+    o->gemm_min_s = G.gemm_min_s; o->gemm_min_so = G.gemm_min_so;
+    o->integrated = coli_vk_device_integrated(); o->shares_ram = coli_vk_device_shares_ram();
+    return 1;
+}
+int coli_vk_tensor_info(const ColiVkTensor *t, ColiVkTensorInfo *o) {
+    if (!t || !o || t->dev != 0) return 0;
+    o->wbuf = (void *)t->wbuf; o->sbuf = (void *)t->sbuf;
+    o->fmt = t->fmt; o->I = t->I; o->O = t->O; o->rowWords = t->rowWords; o->gs = t->gs;
+    return 1;
+}
+/* A fence the chain waited on failed: the device is gone, everyone falls back. */
+void coli_vk_mark_lost(void) { G.ready = 0; }
 
 #ifdef VK_TEST
 // ---- standalone GPU-vs-CPU validation + microbench --------------------------

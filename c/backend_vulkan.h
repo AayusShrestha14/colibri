@@ -230,6 +230,34 @@ const char *coli_vk_shader_path(char *buf, size_t n);
 /* How many coli_vk_matmul calls ran on the device: a check that a path is really used. */
 unsigned long long coli_vk_matmul_calls(void);
 
+/* ---- the dense chain (vk_chain.h) ----------------------------------------------
+ * Whether an engine runs its layers' dense chain on the device (COLI_VK_CHAIN): set,
+ * 0 off, 2 prompts only, else on; unset, on for a discrete GPU, `igpu` (the engine's
+ * measured choice) on an integrated GPU with the expert tier on, off otherwise. With an
+ * engine name the decision is printed as a [VK] line. */
+#define COLI_VK_CHAIN_OFF     0
+#define COLI_VK_CHAIN_ON      1
+#define COLI_VK_CHAIN_PREFILL 2   /* forwards of more than two rows only */
+int coli_vk_chain_decide(const char *engine, int tier_on, int igpu);
+/* The device as the chain sees it: Vulkan handles as void * (VkInstance,
+ * VkPhysicalDevice, VkDevice, VkQueue), the memory types the backend picked, the
+ * shader directory's qmatmul.spv and the fp32 GEMM's tiles. 0 before coli_vk_init. */
+typedef struct {
+    void *instance, *phys, *device, *queue;
+    uint32_t qfam, memtype_host, memtype_cached, memtype_dev;
+    size_t ssbo_align, ssbo_range;
+    const char *spv_path;
+    int gemm_tiles, gemm_tile[4][6];      /* bm, bn, bk, tm, tn, pf */
+    int gemm_min_s, gemm_min_so;
+    int has_prio, integrated, shares_ram;
+} ColiVkCore;
+int  coli_vk_core(ColiVkCore *out);
+/* A resident tensor's buffers (VkBuffer as void *) and layout; 0 for a COLI_VK_DEV2 one. */
+typedef struct { void *wbuf, *sbuf; int fmt, I, O, rowWords, gs; } ColiVkTensorInfo;
+int  coli_vk_tensor_info(const ColiVkTensor *t, ColiVkTensorInfo *out);
+/* The chain's fence wait failed: the device is lost, the backend stops. */
+void coli_vk_mark_lost(void);
+
 #ifdef __cplusplus
 }
 #endif
