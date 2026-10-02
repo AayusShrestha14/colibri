@@ -36,6 +36,10 @@ class FamilyCapabilities:
     # handshake line, openai_server.Engine.vision), never this bit's: a glm53
     # export can carry vision_config and no model.visual.* tensors.
     image: bool = False
+    # A decision engine: it answers POST /v1/systemone natively (the DECIDE
+    # command) and generates nothing. The engine confirms it at start-up with
+    # `CAPS decide=1 chat=0`, which is what the gateway routes on.
+    decision: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,11 +159,13 @@ class FamilyDescriptor:
     # la geometria lo rende visibile. 0 = nessun riferimento dichiarato, il
     # banner stampa display_scale come sempre.
     reference_experts: int = 0
-    # "text" for the chat engines, "image" for a text-to-image pipeline. An
-    # image family has no KV cache, no experts and no chat template: coli
-    # routes it to the image REPL, the image planner and POST
-    # /v1/images/generations, and every text-only invariant (context variable,
-    # segment conformance, tuning) is scoped to modality "text".
+    # "text" for the chat engines, "image" for a text-to-image pipeline,
+    # "decision" for a decision model. An image family has no KV cache, no
+    # experts and no chat template: coli routes it to the image REPL, the image
+    # planner and POST /v1/images/generations, and every text-only invariant
+    # (context variable, segment conformance, tuning) is scoped to modality
+    # "text". A decision family has none of them either: it is served by
+    # `coli serve` / `coli web` and answers POST /v1/systemone only.
     modality: str = "text"
     # Where the tokenizer lives, relative to the model directory. A diffusers
     # pipeline keeps it in processor/, not at the root.
@@ -1653,7 +1659,8 @@ def _build_registry(families):
                 not isinstance(family.has_cli_adapter, bool) or
                 not isinstance(family.tune_prompt_template, str) or
                 "{prompt}" not in family.tune_prompt_template or
-                family.modality not in ("text", "image") or
+                family.modality not in ("text", "image", "decision") or
+                family.capabilities.decision != (family.modality == "decision") or
                 not isinstance(family.tokenizer_file, str) or not family.tokenizer_file):
             raise RegistryError(f"incomplete family descriptor: {family.id}")
         try:
@@ -1752,8 +1759,6 @@ def tuning_replay_prompt(family, prompt):
 
 
 MODEL_INDEX = "model_index.json"
-
-
 def resolve_model(model_dir):
     model = Path(model_dir).expanduser().resolve()
     path = model / "config.json"
@@ -1942,5 +1947,6 @@ def public_metadata(family):
             "audio_payload": family.capabilities.audio_payload,
             "thinking": family.capabilities.thinking,
             "image": family.capabilities.image,
+            "decision": family.capabilities.decision,
         },
     }

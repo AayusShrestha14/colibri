@@ -138,6 +138,14 @@ def _engine_error(fields, message):
     engine's context. Report it the way every OpenAI-compatible server does, so clients that
     know how to compact a conversation actually get the chance to (previously the engine
     silently truncated the prompt instead, which is #401)."""
+    if fields and fields[0] == "DECIDE_INVALID":
+        # A decision engine refusing the record: the caller's mistake, named by the
+        # field the engine points at ("questions.q: only 3 of its 30 option markers
+        # fit ..."), answered as every other /v1/systemone validation error is.
+        reason = " ".join(fields[1:]) or "The decision engine refused the request."
+        head = reason.split(":", 1)[0] if ":" in reason else ""
+        param = head if head and " " not in head else "questions"
+        return APIError(422, reason, param, "invalid_question")
     if fields and fields[0] == "CONTEXT_EXCEEDED":
         # Two spellings of the same frame. colibri and deepseek_v4 write the
         # original `CONTEXT_EXCEEDED <used> <limit>`; qwen36 and qwen38 write
@@ -4897,6 +4905,110 @@ def _write_all(stream, data, frame):
         written += sent
 
 
+# ---------------------------------------------------------------- decision engines
+#
+# A decision engine (Laya; docs/brio.md, "Decision engines") does not generate: it
+# reads a state and typed questions and returns a probability per option. The
+# gateway hands it the request as one DECIDE record and shapes the DECISION it
+# gets back into the /v1/systemone reply, the same reply an LLM gives there.
+
+MAX_DECISION_BYTES = 16 << 20
+
+
+def decision_text(value):
+    """A state, an instruction or a criterion as the text a decision model reads.
+
+    A string is kept exactly as sent; anything else is JSON, written the way the
+    reference packages write the same value (`json.dumps(value, ensure_ascii=False)`,
+    laya's serialize_state and render_criterion), so the model reads the bytes it
+    was trained on. None stays None: the engine knows the model's own default."""
+    if value is None or isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False)
+
+
+def decision_state_type(value):
+    """What the caller sent as the state, by JSON type: a model may read a list (a
+    conversation, newest turn last) differently from a document."""
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, bool):
+        return "boolean"
+    return "number"
+
+
+def systemone_decision_record(body):
+    """The DECIDE record for a /v1/systemone request that passed validation.
+
+    Each question keeps its options in the caller's order: a choice's labels with
+    their descriptions, a score's levels (level 0 first), a noul's false then true
+    with the optional criteria. Instructions left out get the same default text the
+    LLM path asks with."""
+    defaults = {"noul": "Is this true?", "choice": "Which of the following applies?",
+                "score": "Rate this on the scale below."}
+    questions = []
+    for qid, question in body["questions"].items():
+        kind = question["type"]
+        criteria = question.get("criteria")
+        instructions = question.get("instructions")
+        if instructions is None or (isinstance(instructions, str) and not instructions.strip()):
+            instructions = defaults[kind]
+        if kind == "choice":
+            options = [{"label": label,
+                        "text": None if text is None or text == "" else decision_text(text)}
+                       for label, text in criteria.items()]
+        elif kind == "score":
+            options = [{"label": str(i + 1), "text": decision_text(text)}
+                       for i, text in enumerate(criteria)]
+        else:
+            given = {str(key).lower(): text for key, text in (criteria or {}).items()}
+            options = [{"label": side,
+                        "text": None if given.get(side) in (None, "") else decision_text(given[side])}
+                       for side in ("false", "true")]
+        questions.append({"id": qid, "type": kind, "instructions": decision_text(instructions),
+                          "options": options})
+    state = body["state"]
+    return {"state": decision_text(state), "state_type": decision_state_type(state),
+            "questions": questions}
+
+
+def _decision_texts(record):
+    yield record["state"]
+    for question in record["questions"]:
+        yield question["id"]
+        yield question["instructions"]
+        for option in question["options"]:
+            yield option["label"]
+            yield option["text"]
+
+
+def decision_payload(record):
+    """The DECIDE payload bytes: UTF-8 JSON. A NUL would end a C string early and a
+    lone surrogate has no UTF-8 form, so both are the caller's 422."""
+    if any(text and "\0" in text for text in _decision_texts(record)):
+        raise APIError(422, "NUL characters are not supported in a decision request.", "state",
+                       "invalid_value")
+    try:
+        return json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise APIError(422, f"The request carries text that is not valid Unicode ({error.reason}).",
+                       "state", "invalid_value") from error
+
+
+def engine_decides(engine):
+    """The engine announced decide=1: /v1/systemone goes to it as a DECIDE record."""
+    return getattr(engine, "decides", False) is True
+
+
+def engine_chats(engine):
+    """False only for an engine that said chat=0: it has no generating endpoint."""
+    return getattr(engine, "chats", True) is not False
+
+
 class _Pending:
     """One in-flight engine request: the queue its frames are delivered on, whether it asked
     for the per-token numeric channel, and any fault the dispatcher has recorded against it.
@@ -4994,6 +5106,11 @@ class Engine:
         # True/False when the engine said whether it loaded a vision tower; None when
         # it said nothing (an engine that predates CAPS, or a family without a tower).
         self.vision = {"1": True, "0": False}.get(self.caps.get("vision"))
+        # A decision engine says decide=1: /v1/systemone then sends it the record
+        # (DECIDE) instead of scoring options through the logprob channel. chat=0
+        # means it has nothing else: the generating endpoints answer 400.
+        self.decides = self.caps.get("decide") == "1"
+        self.chats = self.caps.get("chat") != "0"
         self.dispatcher = threading.Thread(target=self._dispatch_stdout,
                                            name="colibri-stdout", daemon=True)
         self.dispatcher.start()
@@ -5221,6 +5338,19 @@ class Engine:
                         "lp": record["lp"] if record else None,
                         "topk": record["topk"] if record else [],
                     }))
+                elif kind == "DECISION" and len(fields) == 3:
+                    # A decision engine's answer to DECIDE: one JSON payload, then DONE.
+                    request_id = fields[1]
+                    size = int(fields[2])
+                    if not 0 <= size <= MAX_DECISION_BYTES:
+                        raise RuntimeError("invalid engine DECISION size")
+                    data = self._read_exact(size)
+                    if self._read_exact(1) != b"\n":
+                        raise RuntimeError("invalid engine DECISION terminator")
+                    with self.pending_lock:
+                        entry = self.pending.get(request_id)
+                    if entry is not None and entry.failed is None:
+                        entry.events.put(("decision", data))
                 elif kind == "ACCEPT" and len(fields) >= 3:
                     # #597: the engine validated the submission (fits context) before prefill.
                     # Keep it pending — DATA/DONE still follow — and let generate() commit the
@@ -5293,6 +5423,63 @@ class Engine:
             if not self.closed:
                 self.dispatcher_error = error
                 self._fail_pending(error)
+
+    def decide(self, record, cache_slot=0, cancelled=None):
+        """One DECIDE round trip: the record out, the engine's DECISION back.
+
+        Returns (decision, stats): the parsed DECISION payload and the DONE line's
+        statistics. A record the engine refuses raises the APIError its ERROR names
+        (422 for DECIDE_INVALID); anything else the engine reports is a RuntimeError.
+        No CANCEL is sent: a decision is one forward pass, and the admission is held
+        until the engine's terminal frame either way."""
+        if not self.decides:
+            raise APIError(400, "This engine does not decide.", "model", "unsupported_endpoint")
+        if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
+            raise APIError(400, "Invalid cache slot.", "cache_slot")
+        payload = decision_payload(record)
+        pending = _Pending(False)
+        with self.pending_lock:
+            if self.closed:
+                raise RuntimeError("colibri engine is shutting down")
+            if self.dispatcher_error is not None:
+                raise RuntimeError("colibri engine dispatcher stopped") from self.dispatcher_error
+            if self.process.poll() is not None:
+                raise RuntimeError("colibri engine is not running")
+            request_id = str(self.next_request_id)
+            self.next_request_id += 1
+            self.pending[request_id] = pending
+        try:
+            with self.write_lock:
+                if self.process.poll() is not None:
+                    raise RuntimeError("colibri engine is not running")
+                try:
+                    _write_all(self.process.stdin,
+                               f"DECIDE {request_id} {cache_slot} {len(payload)}\n".encode()
+                               + payload + b"\n", "DECIDE")
+                    self.process.stdin.flush()
+                except OSError as error:
+                    raise RuntimeError(f"failed to write DECIDE to the engine ({error})") from error
+        except Exception:
+            with self.pending_lock:
+                self.pending.pop(request_id, None)
+            raise
+        decision = None
+        while True:
+            kind, value = pending.events.get()
+            if kind == "decision":
+                decision = value
+            elif kind == "done":
+                if decision is None:
+                    raise RuntimeError("the engine finished a DECIDE without a DECISION")
+                try:
+                    parsed = json.loads(decision.decode("utf-8"))
+                except (UnicodeDecodeError, ValueError) as error:
+                    raise RuntimeError(f"the engine sent an unreadable DECISION ({error})") from error
+                return parsed, value
+            elif kind == "accept":
+                continue
+            else:
+                raise value
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
                  cancelled=None, grammar=None, stopped=None, on_accept=None, audio=None,
@@ -5583,6 +5770,9 @@ def is_image_engine(engine):
 # when the model draws images instead.
 TEXT_ENDPOINTS = ("/v1/chat/completions", "/v1/completions", "/v1/messages", "/v1/brio",
                   "/v1/systemone")
+# The endpoints that generate or score text with a language model, refused with a
+# pointer to /v1/systemone when the model is a decision engine (chat=0).
+GENERATING_ENDPOINTS = ("/v1/chat/completions", "/v1/completions", "/v1/messages", "/v1/brio")
 IMAGE_OPTION_KEYS = ("default_width", "default_height", "default_steps", "min_side",
                      "max_side", "multiple")
 
@@ -5651,6 +5841,8 @@ class APIServer(ThreadingHTTPServer):
             info = getattr(self.engine, "info", None) or {}
             entry["capabilities"] = ["image_generation"]
             entry["image"] = {key: info.get(key) for key in IMAGE_OPTION_KEYS}
+        elif engine_decides(self.engine) and not engine_chats(self.engine):
+            entry["capabilities"] = ["decision"]
         return entry
 
     def input_modalities(self):
@@ -6059,6 +6251,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     if is_image_engine(self.server.engine):
                         payload["capabilities"] = ["image_generation"]
                         payload["image"] = dict(getattr(self.server.engine, "info", None) or {})
+                    elif engine_decides(self.server.engine) and not engine_chats(self.server.engine):
+                        payload["capabilities"] = ["decision"]
                 self.send_json(200, payload, request_id)
                 return
             if path == "/experts":
@@ -6125,6 +6319,11 @@ class APIHandler(BaseHTTPRequestHandler):
             if is_image_engine(self.server.engine) and path in TEXT_ENDPOINTS:
                 raise APIError(400, f"`{self.server.model_id}` is an image generation model and "
                                     "does not chat: POST /v1/images/generations instead.",
+                               "model", "unsupported_endpoint")
+            if not engine_chats(self.server.engine) and path in GENERATING_ENDPOINTS:
+                raise APIError(400, f"`{self.server.model_id}` is a decision model: it answers typed "
+                                    "questions with calibrated probabilities and does not generate "
+                                    "text. POST /v1/systemone instead.",
                                "model", "unsupported_endpoint")
             if path == "/v1/images/generations":
                 self.image_generation(body, request_id)
@@ -6557,6 +6756,9 @@ class APIHandler(BaseHTTPRequestHandler):
                              [str(i + 1) for i in range(len(levels))], levels))
             else:
                 raise APIError(422, f"`{where}.type` must be \"noul\", \"choice\" or \"score\".", f"{where}.type")
+        if engine_decides(self.server.engine):
+            self._systemone_decide(body, plan, request_id)
+            return
         inner = {"state": state, "_max_options": 255,
                  "questions": [{"question": text, "options": options} for _, _, text, options, _ in plan]}
         result = self.brio(inner, request_id, send=False)
@@ -6580,6 +6782,58 @@ class APIHandler(BaseHTTPRequestHandler):
                            "output_tokens": result["usage"]["read_tokens"]}}
         self.send_json(200, reply, request_id, result.get("_headers"))
 
+    def _systemone_decide(self, body, plan, request_id):
+        """The native path: the request as one DECIDE record, the engine's
+        probabilities back, shaped exactly like the LLM path's reply. No prompt is
+        rendered and no option is scored on its own: one round trip, one forward."""
+        record = systemone_decision_record(body)
+        cache_slot = conversation_cache_slot([{"role": "system", "content": record["state"]}],
+                                             self.server.kv_slots)
+        started = time.time()
+        with self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission:
+            queue_wait, cache_slot = admission
+            call = time.monotonic()
+            try:
+                decision, _stats = self.server.engine.decide(record, cache_slot,
+                                                             self.client_disconnected)
+            finally:
+                self.server.scheduler.observe_timing("engine_call_seconds", time.monotonic() - call)
+        got = decision.get("answers") if isinstance(decision, dict) else None
+        if not isinstance(got, list) or len(got) != len(plan):
+            raise APIError(502, "The decision engine answered a different number of questions.",
+                           None, "engine_error", "server_error")
+        answers = {}
+        for (qid, kind, _, _, levels), question, answer in zip(plan, record["questions"], got):
+            probs = answer.get("probs") if isinstance(answer, dict) else None
+            n = len(question["options"])
+            if (answer.get("id") != qid or not isinstance(probs, list) or len(probs) != n or
+                    not all(isinstance(p, (int, float)) and math.isfinite(p) for p in probs)):
+                raise APIError(502, f"The decision engine sent no usable probabilities for `{qid}`.",
+                               None, "engine_error", "server_error")
+            best = max(range(n), key=lambda i: (probs[i], -i))
+            if kind == "noul":
+                answers[qid] = {"type": "noul", "noul": round(probs[1], 6)}
+            elif kind == "choice":
+                labels = [option["label"] for option in question["options"]]
+                answers[qid] = {"type": "choice", "choice": labels[best],
+                                "probabilities": {label: round(p, 6) for label, p in zip(labels, probs)},
+                                "confidence": self._systemone_confidence(probs)}
+            else:
+                answers[qid] = {"type": "score",
+                                "score": round(sum((i + 1) * p for i, p in enumerate(probs)), 6),
+                                "legend": {str(i + 1): d for i, d in enumerate(levels)},
+                                "probabilities": {str(i + 1): round(p, 6) for i, p in enumerate(probs)},
+                                "confidence": self._systemone_confidence(probs)}
+        reply = {"model": self.server.model_id, "answers": answers,
+                 "usage": {"input_tokens": int(decision.get("input_tokens") or 0),
+                           "output_tokens": 0}}
+        headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000)),
+                   "x-colibri-elapsed-ms": str(round((time.time() - started) * 1000))}
+        engine_ms = decision.get("engine_ms")
+        if isinstance(engine_ms, (int, float)) and math.isfinite(engine_ms):
+            headers["x-colibri-engine-ms"] = str(round(engine_ms, 1))
+        self.send_json(200, reply, request_id, headers)
+
     # ------------------------------------------------------------- images
     #
     # POST /v1/images/generations, the OpenAI shape plus a `colibri` block with
@@ -6589,6 +6843,10 @@ class APIHandler(BaseHTTPRequestHandler):
     def image_generation(self, body, request_id):
         engine = self.server.engine
         if not is_image_engine(engine):
+            if not engine_chats(engine):
+                raise APIError(400, f"`{self.server.model_id}` does not generate images: it is a "
+                                    "decision model (POST /v1/systemone).",
+                               "model", "unsupported_endpoint")
             raise APIError(400, f"`{self.server.model_id}` does not generate images: it is a "
                                 "chat model (POST /v1/chat/completions).",
                            "model", "unsupported_endpoint")

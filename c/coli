@@ -189,6 +189,15 @@ def model_banner_line(model):
         return generic
     if is_image_model(model):
         return image_banner_line(model) or generic
+    if is_decision_model(model):
+        try:
+            resolved = resolve_model(model)
+            name, scale = display_for(resolved)
+            size = os.path.getsize(os.path.join(model, "model.safetensors"))
+        except (FamilyConfigError, UnknownFamilyError, OSError):
+            return generic
+        return " · ".join(bit for bit in (name, scale, "decision model",
+                                          f"{size/1e6:.0f} MB on disk" if size else "") if bit)
     try:
         with open(os.path.join(model, "config.json"), encoding="utf-8") as f:
             cfg = json.load(f)
@@ -252,6 +261,21 @@ def is_image_model(model):
         return is_image_model_dir(model)
     except (OSError, TypeError):
         return False
+
+def is_decision_model(model):
+    """A decision checkpoint (Laya: rl_agent_config.json, no root config.json):
+    served by coli serve / coli web on POST /v1/systemone, never chatted with."""
+    try:
+        return resolve_model(model).descriptor.modality == "decision"
+    except (FamilyConfigError, UnknownFamilyError, OSError, TypeError, ValueError):
+        return False
+
+def decision_refusal(family):
+    """What every chatting command says about a decision model, and where to go."""
+    return (f"{C.yel}{family.display_name} is a decision model:{C.r} it answers typed questions "
+            f"(choice, score, noul) with calibrated probabilities and does not chat.\n"
+            f"  Start it with: coli serve --model <dir>   (or coli web for the dashboard)\n"
+            f"  then POST /v1/systemone (docs/brio.md, \"Decision engines\")")
 
 def image_banner_line(model):
     """Banner line of an image model: name, what it does, bytes on disk. Sizes
@@ -411,7 +435,8 @@ def need_model(model, engine=None):
     # An image pipeline keeps its tokenizer in processor/, not at the root.
     require_model(model, file=None)
     tokenizer = "tokenizer.json"
-    if is_image_model(model):
+    if is_image_model(model) or is_decision_model(model):
+        # a decision checkpoint keeps it in tokenizer/ (Laya)
         try: tokenizer = resolve_model(model).descriptor.tokenizer_file
         except (FamilyConfigError, UnknownFamilyError): pass   # engine_for says why, below
     require_model(model, file=tokenizer)
@@ -485,6 +510,9 @@ def env_for_engine(a, arch, plan=None):
     if family.modality == "image" and getattr(a, "ctx", None):
         sys.exit(f"{C.yel}--ctx does not apply to {family.display_name}:{C.r} an image model has "
                  f"no context window (the prompt goes through its text encoder once)")
+    if family.modality == "decision" and getattr(a, "ctx", None):
+        sys.exit(f"{C.yel}--ctx does not apply to {family.display_name}:{C.r} a decision model reads "
+                 f"at most its checkpoint's max_len per question (COLI_LAYA_MAX_LEN overrides it)")
     if getattr(a,"ram",0): explicit_env.add("RAM_GB")
     # OMP_NUM_THREADS for the sister engines that do not size their own team.
     #
@@ -613,9 +641,9 @@ def env_for_engine(a, arch, plan=None):
             sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} the engine binary is CPU-only")
         env["COLI_CUDA"] = "1"
         env["CUDA_EXPERT_GB"] = str(vram)
-    if getattr(a, "auto_tier", False) and family.modality == "image":
-        # The tier plan places experts and KV state; an image model has
-        # neither, and build_plan would stop on "no safetensors shards".
+    if getattr(a, "auto_tier", False) and family.modality in ("image", "decision"):
+        # The tier plan places experts and KV state; an image or decision model
+        # has neither, and build_plan would stop on "no safetensors shards".
         print(f"  {C.dim}[PLAN] --auto-tier has nothing to place for "
               f"{family.display_name}; coli plan shows its RAM{C.r}", file=sys.stderr)
     elif getattr(a, "auto_tier", False):
@@ -1240,6 +1268,9 @@ def cmd_info(a):
     if family is not None and family.modality == "image":
         info_image_model(a, family, row)
         return
+    if family is not None and family.modality == "decision":
+        info_decision_model(a, resolved, row)
+        return
     if os.path.exists(cfgp):
         c=json.load(open(cfgp))
         # Multimodal wrappers such as Qwen3.8 keep the language architecture
@@ -1335,6 +1366,67 @@ def info_image_model(a, family, row):
         else f"not built (make -C c {family.build_target})")
     print()
 
+def decision_weights(model):
+    """Parameters and bytes of a decision checkpoint, from its safetensors header."""
+    import struct
+    params = 0
+    with open(os.path.join(model, "model.safetensors"), "rb") as handle:
+        size = struct.unpack("<Q", handle.read(8))[0]
+        if size > 64 << 20:
+            raise ValueError("model.safetensors: implausible header size")
+        header = json.loads(handle.read(size))
+    for name, entry in header.items():
+        if name == "__metadata__" or not isinstance(entry, dict):
+            continue
+        count = 1
+        for dim in entry.get("shape", []):
+            count *= int(dim)
+        params += count
+    return params, os.path.getsize(os.path.join(model, "model.safetensors"))
+
+def info_decision_model(a, resolved, row):
+    """`coli info` for a decision model: the encoder, the head's budget, what it
+    serves, instead of layers and experts."""
+    family = resolved.descriptor
+    enc, cfg = resolved.family_config, resolved.config
+    name, scale = display_for(resolved)
+    row("model", a.model)
+    row("type", f"{name}{' · ' + scale if scale else ''} · decision model · "
+                f"{enc.get('model_type')} encoder, {enc.get('num_hidden_layers')} layer x "
+                f"{enc.get('hidden_size')} · head {cfg.get('head_layers')} layer")
+    row("budget", f"max_len {cfg.get('max_len')} tokens per question, "
+                  f"head_max_len {cfg.get('head_max_len')} for the options")
+    try:
+        params, disk = decision_weights(a.model)
+        row("weights", f"{params/1e6:.0f}M params · {disk/1e6:.0f} MB on disk · "
+                       f"about {params*4/1e9:.1f} GB in RAM (f32)")
+    except (OSError, ValueError) as error:
+        row("weights", f"{C.yel}model.safetensors unreadable:{C.r} {error}")
+    row("use", "coli serve / coli web, then POST /v1/systemone (docs/brio.md)")
+    engine=engine_for(a.model)
+    row("engine", "ready ✓" if os.path.exists(engine)
+        else f"not built (make -C c {family.build_target})")
+    print()
+
+def plan_decision_command(a):
+    """`coli plan` for a decision model: its weights in RAM, nothing that grows."""
+    if getattr(a, "ctx", 0):
+        sys.exit(f"{C.yel}--ctx does not apply to a decision model{C.r}")
+    try:
+        params, disk = decision_weights(a.model)
+    except (OSError, ValueError) as error:
+        sys.exit(f"{C.yel}cannot create resource plan:{C.r} {error}")
+    plan = {"model": os.path.abspath(a.model), "modality": "decision", "params": params,
+            "disk_bytes": disk, "ram_bytes": params * 4,
+            "note": "weights resident in f32; no KV cache, no experts, no VRAM tier"}
+    if a.json:
+        print(json.dumps(plan, indent=2)); return
+    banner("plan · RAM for a decision model", model=a.model)
+    print(f"  weights   {params/1e6:.0f}M params, {disk/1e6:.0f} MB on disk")
+    print(f"  RAM       about {params*4/1e9:.1f} GB (f32), plus activations of a few MB per question")
+    print(f"  nothing grows with use: no KV cache, no experts to stream")
+    print()
+
 def plan_image_command(a):
     """`coli plan` for an image model: weights per component, two schedules."""
     from image_engine import plan_image_model, format_image_plan
@@ -1361,6 +1453,8 @@ def cmd_plan(a):
         sys.exit(f"{C.yel}no model directory given.{C.r}\n  {NO_MODEL_HINT}")
     if is_image_model(a.model):
         return plan_image_command(a)
+    if is_decision_model(a.model):
+        return plan_decision_command(a)
     try:
         ram,ctx,devices,vram=resource_request(a,os.environ)
         if ctx<1: raise ValueError("--ctx must be positive")
@@ -1449,7 +1543,7 @@ def cmd_tune(a):
     # family it then mis-dispatched.
     family=resolve_model(a.model).descriptor
     arch=family.id
-    if family.modality=="image":
+    if family.modality in ("image","decision"):
         sys.exit(f"{C.yel}coli tune measures text engines;{C.r} {family.display_name} has no "
                  f"expert cache or decode loop to tune")
     if not family.has_gateway_adapter:
@@ -1517,6 +1611,8 @@ def cmd_run(a):
     banner("run", model=a.model)
     if family.modality=="image":
         return run_image(a, family, engine, prompt)
+    if family.modality=="decision":
+        sys.exit(decision_refusal(family))
     if not family.has_cli_adapter:
         sys.exit(f"{C.yel}coli run is not wired for {family.display_name};{C.r} "
                  f"use coli chat or coli serve")
@@ -2561,6 +2657,9 @@ def cmd_chat(a):
                                                      entry.get("image")), mid)
                     print(f"  {C.dim}goodbye: the engine keeps running for the next session{C.r}")
                     return
+                if "decision" in (entry.get("capabilities") or []):
+                    sys.exit(f"{C.yel}{base} serves {mid}, a decision model:{C.r} it does not chat. "
+                             f"POST /v1/systemone to it (docs/brio.md)")
                 banner(f"chat · {mid} · attached")
                 chat_attached(a, base, mid); return
             print(f"  {C.dim}{base} serves {mid}, not an "
@@ -2572,6 +2671,8 @@ def cmd_chat(a):
     arch=family.id
     if not family.has_gateway_adapter:
         sys.exit(f"{family.display_name}: gateway adapter is not wired")
+    if family.modality=="decision":
+        sys.exit(decision_refusal(family))
     if family.modality=="image":
         engine=engine_for(a.model)
         need_model(a.model,engine)
