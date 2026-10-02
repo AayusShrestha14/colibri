@@ -132,7 +132,7 @@ static struct {
      * evicts cold tier experts instead of thrashing the per-token attention submits
      * (measured: decode attention 7.8s at 7.6 GB resident -> 17.8s at 15.2 GB).
      * VK_EXT_memory_budget lets the tier fill stop at a reserve instead of guessing. */
-    int has_prio, has_budget;
+    int has_prio, has_budget, has_hostmem;
     float prio;                  /* priority applied to the NEXT allocations (class knob) */
     /* the routed-expert tier's queue (coli_vk_xb_*): family, index, whether it is the
      * main queue after all, and its timestamp bits; device limits its batches respect */
@@ -509,7 +509,7 @@ int coli_vk_init(const char *spv_path) {
     /* Pressure-proofing extensions (both optional, detected at runtime):
      * memory_priority ranks allocations for the kernel's eviction order,
      * memory_budget exposes how much VRAM a new allocation can still take. */
-    const char *dext[4]; uint32_t ndext = 0;
+    const char *dext[6]; uint32_t ndext = 0;
     int has_cm = 0, has_ssc = 0;
     {
         uint32_t ne = 0;
@@ -523,6 +523,9 @@ int coli_vk_init(const char *spv_path) {
 #endif
 #ifdef VK_EXT_memory_budget
                 if (!strcmp(ep[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) G.has_budget = 1;
+#endif
+#ifdef VK_EXT_external_memory_host
+                if (!strcmp(ep[i].extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) G.has_hostmem = 1;
 #endif
 #ifdef VK_KHR_cooperative_matrix
                 if (!strcmp(ep[i].extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) has_cm = 1;
@@ -600,12 +603,17 @@ int coli_vk_init(const char *spv_path) {
 #ifdef VK_EXT_memory_budget
     if (G.has_budget) dext[ndext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
 #endif
+#ifdef VK_EXT_external_memory_host
+    /* host memory the device reads in place (no copy): measured by the harness
+     * (COLI_VK_TEST_HOSTMEM), see docs/vulkan.md on integrated GPUs */
+    if (G.has_hostmem) dext[ndext++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
+#endif
     di.enabledExtensionCount = ndext; di.ppEnabledExtensionNames = ndext ? dext : NULL;
     G.prio = 0.75f;                              /* default class: dense/resident weights */
 #ifdef VK_KHR_cooperative_matrix
     if (G.has_coop) {   /* a device that refuses the extra features still comes up without them */
         VkDeviceCreateInfo dc = di;
-        const char *cext[4]; uint32_t nc = 0;
+        const char *cext[8]; uint32_t nc = 0;
         for (uint32_t i = 0; i < ndext; i++) cext[nc++] = dext[i];
         cext[nc++] = VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME;
         cext[nc++] = VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME;
@@ -3434,6 +3442,136 @@ static int run_xbatch_all(void) {
     return bad;
 }
 
+/* COLI_VK_TEST_HOSTMEM=1: the expert batch reading its experts from the tier pool
+ * (device memory the tier fills by a copy) against host memory the device reads in
+ * place (VK_EXT_external_memory_host, no copy). Batches of 10 experts of Qwen3.8's
+ * shape (hidden 2560, inter 640, int4-g64) cycle through 48 distinct experts so no
+ * expert is in a cache; the device time comes from the batch's timestamps. Also
+ * what the copy into the tier pool costs per expert, against a copy into malloc'd
+ * memory, and whether both memories give the same bits. */
+typedef struct { void *host[2]; VkDeviceMemory mem[2]; } HostImp;
+static int host_import(size_t bytes, void **host, VkDeviceMemory *mem, VkBuffer *buf) {
+#ifdef VK_EXT_external_memory_host
+    VkPhysicalDeviceExternalMemoryHostPropertiesEXT hp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
+    VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &hp};
+    vkGetPhysicalDeviceProperties2(G.phys, &p2);
+    size_t al = hp.minImportedHostPointerAlignment ? hp.minImportedHostPointerAlignment : 4096;
+    size_t sz = (bytes + al - 1) / al * al;
+    if (posix_memalign(host, al, sz)) return 0;
+    memset(*host, 0, sz);
+    PFN_vkGetMemoryHostPointerPropertiesEXT gp = (PFN_vkGetMemoryHostPointerPropertiesEXT)
+        vkGetDeviceProcAddr(G.dev, "vkGetMemoryHostPointerPropertiesEXT");
+    VkMemoryHostPointerPropertiesEXT mp = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+    if (!gp || gp(G.dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, *host, &mp) != VK_SUCCESS || !mp.memoryTypeBits) return 0;
+    uint32_t mt = 0; while (!(mp.memoryTypeBits & (1u << mt))) mt++;
+    VkImportMemoryHostPointerInfoEXT imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, .pHostPointer = *host};
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &imp, .allocationSize = sz, .memoryTypeIndex = mt};
+    if (vkAllocateMemory(G.dev, &ai, NULL, mem) != VK_SUCCESS) return 0;
+    VkExternalMemoryBufferCreateInfo eb = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &eb, .size = bytes,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    if (vkCreateBuffer(G.dev, &bi, NULL, buf) != VK_SUCCESS) return 0;
+    if (vkBindBufferMemory(G.dev, *buf, *mem, 0) != VK_SUCCESS) return 0;
+    static int said;
+    if (!said++) printf("hostmem: imported with alignment %zu, memory type %u\n", al, mt);
+    return 1;
+#else
+    (void)bytes; (void)host; (void)mem; (void)buf; return 0;
+#endif
+}
+static ColiVkTensor *host_tensor(int fmt, int I, int O, int gs, HostImp *hi, uint8_t **rows, float **sc) {
+    ColiVkTensor *t = calloc(1, sizeof(*t));
+    t->fmt = fmt; t->I = I; t->O = O; t->rowWords = rowwords(fmt, I); t->gs = gs;
+    t->wbytes = (size_t)t->rowWords * 4 * O;
+    size_t sb = scale_floats(fmt, I, O, gs) * 4;
+    if (!host_import(t->wbytes, &hi->host[0], &hi->mem[0], &t->wbuf) || !host_import(sb, &hi->host[1], &hi->mem[1], &t->sbuf)) {
+        free(t); return NULL;
+    }
+    *rows = hi->host[0]; *sc = hi->host[1];
+    return t;
+}
+static void bench_hostmem(void) {
+    enum { N = 48, B = 10, R = 60 };
+    const int D = 2560, I = 640, gs = 64;
+    if (!G.has_hostmem) { printf("hostmem: VK_EXT_external_memory_host absent on this device\n"); return; }
+    xb_shutdown();
+    if (!coli_vk_xb_init(D, I, COLI_VK_ACT_SWIGLU, 0.f, 0.f, 0.f)) { printf("hostmem: no expert batch\n"); return; }
+    coli_vk_tier_pool_limit(0);
+    size_t rbg = (size_t)(D / 2), rbd = (size_t)(I / 2);
+    size_t sg = (size_t)I * (D / gs), sd = (size_t)D * (I / gs);
+    size_t ebytes = 2 * (rbg * I + sg * 4) + rbd * D + sd * 4;
+    uint8_t *src = malloc(2 * rbg * I + rbd * D); float *ssrc = malloc((2 * sg + sd) * 4);
+    for (size_t i = 0; i < 2 * rbg * I + rbd * D; i++) src[i] = (uint8_t)rand();
+    for (size_t i = 0; i < 2 * sg + sd; i++) ssrc[i] = 0.001f * (1 + rand() % 7);
+    ColiVkExpert *ex[2][N]; HostImp hi[N][3];
+    double copy_ms = 0, malloc_ms = 0;
+    uint8_t *mbuf = malloc(ebytes);
+    for (int kind = 0; kind < 2; kind++)
+        for (int e = 0; e < N; e++) {
+            ColiVkTensor *t[3]; uint8_t *rows; float *sc; size_t stride;
+            for (int k = 0; k < 3; k++) {
+                int In = k < 2 ? D : I, On = k < 2 ? I : D;
+                const uint8_t *cs = src + (k < 2 ? k * rbg * I : 2 * rbg * I);
+                const float *ss = ssrc + (k < 2 ? k * sg : 2 * sg);
+                size_t rb = k < 2 ? rbg : rbd, ns = k < 2 ? sg : sd;
+                if (kind == 0) {
+                    if (!coli_vk_tier_tensor(&t[k], 4, In, On, gs, &rows, &stride, &sc)) { printf("hostmem: tier pool full\n"); return; }
+                } else {
+                    t[k] = host_tensor(4, In, On, gs, &hi[e][k], &rows, &sc); stride = rb;
+                    if (!t[k]) { printf("hostmem: import failed\n"); return; }
+                }
+                double c0 = vk_now();
+                for (int o = 0; o < On; o++) memcpy(rows + (size_t)o * stride, cs + (size_t)o * rb, rb);
+                memcpy(sc, ss, ns * 4);
+                if (kind == 0) copy_ms += vk_now() - c0;
+            }
+            if (kind == 0) { double c0 = vk_now(); memcpy(mbuf, src, 2 * rbg * I + rbd * D); memcpy(mbuf + 2 * rbg * I + rbd * D, ssrc, (2 * sg + sd) * 4);
+                         __asm__ volatile("" :: "r"(mbuf) : "memory");   /* the copy is kept: nothing reads mbuf */
+                         malloc_ms += vk_now() - c0; }
+            ex[kind][e] = coli_vk_xb_expert(t[0], t[1], t[2]);
+        }
+    float *x = malloc((size_t)D * 4); for (int i = 0; i < D; i++) x[i] = 0.01f * (i % 13) - 0.06f;
+    const float *xr[B], *yr[B]; int rows1[B];
+    for (int j = 0; j < B; j++) { xr[j] = x; rows1[j] = 1; }
+    double ms[2] = {0, 0}, wall[2] = {0, 0};
+    float *y0 = malloc((size_t)D * 4 * B);
+    int same = 1;
+    for (int kind = 0; kind < 2; kind++)
+        for (int r = 0; r < R; r++) {
+            ColiVkExpert *b[B];
+            for (int j = 0; j < B; j++) b[j] = ex[kind][(r * B + j) % N];
+            double t0 = vk_now(), dm = 0;
+            coli_vk_xb_issue(b, rows1, B, xr); coli_vk_xb_join(yr, &dm);
+            if (r) { ms[kind] += dm; wall[kind] += vk_now() - t0; }   /* the first batch warms the pipelines */
+            if (r == 0) for (int j = 0; j < B; j++) {
+                if (kind == 0) memcpy(y0 + (size_t)j * D, yr[j], (size_t)D * 4);
+                else same &= !memcmp(y0 + (size_t)j * D, yr[j], (size_t)D * 4);
+            }
+        }
+    double gb = (double)ebytes * B * (R - 1) / 1e9;
+    printf("hostmem: %d batches of %d experts (%.2f MB each): device memory %.2f ms/batch = %.1f GB/s (wall %.2f ms), "
+           "imported host memory %.2f ms/batch = %.1f GB/s (wall %.2f ms); same bits: %s\n",
+           R - 1, B, ebytes / 1e6, ms[0] / (R - 1), gb / (ms[0] / 1e3), wall[0] / (R - 1),
+           ms[1] / (R - 1), gb / (ms[1] / 1e3), wall[1] / (R - 1), same ? "yes" : "NO");
+    printf("hostmem: one expert copied into the tier pool %.3f ms (%.1f GB/s), into malloc'd memory %.3f ms\n",
+           copy_ms / N, ebytes / 1e6 / copy_ms * N, malloc_ms / N);
+    for (int e = 0; e < N; e++) {
+        coli_vk_xb_expert_free(ex[0][e]);
+        ColiVkExpert *h = ex[1][e];
+        ColiVkTensor *ts[3] = {h->g, h->u, h->d};
+        xb_expert_unlink(h); free(h);
+        for (int k = 0; k < 3; k++) {
+            vkDestroyBuffer(G.dev, ts[k]->wbuf, NULL); vkDestroyBuffer(G.dev, ts[k]->sbuf, NULL);
+            vkFreeMemory(G.dev, hi[e][k].mem[0], NULL); vkFreeMemory(G.dev, hi[e][k].mem[1], NULL);
+            free(hi[e][k].host[0]); free(hi[e][k].host[1]); free(ts[k]);
+        }
+    }
+    free(src); free(ssrc); free(mbuf); free(x); free(y0);
+    xb_shutdown();
+}
+
 int main(int argc, char **argv) {
     const char *spv = argc > 1 ? argv[1] : "shaders/qmatmul.spv";
     if (!coli_vk_init(spv)) { printf("vk init failed\n"); return 1; }
@@ -3454,6 +3592,11 @@ int main(int argc, char **argv) {
     }
     if (getenv("COLI_VK_TEST_GEMM_BENCH") && atoi(getenv("COLI_VK_TEST_GEMM_BENCH"))) {
         bench_gemm();
+        coli_vk_shutdown();
+        return 0;
+    }
+    if (getenv("COLI_VK_TEST_HOSTMEM") && atoi(getenv("COLI_VK_TEST_HOSTMEM"))) {
+        bench_hostmem();
         coli_vk_shutdown();
         return 0;
     }
