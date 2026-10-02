@@ -281,11 +281,14 @@ family_qwen_sanitize() {
 family_inkling_olmoe() {
   make inkling olmoe VK=1
   local cap
-  # inkling, f32 fixture (fmt 10): the oracle and the CPU's ids, at three caps
+  # inkling, f32 fixture (fmt 10): the oracle and the CPU's ids, at three caps. These
+  # arms and the next two test the dense matrices' formats: COLI_VK_DENSE=1, because on
+  # Lavapipe (a CPU device sharing the CPU's RAM) the trunk otherwise stays on the CPU
+  # while the expert tier is on; the tier runs beside it.
   $PY tools/make_tiny_inkling.py tiny_inkling
   for cap in 1 2 8; do
     SNAP=tiny_inkling ./inkling $cap 0 tiny_inkling/ref_inkling.json > cpu.log 2>&1
-    COLI_VULKAN=1 SNAP=tiny_inkling ./inkling $cap 0 tiny_inkling/ref_inkling.json > vk.log 2>&1
+    COLI_VK_DENSE=1 COLI_VULKAN=1 SNAP=tiny_inkling ./inkling $cap 0 tiny_inkling/ref_inkling.json > vk.log 2>&1
     grep -qE 'Matching tokens: ([0-9]+)/\1$' vk.log || { cat vk.log; fail "inkling f32 cap=$cap: oracle"; }
     same_tokens cpu.log vk.log "inkling f32 cap=$cap"
     need_gpu inkling vk.log "inkling f32 cap=$cap"
@@ -314,7 +317,7 @@ with open(dst, "wb") as f:
     f.write(struct.pack("<Q", len(h))); f.write(h); [f.write(b) for b in blobs]
 EOF
   SNAP=tiny_inkling_bf16 ./inkling 8 0 tiny_inkling/ref_inkling.json > cpu.log 2>&1 || true
-  COLI_VULKAN=1 SNAP=tiny_inkling_bf16 ./inkling 8 0 tiny_inkling/ref_inkling.json > vk.log 2>&1 || true
+  COLI_VK_DENSE=1 COLI_VULKAN=1 SNAP=tiny_inkling_bf16 ./inkling 8 0 tiny_inkling/ref_inkling.json > vk.log 2>&1 || true
   same_tokens cpu.log vk.log "inkling bf16"
   grep -q ', 0 bf16)' vk.log || need_gpu inkling vk.log "inkling bf16"
   echo "OK inkling bf16: tokens = CPU, $(vk_count inkling vk.log) matmuls on the GPU"
@@ -335,20 +338,194 @@ EOF
   mkdir -p tiny_inkling_q/dense-int4g64
   mv tiny_inkling_q/dense-int4g64.safetensors tiny_inkling_q/dense-int4g64/dense.safetensors
   SNAP=tiny_inkling_q ./inkling 8 0 tiny_inkling/ref_inkling.json > cpu.log 2>&1 || true
-  COLI_VULKAN=1 SNAP=tiny_inkling_q ./inkling 8 0 tiny_inkling/ref_inkling.json > vk.log 2>&1 || true
+  COLI_VK_DENSE=1 COLI_VULKAN=1 SNAP=tiny_inkling_q ./inkling 8 0 tiny_inkling/ref_inkling.json > vk.log 2>&1 || true
   same_tokens cpu.log vk.log "inkling int4-g64 container"
   need_gpu inkling vk.log "inkling int4-g64 container"
   echo "OK inkling int4-g64 container: tokens = CPU, $(vk_count inkling vk.log) matmuls on the GPU"
 
-  # olmoe: f32 residents (fmt 10), the oracle and the CPU's ids
+  # olmoe: f32 residents (fmt 10), the oracle and the CPU's ids (the trunk on the
+  # device, as above)
   $PY tools/make_olmoe_tiny.py --output olmoe_tiny
   $PY tools/convert_olmoe_merged.py --model olmoe_tiny --out olmoe_tiny_c
   SNAP=olmoe_tiny_c ./olmoe 8 8 olmoe_tiny/ref_olmoe.json > cpu.log 2>&1
-  COLI_VULKAN=1 SNAP=olmoe_tiny_c ./olmoe 8 8 olmoe_tiny/ref_olmoe.json > vk.log 2>&1
+  COLI_VK_DENSE=1 COLI_VULKAN=1 SNAP=olmoe_tiny_c ./olmoe 8 8 olmoe_tiny/ref_olmoe.json > vk.log 2>&1
   grep -qE 'Matching tokens: ([0-9]+)/\1$' vk.log || { cat vk.log; fail "olmoe: oracle"; }
   same_tokens cpu.log vk.log "olmoe"
   need_gpu olmoe vk.log "olmoe"
   echo "OK olmoe: $(grep -o 'Matching tokens: [0-9/]*' vk.log), $(vk_count olmoe vk.log) matmuls on the GPU"
+
+  inkling_olmoe_tier_fixtures
+  # The routed-expert tier (COLI_VULKAN=1 turns it on; the runs above already had it).
+  # inkling: experts in f32 (fmt 10) under the f32, bf16 and dense-int4g64 snapshots,
+  # the int4 and int8 expert containers (fmt 2 and fmt 1: gate and up in one fused
+  # tensor, up I rows in), the runtime int4 and int8 quantization (fmt 2 from int8 rows,
+  # fmt 1), at cap=1 with the trunk where the default puts it (on the CPU here) and at
+  # cap=8 with the trunk on the device (COLI_VK_DENSE=1); TOPP's trimmed ranks; the tier
+  # alone (COLI_VK_DENSE=0); and a budget of two experts, which must evict.
+  local fx D bits R=tiny_inkling/ref_inkling.json OR=olmoe_tiny/ref_olmoe.json
+  for fx in tiny_inkling tiny_inkling_bf16 tiny_inkling_q tiny_inkling_x-i4 tiny_inkling_x-i8; do
+    for cap in 1 8; do
+      D=; [ $cap = 8 ] && D=COLI_VK_DENSE=1
+      tier_gate inkling "inkling tier $fx cap=$cap" $D SNAP=$fx -- $cap 0 $R
+    done
+  done
+  for bits in 4 8; do tier_gate inkling "inkling tier runtime int$bits" SNAP=tiny_inkling -- 2 $bits $R; done
+  tier_gate inkling "inkling tier TOPP" TOPP=0.3 SNAP=tiny_inkling_x-i4 -- 2 0 $R
+  tier_gate inkling "inkling tier alone (COLI_VK_DENSE=0)" COLI_VK_DENSE=0 SNAP=tiny_inkling_x-i4 -- 8 0 $R
+  EVICT=1 tier_gate inkling "inkling tier, a budget of two experts" COLI_VK_TIER_GB=0.00006 SNAP=tiny_inkling -- 8 0 $R
+  # olmoe: int8 rows (fmt 1), the same placements, PILOT's prefetch worker beside the
+  # tier, the tier alone and a budget of three experts, which must evict.
+  for cap in 1 8; do
+    D=; [ $cap = 8 ] && D=COLI_VK_DENSE=1
+    tier_gate olmoe "olmoe tier cap=$cap" $D SNAP=olmoe_tiny_c -- $cap 8 $OR
+  done
+  tier_gate olmoe "olmoe tier PILOT" PILOT=1 WIDE=2 SNAP=olmoe_tiny_c -- 2 8 $OR
+  tier_gate olmoe "olmoe tier alone (COLI_VK_DENSE=0)" COLI_VK_DENSE=0 SNAP=olmoe_tiny_c -- 8 8 $OR
+  EVICT=1 tier_gate olmoe "olmoe tier, a budget of three experts" COLI_VK_TIER_GB=0.000025 SNAP=olmoe_tiny_c -- 8 8 $OR
+
+  # The warm start: a CPU run writes the history (inkling's PIN=<file>, olmoe's
+  # COLI_USAGE), and the tier's run fills the device from it before the first token.
+  rm -f tier.hist
+  PIN=tier.hist SNAP=tiny_inkling ./inkling 8 -p "The capital of France is" -n 8 > cpu.log 2>&1
+  PIN=tier.hist COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 SNAP=tiny_inkling ./inkling 8 -p "The capital of France is" -n 8 > vk.log 2>&1
+  $PY - cpu.log vk.log <<'PY' || { cat vk.log; fail "inkling tier warm start: the text differs from the CPU's"; }
+import re, sys
+def text(p):
+    m = re.search(rb"\[\d+ prompt tokens\](.*?)\n\[prefill", open(p, "rb").read(), re.S)
+    return m.group(1) if m else None
+a, b = text(sys.argv[1]), text(sys.argv[2])
+sys.exit(0 if a is not None and a == b else 1)
+PY
+  grep -qa '^\[VK\] tier inkling: warm start, [1-9]' vk.log || { cat vk.log; fail "inkling tier: no warm start"; }
+  [ "$(tier_count inkling vk.log)" -gt 0 ] || { cat vk.log; fail "inkling tier warm start: no routed expert ran on the device"; }
+  echo "OK inkling tier warm start: text = CPU, $(grep -a -o 'warm start, [0-9]* experts' vk.log), $(grep -a -o 'device [0-9]* of [0-9]* routed experts' vk.log | tail -1)"
+  rm -f tier.hist
+  COLI_USAGE=tier.hist SNAP=olmoe_tiny_c ./olmoe 8 8 $OR > cpu.log 2>&1
+  COLI_USAGE=tier.hist COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 SNAP=olmoe_tiny_c ./olmoe 8 8 $OR > vk.log 2>&1
+  same_tokens cpu.log vk.log "olmoe tier warm start"
+  grep -qa '^\[VK\] tier olmoe: warm start, [1-9]' vk.log || { cat vk.log; fail "olmoe tier: no warm start"; }
+  [ "$(tier_count olmoe vk.log)" -gt 0 ] || { cat vk.log; fail "olmoe tier warm start: no routed expert ran on the device"; }
+  echo "OK olmoe tier warm start: tokens = CPU, $(grep -a -o 'warm start, [0-9]* experts' vk.log), $(grep -a -o 'device [0-9]* of [0-9]* routed experts' vk.log | tail -1)"
+
+  # The serve protocol with the tier on: KV prefix reuse token-identical to a cold
+  # engine, HITS and EMAP (tier 2 on the device) after every turn, Brio's snapshot
+  # scoring; every engine after the first warm-starts from the history the one before
+  # it saved.
+  COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 INKLING_TINY=tiny_inkling \
+    $PY -m unittest tests.test_inkling_prefix_serve tests.test_inkling_dashboard_hits
+  COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 OLMOE_TINY=olmoe_tiny_c \
+    $PY -m unittest tests.test_olmoe_prefix_serve tests.test_olmoe_dashboard_hits tests.test_brio_serve
+}
+
+# The fixtures the expert tier's arms add to the family's own: inkling's int4 and int8
+# expert containers through tools/convert_inkling_int4.py's round trip (its fake
+# vendor checkpoint knows the embedding norm by the name transformers used before
+# 5.18), a tokenizer for inkling's -p mode and serve, and olmoe's for serve.
+inkling_olmoe_tier_fixtures() {
+  $PY - <<'PY'
+import importlib.util, os, shutil
+from safetensors.torch import load_file, save_file
+spec = importlib.util.spec_from_file_location("conv", "tools/convert_inkling_int4.py")
+conv = importlib.util.module_from_spec(spec); spec.loader.exec_module(conv)
+t = load_file("tiny_inkling/model.safetensors")
+if "model.embed_tokens.embed_norm.weight" in t:
+    t["model.embed_norm.weight"] = t.pop("model.embed_tokens.embed_norm.weight")
+for d in ("tiny_inkling_hf", "tiny_inkling_x-tml", "tiny_inkling_x-pass", "tiny_inkling_x-i4", "tiny_inkling_x-i8"):
+    shutil.rmtree(d, ignore_errors=True)
+os.makedirs("tiny_inkling_hf")
+save_file(t, "tiny_inkling_hf/model.safetensors")
+shutil.copy("tiny_inkling/config.json", "tiny_inkling_hf/")
+conv.selftest_e2e("tiny_inkling_hf", "tiny_inkling_x")          # tiny_inkling_x-i4: int4 experts
+conv.convert_dir("tiny_inkling_x-tml", "tiny_inkling_x-i8", 8)   # int8 experts
+PY
+  $PY -c 'import sys; from pathlib import Path; sys.path.insert(0, "."); from tests.test_inkling_prefix_serve import ensure_tokenizer; ensure_tokenizer(Path("tiny_inkling"))'
+  $PY tools/make_edge_tiny_tokenizer.py --vocab-size 128 olmoe_tiny_c
+}
+
+# inkling's and olmoe's expert tier under ASan and UBSan: a sanitized VK=1 build, the
+# tier's configurations on Lavapipe (the expert formats, eviction, TOPP, PILOT's worker
+# beside the tier, the tier alone, the trunk on the device or on the CPU, the warm
+# start) and a serve session of each engine, twice, the second warm-started. Memory
+# safety is the gate, not the tokens (a sanitized build vectorizes differently); each
+# run must still put experts on the device, or the tier was never exercised.
+family_inkling_olmoe_sanitize() {
+  make clean >/dev/null 2>&1 || true
+  make inkling olmoe VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  $PY tools/make_tiny_inkling.py tiny_inkling
+  $PY tools/make_olmoe_tiny.py --output olmoe_tiny --force
+  $PY tools/convert_olmoe_merged.py --model olmoe_tiny --out olmoe_tiny_c
+  inkling_olmoe_tier_fixtures
+  san_io() {  # <engine> <tag> <env and argv...>; KEEP=1 keeps the history of the run before
+    local eng=$1 tag=$2; shift 2
+    [ "${KEEP:-0}" = 1 ] || rm -f tier.usage
+    env ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2 \
+      COLI_USAGE=tier.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 "$@" > san.log 2>&1 || true
+    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    [ "$(tier_count "$eng" san.log)" -gt 0 ] || { cat san.log; fail "$tag: no routed expert ran on the device"; }
+    echo "OK $tag: sanitizers clean, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' san.log | tail -1), $(grep -a -o 'evictions [0-9]*' san.log | tail -1)$(grep -a -o 'warm start, [0-9]* experts' san.log | sed 's/^/, /')"
+  }
+  local fx cap D R=tiny_inkling/ref_inkling.json OR=olmoe_tiny/ref_olmoe.json
+  for fx in tiny_inkling tiny_inkling_x-i4 tiny_inkling_x-i8; do
+    for cap in 1 8; do
+      D=; [ $cap = 8 ] && D=COLI_VK_DENSE=1
+      san_io inkling "asan inkling $fx cap=$cap" $D SNAP=$fx ./inkling $cap 0 $R
+    done
+  done
+  san_io inkling "asan inkling runtime int4" SNAP=tiny_inkling ./inkling 2 4 $R
+  san_io inkling "asan inkling TOPP" TOPP=0.3 SNAP=tiny_inkling_x-i4 ./inkling 2 0 $R
+  san_io inkling "asan inkling eviction" COLI_VK_TIER_GB=0.00006 SNAP=tiny_inkling ./inkling 8 0 $R
+  san_io inkling "asan inkling tier alone" COLI_VK_DENSE=0 SNAP=tiny_inkling_x-i4 ./inkling 8 0 $R
+  san_io inkling "asan inkling -p, history written" PIN=tier.usage SNAP=tiny_inkling ./inkling 8 -p "The capital of France is" -n 8
+  KEEP=1 san_io inkling "asan inkling -p, warm start" PIN=tier.usage SNAP=tiny_inkling ./inkling 8 -p "The capital of France is" -n 8
+  grep -qa 'tier inkling: warm start, [1-9]' san.log || { cat san.log; fail "asan inkling: no warm start"; }
+  for cap in 1 8; do
+    D=; [ $cap = 8 ] && D=COLI_VK_DENSE=1
+    san_io olmoe "asan olmoe PILOT cap=$cap" $D PILOT=1 WIDE=2 SNAP=olmoe_tiny_c ./olmoe $cap 8 $OR
+  done
+  san_io olmoe "asan olmoe eviction" COLI_VK_TIER_GB=0.000025 PILOT=1 SNAP=olmoe_tiny_c ./olmoe 8 8 $OR
+  san_io olmoe "asan olmoe tier alone" COLI_VK_DENSE=0 SNAP=olmoe_tiny_c ./olmoe 8 8 $OR
+  KEEP=1 san_io olmoe "asan olmoe warm start" PILOT=1 SNAP=olmoe_tiny_c ./olmoe 2 8 $OR
+  grep -qa 'tier olmoe: warm start, [1-9]' san.log || { cat san.log; fail "asan olmoe: no warm start"; }
+  # serve: two turns, then a second engine warm-started from the history the first saved
+  local eng
+  for eng in inkling olmoe; do
+    rm -f tier.usage
+    $PY - $eng <<'PY' || fail "asan $eng serve"
+import os, subprocess, sys, threading
+eng = sys.argv[1]
+snap, argv = ("tiny_inkling", ["8"]) if eng == "inkling" else ("olmoe_tiny_c", ["4", "8"])
+env = dict(os.environ, SNAP=snap, SERVE="1", PIN="tier.usage", COLI_USAGE="tier.usage", COLI_VULKAN="1",
+           COLI_VK_TIER_SYNC="1", OMP_NUM_THREADS="2", ASAN_OPTIONS="detect_leaks=0",
+           UBSAN_OPTIONS="print_stacktrace=1")
+for run in range(2):
+    p = subprocess.Popen(["./" + eng] + argv, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, bufsize=0)
+    err = []
+    t = threading.Thread(target=lambda: err.extend(iter(p.stderr.readline, b"")), daemon=True)
+    t.start()
+    while b"READY" not in p.stdout.readline():
+        pass
+    for rid, prompt in (("1", b"The capital of France is"), ("2", b"The capital of France is, and Spain")):
+        p.stdin.write(f"SUBMIT {rid} 0 {len(prompt)} 6 0 1\n".encode() + prompt + b"\n")
+        p.stdin.flush()
+        while True:
+            line = p.stdout.readline()
+            if not line or line.split(b" ", 1)[0] in (b"DONE", b"ERROR"):
+                break
+            if line.startswith(b"DATA "):
+                p.stdout.read(int(line.split()[2])); p.stdout.readline()
+    p.stdin.close(); p.wait(timeout=300); t.join(10)
+    log = b"".join(err).decode(errors="replace")
+    if "ERROR: AddressSanitizer" in log or "runtime error:" in log:
+        print(log); sys.exit(1)
+    turns = [l for l in log.splitlines() if l.startswith(f"[VK] tier {eng} turn: device ")]
+    if len(turns) != 2 or turns[-1].split()[5] == "0" or (run == 1 and "warm start" not in log):
+        print(log); sys.exit(1)
+    print(f"OK asan {eng} serve, engine {run + 1}: sanitizers clean, " + " ".join(turns[-1].split()[4:9]) +
+          (", warm-started" if run else ""))
+PY
+  done
+  make clean >/dev/null 2>&1 || true
 }
 
 family_mimo_qwenimage() {
@@ -471,6 +648,7 @@ case "${1:-}" in
   qwen)           family_qwen ;;
   qwen-sanitize)  family_qwen_sanitize ;;
   inkling-olmoe)  family_inkling_olmoe ;;
+  inkling-olmoe-sanitize) family_inkling_olmoe_sanitize ;;
   mimo-qwenimage) family_mimo_qwenimage ;;
   deepseek)       family_deepseek ;;
   *) echo "usage: $0 shader|qwen|qwen-sanitize|inkling-olmoe|mimo-qwenimage|deepseek" >&2; exit 2 ;;
