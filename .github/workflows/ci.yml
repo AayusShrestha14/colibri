@@ -143,6 +143,50 @@ jobs:
           grep -q "expert tier active" vk.log || {
             echo "FAIL: Vulkan initialised but the expert tier did not activate"; exit 1; }
           echo "OK: shaders compiled, device negotiated, expert tier active"
+      - name: Every qmatmul weight format against a CPU reference
+        run: |
+          cd c
+          # int8, int4, grouped int4, int3, f32, bf16 and fp8-e4m3, through the staged,
+          # batched and unstaged paths and odd widths, before any engine is involved.
+          bash tests/vulkan_engines.sh shader
+
+  # Every engine with a Vulkan hook, run twice on its tiny fixture: on the CPU and on
+  # Lavapipe, with the same snapshot and settings. The gate is the CPU's tokens (and
+  # the engine's own oracle where the configuration is the one it was built for) plus
+  # a non-zero "[VK] <engine>: N matmuls on the GPU": a hook that declined every
+  # matrix would otherwise pass. One leg per family keeps each under its timeout.
+  vulkan-engines:
+    name: Vulkan engines (${{ matrix.family }}, Lavapipe)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - family: qwen
+            req: c/tools/requirements-qwen38-tiny.txt
+          - family: inkling-olmoe
+            req: c/tools/oracle-requirements.txt
+          - family: mimo-qwenimage
+            req: c/tools/requirements-qwenimage-tiny.txt
+          - family: deepseek
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow   # the V4.1 fixture's reference and its vision tower
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: ${{ matrix.req }}
+      - name: Install the Vulkan toolchain, Lavapipe and the fixture dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libvulkan-dev glslc mesa-vulkan-drivers
+          pip install -r ${{ matrix.req }} ${{ matrix.extra }}
+      - name: CPU against Vulkan, engine by engine
+        run: bash c/tests/vulkan_engines.sh ${{ matrix.family }}
 
   musl:
     name: musl libc (Alpine)

@@ -244,6 +244,52 @@ PY
   COLI_VULKAN=1 QWENIMAGE_TINY=qwenimage_tiny $PY -m unittest tests.test_qwenimage_engine_serve
 }
 
+family_deepseek() {
+  make deepseek_v41 VK=1
+  # deepseek_v41: fp8 dense in 32x32 ue8m0 tiles (fmt 12, gs 32, the tile scale
+  # repeated over its rows) and bf16 (fmt 11). The engine exits non-zero on any
+  # token mismatch with the reference; the CPU run must print the same stream.
+  $PY tools/make_dsv41_tiny.py --out dsv41_tiny --emit-ref dsv41_tiny/ref.json
+  $PY tools/make_dsv41_tiny.py --out dsv41_long --emit-ref dsv41_long/ref.json --prompt-len 40 --max-new 6
+  v41() {  # <tag> <env and argv...>
+    local tag=$1; shift
+    env "$@" > v41-cpu.txt 2> v41-cpu.err || { cat v41-cpu.err; fail "deepseek_v41 $tag: CPU run"; }
+    env COLI_VULKAN=1 "$@" > v41-vk.txt 2> v41-vk.err || { cat v41-vk.err; fail "deepseek_v41 $tag: Vulkan run misses the oracle"; }
+    cmp -s v41-cpu.txt v41-vk.txt || { diff v41-cpu.txt v41-vk.txt | head; fail "deepseek_v41 $tag: Vulkan output differs from the CPU"; }
+    need_gpu deepseek_v41 v41-vk.err "deepseek_v41 $tag"
+    echo "OK deepseek_v41 $tag: output = CPU, $(vk_count deepseek_v41 v41-vk.err) matmuls on the GPU"
+  }
+  local cap force
+  for cap in 1 2 8; do v41 "cap=$cap" SNAP=dsv41_tiny ./deepseek_v41 $cap dsv41_tiny/ref.json; done
+  for cap in 2 8; do v41 "40-token prompt cap=$cap" SNAP=dsv41_long ./deepseek_v41 $cap dsv41_long/ref.json; done
+  for force in 1 2 3 4 5; do
+    v41 "DSpark spec=$force" SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=$force ./deepseek_v41 8 dsv41_tiny/ref.json
+  done
+
+  # deepseek_v4: fp8 128x128 blocks (fmt 12, gs 128) and the bf16 router, compressors
+  # and head (fmt 11). The GPU gets the activations after the CPU's own E4M3 rounding,
+  # so the two runs do the same arithmetic. The tiny check builds the VK=1 binary and
+  # keeps passing with the device open; its --oracle path reloads the dense weights
+  # every forward and so stays on the CPU, which is why the device is checked on the
+  # session path below: ids and teacher-forced predictions equal to the CPU's and to
+  # the reference's greedy stream.
+  COLI_VULKAN=1 make deepseek-v4-tiny-check VK=1
+  local prompt
+  prompt=$($PY -c 'import json; c=json.load(open("deepseek_v4_tiny/ref.json"))["cases"]["long"]; print("".join("<t%03d>" % t for t in c["prompt_ids"]))')
+  ./deepseek_v4 ./deepseek_v4_tiny "$prompt" --raw-prompt --max-tokens 4 --record-oracle v4-cpu.json > /dev/null
+  COLI_VULKAN=1 ./deepseek_v4 ./deepseek_v4_tiny "$prompt" --raw-prompt --max-tokens 4 --record-oracle v4-vk.json > /dev/null 2> v4-vk.err
+  $PY - <<'PY' || fail "deepseek_v4: the Vulkan session differs from the CPU's"
+import json, sys
+a, b = json.load(open("v4-cpu.json")), json.load(open("v4-vk.json"))
+ref = json.load(open("deepseek_v4_tiny/ref.json"))["cases"]["long"]["greedy_full_ids"]
+ok = a["full_ids"] == b["full_ids"] == ref and a["tf_pred"] == b["tf_pred"]
+print("OK deepseek_v4 session: ids = CPU = reference" if ok else ("CPU", a, "VK", b, "ref", ref))
+sys.exit(0 if ok else 1)
+PY
+  need_gpu deepseek_v4 v4-vk.err "deepseek_v4 session"
+  echo "OK deepseek_v4: $(vk_count deepseek_v4 v4-vk.err) matmuls on the GPU"
+}
+
 case "${1:-}" in
   shader)         shader_formats ;;
   qwen)           family_qwen ;;
