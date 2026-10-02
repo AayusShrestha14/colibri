@@ -2508,8 +2508,8 @@ static void q38_vk_tier_start(Model *m,int cap){
                   .in_ram=q38_vk_in_ram,.ram_ctx=m};
     if(vc.max_rows<64)vc.max_rows=64;
     uint32_t **heat=rt_counts_all();
+    atexit(coli_vk_shutdown);   /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
     if(!vkt_init(&vc,heat))return;
-    atexit(coli_vk_shutdown);   /* runs after the tier's teardown: the device goes before the drivers unload */
     atexit(vkt_shutdown);
     /* the warm start: the history's hottest experts, read in parallel */
     int all=c->layers*c->experts,*pl=(int*)malloc((size_t)all*sizeof(int)),*pe=(int*)malloc((size_t)all*sizeof(int));

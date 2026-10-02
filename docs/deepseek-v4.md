@@ -310,6 +310,49 @@ generic build. It is deliberately independent of what the binary contains: a
 `CUDA_ARCH=portable` build has no sm_61/sm_75 cubin, and running it on such a
 card fails at launch with `"no kernel image is available"` rather than producing
 a wrong answer. Build with `portable-pre-ampere` for those cards.
+## Vulkan (`VK=1`, any GPU with a Vulkan 1.2 driver)
+
+`make deepseek-v4 VK=1` (libvulkan and `glslc` at build time) links the shared
+Vulkan backend and its routed-expert tier; `COLI_VULKAN=1` opens the device once
+the engine has loaded. No usable device, or no shaders, and the run stays on the
+CPU with one `[VK] deepseek_v4:` line that says so. Two things go to the device:
+
+- **The matrices the engine keeps for its whole life**: the resident dense layers
+  (fp8 128x128 blocks as fmt 12, fed the activation after the CPU's own E4M3
+  rounding), the bf16 head, router and compressors (fmt 11). The `--oracle` path's
+  per-forward copies, the indexer's `weights_proj` and the DSpark stages stay on
+  the CPU.
+- **The routed experts**, on the shared tier ([vulkan.md](vulkan.md#the-routed-expert-tier-vk_tierc)):
+  a cache on the device that fills from the history and adapts while you chat,
+  computed while the CPU computes the experts it does not hold. The experts go up
+  as the store reads them, fp4 with a ue8m0 scale per 32 (MXFP4, fmt 7), with an
+  activation of this engine's own that makes every rounding its CPU expert makes:
+  x to E4M3 per 128 (on the host), gate and up to bf16, the weighted activation to
+  bf16, down's input to E4M3 per 128, the output to bf16
+  ([DeepSeek V4's activation](vulkan.md#deepseek-v4s-activation)). The decode step
+  and the prefill union hand the device their routes first, the store lends the CPU
+  only the experts the device did not take, and every position adds its experts in
+  the CPU path's order, so on what was measured (Lavapipe, the tiny fixtures) the
+  device's rows are the CPU's after those roundings: a served prompt's logprobs
+  with every expert on the device come back byte for byte.
+
+Where the dense matrices go follows the backend's one rule: on a device that shares
+the CPU's RAM (an integrated GPU, Lavapipe) they stay on the CPU while the tier is
+on, and `COLI_VK_DENSE=1` puts them on the device anyway. The tier's history is the
+store's `.coli_usage`: its warm start reads the hottest experts straight from disk
+outside the cache, and a routing the device served is counted as a lookup counts
+one (pins, HITS and heat, the saved history). A hot expert the store keeps in its
+rows16 layout is unpacked for the tier, and only when the tier will take it. EMAP
+shows a device-resident expert as tier 2; each run and serve turn ends with a
+`[VK] tier deepseek_v4` line (device and CPU shares, uploads, evictions, the time
+the device hid). With the CUDA tier on, CUDA wins and the Vulkan tier stays off.
+Variables: `COLI_VULKAN`, `COLI_VK_DENSE` and the `COLI_VK_TIER*` family in
+[ENVIRONMENT.md](ENVIRONMENT.md#vulkan-any-gpu-with-a-vulkan-12-driver). CI runs it
+on Lavapipe (`tests/vulkan_engines.sh deepseek`, `deepseek-sanitize`). The only GPU
+it has run on is an Intel Iris Xe through Mesa's Dozen (Direct3D 12 under WSL),
+for correctness: the same ids as the CPU in every configuration above. No speed
+has been measured.
+
 ## Environment reference (V4 engine)
 
 Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.

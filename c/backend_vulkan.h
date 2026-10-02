@@ -171,6 +171,13 @@ size_t coli_vk_tensor_scale_count(int fmt, int I, int O, int gs);
  * Threading: engine thread only, except where noted. */
 #define COLI_VK_ACT_SWIGLU 0
 #define COLI_VK_ACT_SITU   1
+/* DeepSeek V4's expert, with the roundings its CPU kernel makes: gate and up rounded
+ * to bf16, the clamped SwiGLU, times the row's route weight (coli_vk_xb_issue_w) and
+ * rounded to bf16, then quantized to E4M3 and back with one power-of-two scale per
+ * 128 inputs before down (expert_act_v4.spv beside the main shader). The rows given
+ * are already E4M3-rounded by the caller, as the CPU kernel rounds x; down's output
+ * comes back in f32 for the caller's own bf16 rounding. */
+#define COLI_VK_ACT_SWIGLU_V4 2
 typedef struct ColiVkExpert ColiVkExpert;
 int  coli_vk_xb_init(int D, int I, int act, float limit, float a, float b);   /* again: same D, I, new act */
 int  coli_vk_xb_ready(void);
@@ -185,6 +192,10 @@ void coli_vk_xb_expert_free(ColiVkExpert *e);
  * sum(rows) pointers to D floats, expert by expert. 0 = nothing was submitted (the
  * caller computes those experts itself). One batch in flight at a time. */
 int  coli_vk_xb_issue(ColiVkExpert *const *ex, const int *rows, int count, const float *const *xrows);
+/* The same with one weight per input row (same order as xrows, NULL = 1), which
+ * COLI_VK_ACT_SWIGLU_V4 applies before down; the other activations ignore it. */
+int  coli_vk_xb_issue_w(ColiVkExpert *const *ex, const int *rows, int count, const float *const *xrows,
+                        const float *wrows);
 /* Wait for it: yrows[j] points at the D outputs of input row j (same order), valid
  * until the next issue; *device_ms is its device time when timestamps exist (else 0).
  * 0 = the batch failed (device lost): the caller computes those rows itself. */

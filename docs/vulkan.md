@@ -72,21 +72,21 @@ $env:SNAP = "$env:TEMP\vkprobe"; $env:COLI_VULKAN = "1"; $env:COLI_NO_OMP_TUNE =
 
 | Piece | Env | Mechanism |
 |---|---|---|
-| Routed experts (hot set) | `COLI_VK_EXPERTS=N` (default 320) | Top-N experts by `.coli_usage` heat uploaded **once at startup** into a VRAM registry; at decode they are served from VRAM with **no RAM slot, no disk read, no prefetch**, as one async fused batch (gate+up+silu→down, hidden on-device) overlapped with the CPU computing the remaining experts. Shown as the `vk` bucket in the hit-rate line. |
+| Routed experts | on with `COLI_VULKAN=1` (`COLI_VK_TIER=0` turns it off) | The shared routed-expert tier ([below](#the-routed-expert-tier-vk_tierc)): warm from `.coli_usage` at startup, then adapting while you chat, under a budget (`COLI_VK_TIER_GB`). The resident experts of each MoE step, prefill included, run as one async batch while the CPU loads and computes the others; they need **no RAM slot and no disk read**. Shown as the `vk` bucket in the hit-rate line, and in a `[VK] tier colibri run:` line at exit. `COLI_VK_EXPERTS=N`, the fixed top-N set this engine used to upload, is a deprecated alias: N caps the tier at N experts, `0` turns it off. |
 | Dense projections | `COLI_VK_DENSE=1` | q_a+kv_a fused into one submit, q_b, o; shared expert as a single fused expert-group submit. Resident int4/int8 weights upload once. |
 | MLA attention core | `COLI_VK_ATTN=1` | One dispatch per layer: absorbed query, scores over the KV window, softmax, weighted latent, value rows, **fused with the o-projection** (the context vector never leaves the GPU). The latent/rope KV lives in a persistent per-layer device mirror, appended ~2.3 KB/token/layer with the same invalidation points as the CUDA KV shadow. |
 
-The `PIN_GB=0` (with `PIN` still set) in the example is deliberate: the VRAM
-registry holds the same hot experts a RAM pin would, so the pin's RAM is
-better spent on the adaptive LRU cache. Keep `PIN` set so AUTOPIN does not
-re-pin from history.
+The `PIN_GB=0` (with `PIN` still set) in the example is deliberate: the expert
+tier warms from the same history a RAM pin would, so the pin's RAM is better
+spent on the adaptive LRU cache. Keep `PIN` set so AUTOPIN does not re-pin from
+history.
 
 ## The other engines
 
 Every engine links the same backend in a `VK=1` build (`make <engine> VK=1`;
 `make deepseek-v4 VK=1` for DeepSeek V4) and opens it with `COLI_VULKAN=1` once its
-weights are loaded. Kimi K3 has its own expert tier (`K3_VK`, see
-[ENVIRONMENT.md](ENVIRONMENT.md)) and glm53 its own section in
+weights are loaded. Kimi K3 also reads its older switch `K3_VK=1` and MiMo its
+`MIMO_VK_EXPERTS` (see [ENVIRONMENT.md](ENVIRONMENT.md)), and glm53 has its own section in
 [glm53-flash.md](glm53-flash.md). For the engines below, a missing device or missing
 shaders prints `[VK] <engine>: no usable Vulkan device ..., running on the CPU` and
 the run continues on the CPU. That differs from the GLM engine above, which exits.
@@ -100,27 +100,29 @@ the CPU's RAM (an integrated GPU, or a CPU device such as Lavapipe) and the engi
 runs the routed-expert tier ([below](#the-routed-expert-tier-vk_tierc)): there they
 stay on the CPU and the device takes the experts. On a Radeon 780M the dense matmuls,
 one synchronous call each at the GPU's 800 MHz floor, cost more than the tier gained
-(Qwen3.8 decode at 2.35 tok/s with them on the device, 3.80 without). Today that
-case is qwen36 and qwen38; an engine that moves to the tier inherits it. A discrete
-GPU keeps the dense matrices on the device by default. The GLM engine above reads
-the same variable through the same function with its own default, off.
+(Qwen3.8 decode at 2.35 tok/s with them on the device, 3.80 without). That case is
+every engine below with routed experts, all of them but qwenimage, and any engine
+added to the tier inherits it. A discrete GPU keeps the dense matrices
+on the device by default. The GLM engine above reads the same variable through the
+same function with its own default, off.
 
 What these engines put on the device is their **resident** matrices, in the form
-they already hold in RAM, uploaded at the first multiply (MiMo uploads them at
-startup). Routed experts arrive from disk on every miss; qwen36 and qwen38 keep a
-cache of them on the device with the shared expert tier
-([below](#the-routed-expert-tier-vk_tierc)), MiMo an opt-in one of its own, the
-others none yet.
+they already hold in RAM, uploaded at the first multiply (MiMo and Kimi K3 upload
+them at startup). Routed experts arrive from disk on every miss; every engine below
+that has them, and the GLM engine above, keeps a cache of them on the device with
+the shared expert tier ([below](#the-routed-expert-tier-vk_tierc)).
 
 | Engine | On the device | Weight formats | Stays on the CPU |
 |---|---|---|---|
 | qwen36 (Qwen3.6, Qwen3-Coder, Qwen3.8-27B) | the dense trunk; routed experts on the expert tier | int8 rows; int4-g64 with `COLI_DENSE_BITS=4`; f32 with `COLI_DENSE_I8=0`; experts int4-g64, int4 per row, int8 per row or gs64 | DeltaNet `dn_a`/`dn_b`, vision tower, the experts the tier does not hold |
 | qwen38 (Qwen3.8 Flash Next) | the trunk; routed experts on the expert tier | int8 trunk rows, bf16, f32 (`Q38_NATIVE_BF16=0`); experts int4-g64 (sidecar), FP8 128x128 blocks, bf16 | the MTP head's experts, the experts the tier does not hold |
-| inkling | dense and shared-expert matrices | int8 and int4-g64 (dense-int4g64 container), f32, bf16 | routed experts, embedding and audio lookups, CUDA residents; bf16 on CPUs with the AVX512-BF16 dot (see below) |
-| olmoe | attention q/k/v/o, router, lm_head | f32 | routed experts, embedding |
-| deepseek_v41 | the trunk, vision included | fp8 in 32x32 ue8m0 tiles, bf16 | routed experts |
-| deepseek_v4 | resident dense layers, head, router, compressors | fp8 in 128x128 blocks, bf16 | routed experts, the indexer's `weights_proj`, DSpark stages, the `--oracle` path |
-| mimo | trunk and vision tower; up to `MIMO_VK_EXPERTS=N` routed experts | native fp8/bf16, int8, f32 (`MIMO_DENSE_BITS`); experts as MXFP4 | router |
+| inkling | dense and shared-expert matrices; routed experts on the expert tier | int8 and int4-g64 (dense-int4g64 container), f32, bf16; experts int4 or int8 per row (container or runtime quantization), f32 | embedding and audio lookups, CUDA residents (with CUDA or Metal on, the experts too); bf16 on CPUs with the AVX512-BF16 dot (see below); the experts the tier does not hold |
+| olmoe | attention q/k/v/o, router, lm_head; routed experts on the expert tier | f32; experts int8 per row | embedding, the experts the tier does not hold |
+| kimi_k3 (Kimi K3) | the shared experts' matrices (one row at a time: decode); routed experts on the expert tier | shared experts int8 rows, int4-g64, f32 (`K3_BITS`); experts MXFP4 with ue8m0 scales (fmt 7), SiTU-GLU in the latent space | KDA, MLA, the latent projections, router, head, prefill's shared experts, the experts the tier does not hold |
+| mimo | trunk and vision tower; routed experts on the expert tier | native fp8/bf16, int8, f32 (`MIMO_DENSE_BITS`); experts MXFP4 with e8m0 scales (fmt 7) | router, the experts the tier does not hold |
+| deepseek_v41 | the trunk, vision included; routed experts on the expert tier | fp8 in 32x32 ue8m0 tiles, bf16; experts MXFP4 (fp4, a ue8m0 scale per 32) | the DSpark stages and their experts, the experts the tier does not hold |
+| deepseek_v4 | resident dense layers, head, router, compressors; routed experts on the expert tier | fp8 in 128x128 blocks, bf16; experts MXFP4 (fp4, a ue8m0 scale per 32) with [an activation of its own](#deepseek-v4s-activation) | the indexer's `weights_proj`, DSpark stages, the `--oracle` path's dense layers, the experts the tier does not hold |
+| glm53 (GLM-5.3 Flash) | the resident matrices (an f32 checkpoint's experts among them); the streaming container's routed experts on the expert tier | int8 and int4-g64 (`GLM53_BITS`); experts int4-gs64 | f32 matrices (`GLM53_BITS=32`), the streamed experts the tier does not hold, all of them when `swiglu_limit` is 0 |
 | qwenimage | the DiT's matrices | int8, bf16, f32 (`COLI_IMG_BITS`) | text encoder, VAE, attention |
 
 Each engine ends a run, and each serve turn, with
@@ -138,17 +140,22 @@ them by f32 activations.
     kernel (`QWEN_EXPERT_ACT`, int8 by default): the expert tier's experts match
     `QWEN_EXPERT_ACT=f32`, to 2.5e-7 of the logits on the test fixture;
   - qwen38's int8 trunk;
-  - qwenimage's `COLI_IMG_ACT8`.
+  - qwenimage's `COLI_IMG_ACT8`;
+  - Kimi K3's routed-expert kernel (`K3_IDOT`, on by default): the tier's experts
+    match `K3_IDOT=0`, the configuration of its vendor oracle;
+  - MiMo's `MIMO_IDOT=1`, and inkling's and olmoe's `IDOT=1` (all three off by
+    default).
 - Two engines keep the CPU's exact arithmetic instead:
   - deepseek_v4 rounds activations to E4M3 on the host before the call, as its CPU
-    kernel does.
+    kernel does; its routed experts on the expert tier make every rounding its CPU
+    expert makes ([DeepSeek V4's activation](#deepseek-v4s-activation)).
   - inkling leaves its bf16 matrices on the CPU when the build has the AVX512-BF16
     dot (Zen 4/5, Sapphire Rapids), because that dot rounds activations to bf16.
 
 **Memory.** The host copy stays as the CPU fallback. On an integrated GPU or APU,
 which shares RAM with the CPU, the resident set is therefore held twice: size
 `RAM_GB`/caps with that in mind. Freed tensors give their device memory back (see
-the expert tier's section); MiMo's expert tier still never evicts by its own design.
+the expert tier's section).
 
 **Status.** CI checks every engine above on Lavapipe (`tests/vulkan_engines.sh`, the
 `vulkan-engines` job): each configuration gives the CPU run's tokens, and its matmul
@@ -303,14 +310,33 @@ of them on the device the way a GPU-equipped PC should use its card:
   qwen36 and qwen38 fixture configuration are the bytes of the build before the
   tier (110 configurations: bf16, FP8, int4-g64, int8, the MTP head, every prefill
   mode, both qwen36 expert kernels, the mixed container, four model geometries).
+  The same holds for inkling and olmoe (36 configurations, stdout, stderr and every
+  logit vector), kimi_k3 (30 configurations, every step's logits), mimo (32, text and
+  picture, every prompt position's logits), deepseek_v41 and deepseek_v4 (40
+  comparisons per build: every tiny oracle, the 40-token prompt, DSpark at every
+  forced acceptance, the three V4 cases' oracle records on the 4- and the 8-expert
+  fixture, served logprob echoes, and the engines' C tests), and colibri and glm53
+  (94 configurations: every expert format of both, stdout and the teacher-forced
+  logits). One default moved with
+  it: a `VK=1` build of Kimi K3 used to open the device without being asked (`K3_VK=1`
+  was the default); it now waits for `COLI_VULKAN=1` (or `K3_VK=1`) like every engine.
 
-Engines on the tier today: **qwen36** (Qwen3.6, Qwen3-Coder, the 2.4T geometry: int8
-per row or gs64, int4 per row or gs64 from either expert kernel, the mixed int4/int8
-container) and **qwen38** (Qwen3.8 Flash Next: the int4-g64 sidecar, the release's
-FP8 with 128x128 block scales, BF16). The MTP head's layer of qwen38 stays on the CPU
-(its experts are FP8 beside an int4 sidecar). GLM-5.2's `COLI_VK_EXPERTS`, Kimi K3's
-`K3_VK` and MiMo's `MIMO_VK_EXPERTS` are the older per-engine tiers; the others move
-to this one in the next phase, see [Adding an engine](#adding-an-engine-to-the-tier).
+**Engines on the tier: every MoE engine.** Each describes its experts in the form its
+RAM already holds them (nothing is requantized), adds every expert of a row in the
+order its CPU-only run does, and keeps a history for the warm start where it has one:
+
+| Engine | Experts in RAM (`VktSrc`), device format | Activation | Warm start from | Of its own |
+|---|---|---|---|---|
+| qwen36 (Qwen3.6, Qwen3-Coder, the 2.4T geometry) | int8 per row `I8_ROW` or gs64 `I8_GS` (fmt 1, 13); int4 per row or gs64 from the int8-slot kernel, `I8_AS_I4_ROW` / `I8_AS_I4_GS` (fmt 2, 4); planar int4-g64 from the int4 kernel, `I4U_PLANAR64` (fmt 4); the mixed container's int4 gate/up and int8 down | SwiGLU | `COLI_USAGE` (default `<snap>/.coli_usage`), kept only while the tier is on | the tier's experts match `QWEN_EXPERT_ACT=f32` (the default kernel rounds activations to int8) |
+| qwen38 (Qwen3.8 Flash Next) | the int4-g64 sidecar `I4U_PLANAR64` (fmt 4); the release's FP8 in 128x128 blocks `FP8_BLOCK` (fmt 12); `BF16` (fmt 11); `F32` (fmt 10) | SwiGLU | `COLI_USAGE` (default `<snap>/.coli_usage`), always kept | the MTP head's layer stays on the CPU (its experts are FP8 beside an int4 sidecar) |
+| inkling | int4 container `I4U_PAIRS_ROW` (fmt 2); int8 container `I8_ROW` (fmt 1); runtime int8 rows, `I8_AS_I4_ROW` at 2 to 4 bits (fmt 2) and `I8_ROW` above; `F32` at `bits=0` (fmt 10). Gate and up come from the fused `gate_up` tensor, up I rows in | SwiGLU | `<snap>/.coli_usage` or `PIN=<path>`, in the generate and serve modes; the ref.json oracle reads none | [Inkling and OLMoE](#inkling-and-olmoe) |
+| olmoe | int8 rows `I8_ROW` (fmt 1), gate, up and down as the merged container holds them | SwiGLU | `COLI_USAGE` only | [Inkling and OLMoE](#inkling-and-olmoe) |
+| kimi_k3 (Kimi K3) | the checkpoint's MXFP4 with ue8m0 scales `MXFP4_E8M0` 32 (fmt 7): gate `w1`, up `w3`, down `w2`, in the latent space | SiTU-GLU (`VKT_ACT_SITU`) | `COLI_USAGE` (default `<snap>/.coli_usage`) | [Kimi K3 and MiMo](#kimi-k3-and-mimo) |
+| mimo (MiMo-V2.6 Flash and Pro) | the release's MXFP4 `MXFP4_E8M0` 32 (fmt 7) | SwiGLU | none: the tier fills as experts pass by | [Kimi K3 and MiMo](#kimi-k3-and-mimo) |
+| deepseek_v41 (DeepSeek V4.1 Flash) | MXFP4 `MXFP4_E8M0` 32 (fmt 7), as the checkpoint stores it | SwiGLU with `swiglu_limit` | `COLI_USAGE` (default `<snap>/.coli_usage`), kept only while the tier is on | the backbone's layers; the DSpark stages keep their own experts on the CPU |
+| deepseek_v4 (DeepSeek V4 Flash) | MXFP4 `MXFP4_E8M0` 32 (fmt 7); pinned experts unpacked from rows16 | `VKT_ACT_SWIGLU_V4` | the store's own `<model>/.coli_usage` | [DeepSeek V4's activation](#deepseek-v4s-activation) |
+| colibri (GLM-5.2) | `F32` (fmt 10), int8 `I8_ROW` (fmt 1), int4 per row `I4U_PAIRS_ROW` (fmt 2), int4-gs `I4U_PAIRS_GS` (fmt 4), int3-g64 `I3_G64` (fmt 5); down may have its own | SwiGLU | `<snap>/.coli_usage` | [GLM-5.2 and GLM-5.3 Flash](#glm-52-and-glm-53-flash-on-the-tier) |
+| glm53 (GLM-5.3 Flash) | the streaming container's int4-gs64 `I4U_PAIRS_GS` 64 (fmt 4) | SwiGLU with `swiglu_limit`, run only above 0 | `COLI_USAGE` (default `<snap>/.coli_usage`) | [GLM-5.2 and GLM-5.3 Flash](#glm-52-and-glm-53-flash-on-the-tier) |
 
 With the CUDA expert tier built and on (`COLI_CUDA=1`) as well, **CUDA wins**: the
 Vulkan tier stays off and says so (`[VK] tier <engine>: the CUDA expert tier is on
@@ -325,11 +351,11 @@ the device, since no Vulkan tier runs.
 | `COLI_VK_TIER_RATE` | `16` | Promotions per token at most (a prompt's forward gets this many per prompt token): each copies one expert on the engine thread. |
 | `COLI_VK_TIER_BALANCE` | on | `0`: the device takes every resident expert of a step even when it is the slower side (see below). |
 | `COLI_VK_TIER_WARM` | on | `0`: no warm start; the tier fills as experts pass by. |
-| `COLI_VK_TIER_SYNC` | `0` | `1`: each layer step first waits for the uploads staged so far: residency then follows the routing alone (with `COLI_VK_TIER_BALANCE=0`, the run is reproducible). For tests and debugging. |
+| `COLI_VK_TIER_SYNC` | `0` | `1`: each layer step first waits for the uploads staged so far: residency then follows the routing alone (with `COLI_VK_TIER_BALANCE=0`, the run is reproducible). A promotion that displaces a resident while a batch is in flight waits for the join to free it. For tests and debugging. |
 | `COLI_VK_TIER_GEMM_ROWS` | `16` | Rows from which an expert of a step takes the tiled GEMM instead of the per-row GEMV; `0` never. |
 | `COLI_VK_TIER_QUEUE` | a second queue | `0`: the tier shares the main queue (its batches and the dense matmuls then serialize). |
 | `COLI_VK_DENSE` | on, but off on a device sharing the CPU's RAM while the tier is on | `0`: the dense trunk stays on the CPU and the device takes the routed experts only; `1`: the trunk on the device whatever the device. Unset: on a discrete GPU, or with the tier off, on the device; on an integrated GPU or Lavapipe with the tier on, on the CPU. The startup line says which and why. (The GLM engine reads it through the same rule with its own default, off.) |
-| `COLI_USAGE` | `<snap>/.coli_usage` | The history the warm start reads. qwen38 always keeps it; qwen36 keeps it only while the tier is on, and saves it at the end of every run and serve turn. |
+| `COLI_USAGE` | `<snap>/.coli_usage` | The history the warm start reads; each engine's is in the table above. qwen36 and deepseek_v41 keep it only while the tier is on, and save it at the end of every run and serve turn. olmoe reads one only when this is set, inkling also takes `PIN=<path>`, deepseek_v4 reads its expert store's own (`<model>/.coli_usage`, always kept) and MiMo none. |
 
 **The budget.** On a discrete GPU: what `VK_EXT_memory_budget` says is free in
 device-local memory, less the reserve and the dense weights the engine is about to
@@ -381,6 +407,131 @@ waits for that batch's join.
 The dashboard's expert map (`EMAP`) shows a device-resident expert as tier 2 (VRAM),
 the experts a device step served still light up in `HITS`, and qwen36's
 `CACHE_ROUTE` ranks them like CUDA-resident ones.
+
+### Inkling and OLMoE
+
+Both run their routed experts on this tier with `COLI_VULKAN=1`, in the form their
+RAM caches hold them (the table above). inkling's two shared experts run beside the
+batch, on the CPU or, with the dense matrices, on the device; `TOPP`'s trimmed ranks
+reach neither side; with CUDA or Metal on, the Vulkan tier stays off. olmoe's `PILOT`
+prefetcher skips experts the device holds, and a slot is handed to the tier only
+under the cache lock, while it still holds that expert.
+
+Each layer step routes every row first, then runs per block of 64 rows: the block's
+resident experts go to the device as one batch, the CPU computes the other pairs with
+the kernels and the cache rounds it always uses, and every rank joins its row in
+routing order. The device multiplies f32 activations, as both engines' default CPU
+kernels do; `IDOT=1` (opt-in on both) rounds the CPU's activations and the device's
+not. With `COLI_VULKAN` unset, or in a build without `VK=1`, the stdout and the
+stderr (timings aside) and every logit vector of 36 configurations per build (each
+expert format, caps 1 to 8, `TOPP`, `IDOT`, the generate and serve modes, `PPL`,
+`ROUTE_TRACE`) are the bytes of the build before the tier.
+
+### Kimi K3 and MiMo
+
+Both had a tier of their own, which filled once and never evicted; they joined this
+one, and their switches are read as its own ([ENVIRONMENT.md](ENVIRONMENT.md)): Kimi
+K3's `K3_VK` (`1` opens the device as `COLI_VULKAN=1` does, `0` keeps it closed),
+`K3_VK_GB` (the budget, as `COLI_VK_TIER_GB`) and `K3_VK_UP` (promotions per token, as
+`COLI_VK_TIER_RATE`), MiMo's `MIMO_VK_EXPERTS` (`N` sizes the budget at N experts, `0`
+keeps the experts on the CPU). Kimi K3's experts run SiTU-GLU on the device with the
+config's two constants, in the latent space, and match `K3_IDOT=0` (the CPU's default
+kernel rounds activations to int8); MiMo's run SwiGLU. Both add every pair of a row in
+the CPU run's order (Kimi K3: its union's disk-offset order; MiMo: the row's routing
+order), and offer the experts the CPU computed after the join, those still in the RAM
+cache, so that a promotion that displaces a resident frees it at once and its upload
+starts on a pool with room.
+
+### DeepSeek V4's activation
+
+DeepSeek V4's CPU expert rounds more than the others do: gate and up to bf16 before
+the SwiGLU, the activation times the route weight to bf16, then down's input to E4M3
+with one power-of-two scale per 128 values (its fp4 kernel rounds every input that
+way), and down's output to bf16. Left to the plain SwiGLU, a device row would differ
+from the CPU's by those roundings, not by a summation order. So the tier has a third
+activation for it, `VKT_ACT_SWIGLU_V4` (the backend's `COLI_VK_ACT_SWIGLU_V4`):
+
+- the engine rounds x to E4M3 per 128 before `vkt_issue_w`, as its kernel rounds it,
+  and hands the route weights with the routing;
+- the activation shaders (both routes) round gate and up to bf16 and compute the
+  clamped SwiGLU in the CPU's form;
+- `expert_act_v4.comp`, one pass between the activation and down, multiplies each row
+  by its weight, rounds to bf16, and rounds each block of 128 to E4M3 with the CPU's
+  scale (the smallest power of two that brings the block's maximum under 448);
+- the engine rounds each returned row to bf16 and adds it with no weight of its own,
+  in its CPU path's order (ascending expert id, then rank).
+
+What is left between the two sides is the projections' summation order and the
+device's `exp`; on everything measured the roundings absorbed both, though a value
+that lands on a rounding boundary can still go the other way on another driver.
+Measured on Lavapipe: the harness's
+exact-input case gives the CPU's values bit for bit through every rounding (0 of 3840
+differ, and three mutants of the pass each fail it); `vk-tier-check` gives 264 of 264
+device rows bit-identical to the CPU arithmetic on random MXFP4 experts; a served
+71-token prompt with every routed expert on the device gives the CPU's per-position
+logprob echoes byte for byte. On an Intel Iris Xe through Mesa's Dozen the harness
+case is bit for bit too, and every deepseek_v4 and deepseek_v41 tier configuration
+gives the CPU's tokens.
+
+Two things of the engine's own: the store keeps its pinned hot experts in a 16-row
+interleaved layout (rows16), which the tier unpacks to rows only when it will take
+the expert (`vkt_wants`); and a routing the device served is counted as a store
+lookup counts one (pins, HITS and heat, `.coli_usage`), so the history stays the
+routing's whichever side computed it.
+
+### GLM-5.2 and GLM-5.3 Flash on the tier
+
+**GLM-5.2 (`colibri`).** With `COLI_VULKAN=1` the routed experts go to the tier, in the
+form the loader holds them: f32 (`./colibri <cap> 16`), int8 and int4 per row and
+int3-g64 when a bf16 or FP8 checkpoint is quantized at load, the int4-gs container
+(`convert_fp8_to_int4.py`'s default, gs 64) and int3-g64. Gate and up share one format,
+down may have its own (`--down-bits 3`; an int4-g64 container's rows narrower than the
+group stay per row). E8/IQ3 experts (fmt 6, whose input is rotated), int2 and fp8 have
+no device form and stay on the CPU (`[VK] tier colibri: experts in fmt 6/6/6 ... stay
+on the CPU`), and so does the MTP head's layer (int8). The tier serves every row count:
+decode, the MTP and n-gram verify rows and the batched prefill, by blocks of 64 rows; the
+fixed set it replaces served S <= 4 only.
+
+- *The sum.* Without `COLI_VULKAN`, `moe()` adds a token's experts in the order of the
+  batch's union, as before (the default build's stdout and the teacher-forced logits of
+  every fixture configuration are the base commit's bytes). With the tier on, every
+  expert of a row joins it in routing (rank) order, the device's and the CPU's alike,
+  then the shared expert.
+- *What the CPU computes beside the batch* goes through the same pin set, LRU and disk
+  loads (`PIPE` included) as the CPU path, and every expert it computes is offered to
+  the tier. A device-served expert takes no RAM slot and no disk read.
+- *Arithmetic.* The device multiplies f32 activations. The CPU's int8 dot (`IDOT`,
+  on by default) rounds the activations to int8 for int8 experts, and for int4-per-row
+  experts from two rows (from one on AVX-512 VNNI and ARM dot-product builds): there
+  the tier's experts match `IDOT=0`, which the tests set.
+- *The old names.* `COLI_VK_EXPERTS` (the count of the fixed set, 320 by default) is a
+  deprecated alias: `N` caps the tier at N experts, `0` turns it off as `COLI_VK_TIER=0`
+  does, and a line says so. `COLI_VK_RESERVE_GB` (the old reserve, 3 GB) adds what it
+  asks beyond `COLI_VK_TIER_RESERVE_GB`. With `COLI_VK_ATTN=1` the absorb core's KV
+  mirror (`CTX` rows a layer) is reserved too. The dense set (`COLI_VK_DENSE=1`) is
+  uploaded before the tier sizes itself, so the budget is what remains; the trunk's
+  default here stays off. On an integrated GPU the tier takes its default share of RAM
+  after the expert cache's (the startup reservation of the fixed set is gone).
+- *`COLI_VK_DEV2`*: the second device's registry, fixed at startup, takes the hottest
+  experts of the history that the tier does not hold (with the tier off, the hottest
+  ones), up to `COLI_VK_EXPERTS2`; a step sends them there as one group on a worker
+  thread while the tier's batch and the CPU run.
+
+**GLM-5.3 Flash (`glm53`).** The streaming container's int4-gs64 experts go to the tier;
+the resident matrices follow the dense rule above (on a device that shares the CPU's RAM
+they stay on the CPU while the tier is on; before, `COLI_VULKAN=1` always put them on the
+device). An f32 checkpoint, whose experts are resident matrices, has no tier. The
+experts' SwiGLU is clamped (`swiglu_limit`): `swiglu_clamped` clamps at any limit,
+including 0, where it zeroes every routed expert's output, while the shader clamps only
+above 0; so the tier runs only for a limit above 0 and says why otherwise. The shared
+expert is written first, then every rank of every row in routing order. Its tiny
+fixtures have a single MoE layer, whose forwards the tier cannot tell apart by the
+layer index going back: the engine marks each forward's start (`vkt_begin_forward`).
+
+Both print `[VK] tier colibri|glm53 run:` at the end of a run and a `turn` line after
+each serve turn; `EMAP` shows a tier-resident expert as tier 2. No GPU has run GLM
+weights on the tier yet: `tests/vulkan_engines.sh glm` proves the tokens on Lavapipe,
+nothing about speed.
 
 ### Measured on a Radeon 780M
 
@@ -710,18 +861,22 @@ What each remaining architecture needs on top of today's shaders:
 
 ## Adding an engine to the tier
 
-The integration steps are in [`c/vk_tier.h`](../c/vk_tier.h); in short:
+Every MoE engine here is on the tier ([the table above](#the-routed-expert-tier-vk_tierc));
+these are the steps the next one takes. They are in [`c/vk_tier.h`](../c/vk_tier.h);
+in short:
 
 1. **Describe the experts** (`VktConfig`): geometry, how RAM holds gate/up and down
    (`VktSrc`: int8 per row or grouped, the int8 copy of an int4 container, int4
    pairs signed or `v+8`, `expert_ffn.h`'s planar int4-g64, int3-g64, MXFP4 with f32
    or ue8m0 scales, fp8 per group or in square blocks, bf16, f32), the activation
-   (`VKT_ACT_SWIGLU` with an optional clamp, `VKT_ACT_SITU`), the most assignments a
+   (`VKT_ACT_SWIGLU` with an optional clamp, `VKT_ACT_SITU`, `VKT_ACT_SWIGLU_V4`), the most assignments a
    step carries, the RAM the expert cache may still take and the dense bytes still to
-   come to the device. `vkt_init(&cfg, rt_counts_all())` after the device and the
-   history; then `atexit(coli_vk_shutdown)` and `atexit(vkt_shutdown)`, in that
-   order, so that at exit the tier lets go of its experts and the device is
-   destroyed before the drivers unload.
+   come to the device; optionally `.max_experts`, a count the engine's users already
+   size its device tier in (GLM-5.2's `COLI_VK_EXPERTS`). `atexit(coli_vk_shutdown)`,
+   then `vkt_init(&cfg, rt_counts_all())` after the device and the history, then
+   `atexit(vkt_shutdown)` when it succeeds: at exit the tier lets go of its experts
+   first and the device is destroyed before the drivers unload, whether or not the
+   tier started (`vkt_init` makes the expert batch's pipelines before it can refuse).
 2. **Warm start** (optional): `vkt_plan`, read each planned expert into a buffer of
    the loader's own (any number of threads), `vkt_put`, then `vkt_put_done`.
 3. **Every MoE step**: `vkt_issue(layer, x, S, K, idx, taken)`; compute the pairs not
@@ -729,21 +884,12 @@ The integration steps are in [`c/vk_tier.h`](../c/vk_tier.h); in short:
    are in RAM; the shared expert; `vkt_join` (when the issue took any); then add
    every rank of every row in order, the device's row where `taken`. A failed join
    (device lost) leaves the taken pairs to the CPU and turns the tier off.
+   `vkt_issue_w` also hands the route weights (for an activation that applies them on
+   the device); `vkt_wants(l, e)` says whether `vkt_note` would take an expert, for an
+   engine that must convert its RAM form first; `vkt_begin_forward()` marks a
+   forward's start for a model whose layer index never goes back (a single MoE layer).
 4. **Report**: `vkt_report("run"|"turn", ram_hits, disk_loads)` beside the engine's
    `[VK]` line; `vkt_resident(l, e)` gives EMAP its tier 2.
-
-What each remaining engine needs, from reading its code:
-
-| Engine | Experts in RAM (`VktSrc`) | Activation | Where | To watch |
-|---|---|---|---|---|
-| colibri.c (GLM-5.2) | int4 per row `I4U_PAIRS_ROW`, int4-gs `I4U_PAIRS_GS`, int3-g64 `I3_G64`; gate, up, down separate | SwiGLU | `moe()`'s Vulkan block replaces the `COLI_VK_EXPERTS` registry | sums per expert in union order today: move to rank order; fmt 6 (E8/IQ3, rotated input) stays on the CPU; the MTP layer is int8 (another format); the block now serves only S <= 4 |
-| glm53 | int4 gs64 `I4U_PAIRS_GS` 64 | SwiGLU with `swiglu_limit` | `ffn_layer` | its CPU clamps even at limit 0 (no guard), the shader treats 0 as no clamp: pass the config's value and check `L > 0` on the CPU side first; shared expert written first |
-| inkling | one `gate_up` tensor [2I, D], rows 0..I-1 gate: pass `g = p13`, `u = p13 + I rows`; int4 per row `I4U_PAIRS_ROW` or int8 `I8_ROW` | SwiGLU | `moe` | routed and shared weights normalized together, `route_scale x rgs` already in the weights |
-| kimi_k3 | MXFP4 `MXFP4_E8M0` 32, gate `w1`, up `w3`, down `w2` | SiTU-GLU, a = 4, b = 25 (`VKT_ACT_SITU`) | `moe_forward` / `expert_apply` (experts in the latent space) | replaces `K3_VK` (synchronous, never evicts); the CPU's `K3_IDOT` rounds activations to int8 |
-| deepseek_v41 | MXFP4 `MXFP4_E8M0` 32 | SwiGLU with limit | `moe_run_at` (already sums per (row, rank) in rank order) | DSpark stages have caches of their own |
-| deepseek_v4 | FP4 + ue8m0/32 = `MXFP4_E8M0` 32; pinned experts are repacked rows16 | SwiGLU with limit, **plus** bf16 rounding of gate/up, the route weight applied before down and bf16 rounding of the output | `moe_token_pipeline` (ascending expert id), `v4_moe_batch_union` | needs an activation variant with those roundings and the host's E4M3 rounding of x (as its fp8 dense path does); undo rows16 or keep pinned experts off the tier; hash-routed layers |
-| mimo | MXFP4 `MXFP4_E8M0` 32, stored down, ds, gate, gs, up, us | SwiGLU | `moe` | replaces `MIMO_VK_EXPERTS` (synchronous, never evicts) |
-| olmoe | int8 per row `I8_ROW`, one merged tensor g, u, d | SwiGLU | `moe` | history only with `COLI_USAGE` |
 
 ## Correctness
 
@@ -761,12 +907,32 @@ What each remaining engine needs, from reading its code:
 - The expert tier: `tests/test_vk_alloc` (in `make check`) runs the sub-allocator
   against a byte map, 40,000 random steps included; `make vk-tier-check VK=1` runs
   `vk_tier.c` against a CPU reference for every expert source format, the warm
-  start, adaptation with eviction and partial batches; the harness runs the expert
-  batch for every weight format and both activations, a row's bits checked
+  start, adaptation with eviction, partial batches, and with `COLI_VK_TIER_SYNC=1` a
+  promotion that displaces a resident while a batch is in flight (it must wait for
+  the join's free, not fail and shrink the budget); the harness runs the expert
+  batch for every weight format and every activation, a row's bits checked
   independent of the batch, and the tier pool's budget with frees while a batch is
   in flight. `tests/vulkan_engines.sh qwen` gives the CPU's tokens with the tier on
   in every qwen36 and qwen38 expert format, under eviction, with MTP and with the
   trunk on the CPU; `qwen-sanitize` runs the same under ASan and UBSan.
+  `tests/vulkan_engines.sh inkling-olmoe` does the same for inkling (every expert
+  format above, under the f32, bf16 and dense-int4g64 snapshots, `TOPP`) and olmoe
+  (with `PILOT`'s worker), under eviction, with a warm start, and through both
+  engines' serve tests (prefix reuse, the dashboard, Brio); `inkling-olmoe-sanitize`
+  runs them under ASan and UBSan. `kimi` and the mimo half of `mimo-qwenimage` do it
+  for Kimi K3 and MiMo: their vendor oracles with the tier on, the CPU's
+  tokens in every dense format with the trunk on the device and on the CPU, a budget
+  of two experts that must evict, the old switches, Kimi K3's warm start;
+  `kimi-mimo-sanitize` runs the tier's configurations under ASan and UBSan.
+  `tests/vulkan_engines.sh deepseek` does it for deepseek_v41 (every tiny oracle, the
+  40-token prompt, DSpark, eviction) and deepseek_v4 (the three oracle cases on a 4-
+  and an 8-expert fixture with pinned rows16 experts, eviction, the warm start, the
+  served logprobs), and `deepseek-sanitize` under ASan and UBSan. DeepSeek V4's
+  activation has a case of its own in the harness, checked bit for bit, and in
+  `vk-tier-check`.
+  `tests/vulkan_engines.sh glm` does the same for colibri and glm53 (every expert
+  format, warm and cold, prefill, eviction, the trunk and attention core on the
+  device, `COLI_VK_DEV2`), `glm-sanitize` under ASan and UBSan.
 - The dense chain: `make vk-chain-check VK=1` (`tests/test_vk_chain.c`) runs every chain
   op against a CPU reference; `tests/vulkan_engines.sh qwen-chain` gives the CPU's tokens
   with the chain in every qwen36 geometry and expert container and every qwen38 format,
@@ -824,10 +990,9 @@ hit-rate line is the tier-effectiveness number.
 
 ## Limits and future work
 
-- GLM-5.2 (this section's engine): decode-focused, its `COLI_VK_EXPERTS` tier and the
-  attention core serve `S<=4`; prefill uses the CPU/batched paths (dense projections
-  do run on VK at prefill). The shared expert tier serves prefill too; GLM moves to
-  it in the next phase.
+- GLM-5.2 (this section's engine): the attention core serves `S<=4`; prefill uses the
+  CPU/batched attention paths (dense projections do run on VK at prefill). Its routed
+  experts are on the shared expert tier, which serves prefill too.
 - The expert tier's uploads are host writes into host-visible device memory: a
   discrete card needs Resizable BAR for them (above). A staging copy on a transfer
   queue, for cards without it, is not written.
