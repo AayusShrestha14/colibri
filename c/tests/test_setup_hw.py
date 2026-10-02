@@ -67,6 +67,23 @@ GPU1:
 \tdeviceName         = llvmpipe (LLVM 20.1.2, 256 bits)
 """
 
+# Captured from vulkaninfo.exe --summary on Windows 11 with Intel's driver
+# (device UUIDs dropped).
+VULKANINFO_WINDOWS = """Devices:
+========
+GPU0:
+\tapiVersion         = 1.4.323
+\tdriverVersion      = 101.7076
+\tvendorID           = 0x8086
+\tdeviceID           = 0xa7a1
+\tdeviceType         = PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+\tdeviceName         = Intel(R) Iris(R) Xe Graphics
+\tdriverID           = DRIVER_ID_INTEL_PROPRIETARY_WINDOWS
+\tdriverName         = Intel Corporation
+\tdriverInfo         = 101.7076
+\tconformanceVersion = 1.4.0.0
+"""
+
 
 def memory_properties(heaps):
     """VkPhysicalDeviceMemoryProperties bytes: heaps = [(size, device_local)]."""
@@ -202,6 +219,13 @@ class VulkanParsing(unittest.TestCase):
         self.assertEqual(devices[1]["type"], "cpu")
         self.assertEqual(devices[0]["api_version"], "1.3.289")
         self.assertIsNone(devices[0]["device_local_bytes"])   # the summary has no memory figures
+
+    def test_vulkaninfo_on_windows(self):
+        devices = setup_hw.parse_vulkaninfo_summary(VULKANINFO_WINDOWS)
+        self.assertEqual(len(devices), 1)
+        self.assertEqual(devices[0]["name"], "Intel(R) Iris(R) Xe Graphics")
+        self.assertEqual(devices[0]["vendor"], "Intel")
+        self.assertTrue(setup_hw.vulkan_usable(devices[0]))
 
     def test_memory_record_with_budget(self):
         memory = memory_properties([(16 * 2**30, True), (32 * 2**30, False)])
