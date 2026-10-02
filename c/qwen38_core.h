@@ -4,8 +4,9 @@
  * This header is included once by qwen38.c after its tokenizer and protocol
  * helpers.  It intentionally consumes the official HF safetensors layout:
  * the multimodal wrapper's `model.language_model` namespace and the standalone
- * text model's `model` namespace are both accepted.  Vision and MTP tensors are
- * indexed by st.h but are never read.
+ * text model's `model` namespace are both accepted.  Vision tensors are read
+ * by the vision tower only, and the MTP head's only under Q38_MTP=1
+ * (q38_mtp_attach).
  */
 #ifndef COLI_QWEN38_CORE_H
 #define COLI_QWEN38_CORE_H
@@ -35,6 +36,11 @@ typedef struct {
     int ple_layer, ple_dim, ple_convk, ngram_size, heads_per_ngram;
     int ngram_heads, ngram_head_dim, ngram_parts;
     uint8_t *is_attn;
+    /* MTP head: mtp_num_hidden_layers (0 = the checkpoint has none, -1 = one
+     * this engine does not run) and the RoPE base of its attention (config
+     * mtp.rope_theta, else the model's) */
+    int mtp_layers;
+    float mtp_theta;
     /* vision: 0 = checkpoint di solo testo, o torre non caricata */
     int image_token;
     int vis_depth, vis_hidden, vis_heads, vis_inter, vis_patch;
@@ -190,10 +196,41 @@ typedef struct {
     float *vis_rows;
     int *vis_map, vis_map_len, vis_rows_n;
     Q38Timers timers;
+    /* The MTP head (q38_mtp_attach, Q38_MTP=1). Its decoder layer is layer
+     * index c.layers wherever an index names storage: L[], cache[],
+     * expert_scales[], K/V/IK[] and the route-trace row. mtp_len counts the
+     * head's KV rows that hold a verified pair (the streams at position p
+     * with the token at p+1); mtp_pend keeps the streams of the rows after
+     * them whose next token has not reached the head yet (one, or two after
+     * an accepted draft, the first one's next token in mtp_pend_tok). */
+    int mtp, mtp_wiring;
+    char mtp_prefix[32];
+    float *mtp_norm_emb, *mtp_norm_hid;
+    Q38Weight mtp_fc_emb, mtp_fc_hid;
+    GatedResidual mtp_mixer;
+    int mtp_len, mtp_pend_n, mtp_pend_tok;
+    float *mtp_pend;
+    /* A verify forward (S=2) copies the DeltaNet and PLE state as it stands
+     * once its first snap_after rows are in (0 = no copy), so a rejected
+     * draft rolls back by swapping these in instead of running the forward
+     * again. */
+    int snap_after;
+    float **snap_rec, **snap_conv, *snap_ple;
+    int64_t snap_ple_history[2];
+    int snap_ple_history_len;
 } Model;
+
+/* Layer rows of storage: the c.layers decoder layers, plus the MTP head's at
+ * index c.layers once it is attached. model_init_range sizes L[], cache[]
+ * and expert_scales[] for that extra row up front; a loop over the rows
+ * stops here so a model without the head never touches it. */
+static inline int q38_layer_rows(const Model *m){ return m->c.layers+(m->mtp?1:0); }
 
 static float *g_last_logit;
 static int g_capture_last_logit;
+/* Set for the length of an MTP verify forward (q38_spec_step): its rows must
+ * get the bits a decode step gives them, see q38_weight_matmul and q38_moe. */
+static int g_q38_rowwise;
 
 static double now_s(void) {
     struct timespec t;
@@ -454,6 +491,20 @@ static void q38_vk_report(void) {
 #endif
 static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
                               int S,int I,int O) {
+    /* Every CPU kernel below computes a row the same way whatever S is, so an
+     * MTP verify forward (S=2) reproduces two decode steps bit for bit. A
+     * device answers S == 1 and S > 1 by different routes (the VRAM trunk
+     * only takes decode rows; a Vulkan batch is its own dispatch), so under
+     * a verify such a matrix runs its rows one at a time, as decode does. */
+    if(S>1&&g_q38_rowwise&&weight&&
+       (weight->gpu
+#ifdef COLI_VULKAN
+        ||(g_vk_ready&&q38_vk_eligible(weight))
+#endif
+       )){
+        for(int s=0;s<S;s++)q38_weight_matmul(y+(int64_t)s*O,x+(int64_t)s*I,weight,1,I,O);
+        return;
+    }
     /* A matrix the tier placed in VRAM (q38_trunk_place) answers a decode
      * GEMV from there; prefill rows and any failure take the CPU path below,
      * so the BF16 copy stays the reference for everything but S == 1. */
@@ -708,6 +759,30 @@ static void q38_load_cfg(Cfg *c,const char *snap) {
         else if(!strcmp(s,"full_attention")||!strcmp(s,"qwen_sparse_attention")) c->is_attn[i]=1;
         else {fprintf(stderr,"unsupported layer type %s\n",s);exit(1);}
     }
+    /* The MTP head is described next to the text model (or at the root of a
+     * multimodal config). Only read here; q38_mtp_attach decides whether the
+     * engine can run it, so a config this engine cannot draft with still
+     * loads for plain decoding. */
+    {
+        jval *at=json_get(tc,"mtp_num_hidden_layers")?tc:root;
+        c->mtp_layers=q38_num_int(at,"mtp_num_hidden_layers",0,0,0,64);
+        c->mtp_theta=c->theta;
+        jval *mc=q38_obj(tc,"mtp"); if(!mc) mc=q38_obj(root,"mtp");
+        if(mc){
+            double mt=q38_num(mc,"rope_theta",theta,0);
+            if(!isfinite(mt)||mt<=0.0||mt>FLT_MAX){fprintf(stderr,"invalid mtp.rope_theta\n");exit(1);}
+            c->mtp_theta=(float)mt;
+            jval *types=json_get(mc,"layer_types");
+            if(types&&types->t==J_ARR)
+                for(int i=0;i<types->len;i++){
+                    const char *s=types->kids[i]->t==J_STR?types->kids[i]->str:"";
+                    /* the head's one layer is an attention layer; anything else is a head this engine does not have */
+                    if(strcmp(s,"full_attention")&&strcmp(s,"qwen_sparse_attention")) c->mtp_layers=-1;
+                }
+        }
+        jval *dedicated=json_get(tc,"mtp_use_dedicated_embeddings"); if(!dedicated) dedicated=json_get(root,"mtp_use_dedicated_embeddings");
+        if(dedicated&&dedicated->t==J_BOOL&&dedicated->boolean) c->mtp_layers=-1;   /* mtp.embed_tokens: not this head */
+    }
     /* Vision: opzionale. Un checkpoint di solo testo non ha vision_config, e in
      * quel caso la torre resta spenta invece di rifiutare il modello. La
      * geometria viene dal file, non da costanti qui: una torre di misura diversa
@@ -827,17 +902,25 @@ static Q38Weight q38_load_weight(Model *m,const char *name,int rows,int cols) {
     return weight;
 }
 
+/* A layer's tensor name. Index c.layers is the MTP head's decoder layer,
+ * which the checkpoint keeps as <mtp>.layers.0. */
 static void q38_name(Model *m,char *out,size_t cap,int layer,const char *suffix) {
-    snprintf(out,cap,"%s.layers.%d.%s",m->prefix,layer,suffix);
+    if(layer==m->c.layers&&m->mtp_prefix[0]) snprintf(out,cap,"%s.layers.0.%s",m->mtp_prefix,suffix);
+    else snprintf(out,cap,"%s.layers.%d.%s",m->prefix,layer,suffix);
+}
+
+static void q38_load_gr_at(Model *m,GatedResidual *g,const char *base,int inject) {
+    Cfg *c=&m->c; char nm[384];
+    snprintf(nm,sizeof nm,"%s.hc_norm.weight",base); g->norm=q38_load_tensor(m,nm,c->hc_width);
+    snprintf(nm,sizeof nm,"%s.input_mix_weight_down.weight",base); g->down=q38_load_weight(m,nm,c->hc_rank,c->hc_width);
+    snprintf(nm,sizeof nm,"%s.input_mix_weight_up.weight",base); g->up=q38_load_weight(m,nm,c->hc_width,c->hc_rank);
+    if(inject){snprintf(nm,sizeof nm,"%s.block_inject_weight.weight",base);g->inject=q38_load_weight(m,nm,c->hc_count,c->hc_width);}
 }
 
 static void q38_load_gr(Model *m,GatedResidual *g,int layer,const char *kind,int inject) {
-    Cfg *c=&m->c; char nm[320],base[180];
-    if(layer>=0) snprintf(base,sizeof base,"layers.%d.%s",layer,kind); else snprintf(base,sizeof base,"hyper_connection_mixer");
-    snprintf(nm,sizeof nm,"%s.%s.hc_norm.weight",m->prefix,base); g->norm=q38_load_tensor(m,nm,c->hc_width);
-    snprintf(nm,sizeof nm,"%s.%s.input_mix_weight_down.weight",m->prefix,base); g->down=q38_load_weight(m,nm,c->hc_rank,c->hc_width);
-    snprintf(nm,sizeof nm,"%s.%s.input_mix_weight_up.weight",m->prefix,base); g->up=q38_load_weight(m,nm,c->hc_width,c->hc_rank);
-    if(inject){snprintf(nm,sizeof nm,"%s.%s.block_inject_weight.weight",m->prefix,base);g->inject=q38_load_weight(m,nm,c->hc_count,c->hc_width);}
+    char base[320];
+    if(layer>=0) q38_name(m,base,sizeof base,layer,kind); else snprintf(base,sizeof base,"%s.hyper_connection_mixer",m->prefix);
+    q38_load_gr_at(m,g,base,inject);
 }
 
 static void q38_load_ple(Model *m,Layer *l) {
@@ -894,9 +977,9 @@ static void q38_alloc_state(Model *m) {
     Cfg *c=&m->c;
     m->DN_rec=(float**)calloc((size_t)c->layers,sizeof(float*));
     m->DN_conv=(float**)calloc((size_t)c->layers,sizeof(float*));
-    m->K=(float**)calloc((size_t)c->layers,sizeof(float*));
-    m->V=(float**)calloc((size_t)c->layers,sizeof(float*));
-    m->IK=(float**)calloc((size_t)c->layers,sizeof(float*));
+    m->K=(float**)calloc((size_t)c->layers+1,sizeof(float*));    /* +1: the MTP head's row */
+    m->V=(float**)calloc((size_t)c->layers+1,sizeof(float*));
+    m->IK=(float**)calloc((size_t)c->layers+1,sizeof(float*));
     if(!m->DN_rec||!m->DN_conv||!m->K||!m->V||!m->IK){fprintf(stderr,"OOM model state metadata\n");exit(1);}
     for(int i=m->range_begin;i<m->range_end;i++) if(!c->is_attn[i]) {
         m->DN_rec[i]=(float*)calloc((size_t)c->dn_vheads*c->dn_kdim*c->dn_vdim,sizeof(float));
@@ -1031,6 +1114,45 @@ static void q38_vision_detach(Model *m) {
     m->vis_rows=NULL; m->vis_map=NULL; m->vis_map_len=0; m->vis_rows_n=0;
 }
 
+/* One decoder layer's resident tensors and its expert cache. Index c.layers
+ * is the MTP head's layer (q38_name gives it its checkpoint names): an
+ * attention layer like the model's QSA layers, with the same tensors. */
+static void q38_load_layer(Model *m,int i,int cap) {
+    Cfg *c=&m->c; char nm[320];
+    int attn=i<c->layers?c->is_attn[i]:1;
+    Layer *l=&m->L[i]; q38_load_gr(m,&l->attn_gr,i,"attn_hyper_connection",1); q38_load_gr(m,&l->mlp_gr,i,"mlp_hyper_connection",1);
+    #define WLD(field,suf,o,in) q38_name(m,nm,sizeof nm,i,suf); l->field=q38_load_weight(m,nm,(o),(in))
+    #define VLD(field,suf,n) q38_name(m,nm,sizeof nm,i,suf); l->field=q38_load_tensor(m,nm,(n))
+    WLD(router,"mlp.gate.weight",c->experts,c->hidden);
+    WLD(sh_g,"mlp.shared_expert.gate_proj.weight",c->shared_inter,c->hidden);
+    WLD(sh_u,"mlp.shared_expert.up_proj.weight",c->shared_inter,c->hidden);
+    WLD(sh_d,"mlp.shared_expert.down_proj.weight",c->hidden,c->shared_inter);
+    VLD(sh_gate,"mlp.shared_expert_gate.weight",c->hidden);
+    if(attn){
+        WLD(q,"self_attn.q_proj.weight",c->q_heads*c->head_dim*2,c->hidden);
+        WLD(k,"self_attn.k_proj.weight",c->kv_heads*c->head_dim,c->hidden);
+        WLD(v,"self_attn.v_proj.weight",c->kv_heads*c->head_dim,c->hidden);
+        WLD(o,"self_attn.o_proj.weight",c->hidden,c->q_heads*c->head_dim);
+        VLD(qn,"self_attn.q_norm.weight",c->head_dim);VLD(kn,"self_attn.k_norm.weight",c->head_dim);
+        WLD(idx_qk,"self_attn.indexer.index_qk_proj.weight",(c->idx_qheads+c->idx_kheads)*c->idx_dim,c->hidden);
+        VLD(idx_qn,"self_attn.indexer.q_layernorm.weight",c->idx_dim);VLD(idx_kn,"self_attn.indexer.k_layernorm.weight",c->idx_dim);
+    } else {
+        int vd=c->dn_vheads*c->dn_vdim;
+        WLD(dn_qkv,"linear_attn.in_proj_qkv.weight",c->dn_conv_dim,c->hidden);
+        WLD(dn_z,"linear_attn.in_proj_z.weight",vd,c->hidden);
+        WLD(dn_b,"linear_attn.in_proj_b.weight",c->dn_vheads,c->hidden);
+        WLD(dn_a,"linear_attn.in_proj_a.weight",c->dn_vheads,c->hidden);
+        VLD(dn_conv,"linear_attn.conv1d.weight",(int64_t)c->dn_conv_dim*c->dn_convk);
+        VLD(dn_dtbias,"linear_attn.dt_bias",c->dn_vheads);VLD(dn_alog,"linear_attn.A_log",c->dn_vheads);
+        VLD(dn_norm,"linear_attn.norm.weight",c->dn_vdim);
+        WLD(dn_out,"linear_attn.out_proj.weight",c->hidden,vd);
+    }
+    #undef WLD
+    #undef VLD
+    LCache *lc=&m->cache[i]; lc->cap=cap; lc->slots=(Slot*)calloc((size_t)cap,sizeof(Slot)); lc->by_expert=(int*)malloc((size_t)c->experts*sizeof(int));
+    if(!lc->slots||!lc->by_expert){fprintf(stderr,"OOM expert cache\n");exit(1);} for(int e=0;e<c->experts;e++)lc->by_expert[e]=-1;
+}
+
 static void model_init_range(Model *m,const char *snap,int cap,int bits,
                              int layer_begin,int layer_end,int load_boundaries,
                              int allocate_state) {
@@ -1053,44 +1175,13 @@ static void model_init_range(Model *m,const char *snap,int cap,int bits,
         m->lm_head=q38_load_weight(m,"lm_head.weight",c->vocab,c->hidden);
         q38_load_gr(m,&m->final_gr,-1,NULL,0);
     }
-    m->L=(Layer*)calloc((size_t)c->layers,sizeof(Layer));
-    m->cache=(LCache*)calloc((size_t)c->layers,sizeof(LCache));
-    m->expert_scales=(Q38ExpertScaleCache*)calloc((size_t)c->layers,
+    /* +1 row each: the MTP head's layer, filled only by q38_mtp_attach */
+    m->L=(Layer*)calloc((size_t)c->layers+1,sizeof(Layer));
+    m->cache=(LCache*)calloc((size_t)c->layers+1,sizeof(LCache));
+    m->expert_scales=(Q38ExpertScaleCache*)calloc((size_t)c->layers+1,
                                                   sizeof(*m->expert_scales));
     if(!m->L||!m->cache||!m->expert_scales){fprintf(stderr,"OOM model metadata\n");exit(1);}
-    for(int i=layer_begin;i<layer_end;i++){
-        Layer *l=&m->L[i]; q38_load_gr(m,&l->attn_gr,i,"attn_hyper_connection",1); q38_load_gr(m,&l->mlp_gr,i,"mlp_hyper_connection",1);
-        #define WLD(field,suf,o,in) q38_name(m,nm,sizeof nm,i,suf); l->field=q38_load_weight(m,nm,(o),(in))
-        #define VLD(field,suf,n) q38_name(m,nm,sizeof nm,i,suf); l->field=q38_load_tensor(m,nm,(n))
-        WLD(router,"mlp.gate.weight",c->experts,c->hidden);
-        WLD(sh_g,"mlp.shared_expert.gate_proj.weight",c->shared_inter,c->hidden);
-        WLD(sh_u,"mlp.shared_expert.up_proj.weight",c->shared_inter,c->hidden);
-        WLD(sh_d,"mlp.shared_expert.down_proj.weight",c->hidden,c->shared_inter);
-        VLD(sh_gate,"mlp.shared_expert_gate.weight",c->hidden);
-        if(c->is_attn[i]){
-            WLD(q,"self_attn.q_proj.weight",c->q_heads*c->head_dim*2,c->hidden);
-            WLD(k,"self_attn.k_proj.weight",c->kv_heads*c->head_dim,c->hidden);
-            WLD(v,"self_attn.v_proj.weight",c->kv_heads*c->head_dim,c->hidden);
-            WLD(o,"self_attn.o_proj.weight",c->hidden,c->q_heads*c->head_dim);
-            VLD(qn,"self_attn.q_norm.weight",c->head_dim);VLD(kn,"self_attn.k_norm.weight",c->head_dim);
-            WLD(idx_qk,"self_attn.indexer.index_qk_proj.weight",(c->idx_qheads+c->idx_kheads)*c->idx_dim,c->hidden);
-            VLD(idx_qn,"self_attn.indexer.q_layernorm.weight",c->idx_dim);VLD(idx_kn,"self_attn.indexer.k_layernorm.weight",c->idx_dim);
-        } else {
-            int vd=c->dn_vheads*c->dn_vdim;
-            WLD(dn_qkv,"linear_attn.in_proj_qkv.weight",c->dn_conv_dim,c->hidden);
-            WLD(dn_z,"linear_attn.in_proj_z.weight",vd,c->hidden);
-            WLD(dn_b,"linear_attn.in_proj_b.weight",c->dn_vheads,c->hidden);
-            WLD(dn_a,"linear_attn.in_proj_a.weight",c->dn_vheads,c->hidden);
-            VLD(dn_conv,"linear_attn.conv1d.weight",(int64_t)c->dn_conv_dim*c->dn_convk);
-            VLD(dn_dtbias,"linear_attn.dt_bias",c->dn_vheads);VLD(dn_alog,"linear_attn.A_log",c->dn_vheads);
-            VLD(dn_norm,"linear_attn.norm.weight",c->dn_vdim);
-            WLD(dn_out,"linear_attn.out_proj.weight",c->hidden,vd);
-        }
-        #undef WLD
-        #undef VLD
-        LCache *lc=&m->cache[i]; lc->cap=cap; lc->slots=(Slot*)calloc((size_t)cap,sizeof(Slot)); lc->by_expert=(int*)malloc((size_t)c->experts*sizeof(int));
-        if(!lc->slots||!lc->by_expert){fprintf(stderr,"OOM expert cache\n");exit(1);} for(int e=0;e<c->experts;e++)lc->by_expert[e]=-1;
-    }
+    for(int i=layer_begin;i<layer_end;i++) q38_load_layer(m,i,cap);
     if(c->ple_layer>=layer_begin&&c->ple_layer<layer_end) q38_load_ple(m,&m->L[c->ple_layer]);
     /* La torre solo quando il motore possiede la sequenza intera: uno shard che
      * ospita solo alcuni layer non ha da fare niente con le immagini, e
@@ -1187,9 +1278,9 @@ static void q38_decode_scale_tensor(float *out,const unsigned char *raw,
  * per-matrix loader. */
 static int q38_prepare_expert_scale_bank(Model *m,int layer) {
     Cfg *c=&m->c;
-    if(!m->native_fp8||layer<0||layer>=c->layers)return 0;
+    if(!m->native_fp8||layer<0||layer>=q38_layer_rows(m))return 0;
     if(!m->expert_scales){
-        m->expert_scales=(Q38ExpertScaleCache*)calloc((size_t)c->layers,
+        m->expert_scales=(Q38ExpertScaleCache*)calloc((size_t)c->layers+1,
                                                        sizeof(*m->expert_scales));
         if(!m->expert_scales){fprintf(stderr,"OOM expert scale metadata\n");exit(1);}
     }
@@ -1351,12 +1442,19 @@ static int q38_try_load_native_fp8_expert(Model *m,int layer,int expert,Slot *sl
     return 1;
 }
 
+/* Whether a layer's routed experts come from the int4-g64 sidecar. It holds
+ * the model's layers only: the MTP head's layer (index c.layers) keeps the
+ * snapshot's FP8 experts with a sidecar or without one. */
+static inline int q38_layer_int4(const Model *m,int layer) {
+    return m->x4&&layer>=0&&layer<m->c.layers;
+}
+
 /* Advise the kernel of the experts a route is about to miss: the int4
  * sidecar's one record each, or the native FP8 pair and down ranges. */
 static void q38_prefetch_experts(Model *m,int layer,const int *experts,int count) {
     if(!m->expert_prefetch||!experts||count<1)return;
     LCache *cache=&m->cache[layer];
-    if(m->x4){
+    if(q38_layer_int4(m,layer)){
         for(int index=0;index<count;index++){
             int expert=experts[index];
             if(expert<0||expert>=m->c.experts||cache->by_expert[expert]>=0)continue;
@@ -1644,7 +1742,7 @@ static void q38_load_int4_record(Model *m,int layer,int expert,Slot *slot) {
 
 static void q38_load_expert(Model *m,int layer,int eid,Slot *s) {
     Cfg *c=&m->c; int H=c->hidden,I=c->inter; char nm[320],sn[340];
-    if(m->x4){
+    if(q38_layer_int4(m,layer)){
         double started=now_s();
         q38_load_int4_record(m,layer,eid,s);
         q38_tm_add(m,Q38_TM_EXPERT_READ,started);m->expert_weight_reads++;
@@ -1757,7 +1855,8 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
     if(count>cache->cap)
         return q38_expert_batch_fallback(m,Q38_EXPERT_BATCH_FALLBACK_CACHE_CAPACITY,
                                          layer,cache->cap,count);
-    if(!m->x4&&!q38_prepare_expert_scale_bank(m,layer))
+    int x4=q38_layer_int4(m,layer);
+    if(!x4&&!q38_prepare_expert_scale_bank(m,layer))
         return q38_expert_batch_fallback(m,Q38_EXPERT_BATCH_FALLBACK_SCALE_BANK,layer,0,0);
     /* The demand set is no longer bounded by the decode top-k: the MoE prefill
      * hands over the whole chunk union (up to the cache cap) so its loads run
@@ -1783,7 +1882,7 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
             continue;
         }
         st_tensor *weight[3];
-        if(!m->x4&&!q38_native_fp8_expert_tensors(m,layer,expert,weight)){
+        if(!x4&&!q38_native_fp8_expert_tensors(m,layer,expert,weight)){
             free(jobs);
             return q38_expert_batch_fallback(m,Q38_EXPERT_BATCH_FALLBACK_LAYOUT,
                                              layer,expert,0);
@@ -1818,7 +1917,7 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
                 if(slot->eid>=0)cache->by_expert[slot->eid]=-1;
             }
             slot->eid=-1;jobs[job_count].expert=expert;jobs[job_count].slot=slot;
-            if(!m->x4&&!q38_native_fp8_expert_tensors(m,layer,expert,jobs[job_count].weight)){
+            if(!x4&&!q38_native_fp8_expert_tensors(m,layer,expert,jobs[job_count].weight)){
                 fprintf(stderr,"Qwen3.8 expert layout changed during batch reservation\n");exit(1);
             }
             job_count++;
@@ -1837,13 +1936,13 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
         double started=now_s();
         #pragma omp parallel for schedule(static) num_threads(workers) if(job_count>1)
         for(int job=0;job<job_count;job++){
-            if(m->x4)q38_load_int4_record(m,layer,jobs[job].expert,jobs[job].slot);
+            if(x4)q38_load_int4_record(m,layer,jobs[job].expert,jobs[job].slot);
             else q38_load_native_fp8_ranges(m,layer,jobs[job].expert,jobs[job].slot,
                                             jobs[job].weight);
         }
         q38_tm_add(m,Q38_TM_EXPERT_READ,started);
-        m->expert_weight_reads+=(uint64_t)job_count*(m->x4?1:2);
-        if(!m->x4)m->expert_pair_reads+=(uint64_t)job_count;
+        m->expert_weight_reads+=(uint64_t)job_count*(x4?1:2);
+        if(!x4)m->expert_pair_reads+=(uint64_t)job_count;
         if(job_count>1)m->expert_parallel_batches++;
         for(int job=0;job<job_count;job++){
             Slot *slot=jobs[job].slot;slot->eid=jobs[job].expert;
@@ -1975,6 +2074,11 @@ static void q38_ple(Model *m,const int *ids,int S,const float *hyper,float *out)
         else if(m->ple_history_len==0){m->ple_history[0]=ids[s];m->ple_history_len=1;}
         else if(m->ple_history_len==1){m->ple_history[1]=ids[s];m->ple_history_len=2;}
         else {m->ple_history[0]=m->ple_history[1];m->ple_history[1]=ids[s];}
+        if(s+1==m->snap_after){   /* MTP verify: as q38_deltanet */
+            memcpy(m->snap_ple,ring,(size_t)c->hc_width*state_len*sizeof(float));
+            memcpy(m->snap_ple_history,m->ple_history,sizeof(m->snap_ple_history));
+            m->snap_ple_history_len=m->ple_history_len;
+        }
     }
     free(emb);free(keys);free(value);free(kn);free(qn);free(gated);free(norm);
     q38_tm_add(m,Q38_TM_PLE,phase_started);
@@ -2135,6 +2239,12 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
             for(int h=0;h<VH;h++)
                 q38_rmsg(norm_row+(int64_t)h*VD,core+(int64_t)h*VD,
                          z_row+(int64_t)h*VD,l->dn_norm,VD,c->eps,1);
+            /* MTP verify: the state the token before the draft leaves, for
+             * the rollback of a rejected draft (q38_spec_rollback) */
+            if(base+s+1==m->snap_after){
+                memcpy(m->snap_rec[layer],rec,(size_t)VH*KD*VD*sizeof(float));
+                memcpy(m->snap_conv[layer],ring,(size_t)CD*(CK-1)*sizeof(float));
+            }
         }
         q38_dense_matmul(m,out+(int64_t)base*H,norm,&l->dn_out,
                          rows,V,H);
@@ -2153,6 +2263,7 @@ static int q38_block_desc(const void *aa,const void *bb){
 
 static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int pos_base,float *out) {
     Cfg *c=&m->c;int H=c->hidden,QH=c->q_heads,KVH=c->kv_heads,D=c->head_dim;
+    float theta=layer<c->layers?c->theta:c->mtp_theta;   /* the MTP head has its own RoPE base */
     int IQ=c->idx_qheads,ID=c->idx_dim,R=c->idx_ratio,maxsel=c->idx_budget+R-1;
     float *qp=falloc((int64_t)S*QH*2*D),*kp=falloc((int64_t)S*KVH*D),*vp=falloc((int64_t)S*KVH*D);
     float *ip=falloc((int64_t)S*(IQ+c->idx_kheads)*ID);
@@ -2166,7 +2277,7 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
     for(int s=0;s<S;s++){
         int pos=pos_base+s;
         for(int h=0;h<KVH;h++){
-            float *kh=kp+(int64_t)s*KVH*D+(int64_t)h*D;q38_rms0(kh,kh,l->kn,D,c->eps);q38_rope(kh,D,c->rotary_dim,pos,c->theta);
+            float *kh=kp+(int64_t)s*KVH*D+(int64_t)h*D;q38_rms0(kh,kh,l->kn,D,c->eps);q38_rope(kh,D,c->rotary_dim,pos,theta);
             memcpy(m->K[layer]+((int64_t)h*m->kv_cap+pos)*D,kh,(size_t)D*sizeof(float));
             memcpy(m->V[layer]+((int64_t)h*m->kv_cap+pos)*D,vp+(int64_t)s*KVH*D+(int64_t)h*D,(size_t)D*sizeof(float));
         }
@@ -2194,13 +2305,13 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
         float *qidx=falloc((int64_t)IQ*ID),*pool=falloc(ID);
         int *selected=(int*)malloc((size_t)maxsel*sizeof(int));
         if(!selected){fprintf(stderr,"OOM QSA selection\n");exit(1);}
-        for(int h=0;h<IQ;h++){float *qh=qidx+(int64_t)h*ID;memcpy(qh,ip+(int64_t)s*(IQ+1)*ID+(int64_t)h*ID,(size_t)ID*sizeof(float));q38_rms0(qh,qh,l->idx_qn,ID,c->eps);q38_rope(qh,ID,c->rotary_dim,pos,c->theta);}
+        for(int h=0;h<IQ;h++){float *qh=qidx+(int64_t)h*ID;memcpy(qh,ip+(int64_t)s*(IQ+1)*ID+(int64_t)h*ID,(size_t)ID*sizeof(float));q38_rms0(qh,qh,l->idx_qn,ID,c->eps);q38_rope(qh,ID,c->rotary_dim,pos,theta);}
         int take=blocks<c->idx_budget/R?blocks:c->idx_budget/R,nsel=0;
         Q38Block *rank=blocks?(Q38Block*)malloc((size_t)blocks*sizeof(Q38Block)):NULL;
         if(blocks&&!rank){fprintf(stderr,"OOM QSA block ranking\n");exit(1);}
         for(int b=0;b<blocks;b++){
             memset(pool,0,(size_t)ID*sizeof(float));for(int r=0;r<R;r++){const float *raw=m->IK[layer]+(int64_t)(b*R+r)*ID;for(int d=0;d<ID;d++)pool[d]+=raw[d]/R;}
-            q38_rms0(pool,pool,l->idx_kn,ID,c->eps);q38_rope(pool,ID,c->rotary_dim,b*R,c->theta);
+            q38_rms0(pool,pool,l->idx_kn,ID,c->eps);q38_rope(pool,ID,c->rotary_dim,b*R,theta);
             float score=0.f;for(int h=0;h<IQ;h++){float a=0.f;for(int d=0;d<ID;d++)a+=qidx[(int64_t)h*ID+d]*pool[d];if(a>0.f)score+=a;}rank[b]=(Q38Block){score/sqrtf((float)ID),b};
         }
         if(blocks)qsort(rank,(size_t)blocks,sizeof(Q38Block),q38_block_desc);
@@ -2209,7 +2320,7 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
         index_dt+=now_s()-phase_started; phase_started=now_s();
         for(int h=0;h<QH;h++){
             float *qraw=qp+(int64_t)s*QH*2*D+(int64_t)h*2*D;
-            float *qh=falloc(D);memcpy(qh,qraw,(size_t)D*sizeof(float));q38_rms0(qh,qh,l->qn,D,c->eps);q38_rope(qh,D,c->rotary_dim,pos,c->theta);
+            float *qh=falloc(D);memcpy(qh,qraw,(size_t)D*sizeof(float));q38_rms0(qh,qh,l->qn,D,c->eps);q38_rope(qh,D,c->rotary_dim,pos,theta);
             float *score=falloc(nsel);float mx=-INFINITY;
             int khidx=h/(QH/KVH);for(int j=0;j<nsel;j++){const float *kh=m->K[layer]+((int64_t)khidx*m->kv_cap+selected[j])*D;float a=0.f;for(int d=0;d<D;d++)a+=qh[d]*kh[d];a/=sqrtf((float)D);score[j]=a;if(a>mx)mx=a;}
             float den=0.f;for(int j=0;j<nsel;j++){score[j]=expf(score[j]-mx);den+=score[j];}
@@ -2256,7 +2367,7 @@ static void q38_tier_note(int layer,int eid,const Slot *ex) {
  * 127, the qwen36 dnproj/lmhead format) and uploaded once; the BF16 copy
  * stays for prefill and as fallback. Q38_TRUNK_GPU=0 keeps the trunk on the
  * CPU (parity runs against the BF16 reference). */
-typedef struct { Q38Weight *w; char name[16]; int layer; } Q38TrunkItem;
+typedef struct { Q38Weight *w; char name[16]; int layer, cpu_only; } Q38TrunkItem;
 static Q38TrunkItem *g_trunk; static int g_trunk_n, g_trunk_cap, g_trunk_offer_gpu;
 static long g_trunk_min_kb; static const char *g_trunk_skip;   /* read once per load in q38_trunk_offer_all */
 static void q38_trunk_add(Q38Weight *w,const char *name,int layer) {
@@ -2278,7 +2389,7 @@ static void q38_trunk_add(Q38Weight *w,const char *name,int layer) {
         g_trunk=(Q38TrunkItem*)realloc(g_trunk,(size_t)g_trunk_cap*sizeof(*g_trunk));
         if(!g_trunk){fprintf(stderr,"OOM trunk table\n");exit(1);}
     }
-    Q38TrunkItem *it=&g_trunk[g_trunk_n++]; it->w=w; it->layer=layer;
+    Q38TrunkItem *it=&g_trunk[g_trunk_n++]; it->w=w; it->layer=layer; it->cpu_only=0;
     snprintf(it->name,sizeof it->name,"%s",name);
     if(g_trunk_offer_gpu)qt_trunk_offer(it->name,layer,bytes);
 }
@@ -2311,6 +2422,26 @@ static void q38_trunk_offer_all(Model *m) {
         q38_trunk_add(&L->mlp_gr.inject,"hcmi",l);
         q38_trunk_add(&L->sh_g,"shg",l); q38_trunk_add(&L->sh_u,"shu",l); q38_trunk_add(&L->sh_d,"shd",l);
         q38_trunk_add(&L->router,"router",l);
+    }
+    if(m->mtp){
+        /* The MTP head's matrices: int8 on the CPU like the rest, but never
+         * offered to the placer, which plans the model's layers only, and
+         * never placed by a COLI_PLACE spec that names their component. */
+        int offer=g_trunk_offer_gpu,first=g_trunk_n; g_trunk_offer_gpu=0;
+        int l=c->layers; Layer *L=&m->L[l];
+        q38_trunk_add(&L->q,"attnq",l); q38_trunk_add(&L->k,"attnk",l);
+        q38_trunk_add(&L->v,"attnv",l); q38_trunk_add(&L->o,"attno",l);
+        q38_trunk_add(&L->idx_qk,"qsaidx",l);
+        q38_trunk_add(&L->attn_gr.down,"hcad",l); q38_trunk_add(&L->attn_gr.up,"hcau",l);
+        q38_trunk_add(&L->attn_gr.inject,"hcai",l);
+        q38_trunk_add(&L->mlp_gr.down,"hcmd",l); q38_trunk_add(&L->mlp_gr.up,"hcmu",l);
+        q38_trunk_add(&L->mlp_gr.inject,"hcmi",l);
+        q38_trunk_add(&L->sh_g,"shg",l); q38_trunk_add(&L->sh_u,"shu",l); q38_trunk_add(&L->sh_d,"shd",l);
+        q38_trunk_add(&L->router,"router",l);
+        q38_trunk_add(&m->mtp_fc_emb,"mtpfce",l); q38_trunk_add(&m->mtp_fc_hid,"mtpfch",l);
+        q38_trunk_add(&m->mtp_mixer.down,"mtpmixd",l); q38_trunk_add(&m->mtp_mixer.up,"mtpmixu",l);
+        for(int i=first;i<g_trunk_n;i++)g_trunk[i].cpu_only=1;
+        g_trunk_offer_gpu=offer;
     }
 }
 /* int8 per row, scale = max|w| / 127 (the qwen36 dnproj/lmhead format) */
@@ -2362,9 +2493,10 @@ static void q38_trunk_cpu_int8(Model *m) {
 /* after qt_init: quantize and upload what the placer accepted */
 static void q38_trunk_place_all(Model *m) {
     (void)m;
-    int placed=0; size_t placed_bytes=0; double t0=now_s();
+    int placed=0,offered=g_trunk_n; size_t placed_bytes=0; double t0=now_s();
     for(int i=0;i<g_trunk_n;i++){
         Q38TrunkItem *it=&g_trunk[i]; Q38Weight *w=it->w;
+        if(it->cpu_only){offered--;continue;}
         int dev=qt_place_of(it->name,it->layer);
         if(dev==QT_PLACE_CPU)continue;
         int O=w->rows,I=w->cols;
@@ -2385,7 +2517,7 @@ static void q38_trunk_place_all(Model *m) {
     }
     if(g_trunk_n)
         fprintf(stderr,"[qtier] qwen38 trunk: %d of %d offered matrices resident as int8 (%.2f GiB) in %.1fs; the rest answers from the CPU\n",
-                placed,g_trunk_n,placed_bytes/1073741824.0,now_s()-t0);
+                placed,offered,placed_bytes/1073741824.0,now_s()-t0);
 }
 
 /* Start the tier after the model is loaded. COLI_CUDA=1 turns it on (the
@@ -2435,8 +2567,10 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
         for(int z=0;z<K;z++) route_gates[z]=(float)(val[z]/den);
         rt_route(layer,s,idx,route_gates,K); /* shared counts + post-normalization trace */
         /* Resident experts run on the GPU from here on (asynchronously); the
-         * CPU only loads and computes the rest, in route order. */
-        uint32_t qmask=qt_issue(layer,idx,K,xs);
+         * CPU only loads and computes the rest, in route order. The tier
+         * knows the model's layers only: the MTP head's stays on the CPU. */
+        int tiered=layer<c->layers;
+        uint32_t qmask=tiered?qt_issue(layer,idx,K,xs):0;
         int cpu_idx[Q38_MAX_TOPK],cpu_rank[Q38_MAX_TOPK],cpu_n=0;
         for(int z=0;z<K;z++)if(!((qmask>>z)&1u)){cpu_idx[cpu_n]=idx[z];cpu_rank[cpu_n]=z;cpu_n++;}
         q38_prefetch_experts(m,layer,cpu_idx,cpu_n);
@@ -2454,11 +2588,11 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
             for(int j=0;j<I;j++)eh[j]=q38_silu(eg[j])*eu[j];q38_weight_matmul(eo,eh,&ex->down,1,I,H);
             for(int d=0;d<H;d++)ys[d]+=route_gates[z]*eo[d];
             q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);
-            q38_tier_note(layer,cpu_idx[i],ex);
+            if(tiered)q38_tier_note(layer,cpu_idx[i],ex);
         }
         /* GPU experts land after the CPU ones: same values, one more group in
          * the float sum (that is the only ordering difference to a CPU run). */
-        if(!qt_take(qmask,route_gates,K,ys)){
+        if(tiered&&!qt_take(qmask,route_gates,K,ys)){
             fprintf(stderr,"qwen38: CUDA expert collection failed at layer %d; stopping inference\n",layer);
             exit(1);
         }
@@ -2685,7 +2819,10 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
 }
 
 static void q38_moe(Model *m,Layer *l,int layer,const float *x,int S,float *out) {
-    if(S<=1||!m->prefill_batch)q38_moe_decode(m,l,layer,x,S,out);
+    /* An MTP verify on the CUDA tier routes row by row as decode does, so
+     * the tier's resident experts serve it (the batched path is CPU only). */
+    if(S<=1||!m->prefill_batch||(g_q38_rowwise&&qt_ready()&&layer<m->c.layers))
+        q38_moe_decode(m,l,layer,x,S,out);
     else q38_moe_prefill(m,l,layer,x,S,out);
 }
 
@@ -2697,17 +2834,46 @@ static void reset_recurrent(Model *m) {
         memset(m->DN_conv[i],0,(size_t)c->dn_conv_dim*(c->dn_convk-1)*sizeof(float));
     }
     memset(m->PLE_conv_state,0,(size_t)c->hc_width*(c->ple_convk-1)*c->ngram_size*sizeof(float));m->ple_history_len=0;
+    m->mtp_len=0;m->mtp_pend_n=0;   /* the MTP head's rows go with the model's */
 }
 
 static void ensure_kv(Model *m) {
     Cfg *c=&m->c;if(m->max_t<=m->kv_cap&&m->K)return;
-    if(m->K){for(int i=0;i<c->layers;i++){free(m->K[i]);free(m->V[i]);free(m->IK[i]);}free(m->K);free(m->V);free(m->IK);}
-    m->K=(float**)calloc((size_t)c->layers,sizeof(float*));m->V=(float**)calloc((size_t)c->layers,sizeof(float*));m->IK=(float**)calloc((size_t)c->layers,sizeof(float*));
-    for(int i=0;i<c->layers;i++)if(c->is_attn[i]){
+    int rows=q38_layer_rows(m);
+    if(m->K){for(int i=0;i<rows;i++){free(m->K[i]);free(m->V[i]);free(m->IK[i]);}free(m->K);free(m->V);free(m->IK);}
+    /* +1: the MTP head's attention rows at index c.layers */
+    m->K=(float**)calloc((size_t)c->layers+1,sizeof(float*));m->V=(float**)calloc((size_t)c->layers+1,sizeof(float*));m->IK=(float**)calloc((size_t)c->layers+1,sizeof(float*));
+    for(int i=0;i<rows;i++)if(i==c->layers||c->is_attn[i]){
         m->K[i]=falloc((int64_t)c->kv_heads*m->max_t*c->head_dim);m->V[i]=falloc((int64_t)c->kv_heads*m->max_t*c->head_dim);m->IK[i]=falloc((int64_t)m->max_t*c->idx_dim);
     }
     m->kv_cap=m->max_t;
     kv_prefix_alloc(&m->kvp,m->kv_cap); /* ensure_kv discards the old rows */
+    m->mtp_len=0;m->mtp_pend_n=0;
+}
+
+/* One decoder layer over the four hyper-connection streams: PLE where the
+ * model has it, the token mixer, then the MoE, each read from the streams
+ * and written back through its GatedResidual. step(), the Segment range and
+ * the MTP head (index c.layers, an attention layer) all run this. */
+static void q38_layer_forward(Model *m,int i,float *hyper,const int *ids,int S,int pos_base,
+                              float *mixed,float *inject,float *block) {
+    Cfg *c=&m->c; Layer *l=&m->L[i]; int W=c->hc_width;
+    if(i==c->ple_layer){
+        float *ple=falloc((int64_t)S*W); q38_ple(m,ids,S,hyper,ple);
+        for(int64_t z=0;z<(int64_t)S*W;z++) hyper[z]+=ple[z];
+        free(ple);
+        /* consumate: il chunk successivo ha altri token, e riusare queste
+         * righe darebbe gli embedding del chunk precedente combaciando in
+         * silenzio invece di dare errore. */
+        free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;
+    }
+    q38_gr_read(m,&l->attn_gr,hyper,S,mixed,inject);
+    if(i>=c->layers||c->is_attn[i]) q38_attention(m,l,i,mixed,S,pos_base,block);
+    else q38_deltanet(m,l,i,mixed,S,block);
+    q38_gr_apply(c,hyper,block,inject,S);
+    q38_gr_read(m,&l->mlp_gr,hyper,S,mixed,inject);
+    q38_moe(m,l,i,mixed,S,block);
+    q38_gr_apply(c,hyper,block,inject,S);
 }
 
 /* Run only the requested native layer interval over hyper-residual activations.
@@ -2716,23 +2882,10 @@ static void ensure_kv(Model *m) {
 static void q38_layers_forward_range(Model *m,float *hyper,const int *ids,
                                      int S,int pos_base,int layer_begin,
                                      int layer_end) {
-    Cfg *c=&m->c; int H=c->hidden,W=c->hc_width,C=c->hc_count;
+    Cfg *c=&m->c; int H=c->hidden,C=c->hc_count;
     float *mixed=falloc((int64_t)S*H),*inject=falloc((int64_t)S*C),*block=falloc((int64_t)S*H);
-    for(int i=layer_begin;i<layer_end;i++){
-        Layer *l=&m->L[i];
-        if(i==c->ple_layer){
-            float *ple=falloc((int64_t)S*W); q38_ple(m,ids,S,hyper,ple);
-            for(int64_t z=0;z<(int64_t)S*W;z++) hyper[z]+=ple[z];
-            free(ple);
-        }
-        q38_gr_read(m,&l->attn_gr,hyper,S,mixed,inject);
-        if(c->is_attn[i]) q38_attention(m,l,i,mixed,S,pos_base,block);
-        else q38_deltanet(m,l,i,mixed,S,block);
-        q38_gr_apply(c,hyper,block,inject,S);
-        q38_gr_read(m,&l->mlp_gr,hyper,S,mixed,inject);
-        q38_moe(m,l,i,mixed,S,block);
-        q38_gr_apply(c,hyper,block,inject,S);
-    }
+    for(int i=layer_begin;i<layer_end;i++)
+        q38_layer_forward(m,i,hyper,ids,S,pos_base,mixed,inject,block);
     free(mixed); free(inject); free(block);
 }
 
@@ -2756,7 +2909,22 @@ static void q38_echo(const char *id, int pos, int token, const float *lo, int V,
     free(piece);
 }
 
-static float *step(Model *m,const int *ids,int S,int pos_base) {
+/* The input row of the token at absolute position abs_pos: its embedding,
+ * or the vision tower's row when an image covers that position. */
+static void q38_embed_row(Model *m,int id,int abs_pos,float *out) {
+    int vis_row=-1;
+    if(m->vis_map&&abs_pos>=0&&abs_pos<m->vis_map_len) vis_row=m->vis_map[abs_pos];
+    if(vis_row>=0&&vis_row<m->vis_rows_n)
+        memcpy(out,m->vis_rows+(int64_t)vis_row*m->c.hidden,(size_t)m->c.hidden*sizeof(float));
+    else q38_weight_row(&m->embed,id,out);
+}
+
+/* The forward behind step(): ids[0..S) at pos_base through every layer, the
+ * final mixer and lm_head. The logits of the last `nlogits` rows come back
+ * (step() asks for one, an MTP verify for two), and with `streams` every
+ * row's four streams as the final mixer read them are handed over instead of
+ * freed: that is the state the MTP head reads. */
+static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits,float **streams) {
     Cfg *c=&m->c;int H=c->hidden,W=c->hc_width,C=c->hc_count;
     m->timers.forwards++;
     float *hyper=falloc((int64_t)S*W);
@@ -2767,32 +2935,18 @@ static float *step(Model *m,const int *ids,int S,int pos_base) {
     for(int s=0;s<S;s++){
         if(ids[s]<0||ids[s]>=c->vocab){fprintf(stderr,"token id %d outside vocabulary\n",ids[s]);exit(1);}
         float *e=hyper+(int64_t)s*W;
-        int abs_pos=pos_base+s, vis_row=-1;
-        if(m->vis_map&&abs_pos>=0&&abs_pos<m->vis_map_len) vis_row=m->vis_map[abs_pos];
-        if(vis_row>=0&&vis_row<m->vis_rows_n)
-            memcpy(e,m->vis_rows+(int64_t)vis_row*H,(size_t)H*sizeof(float));
-        else q38_weight_row(&m->embed,ids[s],e);
+        q38_embed_row(m,ids[s],pos_base+s,e);
         for(int b=1;b<C;b++)memcpy(e+(int64_t)b*H,e,(size_t)H*sizeof(float));
     }
     float *mixed=falloc((int64_t)S*H),*inject=falloc((int64_t)S*C),*block=falloc((int64_t)S*H);
-    for(int i=0;i<c->layers;i++){
-        Layer *l=&m->L[i];
-        if(i==c->ple_layer){float *ple=falloc((int64_t)S*W);q38_ple(m,ids,S,hyper,ple);for(int64_t z=0;z<(int64_t)S*W;z++)hyper[z]+=ple[z];free(ple);
-            /* consumate: il chunk successivo ha altri token, e riusare queste
-             * righe darebbe gli embedding del chunk precedente combaciando in
-             * silenzio invece di dare errore. */
-            free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;}
-        q38_gr_read(m,&l->attn_gr,hyper,S,mixed,inject);
-        if(c->is_attn[i])q38_attention(m,l,i,mixed,S,pos_base,block);else q38_deltanet(m,l,i,mixed,S,block);
-        q38_gr_apply(c,hyper,block,inject,S);
-        q38_gr_read(m,&l->mlp_gr,hyper,S,mixed,inject);q38_moe(m,l,i,mixed,S,block);q38_gr_apply(c,hyper,block,inject,S);
-    }
+    for(int i=0;i<c->layers;i++)
+        q38_layer_forward(m,i,hyper,ids,S,pos_base,mixed,inject,block);
     q38_gr_read(m,&m->final_gr,hyper,S,mixed,NULL);m->kv_len=pos_base+S;
     /* Rewinding and writing a shorter branch invalidates its old tail. */
     if(m->kvp.len>pos_base)m->kvp.len=pos_base;
     kv_prefix_record(&m->kvp,ids,pos_base,S);
     if(m->vis_map && m->vis_rows_n>0)kv_prefix_taint(&m->kvp);
-    float *logit=falloc(c->vocab);double phase_started=now_s();
+    float *logit=falloc((int64_t)nlogits*c->vocab);double phase_started=now_s();
     /* Lettura del prefill: la posizione p predice il token p+1. Il primo token
      * fresco lo predice la fotografia del prefisso, quando c'e. Pagata solo da
      * chi ha chiesto il canale. */
@@ -2804,9 +2958,372 @@ static float *step(Model *m,const int *ids,int S,int pos_base) {
             q38_echo(g_echo_id,pos_base+p+1,ids[p+1],logit,c->vocab,g_echo_k);
         }
     }
-    q38_weight_matmul(logit,mixed+(int64_t)(S-1)*H,&m->lm_head,1,H,c->vocab);
+    q38_weight_matmul(logit,mixed+(int64_t)(S-nlogits)*H,&m->lm_head,nlogits,H,c->vocab);
     q38_tm_add(m,Q38_TM_LM_HEAD,phase_started);
-    free(hyper);free(mixed);free(inject);free(block);return logit;
+    if(streams)*streams=hyper; else free(hyper);
+    free(mixed);free(inject);free(block);return logit;
+}
+
+/* ---- the MTP head (Q38_MTP=1) ---------------------------------------------
+ * The checkpoint carries one more decoder layer under mtp.*, trained to read
+ * the model's state at position p together with the token at p+1 and to say
+ * what comes at p+2. Everything it computes is a block this engine already
+ * runs for the model's own layers and checks against the oracle: the decoder
+ * layer is q38_layer_forward at index c.layers (an attention layer:
+ * q38_attention with its own K/V/indexer rows and RoPE base, then q38_moe
+ * with its own router, shared expert and routed experts), its four streams
+ * leave through a GatedResidual of its own, mtp.hyper_connection_mixer, read
+ * by q38_gr_read exactly as q38_forward reads final_gr, and the shared
+ * lm_head gives the logits. The token at p+1 enters through the model's
+ * embedding (q38_embed_row); the head has none of its own.
+ *
+ * What the tensors leave open is how the two inputs become the four streams
+ * that layer reads. The model's streams at p (the 4 x hidden that the final
+ * mixer reads) meet pre_fc_norm_hidden [4*hidden] and fc_hidden
+ * [hidden, hidden]; the token's embedding meets pre_fc_norm_embedding
+ * [hidden] and fc_embedding [hidden, hidden]. Two square projections add (a
+ * single fc over the concatenation [e; h] is the same sum split in two), and
+ * the sum is a stream. Q38_MTP_WIRING picks one reading of the rest:
+ *   a  (default) pre_fc_norm_hidden normalizes the 4*hidden vector as one
+ *      vector -- q38_rms0 over all of it, the way pre_fc_norm_embedding
+ *      normalizes its input; neither norm belongs to a GatedResidual -- then
+ *      fc_hidden maps each stream and fc_embedding(norm(e)) is added to all
+ *      four, as q38_forward puts a token's embedding in all four streams;
+ *   b  as a, but the norm is per stream: q38_rms0 over each hidden-wide
+ *      stream with its slice of the weight, the grouping hc_norm has in
+ *      q38_gr_read;
+ *   c  the per-stream norm of b, the four streams averaged into one vector,
+ *      fc_hidden on that, plus fc_embedding(norm(e)), and the result copied
+ *      into the four streams as q38_forward does with an embedding.
+ * The output is the same whichever is chosen (the verify decides every
+ * token); the wirings differ in how often a draft is right, which only the
+ * trained weights can say, and the acceptance rate measures. Each norm is
+ * zero-centered (q38_rms0) like every Qwen4-Exp text RMSNorm but DeltaNet's
+ * gated one; q38_mtp_attach prints the mean of each norm weight, near 0 for
+ * that reading and near 1 for a plain norm. The pair (streams at p, token at
+ * p+1) is the head's row p: its K/V row and its RoPE position are p.
+ * Counting it at p+1 instead would change no score beyond rounding, since
+ * RoPE and the indexer's block scores depend on distances only.
+ *
+ * The head's KV rows hold verified pairs only, so it reads a row of the
+ * model's streams once the token after that row is known: the last row of a
+ * forward waits in mtp_pend, a draft runs the pending rows with the token
+ * the caller just picked, and the rows of a verify wait until the caller's
+ * next pick settles which of them stand. */
+enum { Q38_MTP_WHOLE_NORM='a', Q38_MTP_STREAM_NORM='b', Q38_MTP_STREAM_MEAN='c' };
+
+/* Q38_MTP_FORCE (tests): 'r' rejects every draft, a right one too, so the
+ * rollback runs on every token; 'a' drafts the reference's next token
+ * (ref.json, g_q38_mtp_oracle) so every draft is accepted; 'm' alternates a
+ * reference draft with a wrong one. The head still runs in every mode. */
+static const int *g_q38_mtp_oracle; static int g_q38_mtp_oracle_n;
+static FILE *g_q38_mtp_dump;   /* Q38_MTP_DUMP=<file>: per draft, the head's row, its token and its logits (tests) */
+
+/* The four streams the head's layer starts from, for S pairs: row s pairs
+ * the model's streams at pos_base+s with the token next[s] at pos_base+s+1. */
+static void q38_mtp_input(Model *m,const float *streams,const int *next,int S,int pos_base,float *hyper) {
+    Cfg *c=&m->c; int H=c->hidden,W=c->hc_width,C=c->hc_count;
+    float *en=falloc((int64_t)S*H),*fe=falloc((int64_t)S*H),*row=falloc(H),*hn=falloc((int64_t)S*W);
+    for(int s=0;s<S;s++){
+        q38_embed_row(m,next[s],pos_base+s+1,row);
+        q38_rms0(en+(int64_t)s*H,row,m->mtp_norm_emb,H,c->eps);
+    }
+    q38_dense_matmul(m,fe,en,&m->mtp_fc_emb,S,H,H);
+    for(int s=0;s<S;s++){
+        const float *x=streams+(int64_t)s*W; float *y=hn+(int64_t)s*W;
+        if(m->mtp_wiring==Q38_MTP_WHOLE_NORM) q38_rms0(y,x,m->mtp_norm_hid,W,c->eps);
+        else for(int b=0;b<C;b++)
+            q38_rms0(y+(int64_t)b*H,x+(int64_t)b*H,m->mtp_norm_hid+(int64_t)b*H,H,c->eps);
+    }
+    if(m->mtp_wiring==Q38_MTP_STREAM_MEAN){
+        float *mean=falloc((int64_t)S*H),*fh=falloc((int64_t)S*H);
+        for(int s=0;s<S;s++)for(int d=0;d<H;d++){
+            float v=0.f;for(int b=0;b<C;b++)v+=hn[(int64_t)s*W+(int64_t)b*H+d];
+            mean[(int64_t)s*H+d]=v/C;
+        }
+        q38_dense_matmul(m,fh,mean,&m->mtp_fc_hid,S,H,H);
+        for(int s=0;s<S;s++)for(int b=0;b<C;b++)for(int d=0;d<H;d++)
+            hyper[(int64_t)s*W+(int64_t)b*H+d]=fh[(int64_t)s*H+d]+fe[(int64_t)s*H+d];
+        free(mean);free(fh);
+    } else {
+        /* fc_hidden on every stream: S rows of four streams are S*C rows of hidden */
+        float *fh=falloc((int64_t)S*W);
+        q38_dense_matmul(m,fh,hn,&m->mtp_fc_hid,S*C,H,H);
+        for(int s=0;s<S;s++)for(int b=0;b<C;b++)for(int d=0;d<H;d++)
+            hyper[(int64_t)s*W+(int64_t)b*H+d]=fh[(int64_t)s*W+(int64_t)b*H+d]+fe[(int64_t)s*H+d];
+        free(fh);
+    }
+    free(en);free(fe);free(row);free(hn);
+}
+
+/* The head over S pairs at rows pos_base..pos_base+S-1: their K/V/indexer
+ * rows enter its attention and, with `logit`, the last row's logits come
+ * back through the head's mixer and lm_head. Rows go in bounded chunks so a
+ * long prompt's pairs do not need a prompt-sized workspace; the head's
+ * attention is causal, so chunking changes no result. */
+static void q38_mtp_rows(Model *m,const float *streams,const int *next,int S,int pos_base,float *logit) {
+    Cfg *c=&m->c; int H=c->hidden,W=c->hc_width,C=c->hc_count;
+    int cap=q38_bounded_prefill_rows(S,0,(uint64_t)(3*W+2*H+C)*sizeof(float));
+    float *hyper=falloc((int64_t)cap*W),*mixed=falloc((int64_t)cap*H);
+    float *inject=falloc((int64_t)cap*C),*block=falloc((int64_t)cap*H);
+    for(int base=0;base<S;base+=cap){
+        int rows=S-base<cap?S-base:cap;
+        q38_mtp_input(m,streams+(int64_t)base*W,next+base,rows,pos_base+base,hyper);
+        q38_layer_forward(m,c->layers,hyper,next+base,rows,pos_base+base,mixed,inject,block);
+        m->mtp_len=pos_base+base+rows;
+        if(logit&&base+rows==S){
+            double started=now_s();
+            q38_gr_read(m,&m->mtp_mixer,hyper+(int64_t)(rows-1)*W,1,mixed,NULL);
+            q38_weight_matmul(logit,mixed,&m->lm_head,1,H,c->vocab);
+            q38_tm_add(m,Q38_TM_LM_HEAD,started);
+        }
+    }
+    free(hyper);free(mixed);free(inject);free(block);
+}
+
+/* The pending rows meet their next token: the head reads them (the first of
+ * two with the token already known in mtp_pend_tok, the last with `tok`). */
+static void q38_mtp_take_pending(Model *m,int tok,float *logit) {
+    int next[2]={m->mtp_pend_tok,tok},n=m->mtp_pend_n;
+    q38_mtp_rows(m,m->mtp_pend,next+2-n,n,m->mtp_len,logit);
+    m->mtp_pend_n=0;
+}
+
+/* After a forward fed ids[0..S) at pos_base (step()): the pairs it completes
+ * go into the head -- the pending rows with ids[0], then rows 0..S-2 with
+ * ids[1..S-1] -- and row S-1 waits for the token after it. A forward that
+ * does not continue the head's rows (a rewind no restore accompanied) stops
+ * the head until the next reset or restore: it cannot draft past rows it
+ * never read. */
+static void q38_mtp_feed(Model *m,const int *ids,int S,int pos_base,const float *streams) {
+    int W=m->c.hc_width;
+    if(m->mtp_len+m->mtp_pend_n>pos_base){
+        m->mtp_pend_n=0;
+        if(m->mtp_len>pos_base-1)m->mtp_len=pos_base>0?pos_base-1:0;
+    }
+    if(m->mtp_pend_n&&m->mtp_len+m->mtp_pend_n==pos_base)q38_mtp_take_pending(m,ids[0],NULL);
+    if(m->mtp_len!=pos_base){m->mtp_pend_n=0;return;}
+    if(S>1)q38_mtp_rows(m,streams,ids+1,S-1,pos_base,NULL);
+    memcpy(m->mtp_pend,streams+(int64_t)(S-1)*W,(size_t)W*sizeof(float));
+    m->mtp_pend_n=1;
+}
+
+static int q38_argmax(const float *lo,int V) {
+    int best=0;float value=lo[0];
+    for(int i=1;i<V;i++)if(lo[i]>value){value=lo[i];best=i;}
+    return best;
+}
+
+/* The head's draft for the token after `tok`, which is about to be fed at
+ * `pos`: the pending rows take `tok`, and the last one's logits name the
+ * token at pos+1. -1 when the head has not read up to pos. */
+static int q38_mtp_draft(Model *m,int tok,int pos) {
+    if(!m->mtp_pend_n||m->mtp_len+m->mtp_pend_n!=pos)return -1;
+    float *logit=falloc(m->c.vocab);
+    q38_mtp_take_pending(m,tok,logit);
+    int draft=q38_argmax(logit,m->c.vocab);
+    if(g_q38_mtp_dump){
+        int32_t head[2]={pos-1,tok};
+        if(fwrite(head,sizeof head,1,g_q38_mtp_dump)!=1||
+           fwrite(logit,sizeof(float),(size_t)m->c.vocab,g_q38_mtp_dump)!=(size_t)m->c.vocab){
+            fprintf(stderr,"Q38_MTP_DUMP: write failed\n");exit(1);
+        }
+    }
+    free(logit);
+    return draft;
+}
+
+static float *step(Model *m,const int *ids,int S,int pos_base) {
+    float *streams=NULL;
+    float *logit=q38_forward(m,ids,S,pos_base,1,m->mtp?&streams:NULL);
+    if(streams){q38_mtp_feed(m,ids,S,pos_base,streams);free(streams);}
+    return logit;
+}
+
+/* ---- speculative decoding with the MTP head -------------------------------
+ * colibri.c's DRAFT loop on a model with recurrent state. The caller asks
+ * for the logits that follow the token it just picked; q38_spec_step has
+ * the head draft the token after that one and feeds both in one forward
+ * (S=2, the verify), returns the first row's logits as step() would and
+ * keeps the second row's. The caller's next pick settles the draft. Equal:
+ * the kept logits answer with no forward. Not equal: the second row is
+ * undone -- the DeltaNet and PLE state go back to the copy the verify took
+ * after its first row (q38_deltanet and q38_ple take it when snap_after
+ * says so; the rollback swaps pointers), kv_len and the kv_prefix record go
+ * back one row, and the attention and indexer rows past it are a stale tail
+ * the next forward overwrites, as every rewind here treats them. The head's
+ * own rows never need undoing: it reads settled rows only.
+ *
+ * Every verify row is computed the way a decode step computes it (the CPU
+ * kernels give a row the same bits whatever S is; device matrices run row by
+ * row, see q38_weight_matmul), so the logits the caller sees, and its pick,
+ * are those of plain decoding, greedy or sampled: the draft never reaches
+ * the sampler, and a sample that equals it is simply an accepted draft. The
+ * one exception is the CUDA expert tier, whose float order already depends
+ * on which experts are resident when, with drafts or without. */
+typedef struct {
+    int on, force;               /* drafting; Q38_MTP_FORCE's mode letter or 0 */
+    int ahead, draft, ahead_pos; /* a verify whose second row (the draft at ahead_pos) awaits the caller's pick */
+    float *ahead_logit, *ahead_streams;
+    uint64_t drafts, accepted, forwards, tokens;
+} Q38Spec;
+
+/* Back to the state after the verify's first row, `len` positions fed. */
+static void q38_spec_rollback(Model *m,int len) {
+    Cfg *c=&m->c;
+    for(int i=0;i<c->layers;i++)if(!c->is_attn[i]){
+        float *t=m->DN_rec[i];m->DN_rec[i]=m->snap_rec[i];m->snap_rec[i]=t;
+        t=m->DN_conv[i];m->DN_conv[i]=m->snap_conv[i];m->snap_conv[i]=t;
+    }
+    if(m->snap_ple){
+        float *t=m->PLE_conv_state;m->PLE_conv_state=m->snap_ple;m->snap_ple=t;
+        memcpy(m->ple_history,m->snap_ple_history,sizeof(m->snap_ple_history));
+        m->ple_history_len=m->snap_ple_history_len;
+    }
+    m->kv_len=len;
+    if(m->kvp.len>len)m->kvp.len=len;
+}
+
+/* The verify's second row did not stand: undo it, and its first row's
+ * streams wait for the token the caller picked instead. */
+static void q38_spec_drop_ahead(Model *m,Q38Spec *sp) {
+    q38_spec_rollback(m,sp->ahead_pos);
+    memcpy(m->mtp_pend,sp->ahead_streams,(size_t)m->c.hc_width*sizeof(float));
+    m->mtp_pend_n=1;
+    free(sp->ahead_logit);free(sp->ahead_streams);
+    sp->ahead_logit=sp->ahead_streams=NULL;sp->ahead=0;
+}
+
+/* The logits that follow `tok`, fed at `pos`, exactly as step(m,&tok,1,pos)
+ * gives them. `more` is how many tokens the caller may still want after
+ * `tok`: a draft saves a forward only when there is a second one. The
+ * returned buffer is the caller's (it may hold a second row past the first
+ * vocab floats). */
+static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
+    Cfg *c=&m->c; int V=c->vocab,W=c->hc_width;
+    sp->tokens++;
+    if(sp->ahead){
+        if(tok==sp->draft&&pos==sp->ahead_pos&&sp->force!='r'){
+            /* both verify rows stand: the first one's next token is the
+             * draft, the second waits for the caller's next pick */
+            float *logit=sp->ahead_logit;
+            memcpy(m->mtp_pend,sp->ahead_streams,(size_t)2*W*sizeof(float));
+            m->mtp_pend_n=2;m->mtp_pend_tok=tok;
+            free(sp->ahead_streams);
+            sp->ahead_logit=sp->ahead_streams=NULL;sp->ahead=0;sp->accepted++;
+            return logit;
+        }
+        q38_spec_drop_ahead(m,sp);
+    }
+    int draft=-1;
+    if(sp->on&&more>=2&&pos+1<m->kv_cap){
+        draft=q38_mtp_draft(m,tok,pos);
+        if(draft>=0&&(sp->force=='a'||sp->force=='m')){
+            int truth=pos+1<g_q38_mtp_oracle_n?g_q38_mtp_oracle[pos+1]:-1;
+            if(truth>=0)draft=sp->force=='m'&&(sp->drafts&1)?(truth+1)%V:truth;
+        }
+    }
+    if(draft<0){sp->forwards++;return step(m,&tok,1,pos);}
+    int ids[2]={tok,draft};float *streams=NULL;
+    m->snap_after=1;g_q38_rowwise=1;
+    float *logit=q38_forward(m,ids,2,pos,2,&streams);
+    m->snap_after=0;g_q38_rowwise=0;
+    sp->drafts++;sp->forwards++;
+    sp->ahead=1;sp->draft=draft;sp->ahead_pos=pos+1;
+    sp->ahead_logit=falloc(V);memcpy(sp->ahead_logit,logit+V,(size_t)V*sizeof(float));
+    sp->ahead_streams=streams;
+    return logit;
+}
+
+/* End of a generation: a verify row the caller never consumed is undone, so
+ * the state is the one plain decoding leaves after the same tokens. */
+static void q38_spec_end(Model *m,Q38Spec *sp) {
+    if(sp->ahead)q38_spec_drop_ahead(m,sp);
+}
+
+static float q38_mean(const float *x,int n) {
+    double sum=0.0; for(int i=0;i<n;i++) sum+=x[i];
+    return n?(float)(sum/n):0.f;
+}
+
+/* Q38_MTP=1: load the checkpoint's MTP head and draft with it. Unset or 0
+ * leaves it unread, as every run before it. The CLI and serve engine attach
+ * it after the model (the Segment and Edge adapters never do); a checkpoint
+ * without a head this engine runs is refused rather than decoded without
+ * one, so a benchmark cannot quietly measure plain decoding. The head's
+ * routed experts stay the snapshot's (FP8 on the release): the int4-g64
+ * sidecar holds the model's layers, and the head's one layer, read on at
+ * most two rows per draft, is a small part of the expert traffic. */
+static void q38_mtp_attach(Model *m,int cap) {
+    if(!q38_env_bool("Q38_MTP",0))return;
+    Cfg *c=&m->c;int H=c->hidden,W=c->hc_width;
+    if(m->range_begin!=0||m->range_end!=c->layers||!m->lm_head.rows){
+        fprintf(stderr,"Q38_MTP=1 needs the whole model loaded -- refusing\n");exit(1);
+    }
+    if(c->mtp_layers!=1){
+        if(c->mtp_layers==0)
+            fprintf(stderr,"Q38_MTP=1 but config.json has no MTP head (mtp_num_hidden_layers) -- refusing\n");
+        else if(c->mtp_layers<0)
+            fprintf(stderr,"Q38_MTP=1 but the config's MTP head is not one attention layer over the "
+                           "model's embedding -- refusing\n");
+        else fprintf(stderr,"Q38_MTP=1 but the MTP head has %d layers; this engine runs one -- refusing\n",
+                     c->mtp_layers);
+        exit(1);
+    }
+    const char *wiring=getenv("Q38_MTP_WIRING");
+    m->mtp_wiring=wiring&&*wiring?wiring[0]:Q38_MTP_WHOLE_NORM;
+    if((wiring&&*wiring&&wiring[1])||(m->mtp_wiring!=Q38_MTP_WHOLE_NORM&&
+       m->mtp_wiring!=Q38_MTP_STREAM_NORM&&m->mtp_wiring!=Q38_MTP_STREAM_MEAN)){
+        fprintf(stderr,"Q38_MTP_WIRING must be a, b or c (qwen38_core.h, the MTP head)\n");exit(1);
+    }
+    /* the release keeps the head at the top level, next to model.* */
+    char probe[96];const char *found=NULL;
+    const char *bases[3]={"mtp","model.mtp",NULL};
+    char nested[48];snprintf(nested,sizeof nested,"%s.mtp",m->prefix);bases[2]=nested;
+    for(int i=0;i<3&&!found;i++){
+        snprintf(probe,sizeof probe,"%s.fc_embedding.weight",bases[i]);
+        if(st_has(&m->S,probe))found=bases[i];
+    }
+    if(!found){fprintf(stderr,"Q38_MTP=1 but the checkpoint has no mtp.fc_embedding.weight -- refusing\n");exit(1);}
+    snprintf(m->mtp_prefix,sizeof m->mtp_prefix,"%s",found);
+    uint64_t resident_before=m->resident_weight_bytes;
+    char nm[384],base[320];
+    snprintf(nm,sizeof nm,"%s.pre_fc_norm_embedding.weight",found); m->mtp_norm_emb=q38_load_tensor(m,nm,H);
+    snprintf(nm,sizeof nm,"%s.pre_fc_norm_hidden.weight",found); m->mtp_norm_hid=q38_load_tensor(m,nm,W);
+    snprintf(nm,sizeof nm,"%s.fc_embedding.weight",found); m->mtp_fc_emb=q38_load_weight(m,nm,H,H);
+    snprintf(nm,sizeof nm,"%s.fc_hidden.weight",found); m->mtp_fc_hid=q38_load_weight(m,nm,H,H);
+    snprintf(base,sizeof base,"%s.hyper_connection_mixer",found); q38_load_gr_at(m,&m->mtp_mixer,base,0);
+    m->mtp=1;                                 /* from here on index c.layers is the head's layer */
+    /* Q38_MTP_CAP: the head's expert cache, by default the cap every layer
+     * has. Its experts are FP8 even beside the int4 sidecar, so on a cap
+     * sized to fill RAM with int4 experts it costs more than a model layer. */
+    int mtp_cap=q38_env_positive_int("Q38_MTP_CAP",cap,c->experts);
+    q38_load_layer(m,c->layers,mtp_cap);
+    m->mtp_pend=falloc((int64_t)2*W);
+    /* the verify's rollback copies (q38_spec_rollback) */
+    m->snap_rec=(float**)calloc((size_t)c->layers,sizeof(float*));
+    m->snap_conv=(float**)calloc((size_t)c->layers,sizeof(float*));
+    if(!m->snap_rec||!m->snap_conv){fprintf(stderr,"OOM MTP rollback state\n");exit(1);}
+    for(int i=0;i<c->layers;i++)if(!c->is_attn[i]){
+        m->snap_rec[i]=falloc((int64_t)c->dn_vheads*c->dn_kdim*c->dn_vdim);
+        m->snap_conv[i]=falloc((int64_t)c->dn_conv_dim*(c->dn_convk-1));
+    }
+    if(m->PLE_conv_state)m->snap_ple=falloc((int64_t)W*(c->ple_convk-1)*c->ngram_size);
+    snprintf(nm,sizeof nm,"%s.layers.0.mlp.experts.0.gate_proj.weight",found);
+    st_tensor *expert=st_find(&m->S,nm);
+    double expert_bytes=expert?3.0*(double)expert->nbytes:0.0;   /* gate, up and down are the same size */
+    const char *how=m->mtp_wiring==Q38_MTP_WHOLE_NORM?"one norm over the four streams, fc_hidden per stream":
+                    m->mtp_wiring==Q38_MTP_STREAM_NORM?"a norm per stream, fc_hidden per stream":
+                    "a norm per stream, the streams averaged, one fc_hidden";
+    fprintf(stderr,"[qwen38] MTP head %s.*: wiring %c (%s), RoPE base %g, %.2f MiB resident; "
+                   "routed experts %s from the snapshot%s, cache %d (Q38_MTP_CAP) x %.2f MiB = %.2f GiB full\n",
+            found,m->mtp_wiring,how,(double)c->mtp_theta,
+            (m->resident_weight_bytes-resident_before)/1048576.0,
+            expert?st_dtype_name(expert->dtype):"(fused)",m->x4?" (the int4-g64 sidecar covers the model's layers)":"",
+            mtp_cap,expert_bytes/1048576.0,expert_bytes*mtp_cap/1073741824.0);
+    fprintf(stderr,"[qwen38] MTP norm weights, mean: embedding %.4f, hidden %.4f, mixer %.4f "
+                   "(q38_rms0 scales by 1+w: near 0 fits it, near 1 would mean a plain norm)\n",
+            q38_mean(m->mtp_norm_emb,H),q38_mean(m->mtp_norm_hid,W),q38_mean(m->mtp_mixer.norm,W));
 }
 
 static int q38_tm_enabled(void) {
@@ -2877,7 +3394,8 @@ static void q38_layer_free(Layer *l) {
 static void q38_model_free(Model *m) {
     if(!m) return;
     kv_prefix_free(&m->kvp);
-    for(int i=0;i<m->c.layers;i++) {
+    int rows=q38_layer_rows(m);
+    for(int i=0;i<rows;i++) {
         if(m->L)q38_layer_free(&m->L[i]);
         if(m->cache) {
             if(m->cache[i].slots) {
@@ -2892,9 +3410,14 @@ static void q38_model_free(Model *m) {
             free(m->cache[i].slots); free(m->cache[i].by_expert);
         }
         if(m->expert_scales)free(m->expert_scales[i].values);
-        free(m->DN_rec ? m->DN_rec[i] : NULL); free(m->DN_conv ? m->DN_conv[i] : NULL);
+        if(i<m->c.layers){free(m->DN_rec ? m->DN_rec[i] : NULL); free(m->DN_conv ? m->DN_conv[i] : NULL);}
+        if(i<m->c.layers){free(m->snap_rec ? m->snap_rec[i] : NULL); free(m->snap_conv ? m->snap_conv[i] : NULL);}
         free(m->K ? m->K[i] : NULL); free(m->V ? m->V[i] : NULL); free(m->IK ? m->IK[i] : NULL);
     }
+    free(m->snap_rec); free(m->snap_conv); free(m->snap_ple); free(m->mtp_pend);
+    free(m->mtp_norm_emb); free(m->mtp_norm_hid);
+    q38_weight_free(&m->mtp_fc_emb); q38_weight_free(&m->mtp_fc_hid);
+    free(m->mtp_mixer.norm); q38_weight_free(&m->mtp_mixer.down); q38_weight_free(&m->mtp_mixer.up);
     if(m->x4){st_destroy(&m->x4->S);free(m->x4->fd);free(m->x4->off);free(m->x4);}
     free(m->L); free(m->cache); free(m->expert_scales); free(m->DN_rec); free(m->DN_conv); free(m->K); free(m->V); free(m->IK);
     q38_weight_free(&m->embed);q38_weight_free(&m->lm_head);

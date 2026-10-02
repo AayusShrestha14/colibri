@@ -4,8 +4,9 @@
 [`Qwen/Qwen3.8-Flash-Next-FP8`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8)
 directly from the official safetensors shards. No conversion or second copy of
 the weights is required. The engine supports text and images through the
-checkpoint's vision encoder; see **Vision** below. It does not use the optional
-MTP layer.
+checkpoint's vision encoder; see **Vision** below. The checkpoint's optional
+MTP layer drafts tokens for speculative decoding under `Q38_MTP=1`; see
+[Speculative decoding with the MTP head](#speculative-decoding-with-the-mtp-head).
 
 The upstream language model has 125B ordinary parameters with 6B activated,
 plus a 51B hashed n-gram embedding. It has 48 layers arranged as 12 repetitions
@@ -260,6 +261,56 @@ round trip against the FP8 source, the engine reproducing the float32
 reference of the dequantized sidecar through every expert path with the last
 logits identical to the bit across them, and the CUDA tier declining the int4
 experts on the fake backend.
+
+## Speculative decoding with the MTP head
+
+Optional, off by default. The release carries one more decoder layer under
+`mtp.*` that reads the model's four hyper-connection streams at a position
+together with the next token's embedding and predicts the token after it.
+`Q38_MTP=1` loads it and decodes speculatively: after each token the head
+drafts the next one, and one forward over both (S=2) returns the logits of the
+first as a plain decode step would while it checks the draft. When the token
+picked from those logits equals the draft, the second row's logits answer the
+next step with no forward; when it does not, the second row is undone: the
+Gated DeltaNet and PLE state go back to a copy taken after the first row (a
+pointer swap, nothing is recomputed) and the attention, indexer and prefix
+records go back one position.
+
+Every row of the verify forward is computed as a decode step computes it, so
+the output is the output of plain decoding, token for token and logit for logit,
+greedy or sampled (a sampled token that happens to equal the draft is an
+accepted draft). The CUDA expert tier is the exception it already is: its float
+order follows which experts are resident when.
+
+The head is built only from blocks the engine already runs for its own layers:
+the decoder layer is a QSA attention layer with its indexer, gated residuals,
+the MoE with its shared expert, the head's own hyper-connection mixer and the
+shared `lm_head`. How its two inputs become the four streams that layer reads
+is not fixed by the tensors, so `Q38_MTP_WIRING` selects a reading (`c/qwen38_core.h`,
+"the MTP head"): `a` (default) normalizes the 4 x 2560 streams as one vector,
+`b` normalizes each stream, `c` averages the normalized streams before
+`fc_hidden`. The output does not depend on the choice; the acceptance rate does,
+and it is what tells which reading the trained weights agree with.
+
+Every run prints its line, and a served request prints one per turn, on stderr:
+
+```
+[qwen38 MTP] run: 1.75 tokens/forward (4 forwards per 7 tokens) | acceptance 100.0% (3/3 drafts) | wiring a
+```
+
+Tokens are the decode tokens after the prompt and forwards the forwards that
+produced them. The head's routed experts stay the snapshot's FP8 with or
+without the int4-g64 sidecar (one layer read for at most two rows per draft is
+a small share of the expert traffic); their cache holds `Q38_MTP_CAP` experts,
+by default the cap every layer has, and the startup line prints what it costs.
+
+`make -C c qwen38-tiny-mtp-check` adds a head with random weights under the
+release's names to the three tiny fixtures and gates on the head's draft
+logits against a float32 reference of each wiring
+(`c/tools/qwen38_mtp_ref.py`), and on byte-identical output with drafts and
+without them across caps, prefill batching, both trunk formats, BF16, FP8 and
+int4 experts, text and serve, with drafts all rejected, all accepted and
+alternating.
 
 ## GPU: CUDA VRAM expert tier
 
@@ -519,7 +570,9 @@ vector, and runs both native-BF16 and expanded-FP32 resident modes at cache
 capacities one and four. CI repeats the capacity-one path under ASan and UBSan
 and verifies that a config/tensor shape disagreement is refused.
 `make -C c qwen38-tiny-int4-check` gates the optional int4-g64 experts (see
-[Routed experts as int4-g64](#routed-experts-as-int4-g64)).
+[Routed experts as int4-g64](#routed-experts-as-int4-g64)), and
+`make -C c qwen38-tiny-mtp-check` the MTP head (see
+[Speculative decoding with the MTP head](#speculative-decoding-with-the-mtp-head)).
 
 ## Supported checkpoint layouts
 
