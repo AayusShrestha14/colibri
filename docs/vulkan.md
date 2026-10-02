@@ -134,8 +134,25 @@ memory, which is also why MiMo's expert tier never evicts.
 
 **Status.** CI checks every engine above on Lavapipe (`tests/vulkan_engines.sh`, the
 `vulkan-engines` job): each configuration gives the CPU run's tokens, and its matmul
-count is above zero. That proves correctness, not speed. None of these engines has
-been measured on a real GPU yet.
+count is above zero. That proves correctness, not speed.
+
+The first real GPU measured is an integrated Radeon 780M (RADV) in a Ryzen 7 PRO
+8700GE (16 threads, 61 GiB DDR5, NVMe): same binaries, cold page cache, load under 2.
+The shader harness (`tests/vulkan_engines.sh shader`) passes every format case there.
+The engines are correct on it and slower than the CPU today:
+
+| Workload | CPU | Vulkan, 780M |
+|---|---|---|
+| Qwen3.8 Flash Next int4, decode 100 tokens | 3.55 tok/s | 1.53 tok/s |
+| Qwen3.8 Flash Next, prefill 512 tokens | 51 s | 109 s |
+| Qwen3.6-35B-A3B, decode | 5.97 tok/s | 3.06 tok/s (identical output) |
+| Qwen3.6-35B-A3B, prefill 512 tokens | 39.8 s | 60.7 s |
+
+Why, measured:
+- **Decode**: every matmul is a synchronous submit, about 726 per token, and an
+  integrated GPU reads the same RAM as the CPU.
+- **Prefill**: the shader is a per-row GEMV, so each weight is read once per prompt
+  row.
 
 ## Correctness
 

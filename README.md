@@ -18,15 +18,18 @@ parameters** — on consumer and heterogeneous hardware, in pure C with zero
 engine dependencies, by treating storage, RAM, and VRAM as a single inference
 hierarchy (AI memory multitiering).
 
-Ten families run today: **GLM-5.2/5.3** (744B), **GLM-5.3-Flash** (321B, with
-vision), **Inkling** (975B), **Kimi K3** (2.8T), **DeepSeek V4 Flash** (284B), **DeepSeek V4.1 Flash** (552B, with vision),
-**MiMo-V2.6 Flash** (309B, with vision),
-**Qwen3.8-Flash-Next** (125B + 51B n-gram), **Qwen3.6** (35B-A3B) and
-**OLMoE** (7B) —
-one C file each, the same `coli chat` / `coli serve` / `coli web` front end.
-Images too: **Qwen-Image-2.1** generates pictures from text, shown inline in
-the terminal by `coli chat` and served at `POST /v1/images/generations`
-([qwen-image.md](docs/qwen-image.md)).
+Ten language-model families run today. We count engines, not checkpoints: one C
+file each, the same `coli chat` / `coli serve` / `coli web` front end, and some
+engines run more than one model. **GLM-5.2/5.3** (744B), **GLM-5.3-Flash** (321B,
+with vision), **Inkling** (975B), **Kimi K3** (2.8T), **DeepSeek V4 Flash** (284B),
+**DeepSeek V4.1 Flash** (552B, with vision), **MiMo-V2.6 Flash** (309B, with
+vision; the same engine runs **MiMo-V2.6 Pro**, 1.02T), **Qwen3.8-Flash-Next**
+(125B + 51B n-gram), **Qwen3.6** (35B-A3B; the same engine runs
+**Qwen3-Coder-30B-A3B** and the dense **Qwen3.8-27B**, with vision) and
+**OLMoE** (7B).
+Images too: an eleventh engine runs **Qwen-Image-2.1**, which generates pictures
+from text, shown inline in the terminal by `coli chat` and served at
+`POST /v1/images/generations` ([qwen-image.md](docs/qwen-image.md)).
 [Full roster ↓](#other-supported-models)
 
 > **Colibrì is an inference engine you can run today, and an open research
@@ -306,6 +309,10 @@ the expert tier, dense projections, and the MLA attention core to any GPU with
 a Vulkan 1.2 driver — including AMD cards via Mesa/RADV (the only backend for
 cards the vendor stacks no longer support, like the RX 580, and competitive
 with ROCm on RDNA4 — see [the benchmarking notes](docs/vulkan.md)).
+Every other engine now opens the same backend for its resident matrices with
+`COLI_VULKAN=1` in a `VK=1` build; it is checked against the CPU's tokens in CI,
+but on the first real GPU they have been measured on, an integrated Radeon 780M,
+it is slower than the CPU today ([the other engines](docs/vulkan.md#the-other-engines)).
 
 > **On real NVMe, measure `DIRECT=1`.** O_DIRECT bypasses the page cache and is
 > often a large win on drives with DRAM cache and bandwidth headroom (+34%
@@ -438,10 +445,11 @@ the full 756 GB on disk at once:
 
 #### Other supported models
 
-GLM-5.2 is the reference model, but the same streaming approach runs six more
-families. Each is a **sibling engine** — one C file, its own architecture, the same
-`coli chat` / `coli serve` / `coli web` front end (the launcher picks the binary from
-the model's `config.json`):
+GLM-5.2 is the reference model, but the same streaming approach runs nine more
+language-model families, and one engine generates images. Each is a **sibling
+engine**: one C file, its own architecture, the same `coli chat` / `coli serve` /
+`coli web` front end (the launcher picks the binary from the model's `config.json`,
+or from `model_index.json` for the image model):
 
 > **What each one needs.** These differ a lot, and reading two of them together
 > has confused people into thinking the requirements contradict each other
@@ -450,32 +458,54 @@ the model's `config.json`):
 >
 > | Model | Disk for the weights | RAM | GPU |
 > |---|---|---|---|
-> | **OLMoE** | ~7 GB (int8 container) | 8 GB | not needed |
-> | **GLM-5.2/5.3** | ~372 GB (5.2) / ~419 GB (5.3) | 16 GB min, 24 GB comfortable | not needed |
-> | **GLM-5.3-Flash** | ~195 GB converted | 25 GB (12 GB weights at int4 + expert cache) | not needed |
-> | **Inkling** | ~469 GB | 25 GB with the int4 dense container, ~120 GB without | not needed |
-> | **Kimi K3** | ~1.6 TB | 32 GB+ | not needed |
-> | **DeepSeek V4 Flash** | ~167 GB (REAP 150B: ~85 GB) | 16 GB min, 32 GB comfortable | optional; any NVIDIA card from the GTX 10 series up (Pascal/Turing via `CUDA_ARCH=portable-pre-ampere NO_TC=1`, best on RTX 50) makes prefill 5-10x and decode ~2.5x faster |
-> | **Qwen3.8-Flash-Next** | ~185.5 GB (official FP8 checkpoint) | 16 GB min, 24 GB comfortable at the default context | optional; the CUDA VRAM expert tier with dense trunk quantized to int8 in VRAM |
-> | **Qwen3.8-27B** (dense, text and images) | ~51 GB converted (f16) | 20 GB with int4 dense weights, 30 GB in int8 | not used yet (CPU) |
-> | **Qwen3.6-35B-A3B** | ~20 GB (int4-gs64 container) | 24 GB (needs full RAM residency) | optional; the CUDA VRAM expert tier measured **1.44 -> 10.05 tok/s (7.0x)** on two 8 GB cards, output bit-identical to CPU |
+> | **OLMoE** | ~7 GB (int8 container) | 8 GB | not needed; Vulkan opt-in |
+> | **GLM-5.2/5.3** | ~372 GB (5.2) / ~419 GB (5.3) | 16 GB min, 24 GB comfortable | not needed; Vulkan opt-in |
+> | **GLM-5.3-Flash** | ~195 GB converted | 25 GB (12 GB weights at int4 + expert cache) | not needed; Vulkan opt-in |
+> | **Inkling** | ~469 GB | 25 GB with the int4 dense container, ~120 GB without | not needed; Vulkan opt-in |
+> | **Kimi K3** | ~1.6 TB | 32 GB+ | not needed; Vulkan opt-in |
+> | **DeepSeek V4 Flash** | ~167 GB (REAP 150B: ~85 GB) | 16 GB min, 32 GB comfortable | optional; any NVIDIA card from the GTX 10 series up (Pascal/Turing via `CUDA_ARCH=portable-pre-ampere NO_TC=1`, best on RTX 50) makes prefill 5-10x and decode ~2.5x faster; Vulkan opt-in |
+> | **DeepSeek V4.1 Flash** | ~510 GB (official checkpoint; 203 GB of it is an n-gram memory read a few hundred bytes at a time) | ~18 GB resident (dense, embeddings, vision) plus the expert cache `--ram` sizes; 24.8 GB peak RSS measured at cap 8 | not needed; Vulkan opt-in |
+> | **MiMo-V2.6 Flash** | ~178 GB (official checkpoint) | 30.1 GB resident measured with 32 experts cached per layer, 49.8 GB with 64; `--ram` sizes the cache | not needed; Vulkan opt-in |
+> | **MiMo-V2.6 Pro** | ~574 GB (~564 GB without the three files the engine never loads) | dense set 30.2 GiB as released, 21.7 GiB in int8; 48.0 GB resident measured with 12 experts cached per layer (dense as released), 50.7 GB with 20 (dense in int8) | not needed; Vulkan opt-in |
+> | **Qwen3.8-Flash-Next** | ~185.5 GB (official FP8 checkpoint), plus 68.0 GB for the optional int4-g64 expert sidecar | 24 GB comfortable at the default context with the FP8 experts (cap 32; 16 GB is below the floor); 11.6 GB RSS measured at cap 32 with the int4-g64 sidecar | optional; the CUDA VRAM expert tier (FP8 experts only) with dense trunk quantized to int8 in VRAM; Vulkan opt-in |
+> | **Qwen3.8-27B** (dense, text and images) | ~51 GB converted (f16) | 20 GB with int4 dense weights, 30 GB in int8 | not needed; no CUDA tier yet; Vulkan opt-in |
+> | **Qwen3.6-35B-A3B** | ~20 GB (int4-gs64 container) | 24 GB (needs full RAM residency) | optional; the CUDA VRAM expert tier measured **1.44 -> 10.05 tok/s (7.0x)** on two 8 GB cards, output bit-identical to CPU; Vulkan opt-in |
+> | **Qwen3-Coder-30B-A3B** | ~19 GB (int4-gs64 container; 30 GB in int8) | 6.5 GB resident measured with 32 experts cached per layer, 15.2 GB with all 128 | not needed; Vulkan opt-in |
+> | **Qwen-Image-2.1** (text to image) | ~33 GB (official diffusers checkpoint) | 16.0 GB with everything resident, 8.5 GB peak with the text encoder loaded per prompt, plus working buffers (9.0 GB peak measured for one 768x512 image) | not needed; Vulkan opt-in, not timed on a GPU yet |
 >
-> A GPU only ever makes it faster. Speed is set by your disk, because the experts
-> are streamed from it — expect a fraction of a token per second on a slow drive
-> and a few per second on a fast one with the cache warm.
+> A GPU never changes what the model answers, only where the work runs. Speed is
+> set by your disk, because the experts are streamed from it: expect a fraction
+> of a token per second on a slow drive and a few per second on a fast one with
+> the cache warm.
+>
+> **Vulkan opt-in** means a `VK=1` build. Run with `COLI_VULKAN=1`, the engine
+> puts its resident matrices on any GPU with a Vulkan 1.2 driver (GLM-5.2 has a
+> full decode path there, Kimi K3 its own expert tier, `K3_VK`), and CI checks
+> those engines against the CPU's tokens on a software driver
+> ([vulkan.md](docs/vulkan.md#the-other-engines)). Correct is not yet faster. On
+> the first real GPU measured for these engines, an integrated Radeon 780M (Ryzen 7
+> PRO 8700GE, same binaries, cold page cache), it is slower than the CPU today:
+> Qwen3.6-35B-A3B decoded 3.06 tok/s against 5.97 on the CPU, with identical
+> output, and Qwen3.8-Flash-Next with int4 experts 1.53 against 3.55. Every matmul
+> is a synchronous submit, about 726 per token, and an integrated GPU reads the
+> same RAM as the CPU.
 
 | Family | Total / active | Weights | Build | Docs |
 |---|---|---|---|---|
 | **GLM-5.2/5.3** | 744B / 40B | [`mastouri/…-int4-g64-with-int8-mtp`](https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp) (372 GB) or [`Justvugg/GLM-5.3-colibri-int4-g64`](https://huggingface.co/Justvugg/GLM-5.3-colibri-int4-g64) (419 GB) | `make -C c glm` | this page |
 | **Inkling** (Thinking Machines) | 975B / 41B | [`nbeerbower/Inkling-colibri-int4`](https://huggingface.co/nbeerbower/Inkling-colibri-int4) (469 GB) | `make -C c inkling` | [inkling.md](docs/inkling.md) |
-| **GLM-5.3-Flash** (Z.ai) | 321B / 40B | [`zai-org/GLM-5.3-Flash`](https://huggingface.co/zai-org/GLM-5.3-Flash) — converted to **int4-gs64** routed experts, dense stays BF16 and the precision is a load-time choice; vision included | `make -C c glm53` | [glm53-flash.md](docs/glm53-flash.md) |
+| **GLM-5.3-Flash** (Z.ai) | 321B / 18B | [`zai-org/GLM-5.3-Flash`](https://huggingface.co/zai-org/GLM-5.3-Flash), converted to **int4-gs64** routed experts, dense stays BF16 and the precision is a load-time choice; vision included | `make -C c glm53` | [glm53-flash.md](docs/glm53-flash.md) |
 | **Kimi K3** (Moonshot) | 2.8T / 104B | [`moonshotai/Kimi-K3`](https://huggingface.co/moonshotai/Kimi-K3) — original checkpoint, routed experts stay **native MXFP4** | `make -C c kimi_k3` | [kimi_k3.md](docs/kimi_k3.md) |
 | **DeepSeek V4 Flash** | 284B / 13B | official sharded checkpoint — routed experts stay **native fp4**, dense stays fp8-e4m3; the **REAP-pruned 150B** ([`puwaer/DeepSeek-V4-Flash-0731-reap-150b`](https://huggingface.co/puwaer/DeepSeek-V4-Flash-0731-reap-150b), 85 GB, 132 of 256 experts) loads with the same engine and no conversion | `make -C c deepseek-v4` | [deepseek-v4.md](docs/deepseek-v4.md) |
 | **DeepSeek V4.1 Flash** | 552B / 16B | official checkpoint, **no conversion**: experts are already fp4, dense is fp8-e4m3. 203 GB of it is an n-gram memory read from disk a few hundred bytes at a time, and the routed experts cost **4.5 GB per token** against GLM-5.2's 12.7. Vision, tool calling and the DSpark draft head are all on | `make -C c deepseek_v41` | [deepseek-v41.md](docs/deepseek-v41.md) |
 | **MiMo-V2.6 Flash** (Xiaomi) | 309B / 15B | [`XiaomiMiMo/MiMo-V2.6-Flash-MOPD`](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-MOPD) (178 GB), official checkpoint, **no conversion**: routed experts stay **native MXFP4**, dense stays FP8/BF16. 39 of its 48 layers attend a 128-token window, so a long context costs the KV of 9. Vision and tool calling on | `make -C c mimo` | [mimo.md](docs/mimo.md) |
-| **Qwen3.8-Flash-Next** (Alibaba) | 125B + 51B n-gram / 6B | [`Qwen/Qwen3.8-Flash-Next-FP8`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8) — original checkpoint; PLE stays pageable and experts stay **native block-FP8** | `make -C c qwen38` (`CUDA=1` for the VRAM expert tier) | [qwen38.md](docs/qwen38.md) |
+| **MiMo-V2.6 Pro** (Xiaomi) | 1.02T / 42B | [`XiaomiMiMo/MiMo-V2.6-Pro-MOPD`](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-MOPD) (573.5 GB), official checkpoint, **no conversion**, on the MiMo engine: the same architecture at 70 layers and 384 experts. Checked against Xiaomi's own modeling code on the first 32 of its 70 layers. Vision and tool calling on | `make -C c mimo` | [mimo.md](docs/mimo.md#pro) |
+| **Qwen3.8-Flash-Next** (Alibaba) | 125B + 51B n-gram / 6B | [`Qwen/Qwen3.8-Flash-Next-FP8`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8), original checkpoint; PLE stays pageable and experts stay **native block-FP8**, or are read as **int4-g64** from an optional sidecar (see below). Opt-in MTP drafting (`Q38_MTP=1`) | `make -C c qwen38` (`CUDA=1` for the VRAM expert tier) | [qwen38.md](docs/qwen38.md) |
 | **Qwen3.6** (Alibaba) | 35B / 3B | [`Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64`](https://huggingface.co/Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64) (~20 GB, **recommended**) — hybrid Gated Attention + Gated DeltaNet | `make -C c qwen36` (`CUDA=1` for the VRAM expert tier) | [qwen36.md](docs/qwen36.md) |
+| **Qwen3.8-27B** (Alibaba) | 27B, dense | [`Qwen/Qwen3.8-27B`](https://huggingface.co/Qwen/Qwen3.8-27B) converted with `c/tools/convert_qwen36.py` to an f16 container (51 GB); the engine quantizes it to int8, or int4 with `COLI_DENSE_BITS=4`, while loading. One MLP per layer and no router, on the Qwen3.6 engine. Text and images | `make -C c qwen36` | [qwen36.md](docs/qwen36.md#the-dense-27b) |
+| **Qwen3-Coder-30B-A3B** (Alibaba) | 30B / 3B | [`Justvugg/Qwen3-Coder-30B-A3B-colibri-int4`](https://huggingface.co/Justvugg/Qwen3-Coder-30B-A3B-colibri-int4) (19 GB, int4-gs64), converted from [`Qwen/Qwen3-Coder-30B-A3B-Instruct`](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct). All-attention Qwen3 MoE on the Qwen3.6 engine, 128 experts top-8, its own XML tool-call form and no thinking; teacher forced, the int4 container picks the bf16 release's top-1 token at 96.9% of positions | `make -C c qwen36` | [qwen36.md](docs/qwen36.md#qwen3-coder-30b-a3b) |
 | **OLMoE** (AI2) | 7B / 1B | converted with `c/tools/convert_olmoe_merged.py` — **int8** container, ~7 GB | `make -C c olmoe` | — |
+| **Qwen-Image-2.1** (Alibaba) | image model | [`Qwen/Qwen-Image-2.1`](https://huggingface.co/Qwen/Qwen-Image-2.1) (~33 GB), official diffusers checkpoint, **no conversion**: the text encoder and the diffusion transformer are quantized to int8 while loading. Pictures inline in `coli chat`, `POST /v1/images/generations` on `coli serve`. Qwen Research License: non-commercial use only | `make -C c qwenimage` | [qwen-image.md](docs/qwen-image.md) |
 
 Qwen3.6 ships three pre-converted containers: **int4-gs64** (recommended — measured
 cosine to the int8 anchor 0.98777 → 0.99313 and KL 0.109 → 0.080 against per-row, i.e.
@@ -484,6 +514,18 @@ as the A/B baseline, and [KAT-Coder v2.5](https://huggingface.co/Kreuzzelg/kat-c
 which the same engine runs unchanged — any architecture-identical checkpoint works
 without a code path of its own. With `CUDA=1` the VRAM expert tier measured
 **1.44 → 10.05 tok/s (7.0×) on two 8 GB cards**, output bit-identical to the CPU path.
+
+Qwen3.8-Flash-Next reads its routed experts as released, in block-FP8. An optional
+**int4-g64 sidecar** (`c/tools/convert_qwen38_experts_int4.py`, 68.0 GB written next
+to the FP8 shards) makes each miss read 56% of the bytes. Measured on a Ryzen 7 PRO
+8700GE (16 threads, 61 GiB, NVMe), it decodes 1.4-1.5x faster at the same cache
+size and 1.56x faster at the same RAM, for +0.017 nats per token of perplexity on
+average ([qwen38.md](docs/qwen38.md#routed-experts-as-int4-g64)). Speculative
+decoding with the checkpoint's own MTP head is opt-in (`Q38_MTP=1`), and the output
+is identical to plain decoding. On the same machine with the int4 experts, 94-96%
+of drafts were accepted, 1.94 tokens per forward, for +12-14% tok/s (3.57 to 4.01
+at cap 96, 4.15 to 4.74 at cap 170). The gain is small there because the expert
+reads from disk do not shrink ([qwen38.md](docs/qwen38.md)).
 
 Kimi K3 needs no conversion: its QAT-trained MXFP4 experts are streamed straight from
 the original Hugging Face shards, and the bf16 dense set is quantized at load time.
@@ -667,11 +709,11 @@ checkpoint validation, and the generated tiny independent oracle.
   lower cost per useful token. Everything lands the way this project works:
   measured end to end, reviewed, and developed in the open.
 - **More open models.** The tiering algorithm is model-agnostic: any MoE with
-  routed experts can be staged the same way. Ten families run today (GLM-5.2,
-  GLM-5.3-Flash, Inkling, Kimi K3, DeepSeek V4 Flash, DeepSeek V4.1 Flash, MiMo-V2.6 Flash,
-  Qwen3.8-Flash-Next, Qwen3.6, OLMoE); further open-weight families — **MiniMax** among the
-  candidates — earn an engine the way the first eight did: when someone
-  measures one end to end.
+  routed experts can be staged the same way. Ten language-model families run today
+  (GLM-5.2/5.3, GLM-5.3-Flash, Inkling, Kimi K3, DeepSeek V4 Flash, DeepSeek V4.1
+  Flash, MiMo-V2.6, Qwen3.8-Flash-Next, Qwen3.6, OLMoE), plus Qwen-Image-2.1 for
+  pictures; further open-weight families, **MiniMax** among the candidates, earn an
+  engine the way these did: when someone measures one end to end.
 
 ## Supporting the project
 
@@ -693,10 +735,14 @@ c/
 ├── colibri.c             GLM-5.2 engine  (make glm)
 ├── inkling.c             Inkling engine  (make inkling)
 ├── kimi_k3.c             Kimi K3 engine  (make kimi_k3)
+├── glm53.c               GLM-5.3-Flash engine  (make glm53)
 ├── deepseek_v4.c         DeepSeek V4 Flash engine  (make deepseek-v4)
-├── qwen38.c              Qwen3.8-Flash-Next text engine  (make qwen38)
-├── qwen36.c              Qwen3.6 engine  (make qwen36)
+├── deepseek_v41.c        DeepSeek V4.1 Flash engine  (make deepseek_v41)
+├── mimo.c                MiMo-V2.6 Flash and Pro engine  (make mimo)
+├── qwen38.c              Qwen3.8-Flash-Next engine  (make qwen38)
+├── qwen36.c              Qwen3.6, Qwen3-Coder, Qwen3.8-27B engine  (make qwen36)
 ├── olmoe.c               OLMoE engine  (make olmoe)
+├── qwenimage.c           Qwen-Image-2.1 engine  (make qwenimage)
 │
 ├── st.h                  safetensors index and range reads
 ├── quant.h               canonical container decoders
@@ -709,7 +755,7 @@ c/
 │
 ├── backend_cuda.*        optional CUDA tier   (CUDA=1)
 ├── backend_metal.*       optional Metal tier  (METAL=1)
-├── backend_vulkan.*      optional Vulkan tier (VULKAN=1)
+├── backend_vulkan.*      optional Vulkan tier (VK=1)
 │
 ├── Makefile              build and local checks
 ├── coli                  user-facing CLI
