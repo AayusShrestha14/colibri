@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import {
-  askBrio, extractSSE, extractSSEEvents, generateImage, generatesImages, getHealth, getProfile,
+  askBrio, askSystemOne, decidesOnly, extractSSE, extractSSEEvents, generateImage, generatesImages, getHealth, getProfile,
   listModelInfo, serverEndpoint, streamChat, type GenerateImageOptions, type ImageProgress,
 } from "./api"
 
@@ -147,6 +147,34 @@ describe("askBrio", () => {
       { status: 400, headers: { "Content-Type": "application/json" } })))
     await expect(askBrio("http://x/v1", "", "m", "s", "q", ["a"]))
       .rejects.toThrow("options must be a non-empty array")
+  })
+})
+
+describe("askSystemOne", () => {
+  it("asks a decision model one choice question and draws it like a brio answer", async () => {
+    const seen: { url?: string; body?: { questions: { q: { type: string; criteria: object } } } } = {}
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
+      seen.url = url
+      seen.body = JSON.parse(String(init.body))
+      return new Response(JSON.stringify({
+        id: "req_1", model: "laya", provider: "colibri",
+        answers: { q: { type: "choice", choice: "b", probabilities: { a: 0.25, b: 0.75 }, confidence: 0.5 } },
+        usage: { input_tokens: 40, output_tokens: 0, cost: 0 },
+      }), { status: 200, headers: { "Content-Type": "application/json" } })
+    }))
+    const out = await askSystemOne("http://x/v1", "", "laya", "state", "q?", ["a", "b"])
+    expect(seen.url).toBe("http://x/v1/systemone")
+    expect(seen.body?.questions.q).toEqual({ type: "choice", instructions: "q?", criteria: { a: null, b: null } })
+    expect(out.answer).toBe("b")
+    expect(out.choices.map((c) => c.option)).toEqual(["b", "a"])
+    expect(out.entropy).toBeCloseTo(-(0.25 * Math.log(0.25) + 0.75 * Math.log(0.75)) / Math.log(2), 6)
+    expect(out.usage).toEqual({ prompt_tokens: 40, completion_tokens: 0, read_tokens: 40, total_tokens: 40 })
+  })
+
+  it("knows a decision model from its capabilities", () => {
+    expect(decidesOnly({ id: "laya", capabilities: ["systemone", "decision"] })).toBe(true)
+    expect(decidesOnly({ id: "qwen36", capabilities: ["chat", "systemone"] })).toBe(false)
+    expect(decidesOnly(undefined)).toBe(false)
   })
 })
 

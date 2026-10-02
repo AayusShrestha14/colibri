@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react"
 import { FileUp, ListChecks, LoaderCircle, Plus, X } from "lucide-react"
 
-import { askBrio, type BrioResponse } from "@/lib/api"
+import { askBrio, askSystemOne, type BrioResponse } from "@/lib/api"
 import { useLocale } from "./i18n"
 
 /* Modalita brio.
@@ -38,8 +38,10 @@ let nextId = 1
 const blank = (): Row => ({ id: nextId++, text: "", options: "" })
 const first = (): Row => ({ id: nextId++, text: "", options: "yes\nno" })
 
-export default function Brio({ baseUrl, apiKey, model, connected }: {
+export default function Brio({ baseUrl, apiKey, model, connected, decision = false }: {
   baseUrl: string; apiKey: string; model: string; connected: boolean
+  /* a decision model (Laya): it answers only POST /v1/systemone */
+  decision?: boolean
 }) {
   const { t } = useLocale()
   const [state, setState] = useState("")
@@ -84,7 +86,8 @@ export default function Brio({ baseUrl, apiKey, model, connected }: {
       setRunning(row.id)
       const started = performance.now()
       try {
-        const result = await askBrio(baseUrl, apiKey, model, state, row.text, lines(row.options), controller.signal)
+        const ask = decision ? askSystemOne : askBrio
+        const result = await ask(baseUrl, apiKey, model, state, row.text, lines(row.options), controller.signal)
         patch(row.id, { result, seconds: (performance.now() - started) / 1000 })
       } catch (cause) {
         if (controller.signal.aborted) break   /* fermato apposta: le domande dopo restano intatte */

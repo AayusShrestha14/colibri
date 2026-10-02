@@ -131,8 +131,10 @@ async function responseError(response: Response) {
 
 export interface ModelInfo {
   id: string
-  /* What a model does beyond chat. colibri marks an image model with
-     "image_generation": it answers /v1/images/generations and refuses chat. */
+  /* What a model does. colibri marks an image model with "image_generation"
+     (it answers /v1/images/generations and refuses chat), a language model
+     with "chat" and "systemone", and a decision model with "systemone" and
+     "decision" (it answers only POST /v1/systemone). */
   capabilities?: string[]
 }
 
@@ -321,6 +323,57 @@ export async function askBrio(
   })
   if (!response.ok) throw new Error(await responseError(response))
   return (await response.json()) as BrioResponse
+}
+
+/* A decision engine (Laya) answers only POST /v1/systemone: there the page's
+ * question is one `choice` with the options as labels, and the reply is shaped
+ * like askBrio's so the page draws it the same way. The engine reads every
+ * token and generates none; its probabilities are calibrated, not log-probs,
+ * so `logprob` is the log of the probability and `tokens` is 0. */
+export async function askSystemOne(
+  baseUrl: string,
+  apiKey: string,
+  model: string,
+  state: string,
+  question: string,
+  options: string[],
+  signal?: AbortSignal,
+): Promise<BrioResponse> {
+  const response = await fetch(endpoint(baseUrl, "systemone"), {
+    method: "POST",
+    headers: headers(apiKey),
+    body: JSON.stringify({
+      model, state,
+      questions: { q: { type: "choice", instructions: question, criteria: Object.fromEntries(options.map((o) => [o, null])) } },
+    }),
+    signal,
+  })
+  if (!response.ok) throw new Error(await responseError(response))
+  const body = (await response.json()) as {
+    answers?: { q?: { choice?: string; probabilities?: Record<string, number> } }
+    usage?: { input_tokens?: number; output_tokens?: number }
+  }
+  const probabilities = body.answers?.q?.probabilities ?? {}
+  const choices = options
+    .map((option) => ({ option, p: probabilities[option] ?? 0, tokens: 0 }))
+    .map((c) => ({ ...c, logprob: Math.log(Math.max(c.p, 1e-12)), mean_logprob: Math.log(Math.max(c.p, 1e-12)) }))
+    .sort((a, b) => b.p - a.p)
+  const entropy = choices.length > 1
+    ? -choices.reduce((sum, c) => sum + (c.p > 0 ? c.p * Math.log(c.p) : 0), 0) / Math.log(choices.length)
+    : 0
+  const read = body.usage?.input_tokens ?? 0
+  return {
+    answer: body.answers?.q?.choice ?? choices[0]?.option ?? "",
+    entropy,
+    normalize: "sum",
+    choices,
+    usage: { prompt_tokens: read, completion_tokens: 0, read_tokens: read, total_tokens: read },
+  }
+}
+
+/* A model that only decides: colibri marks it "decision" in /v1/models. */
+export function decidesOnly(model: ModelInfo | undefined) {
+  return !!model?.capabilities?.includes("decision")
 }
 
 /* ---- text-to-image ----------------------------------------------------------
