@@ -1449,8 +1449,10 @@ static void validate_cfg(const Cfg *c, int n_layers_from_config) {
                  "topk %d out of range 1..256 (idx[]/val[] in moe())", c->topk);
         CFG_NEED(c->topk <= c->n_experts, "topk %d exceeds num_experts %d",
                  c->topk, c->n_experts);
-        CFG_NEED(c->inter > 0 && c->shared_inter > 0,
-                 "moe_inter %d / shared_inter %d must be positive", c->inter, c->shared_inter);
+        /* shared_inter 0: no shared expert (Qwen3 MoE, qwen3_moe); Qwen3.5/3.6 carry one. */
+        CFG_NEED(c->inter > 0 && c->shared_inter >= 0 && c->shared_inter <= 1 << 20,
+                 "moe_inter %d must be positive and shared_inter %d in 0..1048576",
+                 c->inter, c->shared_inter);
     }
     if (c->vis_depth) {
         CFG_NEED(c->vis_depth > 0 && c->vis_depth <= 64, "vision depth %d out of range", c->vis_depth);
@@ -1941,15 +1943,17 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         /* shared expert (dense, int8-during-load). A dense model's MLP is the same
          * SwiGLU under mlp.{gate,up,down}_proj, with no gate in front of it. */
         const char *shp = c->n_experts ? "mlp.shared_expert." : "mlp.";
+        if (c->shared_inter > 0) {   /* Qwen3 MoE has none: its sh_* stay empty */
         snprintf(nm,sizeof(nm),"model.layers.%d.%sgate_proj.weight", ai, shp);
         load_tq(m, nm, c->hidden, c->shared_inter, quantize_dense, "shexp", &l->sh_g); QCOUNT(l->sh_g);
         snprintf(nm,sizeof(nm),"model.layers.%d.%sup_proj.weight", ai, shp);
         load_tq(m, nm, c->hidden, c->shared_inter, quantize_dense, "shexp", &l->sh_u); QCOUNT(l->sh_u);
         snprintf(nm,sizeof(nm),"model.layers.%d.%sdown_proj.weight", ai, shp);
         load_tq(m, nm, c->shared_inter, c->hidden, quantize_dense, "shexp", &l->sh_d); QCOUNT(l->sh_d);
+        }
         /* shared_expert_gate: Linear(hidden -> 1), sigmoid-gated shared expert */
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert_gate.weight", ai);
-        l->sh_gate = c->n_experts && dense_has(m, nm) ? load_t_n(m, nm, c->hidden) : NULL;
+        l->sh_gate = c->n_experts && c->shared_inter > 0 && dense_has(m, nm) ? load_t_n(m, nm, c->hidden) : NULL;
         if (c->is_attn[i]) {
             /* Gated Attention (full_attention) layer, dense projections int8-during-load */
             snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.q_proj.weight", ai);
@@ -2480,7 +2484,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     if (!qtd_batch(l->qth_v, vv, x, S, D, kv_out)) matmul_d(vv, x, &l->v, S, D, kv_out);
     /* split q into query (first hd) and gate (next gate_dim), both per head */
     float *query = falloc((int64_t)S*H*hd);
-    float *gate  = falloc((int64_t)S*H*gate_dim);
+    float *gate  = gate_dim ? falloc((int64_t)S*H*gate_dim) : NULL;   /* qwen3_moe: no gate */
     for (int s = 0; s < S; s++) {
         for (int hh = 0; hh < H; hh++) {
             const float *qs = q + (int64_t)s*q_out + hh*qdim;
@@ -2534,12 +2538,12 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             }
         }
     }
-    /* apply attn_output_gate: attn_out *= sigmoid(gate) */
+    /* apply attn_output_gate: attn_out *= sigmoid(gate). Without a gate (Qwen3 MoE)
+     * the output passes as it is: a missing gate is not sigmoid(0) = 0.5. */
     float *ag = falloc((int64_t)S*H*hd);
     for (int s = 0; s < S; s++) for (int hh = 0; hh < H; hh++) for (int dd = 0; dd < hd; dd++) {
         int o = ((int64_t)s*H + hh)*hd + dd;
-        float g = gate_dim ? gate[o] : 0.f;
-        ag[o] = ctx[o] * (1.f / (1.f + expf(-g)));
+        ag[o] = gate_dim ? ctx[o] * (1.f / (1.f + expf(-gate[o]))) : ctx[o];
     }
     if (!qtd_batch(l->qth_o, out, ag, S, H*hd, D)) matmul_d(out, ag, &l->o, S, H*hd, D);
     free(q); free(k); free(vv); free(query); free(gate); free(ctx); free(ag);
@@ -2569,6 +2573,7 @@ static int qwen_shared_batch_rows(int S, int D, int I) {
 static void qwen_shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
                                     float *out, float *g, float *u, float *hh) {
     Cfg *c=&m->c; int D=c->hidden, I=c->shared_inter;
+    if (I <= 0) return;   /* no shared expert (qwen3_moe) */
     int B=qwen_shared_batch_rows(S,D,I);
     double _ts=tm_now();
     if (B == 1) {
@@ -2901,7 +2906,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             }
             /* Compute the shared expert NOW so it overlaps with the GPU
              * groups; the common block below is skipped. */
-            {
+            if (c->shared_inter > 0) {
                 double _ts2 = tm_now();
                 int Ish = c->shared_inter;
                 if (!qtd(l->qth_shg, sh, xs, D, Ish))  matmul_d(sh, xs, &l->sh_g, 1, D, Ish);

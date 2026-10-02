@@ -506,6 +506,28 @@ jobs:
               ./qwen36 "$cap" 8 qwen38_2p4t_tiny/ref_full.json
             echo "::endgroup::"
           done
+      - name: "Qwen3-Coder geometry: qwen3_moe, every layer attention, no shared expert"
+        run: |
+          cd c
+          # Qwen/Qwen3-Coder-30B-A3B-Instruct is Qwen3MoeForCausalLM: no DeltaNet, no
+          # attention output gate, no shared expert, full rotary and plain RMSNorm
+          # weights. The fixture draws its norms around 1 so a container that applied
+          # them zero-centered could not pass, and the converter has to say so in the
+          # meta; the engine runs it token for token against transformers.
+          python3 tools/make_qwen36_tiny.py --geometry qwen3-coder-30b \
+                  --out qwen3_coder_tiny --ref-mode full \
+                  --emit-ref qwen3_coder_tiny/ref_full.json
+          python3 tools/convert_qwen36.py --model qwen3_coder_tiny \
+                  --out qwen3_coder_tiny_c --ebits 8
+          python3 -c "import json; m = json.load(open('qwen3_coder_tiny_c/qwen36_meta.json')); \
+                      assert (m['shared_inter'], m['zero_centered_norms'], m['partial_rotary_factor'], \
+                              set(m['layer_types'])) == (0, False, 1.0, {'full_attention'}), m"
+          for cap in 1 8; do
+            echo "::group::Qwen3-Coder geometry cap=$cap"
+            COLI_DENSE_I8=0 SNAP=qwen3_coder_tiny_c \
+              ./qwen36 "$cap" 8 qwen3_coder_tiny/ref_full.json
+            echo "::endgroup::"
+          done
       - name: "Qwen3.8-27B geometry: a dense checkpoint of the same architecture (#1757)"
         run: |
           cd c
