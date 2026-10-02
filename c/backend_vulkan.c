@@ -2173,6 +2173,13 @@ int main(int argc, char **argv) {
     g_ref_gs = 32;  bad |= run_case(12, 2, 4096, 256, 5);
     g_ref_gs = 128; bad |= run_case(12, 2, 4096, 256, 5);
     g_ref_gs = 64;
+    /* COLI_VK_TEST_MATMUL_ONLY=1: stop after the per-format matmul cases above. CI runs
+     * this on Lavapipe, where the benches below say nothing and take most of the time. */
+    if (getenv("COLI_VK_TEST_MATMUL_ONLY") && atoi(getenv("COLI_VK_TEST_MATMUL_ONLY"))) {
+        printf(bad ? "FAIL\n" : "PASS\n");
+        coli_vk_shutdown();
+        return bad;
+    }
     /* Batched (amortized) throughput on the int4 expert shapes — the real expert-tier pattern. */
     {
         int I = 6144, O = 2048;   /* our gate/up dims */
