@@ -1459,10 +1459,11 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
     }
     /* DSA indexer: prefill — write K portion for full layers */
     if(c->index_hd > 0 && c->idx_type[li] && k3_dsa_indexer_on()){
+        /* the chunk's keys in one call ([C, index_hd] from [C, hidden], rows contiguous
+         * in Ic; every kernel computes a row as the one-row call does), then per row */
+        w_matmul(a->Ic + (int64_t)pos0 * c->index_hd, x, &a->wk, C);
         for(int t=0;t<C;t++){
             float *ikd = a->Ic + (int64_t)(pos0+t) * c->index_hd;
-            const float *xt = x + (int64_t)t * c->hidden;
-            w_matmul(ikd, xt, &a->wk, 1);                        /* [index_hd] from [hidden] */
             rmsnorm_(ikd, ikd, a->knw, c->index_hd, c->eps);
             if(c->qk_rope > 0)
                 dsa_rope(ikd, pos0+t, c->qk_rope, c->theta);   /* in-place on first qk_rope dims */

@@ -563,10 +563,7 @@ static void mv8_rows(float *y, int ystride, const W8 *w, const float *x, int xst
     }
 }
 
-static void mvb(float *y, const WB *w, const float *x) {
-#ifdef COLI_VULKAN
-    if (vk_mul(11, w->w, NULL, w->O, w->I, y, w->O, x, w->I, 1)) return;
-#endif
+static void mvb_cpu(float *y, const WB *w, const float *x) {
     int I = w->I;
     #pragma omp parallel for schedule(static)
     for (int o = 0; o < w->O; o++) {
@@ -584,6 +581,21 @@ static void mvb(float *y, const WB *w, const float *x) {
         for (; i < I; i++) sum += bf16_to_f32(row[i]) * x[i];
         y[o] = sum;
     }
+}
+static void mvb(float *y, const WB *w, const float *x) {
+#ifdef COLI_VULKAN
+    if (vk_mul(11, w->w, NULL, w->O, w->I, y, w->O, x, w->I, 1)) return;
+#endif
+    mvb_cpu(y, w, x);
+}
+/* mvb for `rows` positions: one call on the device (an S-row GEMM instead of a GEMV
+ * per position), the one-position kernel row by row on the CPU, so the CPU bits are
+ * mvb's. A prefill site that projected token by token calls this once instead. */
+static void mvb_rows(float *y, int ystride, const WB *w, const float *x, int xstride, int rows) {
+#ifdef COLI_VULKAN
+    if (vk_mul(11, w->w, NULL, w->O, w->I, y, ystride, x, xstride, rows)) return;
+#endif
+    for (int r = 0; r < rows; r++) mvb_cpu(y + (size_t)r * ystride, w, x + (size_t)r * xstride);
 }
 
 /* ------------------------------------------------------------- engram ------ */
@@ -1769,22 +1781,19 @@ static int compressor_run(Model *m, int layer, const float *x, int n, int start_
     Layer *l = &m->L[layer];
     int hd = c->head_dim, ratio = c->compress_ratio[layer];
     if (ratio == 1) {
+        float *kv = xmalloc((size_t)n * hd * sizeof(float), "compressor kv");
+        mvb_rows(kv, hd, &l->comp_wkv, x, c->dim, n);
         for (int t = 0; t < n; t++) {
-            float kv[512];
-            if (hd > (int)(sizeof(kv) / sizeof(kv[0]))) {
-                fprintf(stderr, "[compressor] head_dim %d exceeds the scratch\n", hd); exit(1); }
-            mvb(kv, &l->comp_wkv, x + (size_t)t * c->dim);
-            rms_into(latent + (size_t)t * hd, kv, l->comp_norm.w, hd, c->norm_eps);
+            rms_into(latent + (size_t)t * hd, kv + (size_t)t * hd, l->comp_norm.w, hd, c->norm_eps);
             rows[t] = start_pos + t;
         }
+        free(kv);
         return n;
     }
     float *kv = xmalloc((size_t)n * hd * sizeof(float), "compressor kv");
     float *score = xmalloc((size_t)n * hd * sizeof(float), "compressor scores");
-    for (int t = 0; t < n; t++) {
-        mvb(kv + (size_t)t * hd, &l->comp_wkv, x + (size_t)t * c->dim);
-        mvb(score + (size_t)t * hd, &l->comp_wgate, x + (size_t)t * c->dim);
-    }
+    mvb_rows(kv, hd, &l->comp_wkv, x, c->dim, n);
+    mvb_rows(score, hd, &l->comp_wgate, x, c->dim, n);
     int produced = 0;
     if (start_pos == 0) {
         int remainder = n % ratio, cutoff = n - remainder;
@@ -1914,12 +1923,22 @@ static void indexer_run(Model *m, int layer, const float *x, const float *qr, in
     int nh = c->index_n_heads, ihd = c->index_head_dim, ratio = c->compress_ratio[layer];
     int tidy = getenv("V41_INDEX_OWNER") != NULL;
     const float *rope = rope_for(m, layer);
-    float *q = xmalloc((size_t)nh * ihd * sizeof(float), "indexer queries");
-    float *weights = xmalloc((size_t)nh * sizeof(float), "indexer weights");
+    /* The query and weight projections for a block of positions at once (the
+     * device's GEMM instead of a GEMV per position; the CPU bits are mv8's and
+     * mvb's either way), then each position scores in order as before. */
+    int block = n < MV_ROWS_MAX ? n : MV_ROWS_MAX;
+    float *qblk = xmalloc((size_t)block * nh * ihd * sizeof(float), "indexer queries");
+    float *wblk = xmalloc((size_t)block * nh * sizeof(float), "indexer weights");
     float *score = xmalloc((size_t)compress_len * sizeof(float), "indexer scores");
     float scale = (1.0f / sqrtf((float)ihd)) * (1.0f / sqrtf((float)nh));
 
     for (int t = 0; t < n; t++) {
+        if (t % block == 0) {
+            int rows = n - t < block ? n - t : block;
+            mv8_rows(qblk, nh * ihd, &l->idx_wq_b, qr + (size_t)t * c->q_lora, c->q_lora, rows);
+            mvb_rows(wblk, nh, &l->idx_wproj, x + (size_t)t * c->dim, c->dim, rows);
+        }
+        float *q = qblk + (size_t)(t % block) * nh * ihd, *weights = wblk + (size_t)(t % block) * nh;
         const float *ikey = m->L[owner].ikey;
         if (!tidy) {
             int published = published_owner(m, layer, start_pos, t);
@@ -1933,10 +1952,8 @@ static void indexer_run(Model *m, int layer, const float *x, const float *qr, in
              * read when prefilled cold. */
             else if (n == 1 && m->published_index_k) ikey = m->published_index_k;
         }
-        mv8(q, &l->idx_wq_b, qr + (size_t)t * c->q_lora);
         for (int h = 0; h < nh; h++)
             rope_apply(q + (size_t)h * ihd + ihd - c->rope_dim, rope, start_pos + t, c->rope_dim, 0);
-        mvb(weights, &l->idx_wproj, x + (size_t)t * c->dim);
         for (int h = 0; h < nh; h++) weights[h] *= scale;
         /* how many compressed positions this query can reach: the groups closed at or
          * before its own position, which is one expression for prefill and decode
@@ -1991,7 +2008,7 @@ static void indexer_run(Model *m, int layer, const float *x, const float *qr, in
         for (int k = 0; k < topk; k++)
             row[k] = (k < taken && row[k] < lens) ? row[k] + offset : -1;
     }
-    free(q); free(weights); free(score);
+    free(qblk); free(wblk); free(score);
 }
 
 /* wo_a is block diagonal over o_groups: each group projects only its own heads, and
@@ -2120,15 +2137,15 @@ static void attention_run(Model *m, int layer, const float *x, int n, int start_
                  * FIRST position of the group it pools, which is its row times the
                  * ratio -- the same value the vendor spells two different ways on the
                  * prefill and decode paths. */
+                float *keys = xmalloc((size_t)produced * c->index_head_dim * sizeof(float), "index keys");
+                mvb_rows(keys, c->index_head_dim, &l->idx_wk, latent, hd, produced);
                 for (int g = 0; g < produced; g++) {
-                    float key[512];
-                    if (c->index_head_dim > (int)(sizeof(key) / sizeof(key[0]))) {
-                        fprintf(stderr, "[indexer] index_head_dim too large\n"); exit(1); }
-                    mvb(key, &l->idx_wk, latent + (size_t)g * hd);
                     float *dest = l->ikey + (size_t)latent_row[g] * c->index_head_dim;
-                    rms_into(dest, key, l->idx_knorm.w, c->index_head_dim, c->norm_eps);
+                    rms_into(dest, keys + (size_t)g * c->index_head_dim, l->idx_knorm.w,
+                             c->index_head_dim, c->norm_eps);
                     rope_apply(dest + c->index_head_dim - rd, rope, latent_row[g] * ratio, rd, 0);
                 }
+                free(keys);
                 /* publish, as model.py does, only when a group completed */
                 m->published_index_k = l->ikey;
                 m->published_index_layer = layer;
@@ -2289,12 +2306,12 @@ static void shared_ffn_rows(Model *m, Layer *l, const float *x, int rows, float 
 /* model.py Gate + MoE. The bias steers the choice of experts and nothing else: the
  * weights come from the unbiased scores, which is the whole point of noaux_tc.
  * Split out of the MoE proper so a whole block of positions can be routed before
- * any expert is read -- which is what lets the reads and the matmuls be shared. */
-static void moe_gate(Model *m, Layer *l, int E, int topk, const float *x,
+ * any expert is read -- which is what lets the reads and the matmuls be shared.
+ * `scores` holds the position's gate logits (the caller projects the block at once)
+ * and is overwritten. */
+static void moe_gate(Model *m, Layer *l, int E, int topk, float *scores,
                      int *chosen, float *weights) {
     Cfg *c = &m->c;
-    float *scores = xmalloc((size_t)E * sizeof(float), "gate scores");
-    mvb(scores, &l->gate_w, x);
     for (int e = 0; e < E; e++) {
         float value = scores[e] / c->gate_temp;
         /* sqrtsoftplus: softplus then square root, in fp32 as the vendor does */
@@ -2319,7 +2336,6 @@ static void moe_gate(Model *m, Layer *l, int E, int topk, const float *x,
         for (int k = 0; k < topk; k++) weights[k] /= total;
     }
     for (int k = 0; k < topk; k++) weights[k] *= c->route_scale;
-    free(scores);
 }
 
 #define MOE_TOPK_MAX 64
@@ -2358,9 +2374,12 @@ static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int 
         float *outc = out + (size_t)r0 * dim;
         int chosen[MOE_ROW_CHUNK * MOE_TOPK_MAX];
         float weights[MOE_ROW_CHUNK * MOE_TOPK_MAX];
+        float *scores = xmalloc((size_t)rows * E * sizeof(float), "gate scores");
+        mvb_rows(scores, E, &l->gate_w, xc, dim, rows);   /* the chunk's gate logits at once */
         for (int r = 0; r < rows; r++)
-            moe_gate(m, l, E, topk, xc + (size_t)r * dim,
+            moe_gate(m, l, E, topk, scores + (size_t)r * E,
                      chosen + r * topk, weights + r * topk);
+        free(scores);
 
         int draws = rows * topk;
         if (cache->cap < topk) {
@@ -2584,10 +2603,11 @@ static void vision_forward(Model *m, Vision *v, const float *patches, int n_h, i
     int vd = c->vision_dim, heads = c->vision_heads, hd = vd / heads, half = hd / 2;
     int n = n_h * n_w, patch_in = 3 * c->vision_patch * c->vision_patch;
     float *x = xmalloc((size_t)n * vd * sizeof(float), "vision stream");
-    for (int i = 0; i < n; i++) {
-        mvb(x + (size_t)i * vd, &v->proj_w, patches + (size_t)i * patch_in);
+    /* every projection below runs over all n patches at once (mvb_rows: one device
+     * GEMM, mvb's own bits on the CPU) */
+    mvb_rows(x, vd, &v->proj_w, patches, patch_in, n);
+    for (int i = 0; i < n; i++)
         for (int j = 0; j < vd; j++) x[(size_t)i * vd + j] += v->proj_b.w[j];
-    }
     /* 2D RoPE tables: one angle per (patch, frequency), row and column interleaved
      * exactly as vision.py stacks them */
     float *cosine = xmalloc((size_t)n * half * sizeof(float), "vision cos");
@@ -2603,20 +2623,22 @@ static void vision_forward(Model *m, Vision *v, const float *patches, int n_h, i
             sine[(size_t)p * half + f] = sinf(angle);
         }
     }
-    float *qkv = xmalloc((size_t)3 * vd * sizeof(float), "vision qkv");
+    float *qkv_all = xmalloc((size_t)n * 3 * vd * sizeof(float), "vision qkv");
     float *q = xmalloc((size_t)n * vd * sizeof(float), "vision q");
     float *k = xmalloc((size_t)n * vd * sizeof(float), "vision k");
     float *val = xmalloc((size_t)n * vd * sizeof(float), "vision v");
     float *normed = xmalloc((size_t)n * vd * sizeof(float), "vision normed");
     float *attended = xmalloc((size_t)n * vd * sizeof(float), "vision attended");
-    float *hidden = xmalloc((size_t)2 * c->vision_inter * sizeof(float), "vision mlp");
+    float *hidden_all = xmalloc((size_t)n * 2 * c->vision_inter * sizeof(float), "vision mlp");
+    float *projected_all = xmalloc((size_t)n * vd * sizeof(float), "vision projected");
     float *scores = xmalloc((size_t)n * sizeof(float), "vision scores");
     for (int layer = 0; layer < c->vision_layers; layer++) {
         VisionBlock *b = &v->block[layer];
         for (int i = 0; i < n; i++)
             rms_into(normed + (size_t)i * vd, x + (size_t)i * vd, b->norm1.w, vd, 1e-6f);
+        mvb_rows(qkv_all, 3 * vd, &b->qkv_w, normed, vd, n);
         for (int i = 0; i < n; i++) {
-            mvb(qkv, &b->qkv_w, normed + (size_t)i * vd);
+            float *qkv = qkv_all + (size_t)i * 3 * vd;
             for (int j = 0; j < 3 * vd; j++) qkv[j] += b->qkv_b.w[j];
             for (int h = 0; h < heads; h++) {
                 const float *co = cosine + (size_t)i * half, *si = sine + (size_t)i * half;
@@ -2655,25 +2677,24 @@ static void vision_forward(Model *m, Vision *v, const float *patches, int n_h, i
                     for (int d = 0; d < hd; d++) dst[d] += weight * vj[d];
                 }
             }
+        mvb_rows(projected_all, vd, &b->o_w, attended, vd, n);
         for (int i = 0; i < n; i++) {
-            float projected[4096];
-            if (vd > (int)(sizeof(projected) / sizeof(projected[0]))) {
-                fprintf(stderr, "[vision] vision_dim %d exceeds the scratch\n", vd); exit(1); }
-            mvb(projected, &b->o_w, attended + (size_t)i * vd);
+            const float *projected = projected_all + (size_t)i * vd;
             for (int j = 0; j < vd; j++) x[(size_t)i * vd + j] += projected[j] + b->o_b.w[j];
         }
         for (int i = 0; i < n; i++)
             rms_into(normed + (size_t)i * vd, x + (size_t)i * vd, b->norm2.w, vd, 1e-6f);
+        mvb_rows(hidden_all, 2 * c->vision_inter, &b->w1, normed, vd, n);
         for (int i = 0; i < n; i++) {
-            float projected[4096];
-            mvb(hidden, &b->w1, normed + (size_t)i * vd);
+            float *hidden = hidden_all + (size_t)i * 2 * c->vision_inter;
             for (int j = 0; j < c->vision_inter; j++) {
                 float gate = hidden[j], up = hidden[c->vision_inter + j];
                 hidden[j] = (gate / (1.0f + expf(-gate))) * up;
             }
-            mvb(projected, &b->w2, hidden);
-            for (int j = 0; j < vd; j++) x[(size_t)i * vd + j] += projected[j];
         }
+        mvb_rows(projected_all, vd, &b->w2, hidden_all, 2 * c->vision_inter, n);
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < vd; j++) x[(size_t)i * vd + j] += projected_all[(size_t)i * vd + j];
     }
     for (int i = 0; i < n; i++)
         rms_into(normed + (size_t)i * vd, x + (size_t)i * vd, v->norm.w, vd, 1e-6f);
@@ -2682,10 +2703,12 @@ static void vision_forward(Model *m, Vision *v, const float *patches, int n_h, i
     int ratio = c->vision_ratio;
     int blocks_h = (n_h + ratio - 1) / ratio, blocks_w = (n_w + ratio - 1) / ratio;
     int block_dim = vd * ratio * ratio;
-    float *block = xmalloc((size_t)block_dim * sizeof(float), "aligner block");
-    float *projected = xmalloc((size_t)c->dim * sizeof(float), "aligner hidden");
+    int nblocks = blocks_h * blocks_w;
+    float *blocks = xmalloc((size_t)nblocks * block_dim * sizeof(float), "aligner blocks");
+    float *projected = xmalloc((size_t)nblocks * c->dim * sizeof(float), "aligner hidden");
     for (int bh = 0; bh < blocks_h; bh++)
         for (int bw = 0; bw < blocks_w; bw++) {
+            float *block = blocks + (size_t)(bh * blocks_w + bw) * block_dim;
             for (int ch = 0; ch < vd; ch++)
                 for (int kh = 0; kh < ratio; kh++)
                     for (int kw = 0; kw < ratio; kw++) {
@@ -2695,18 +2718,17 @@ static void vision_forward(Model *m, Vision *v, const float *patches, int n_h, i
                             value = normed[(size_t)(row * n_w + col) * vd + ch];
                         block[((size_t)ch * ratio + kh) * ratio + kw] = value;
                     }
-            float *dest = out + (size_t)(bh * blocks_w + bw) * c->dim;
-            mvb(projected, &v->align_w1, block);
-            for (int j = 0; j < c->dim; j++) {
-                float value = projected[j] + v->align_b1.w[j];
-                /* exact GELU, matching torch's default (erf, not the tanh approximation) */
-                projected[j] = 0.5f * value * (1.0f + erff(value / sqrtf(2.0f)));
-            }
-            mvb(dest, &v->align_w2, projected);
-            for (int j = 0; j < c->dim; j++) dest[j] += v->align_b2.w[j];
         }
-    free(projected); free(block); free(scores); free(hidden); free(attended);
-    free(normed); free(val); free(k); free(q); free(qkv); free(sine); free(cosine); free(x);
+    mvb_rows(projected, c->dim, &v->align_w1, blocks, block_dim, nblocks);
+    for (size_t j = 0; j < (size_t)nblocks * c->dim; j++) {
+        float value = projected[j] + v->align_b1.w[j % c->dim];
+        /* exact GELU, matching torch's default (erf, not the tanh approximation) */
+        projected[j] = 0.5f * value * (1.0f + erff(value / sqrtf(2.0f)));
+    }
+    mvb_rows(out, c->dim, &v->align_w2, projected, c->dim, nblocks);
+    for (size_t j = 0; j < (size_t)nblocks * c->dim; j++) out[j] += v->align_b2.w[j % c->dim];
+    free(projected); free(blocks); free(scores); free(hidden_all); free(projected_all); free(attended);
+    free(normed); free(val); free(k); free(q); free(qkv_all); free(sine); free(cosine); free(x);
 }
 
 /* -------------------------------------------------------------- forward ---- */
