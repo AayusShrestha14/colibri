@@ -1480,6 +1480,27 @@ class StageSpanReportingTest(unittest.TestCase):
         self.assertEqual(len(public[1]), 1)
         self.assertEqual(public[1][0]["function"]["name"], "weather")
 
+    def test_the_mimo_parser_maps_the_content_it_returns(self):
+        # The logprobs channel is open on mimo, so its parser has to say which
+        # characters of the reply survive as content: every call block, then the
+        # whitespace around what is left, exactly as the plain parse removes them.
+        tool = {"type": "function", "function": {
+            "name": "weather", "parameters": {"type": "object",
+                                              "properties": {"city": {"type": "string"},
+                                                             "days": {"type": "integer"}}}}}
+        raw = ("  Sure. <tool_call>\n<function=weather>\n<parameter=city>Rome</parameter>\n"
+               "<parameter=days>3</parameter>\n</function>\n</tool_call> then this. ")
+        with patch("openai_server.ARCH", "mimo"):
+            content, calls, box_map, content_map = parse_arch_tool_calls_spans(raw, [tool])
+            public = parse_arch_tool_calls(raw, [tool])
+        self.assertEqual(content, "Sure.  then this.")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]),
+                         {"city": "Rome", "days": 3})
+        self._assert_map_rebuilds(raw, content, content_map)
+        self._assert_map_rebuilds(raw, "  Sure.  then this. ", box_map)
+        self.assertEqual(public[0], content)
+        self.assertEqual([c["function"] for c in public[1]], [c["function"] for c in calls])
+
     def test_the_qwen38_engine_parses_its_own_calls_with_no_flavor_set(self):
         # The native arm of the same dispatch: chat_flavor() falls back to ARCH, so a
         # qwen38 engine with no flavor recorded still reaches the qwen38 parser.
@@ -6280,6 +6301,32 @@ class LogprobsStageCompositionTest(unittest.TestCase):
         self.assertEqual("".join(entry["token"] for entry in entries),
                          choice["message"]["content"])
 
+    def test_mimo_tool_call_syntax_is_not_described_as_content(self):
+        # MiMo's call form, through the same three stages on a mimo gateway: the
+        # reasoning and the call block are cut, and the entries join back to the
+        # content the message returns.
+        call = ("<tool_call>\n<function=search>\n<parameter=q>x</parameter>\n"
+                "</function>\n</tool_call>")
+        engine = ScriptedEngine(
+            chunks=("why", "</think>", "before ", call, " after"),
+            records=[(b"why", -0.1, [(1, -0.1)]), (b"</think>", -0.2, [(2, -0.2)]),
+                     (b"before ", -0.3, [(3, -0.3)]), (call.encode(), -0.4, [(4, -0.4)]),
+                     (b" after", -0.5, [(5, -0.5)])])
+        with patch("openai_server.ARCH", "mimo"):
+            choice = self._chat(engine, enable_thinking=True, tools=[{
+                "type": "function",
+                "function": {"name": "search",
+                             "parameters": {"type": "object",
+                                            "properties": {"q": {"type": "string"}}}}}])
+        entries = choice["logprobs"]["content"]
+        self.assertEqual(choice["message"]["reasoning_content"], "why")
+        self.assertEqual(choice["message"]["content"], "before  after")
+        self.assertEqual(len(choice["message"]["tool_calls"]), 1)
+        self.assertEqual([entry["token"] for entry in entries], ["before ", " after"])
+        self.assertEqual([entry["logprob"] for entry in entries], [-0.3, -0.5])
+        self.assertEqual("".join(entry["token"] for entry in entries),
+                         choice["message"]["content"])
+
     def test_a_plain_chat_turn_describes_every_token(self):
         # The control: with no stage cutting anything, nothing is dropped.
         choice = self._chat(ScriptedEngine(chunks=("the ", "answer")))
@@ -6521,9 +6568,9 @@ class ClientVisibleEngineFaultCodeTest(unittest.TestCase):
 
 class CapabilitySplitIndependenceTest(unittest.TestCase):
     """`supports_logprobs_echo` and `supports_tok_ids` gate two unrelated SUBMIT extension
-    keys and must be settable one without the other. Both are `arch == "glm"` today, so
-    nothing short of a double with the two flags set to different values can show the
-    split is real rather than cosmetic."""
+    keys and must be settable one without the other. A mimo engine has the first and not
+    the second; the doubles below also set them apart by hand, so the split is shown to be
+    real rather than cosmetic."""
 
     def test_logprobs_is_refused_when_only_token_id_intake_is_available(self):
         base = _spawn_test_server(self, ScriptedEngine(supports_logprobs_echo=False,
@@ -6552,6 +6599,17 @@ class CapabilitySplitIndependenceTest(unittest.TestCase):
         self.assertTrue(engine.supports_tok_ids)
         engine.supports_logprobs_echo = False
         self.assertTrue(engine.supports_tok_ids)
+
+    def test_a_mimo_engine_has_the_numeric_channel_and_not_token_id_intake(self):
+        # mimo.c keeps the channel's whole contract (an ECHO for every prompt position
+        # unless a pin photo covers the prefix); it reads its frames with serve_codec.h,
+        # which has no `ids=`.
+        process = FakeProcess(lambda process, written: None)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("mimo", "model", cap=8, family=family_by_id("mimo"))
+        self.addCleanup(engine.close)
+        self.assertTrue(engine.supports_logprobs_echo)
+        self.assertFalse(engine.supports_tok_ids)
 
 
 class ChatFlavorLogprobsGateTest(unittest.TestCase):
