@@ -4,7 +4,7 @@ import { FileUp, ListChecks, LoaderCircle, Plus, X } from "lucide-react"
 import { askBrio, askSystemOne, type BrioResponse } from "@/lib/api"
 import { useLocale } from "./i18n"
 
-/* Modalita brio.
+/* System One mode (the page is still Brio in the code).
  *
  * Lo stesso modello con cui si chatta smette di scrivere: gli si da un insieme
  * chiuso di opzioni e lui dice quanto e probabile ciascuna.

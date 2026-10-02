@@ -49,13 +49,13 @@ $ ./coli chat
 <p align="center">
   <img src="docs/media/colibri-dashboard.png" width="900" alt="colibrì 網頁儀表板——即時指標、硬體面板與專家儲存層級">
 </p>
-<p align="center"><em>網頁儀表板（<code>./coli web</code>），1.12.0 重新設計：一個工作區，底部停靠列切換聊天、Brio 模式、
+<p align="center"><em>網頁儀表板（<code>./coli web</code>），1.12.0 重新設計：一個工作區，底部停靠列切換聊天、System One 模式、
 Brain 頁面和效能分析，支援淺色與深色主題。圖中是 Qwen3.6 在純 CPU 機器上作答，專家從硬碟串流讀取。</em></p>
 
 <p align="center">
-  <img src="docs/media/colibri-brio.png" width="900" alt="Brio 頁面：文件只讀一次，每個允許的答案各有一個機率，並給出熵">
+  <img src="docs/media/colibri-brio.png" width="900" alt="System One 頁面：文件只讀一次，每個允許的答案各有一個機率，並給出熵">
 </p>
-<p align="center"><em><strong>Brio 模式</strong>：同一個模型，只是不再讓它寫。給它一段文件和唯一允許的幾個答案，
+<p align="center"><em><strong>System One 模式</strong>：同一個模型，只是不再讓它寫。給它一段文件和唯一允許的幾個答案，
 它讀出每個答案的機率，不生成任何 token，並給出一個熵，說明它何時沒有把握。圖中：<strong>request changes，99.9%</strong>，
 熵 0.005，讀取 4 個 token，生成 0 個。</em></p>
 
@@ -482,17 +482,17 @@ COLI_MODEL=/nvme/glm52_i4 ./coli tune     # 測量並儲存本機最快且安全
 ./coli serve --model /nvme/glm52_i4       # API + 儀表板，不開啟瀏覽器（headless）
 ```
 
-#### Brio 模式：問一個封閉式問題
+#### System One 模式：問一個封閉式問題
 
 人們向模型提出的大多數請求是一次選擇，而不是一段文字：哪個佇列、哪個結論、某個欄位應取四個值中的哪一個。
-Brio 模式把允許的選項交給引擎，讀出每個選項的機率，而不是生成文字：`completion_tokens` 為 0，
+System One 模式把允許的選項交給引擎，讀出每個選項的機率，而不是生成文字：`completion_tokens` 為 0，
 答案不可能落在你的清單之外，並且每個答案都附帶一個熵，"模型沒有把握"因此成為一個可以設門檻的數字。
 它在全部十個模型家族上可用，執行在同一個伺服器上，且按請求可選：不請求它的聊天，輸出逐位元組保持不變。
 
 ```bash
 # 在 TUI 中：同一個模型，只是不再讓它寫
 ./coli chat --model /nvme/qwen36_i4_gs64
-> /brio merge | request changes | close
+> /decide merge | request changes | close
 > 340 lines, 8 files, no tests. CI is green but nothing covers that path.
 
 # 從任何程式：向執行中的伺服器傳送一個 JSON 請求
@@ -505,8 +505,9 @@ curl -s http://127.0.0.1:8000/v1/brio -H 'Content-Type: application/json' -d '{
 
 `questions` 可以對只讀一次的文件提出多個問題；`schema` 逐欄位填充一個 JSON 物件，結構上必然合法。
 在 Qwen3.6 上與在同一台 CPU 機器上生成同樣答案相比的實測：四欄位 schema 快 2.4 倍，
-對同一文件的四個問題快 5.7 倍。完整說明、請求與回覆格式、以及它不適用的情形見 [docs/brio.md](docs/brio.md)。
-儀表板中也有 Brio 頁面。
+對同一文件的四個問題快 5.7 倍。完整說明、請求與回覆格式、以及它不適用的情形見 [docs/systemone.md](docs/systemone.md)。
+儀表板中也有 System One 頁面。同樣的回答也可以透過 `POST /v1/systemone` 取得，
+它與 TypeSafe 的 Jev API 相同：Jev 用戶端只需更改 base URL 即可切換。
 
 
 在 Windows 上，發布壓縮檔附帶 `coli.cmd`：按兩下即可快速開始，或在 cmd 或 PowerShell 中執行
@@ -556,7 +557,7 @@ COLI_MODEL=/nvme/kimi_k3       ./coli chat
 | Vulkan 後端（任何 GPU：透過 RADV 支援 AMD，包括 ROCm 已放棄的顯示卡） | [docs/vulkan.md](docs/vulkan.md) |
 | Apple Silicon Metal 後端 | [docs/metal.md](docs/metal.md) |
 | OpenAI 相容 API、KV slots、網頁儀表板 | [docs/api.md](docs/api.md) |
-| Brio 模式：對封閉的選項集評分而不是生成 | [docs/brio.md](docs/brio.md) |
+| System One 模式：對封閉的選項集評分而不是生成 | [docs/systemone.md](docs/systemone.md) |
 | 實驗性的層分段嵌入 ABI | [docs/segment-runtime.md](docs/segment-runtime.md) |
 | 實驗性的 tokenizer／嵌入／head Edge ABI | [docs/edge-runtime.md](docs/edge-runtime.md) |
 | 文法強制草稿（結構化輸出） | [docs/grammar-draft.md](docs/grammar-draft.md) |

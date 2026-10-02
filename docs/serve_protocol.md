@@ -81,7 +81,7 @@ DECIDE <id> <slot> <bytes>\n<payload>\n
   `ERROR <id> DECIDE_INVALID <reason>` for a record it refuses (the client's
   422; the reason starts with the field, `questions.<id>: ...`) and
   `ERROR <id> DECIDE_FAILED <reason>` for its own failure. The record and the
-  answer are specified in [docs/brio.md, Decision engines](brio.md#decision-engines);
+  answer are specified in [docs/systemone.md, Decision engines](systemone.md#decision-engines);
   `c/decide_serve.h` parses one and writes the other.
 - EOF on stdin = graceful shutdown: in-flight requests finish first.
 

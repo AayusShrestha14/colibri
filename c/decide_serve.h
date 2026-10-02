@@ -1,4 +1,4 @@
-/* decide_serve.h -- the engine side of the DECIDE command (docs/brio.md,
+/* decide_serve.h -- the engine side of the DECIDE command (docs/systemone.md,
  * "Decision engines"; docs/serve_protocol.md).
  *
  * A decision engine does not generate. It receives one record, the state and

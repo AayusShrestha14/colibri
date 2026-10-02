@@ -56,14 +56,14 @@ $ ./coli chat
 <p align="center">
   <img src="docs/media/colibri-dashboard.png" width="900" alt="colibrì Web ダッシュボード — ライブメトリクス、ハードウェアパネル、エキスパートのティア">
 </p>
-<p align="center"><em>Web ダッシュボード（<code>./coli web</code>）。1.12.0 で再設計され、チャット、Brio モード、Brain ページ、
+<p align="center"><em>Web ダッシュボード（<code>./coli web</code>）。1.12.0 で再設計され、チャット、System One モード、Brain ページ、
 Profiling のためのドックを備えたワークスペースになりました。ライトテーマとダークテーマに対応します。ここでは CPU マシン上の
 Qwen3.6 が、ディスクからストリーミングされるエキスパートで応答しています。</em></p>
 
 <p align="center">
-  <img src="docs/media/colibri-brio.png" width="900" alt="Brio ページ: 1 回だけ読まれる文書、許可された各回答の確率、そしてエントロピー">
+  <img src="docs/media/colibri-brio.png" width="900" alt="System One ページ: 1 回だけ読まれる文書、許可された各回答の確率、そしてエントロピー">
 </p>
-<p align="center"><em><strong>Brio モード</strong>: 同じモデルに、書くのをやめるよう指示したものです。文書と、選んでよい回答だけを渡すと、
+<p align="center"><em><strong>System One モード</strong>: 同じモデルに、書くのをやめるよう指示したものです。文書と、選んでよい回答だけを渡すと、
 各回答の確率を読み取り、何も生成せず、確信がないときにそれを示すエントロピーを報告します。ここでは
 <strong>request changes が 99.9%</strong>、エントロピー 0.005、読み取り 4 トークン、生成 0 トークンです。</em></p>
 
@@ -530,10 +530,10 @@ COLI_MODEL=/nvme/glm52_i4 ./coli tune     # このマシンで最速かつ安全
 ./coli serve --model /nvme/glm52_i4       # API + ダッシュボード、ブラウザなし（ヘッドレス）
 ```
 
-#### Brio モード: クローズドな質問をする
+#### System One モード: クローズドな質問をする
 
 人がモデルに求めることの多くは、段落ではなく選択です: どのキューか、どの判定か、あるフィールドが取り得る
-4 つの値のどれか。Brio モードはエンジンに選択肢を渡し、生成する代わりにそれぞれの確率を読み取ります:
+4 つの値のどれか。System One モードはエンジンに選択肢を渡し、生成する代わりにそれぞれの確率を読み取ります:
 `completion_tokens` は 0 で、どの回答もリストの外に出ることはなく、すべての回答にエントロピーが付くため、
 「モデルに確信がない」ことが閾値を設定できる数値になります。10 のファミリーすべてで、同じサーバー上で
 動作し、リクエストごとのオプトインです: 求めない人にとって、チャットはバイト単位で同一のままです。
@@ -541,7 +541,7 @@ COLI_MODEL=/nvme/glm52_i4 ./coli tune     # このマシンで最速かつ安全
 ```bash
 # in the TUI: the same model, told to stop writing
 ./coli chat --model /nvme/qwen36_i4_gs64
-> /brio merge | request changes | close
+> /decide merge | request changes | close
 > 340 lines, 8 files, no tests. CI is green but nothing covers that path.
 
 # from anywhere: one JSON request on the running server
@@ -556,7 +556,8 @@ curl -s http://127.0.0.1:8000/v1/brio -H 'Content-Type: application/json' -d '{
 1 フィールドずつ埋めるため、構造上必ず妥当になります。Qwen3.6 で、同じ CPU マシン上で同じ回答を
 生成する場合と比べて計測したところ、4 フィールドのスキーマで 2.4 倍、1 つの文書に対する 4 つの質問で
 5.7 倍でした。モード全体、リクエストとレスポンスの形、そして役に立たない場面については
-[docs/brio.md](docs/brio.md) を参照してください。ダッシュボードにも Brio ページがあります。
+[docs/systemone.md](docs/systemone.md) を参照してください。ダッシュボードにも System One ページがあります。同じ回答は TypeSafe の Jev と同じ API である
+`POST /v1/systemone` からも得られ、Jev のクライアントは base URL を変えるだけで切り替えられます。
 
 
 Windows ではリリースアーカイブに `coli.cmd` が同梱されています。ダブルクリックでクイックスタート、
@@ -613,7 +614,7 @@ GLM 以外のエンジンでは、`coli chat` がローカルでゲートウェ�
 | Vulkan バックエンド（任意の GPU: RADV 経由の AMD、ROCm がサポートを終了したカードを含む） | [docs/vulkan.md](docs/vulkan.md) |
 | Apple Silicon Metal バックエンド | [docs/metal.md](docs/metal.md) |
 | OpenAI 互換 API、KV スロット、Web ダッシュボード | [docs/api.md](docs/api.md) |
-| Brio モード: 生成する代わりに、閉じた選択肢の集合をスコアリング | [docs/brio.md](docs/brio.md) |
+| System One モード: 生成する代わりに、閉じた選択肢の集合をスコアリング | [docs/systemone.md](docs/systemone.md) |
 | 実験的なレイヤーセグメント埋め込み ABI | [docs/segment-runtime.md](docs/segment-runtime.md) |
 | 実験的なトークナイザ/埋め込み/ヘッドの Edge ABI | [docs/edge-runtime.md](docs/edge-runtime.md) |
 | 文法強制ドラフト（構造化出力） | [docs/grammar-draft.md](docs/grammar-draft.md) |

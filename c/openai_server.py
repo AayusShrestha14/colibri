@@ -4907,7 +4907,7 @@ def _write_all(stream, data, frame):
 
 # ---------------------------------------------------------------- decision engines
 #
-# A decision engine (Laya; docs/brio.md, "Decision engines") does not generate: it
+# A decision engine (Laya; docs/systemone.md, "Decision engines") does not generate: it
 # reads a state and typed questions and returns a probability per option. The
 # gateway hands it the request as one DECIDE record and shapes the DECISION it
 # gets back into the /v1/systemone reply, the same reply an LLM gives there.
@@ -6634,7 +6634,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     if len(token_counts) > 1:
                         counts = ", ".join(f"{entry['option']}={entry['tokens']}"
                                            for entry in scored)
-                        print(f"[brio] WARNING: normalize=mean with unequal option "
+                        print(f"[systemone] WARNING: normalize=mean with unequal option "
                               f"token counts ({counts}) — per-token averages favor "
                               f"multi-token options; consider normalize=sum",
                               file=sys.stderr)
@@ -6752,7 +6752,7 @@ class APIHandler(BaseHTTPRequestHandler):
     # What differs, stated rather than hidden: `model` echoes the served
     # model, not "jev-latest"; `usage.output_tokens` counts the option tokens
     # READ, since this engine generates nothing; validation errors are 422 as
-    # theirs are, with this server's error envelope. docs/brio.md has the
+    # theirs are, with this server's error envelope. docs/systemone.md has the
     # mapping table.
     _SYSTEMONE_MAX_QUESTIONS = 64
 
@@ -6912,7 +6912,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def _systemone_options(self, body):
         """colibri's optional fields on /v1/systemone, none of which a Jev client
-        sends (docs/brio.md lists them):
+        sends (docs/systemone.md lists them):
 
           normalize   "sum" (default) or "mean": how a language model's option
                       log-probabilities become one score per option

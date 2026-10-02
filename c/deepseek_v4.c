@@ -12187,7 +12187,7 @@ static int head_argmax(ColiV4Engine *engine, const float *hidden,
 }
 /* Every head score of one hidden row, in vocabulary order. head_argmax used
  * to run this matmul and keep only the maximum; the numeric channel (SUBMIT
- * logprobs=k, docs/brio.md) needs the whole row, so the row is computed here
+ * logprobs=k, docs/systemone.md) needs the whole row, so the row is computed here
  * once and the argmax is a scan over it. Same head_bf16_dot per row, same scan
  * order: the token picked and its logit do not change. */
 static int head_scores_impl(ColiV4Engine *engine, const float *hidden,
@@ -13683,7 +13683,7 @@ int coli_v4_session_generate(ColiV4Session *session,
             fprintf(stderr, "[PREFIX] hint boundary at %d tokens\n", ckpt_at);
     }
     session->prefix_reused = reuse;
-    /* The numeric channel (docs/brio.md). Scratch sized to the head, kept on
+    /* The numeric channel (docs/systemone.md). Scratch sized to the head, kept on
      * the session so every early return below leaves nothing behind. */
     const int vocab = config->vocab_size;
     const int echo = options->logprobs > 0 && options->on_echo != NULL;

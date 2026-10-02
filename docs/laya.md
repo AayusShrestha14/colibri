@@ -8,7 +8,7 @@ calibrated probabilities in one forward pass. It never generates text.
 `c/laya` runs it from the official checkpoint with no conversion, and
 `coli serve` exposes it on `POST /v1/systemone`, the same request and reply
 as TypeSafe's Jev API and as every other model colibri serves
-([brio.md](brio.md#decision-engines)).
+([systemone.md](systemone.md#decision-engines)).
 
 ## Download and run
 

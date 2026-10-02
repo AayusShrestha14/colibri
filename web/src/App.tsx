@@ -606,7 +606,7 @@ export default function App() {
         </div>
       </section>}
       <section className="brio-workspace" hidden={view !== "brio"}>
-        <header className="page-heading"><span>COLIBRI / BRIO</span><h1>{t("nav.brio")}</h1></header>
+        <header className="page-heading"><span>COLIBRI / SYSTEM ONE</span><h1>{t("nav.brio")}</h1></header>
         <Brio baseUrl={baseUrl} apiKey={apiKey} model={model} connected={connected}
               decision={decisionModels.includes(model)} />
       </section>

@@ -1,6 +1,7 @@
 const zhTW: Record<string, string> = {
   "nav.chat": "對話",
   "nav.brain": "大腦",
+  "nav.brio": "System One",
   "nav.profiling": "效能分析",
 
   "brand.tagline": "本地巨人，極小足跡",

@@ -1,4 +1,4 @@
-"""La vista Brio: presente, raggiungibile, e non rompe la chat accanto."""
+"""La vista System One (Brio nel codice): presente, raggiungibile, e non rompe la chat accanto."""
 import json, subprocess, sys, threading, time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -49,7 +49,7 @@ with sync_playwright() as pw:
         pg.locator(".dock-handle").click()
         pg.locator(".navigation-dock nav").get_by_role("button", name=name, exact=True).click()
 
-    navigate("Brio")
+    navigate("System One")
     pg.locator(".brio-card textarea").first.fill("The PR touches the engine and has no tests.")
     pg.locator(".brio-q-head input").first.fill("What should the reviewer do?")
     pg.locator(".brio-own").first.fill("merge\nrequest changes")

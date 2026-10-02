@@ -275,7 +275,7 @@ def decision_refusal(family):
     return (f"{C.yel}{family.display_name} is a decision model:{C.r} it answers typed questions "
             f"(choice, score, noul) with calibrated probabilities and does not chat.\n"
             f"  Start it with: coli serve --model <dir>   (or coli web for the dashboard)\n"
-            f"  then POST /v1/systemone (docs/brio.md, \"Decision engines\")")
+            f"  then POST /v1/systemone (docs/systemone.md, \"Decision engines\")")
 
 def image_banner_line(model):
     """Banner line of an image model: name, what it does, bytes on disk. Sizes
@@ -1402,7 +1402,7 @@ def info_decision_model(a, resolved, row):
                        f"about {params*4/1e9:.1f} GB in RAM (f32)")
     except (OSError, ValueError) as error:
         row("weights", f"{C.yel}model.safetensors unreadable:{C.r} {error}")
-    row("use", "coli serve / coli web, then POST /v1/systemone (docs/brio.md)")
+    row("use", "coli serve / coli web, then POST /v1/systemone (docs/systemone.md)")
     engine=engine_for(a.model)
     row("engine", "ready ✓" if os.path.exists(engine)
         else f"not built (make -C c {family.build_target})")
@@ -1729,12 +1729,12 @@ def render_gen_stats(st, mode):
 # Stanno in un posto solo perche servono a tre cose che devono restare
 # d'accordo: il completamento col TAB, l'elenco di /help, e il controllo che
 # impedisce a un comando scritto male di partire come messaggio al modello.
-# Quest'ultimo e il motivo per cui esistono: prima "/brio merge" con una lettera
+# Quest'ultimo e il motivo per cui esistono: prima "/decide merge" con una lettera
 # sbagliata finiva dritto al modello, che rispondeva educatamente a una riga di
 # comando. Ogni forma si accetta sia con / sia con : -- i comandi storici usano
 # i due punti e non si toglie a nessuno l'abitudine.
 CHAT_COMMANDS = {
-    "brio":  "a | b | c   score the options instead of generating; no options returns to chat",
+    "decide": "a | b | c  System One mode: score the options instead of generating; no options returns to chat",
     "reset": "            start the conversation again",
     "help":  "            this list",
     "quit":  "            leave (also :q)",
@@ -1786,7 +1786,7 @@ def install_chat_completer(commands=None, arguments=None):
     readline.set_completer(complete)
 
 def chat_brio(a, base, model_id, msgs, question, options, w):
-    """Un giro di modalita brio dalla TUI: una richiesta, una distribuzione.
+    """Un giro di modalita System One dalla TUI (/decide): una richiesta, una distribuzione.
 
     Il ciclo (fotografia del prefisso, una lettura per opzione, normalizzazione
     per lunghezza) sta nel gateway, non qui: sono tre cose facili da sbagliare e
@@ -1798,7 +1798,7 @@ def chat_brio(a, base, model_id, msgs, question, options, w):
     req=urllib.request.Request(base.rstrip("/")+"/v1/brio", data=body,
                                headers={"Content-Type":"application/json"})
     if a.api_key: req.add_header("Authorization", f"Bearer {a.api_key}")
-    print(f"\n  {C.teal}◆ brio{C.r}")
+    print(f"\n  {C.teal}◆ System One{C.r}")
     sp=Spinner("scoring…"); sp.start(); t0=time.time()
     try:
         with urllib.request.urlopen(req) as r:
@@ -1860,13 +1860,13 @@ def chat_attached(a, base, model_id):
     import urllib.request, urllib.error
     print(f"  {C.grn}✦ attached{C.r} {C.dim}to {base} · model {model_id} · the engine stays warm after you quit{C.r}")
     print(f"  {C.dim}type and press Enter · Ctrl-C stops the answer · :reset starts a new conversation · :q exits{C.r}")
-    print(f"  {C.dim}/ for commands · TAB completes · /brio puts the SAME model in brio mode{C.r}\n")
+    print(f"  {C.dim}/ for commands · TAB completes · /decide puts the SAME model in System One mode{C.r}\n")
     install_chat_completer()
     arch=server_arch(base, getattr(a,"api_key",None))
     if arch in CHAT_THINK_OFF and getattr(a,"think",None) is None:
         print(f"  {C.dim}thinking is off here (--think turns it on){C.r}\n")
     msgs=[]
-    brio_options=[]          # non vuoto = modalita brio accesa
+    brio_options=[]          # non vuoto = modalita System One accesa (/decide)
     w=term_w()-4
     while True:
         if TTY:
@@ -1892,19 +1892,19 @@ def chat_attached(a, base, model_id):
         if name == "reset":
             msgs=[]; brio_options=[]
             print(f"  {C.dim}✦ new conversation{C.r}\n"); continue
-        # ---- modalita brio -------------------------------------------------
+        # ---- modalita System One (/decide) ---------------------------------
         # Lo stesso modello con cui stai chattando smette di generare e comincia
         # a punteggiare: gli si danno le opzioni ammesse e lui dice quanto e
         # probabile ciascuna. La conversazione fin qui FA da contesto, quindi
-        # /brio a meta chat continua il discorso invece di ricominciarlo.
-        if name == "brio":
+        # /decide a meta chat continua il discorso invece di ricominciarlo.
+        if name == "decide":
             spec=rest
             if not spec:
                 if brio_options:
                     brio_options=[]
                     print(f"  {C.dim}✦ chat{C.r}\n")
                 else:
-                    print(f"  {C.yel}  /brio needs the options: /brio merge | request changes | close{C.r}\n")
+                    print(f"  {C.yel}  /decide needs the options: /decide merge | request changes | close{C.r}\n")
                 continue
             # dict.fromkeys deduplica tenendo l'ordine: il server rifiuta due
             # opzioni uguali con un 400, e "merge | merge | close" e' un refuso
@@ -1914,8 +1914,8 @@ def chat_attached(a, base, model_id):
                 brio_options=[]
                 print(f"  {C.yel}  at least two options are needed, separated by |{C.r}\n")
                 continue
-            print(f"  {C.grn}✦ brio{C.r} {C.dim}· {len(brio_options)} options · "
-                  f"the model stops generating and scores instead · /brio returns to chat{C.r}\n")
+            print(f"  {C.grn}✦ System One{C.r} {C.dim}· {len(brio_options)} options · "
+                  f"the model stops generating and scores instead · /decide returns to chat{C.r}\n")
             continue
         if brio_options:
             chat_brio(a, base, model_id, msgs, msg, brio_options, w)
@@ -2659,7 +2659,7 @@ def cmd_chat(a):
                     return
                 if "decision" in (entry.get("capabilities") or []):
                     sys.exit(f"{C.yel}{base} serves {mid}, a decision model:{C.r} it does not chat. "
-                             f"POST /v1/systemone to it (docs/brio.md)")
+                             f"POST /v1/systemone to it (docs/systemone.md)")
                 banner(f"chat · {mid} · attached")
                 chat_attached(a, base, mid); return
             print(f"  {C.dim}{base} serves {mid}, not an "

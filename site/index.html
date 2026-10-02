@@ -223,7 +223,7 @@ footer{border-top:1px solid var(--line)}
 <rect height="14" width="14" x="84" y="84" fill="#00afaf"/><rect height="14" width="14" x="98" y="84" fill="#00afaf"/><rect height="14" width="14" x="112" y="84" fill="#5fd7d7"/><rect height="14" width="14" x="126" y="84" fill="#5fd7d7"/>
 <rect height="14" width="14" x="98" y="98" fill="#00afaf"/><rect height="14" width="14" x="112" y="98" fill="#5fd7d7"/>
 <rect height="14" width="14" x="112" y="112" fill="#5fd7d7"/></g></svg><b>colibri</b></a>
-  <nav class="hnav"><a href="#models">Models</a><a href="#brio">Brio</a>
+  <nav class="hnav"><a href="#models">Models</a><a href="#systemone">System One</a>
     <a href="https://github.com/JustVugg/colibri/blob/main/docs/quickstart.md">Docs</a></nav>
   <label class="hsearch">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
@@ -257,7 +257,7 @@ footer{border-top:1px solid var(--line)}
            autoplay muted loop playsinline preload="metadata"
            aria-label="A real session: the terminal chat, then the same model scoring a closed set of options in the dashboard"></video>
     <figcaption>A real session, nothing staged: <code>coli chat</code> attached to a running
-      server, then the same model in brio mode. The numbers are the ones it produced.</figcaption>
+      server, then the same model in System One mode. The numbers are the ones it produced.</figcaption>
   </figure>
 </div></section>
 
@@ -406,7 +406,7 @@ footer{border-top:1px solid var(--line)}
   <nav class="railnav" id="rail">
     <a href="#fits" class="on">Bigger than your RAM</a>
     <a href="#open">Frontier open models</a>
-    <a href="#brio">Brio mode</a>
+    <a href="#systemone">System One mode</a>
     <a href="#yours">Your weights stay yours</a>
   </nav>
   <div>
@@ -441,12 +441,13 @@ footer{border-top:1px solid var(--line)}
       <a class="more" href="#models">Browse all models &rarr;</a>
     </div>
 
-    <div class="block" id="brio">
-      <h2>Brio mode</h2>
+    <div class="block" id="systemone">
+      <h2>System One mode</h2>
       <p class="sub">Most of what people ask a model for is a choice, not an essay. Hand it the
         options it may pick and it reports the probability of each one. Nothing is generated,
-        so there is nothing to parse and no answer outside the list.</p>
-      <div class="chart"><div class="crow"><span class="cl">one question, 10 options<s>brio</s></span><span class="ct"><i style="width:38.8%"></i></span><span class="cv">101.2 s</span></div><div class="crow"><span class="cl"><s>chat</s></span><span class="ct"><i style="width:48.1%"></i></span><span class="cv">125.6 s<s> 1.2x</s></span></div><div class="crow"><span class="cl">JSON, 4-field schema<s>brio</s></span><span class="ct"><i style="width:39.8%"></i></span><span class="cv">103.8 s</span></div><div class="crow"><span class="cl"><s>chat</s></span><span class="ct"><i style="width:94.2%"></i></span><span class="cv">246.0 s<s> 2.4x</s></span></div><div class="crow"><span class="cl">4 items, shared instructions<s>brio</s></span><span class="ct"><i style="width:17.5%"></i></span><span class="cv">45.7 s</span></div><div class="crow"><span class="cl"><s>chat</s></span><span class="ct"><i style="width:100.0%"></i></span><span class="cv">261.1 s<s> 5.7x</s></span></div></div>
+        so there is nothing to parse and no answer outside the list. Typed decisions with
+        calibrated probabilities, API compatible with Jev (<code>POST /v1/systemone</code>).</p>
+      <div class="chart"><div class="crow"><span class="cl">one question, 10 options<s>System One</s></span><span class="ct"><i style="width:38.8%"></i></span><span class="cv">101.2 s</span></div><div class="crow"><span class="cl"><s>chat</s></span><span class="ct"><i style="width:48.1%"></i></span><span class="cv">125.6 s<s> 1.2x</s></span></div><div class="crow"><span class="cl">JSON, 4-field schema<s>System One</s></span><span class="ct"><i style="width:39.8%"></i></span><span class="cv">103.8 s</span></div><div class="crow"><span class="cl"><s>chat</s></span><span class="ct"><i style="width:94.2%"></i></span><span class="cv">246.0 s<s> 2.4x</s></span></div><div class="crow"><span class="cl">4 items, shared instructions<s>System One</s></span><span class="ct"><i style="width:17.5%"></i></span><span class="cv">45.7 s</span></div><div class="crow"><span class="cl"><s>chat</s></span><span class="ct"><i style="width:100.0%"></i></span><span class="cv">261.1 s<s> 5.7x</s></span></div></div>
       <p class="src">Measured on qwen36 (22 GB), same engine, separate processes. Time from the
         prompt to the answer.</p>
 
@@ -459,7 +460,7 @@ footer{border-top:1px solid var(--line)}
         <div class="ex"><h3>Filling a schema</h3>
           <p>Braces, quotes and field names are data. The engine fills one slot at a time, so
              the JSON is valid by construction.</p>
-          <div class="io"><b>brio</b> every value is one you allowed<br>
+          <div class="io"><b>System One</b> every value is one you allowed<br>
             <b>chat</b> invented no_tests and track</div></div>
         <div class="ex"><h3>Many questions, one document</h3>
           <p>Read the contract once, then ask it twenty things. The first question pays for the
@@ -496,9 +497,9 @@ footer{border-top:1px solid var(--line)}
         with exactly the same face.</p>
       <div class="chart"><div class="crow"><span class="cl">area<s>the model is sure</s></span><span class="ct"><i style="width:94.4%"></i></span><span class="cv">94.4%<s> entropy 0.17</s></span></div><div class="crow"><span class="cl">needs_tests<s>it is not</s></span><span class="ct"><i style="width:52.0%"></i></span><span class="cv">52%<s> entropy 0.95</s></span></div><div class="crow"><span class="cl">risk<s>it is not</s></span><span class="ct"><i style="width:46.0%"></i></span><span class="cv">46%<s> entropy 0.99</s></span></div></div>
       <p class="src">That number is what you put a threshold on to send a case to a human.
-        Brio does not write prose, so anything open-ended is still the chat's job, and the
+        System One mode does not write prose, so anything open-ended is still the chat's job, and the
         speed multipliers above were measured on an engine reading experts from disk.</p>
-      <a class="more" href="https://github.com/JustVugg/colibri/blob/main/docs/brio.md">Read the brio guide &rarr;</a>
+      <a class="more" href="https://github.com/JustVugg/colibri/blob/main/docs/systemone.md">Read the System One guide &rarr;</a>
     </div>
 
     <div class="block" id="yours">
@@ -544,7 +545,7 @@ footer{border-top:1px solid var(--line)}
   <span>Currently shipping <b>v1.12.1</b></span>
   <span class="sp">
     <a href="https://github.com/JustVugg/colibri/">GitHub</a><a href="https://github.com/JustVugg/colibri/blob/main/docs/quickstart.md">Docs</a>
-    <a href="https://github.com/JustVugg/colibri/blob/main/docs/brio.md">Brio</a><a href="https://github.com/JustVugg/colibri/blob/main/docs/api.md">API</a>
+    <a href="https://github.com/JustVugg/colibri/blob/main/docs/systemone.md">System One</a><a href="https://github.com/JustVugg/colibri/blob/main/docs/api.md">API</a>
     <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md">Benchmarks</a><a href="https://github.com/JustVugg/colibri/issues">Issues</a>
     <a href="https://github.com/JustVugg/colibri/blob/main/LICENSE">Apache 2.0</a>
   </span>

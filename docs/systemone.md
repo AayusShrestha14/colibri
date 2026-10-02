@@ -1,6 +1,8 @@
-# Brio mode — scoring a closed set instead of generating
+# System One mode: typed decisions with calibrated probabilities
 
-In brio mode the engine stops writing and starts **scoring**. You give it a prompt
+System One mode answers closed questions with a probability per allowed option,
+through an API compatible with TypeSafe's Jev (`POST /v1/systemone`). In System
+One mode a language model stops writing and starts **scoring**. You give it a prompt
 and a set of allowed options; it answers with how likely each option is, and with
 an entropy that says how sure it is. Same binary, same model, same chat path: the
 mode is a key on the request, not a build flag or a separate server.
@@ -8,12 +10,12 @@ mode is a key on the request, not a build flag or a separate server.
 ## Why you would want it
 
 A generated answer is a string. You parse it, you hope it is one of the values you
-asked for, and you get nothing back about confidence — the model writes `high` the
+asked for, and you get nothing back about confidence: the model writes `high` the
 same way whether it knows or is guessing.
 
-Brio mode answers the three questions a closed-set decision actually has:
+System One mode answers the three questions a closed-set decision actually has:
 
-| | generation | brio |
+| | generation | System One |
 |---|---|---|
 | which option | a string to parse | the option, by construction |
 | how likely each one | not available | a probability per option, including ones the model would never write |
@@ -24,10 +26,10 @@ that decides whether a decision can be automated.
 
 ## It needs a running server
 
-There are three ways to use brio mode and they are all clients of the same
+There are three ways to use System One mode and they are all clients of the same
 server: the **HTTP endpoint**, the **terminal** (`coli chat --attach`) and the
-**Brio page** in the web interface. What does not exist is a one-shot form —
-no `coli brio <model> ...` that loads, answers and exits.
+**System One page** in the web interface. What does not exist is a one-shot form:
+no `coli decide <model> ...` that loads, answers and exits.
 
 That is not an omission. The whole point is the snapshot: the shared prefix is
 read once and kept in the engine's memory, so every question after the first is
@@ -45,9 +47,9 @@ and then reach it however you prefer:
 
 | from | how |
 |---|---|
-| your own code | `POST /v1/brio`, below |
-| the terminal | `coli chat --attach http://127.0.0.1:8000`, then `/brio` |
-| the browser | open the server's address, Brio in the navigation dock |
+| your own code | `POST /v1/systemone` or `POST /v1/brio`, below |
+| the terminal | `coli chat --attach http://127.0.0.1:8000`, then `/decide` |
+| the browser | open the server's address, System One in the navigation dock |
 
 All three end up in the same place, so a snapshot warmed by one of them is
 already warm for the others.
@@ -103,7 +105,7 @@ option tokens the engine read to score them.
 ### Many questions on one text: `questions`
 
 The document is photographed once and every question pays only for its own
-words. This is the case where brio mode saves the most (5.7x against the chat,
+words. This is the case where System One mode saves the most (5.7x against the chat,
 measured below), and the server keeps the order of the snapshots itself.
 
 ```json
@@ -336,30 +338,33 @@ scoring without restating anything.
 ```
 coli chat --attach http://127.0.0.1:8000
 
-› /brio merge | request changes | close
-  ✦ brio · 3 options · the model no longer generates, it assigns probabilities
+› /decide merge | request changes | close
+  ✦ System One · 3 options · the model no longer generates, it assigns probabilities
 
 › The PR touches the engine and carries no tests. What should we do?
-  ◆ brio
+  ◆ System One
      request changes  ███████████████████████░░░  93.6%  2 tok
      merge            ██░░░░░░░░░░░░░░░░░░░░░░░░   6.4%  1 tok
      close            ░░░░░░░░░░░░░░░░░░░░░░░░░░   0.0%  1 tok
      → request changes  entropy 0.218  (confident)
   58.71s · 4 tokens read · 0 generated
 
-› /brio
+› /decide
   ✦ chat
 ```
 
-`/brio` with options enters the mode with the conversation so far as the context;
-`/brio` alone returns to chat. `:brio` works too. TAB completes the commands.
+`/decide` with options enters the mode with the conversation so far as the context;
+`/decide` alone returns to chat. `:decide` works too. TAB completes the commands.
 
 ## In the browser
 
-The **Brio** entry in the navigation dock opens a page built around the same
+The **System One** entry in the navigation dock opens a page built around the same
 shape: the document on top, read once, and questions accumulating below it, each
 with its own set of allowed options and its own answer. The bars show the
-probability of every option, and the entropy sits next to the winner.
+probability of every option, and the entropy sits next to the winner. On a
+decision model (`capabilities` says `decision`) each question goes to
+`POST /v1/systemone` as one `choice`, and the bars are its calibrated
+probabilities.
 
 Options are per question, not shared across the page: "how risky is this" wants
 low/medium/high where "do we sign" wants yes/no, and one list for all of them
@@ -372,7 +377,7 @@ go and chat about something else, and the answers are waiting when you come back
 
 ## Under the protocol
 
-If you speak the [serve protocol](serve_protocol) directly, brio mode is two
+If you speak the [serve protocol](serve_protocol) directly, System One mode is two
 optional keys on `SUBMIT`. Both are opt-in: a request that does not send them
 produces byte-identical frames to one sent before the feature existed.
 
@@ -387,7 +392,7 @@ SUBMIT <id> <slot> <bytes> <max_tokens> <temp> <top_p> [gbytes] [key=value ...]
 
 `max_tokens=0` is legal **only** together with `logprobs>0`, and means "read the
 prompt and stop". Without it each option costs a full decode step that is then
-discarded — on a one-token option, double the work.
+discarded: on a one-token option, double the work.
 
 An `ECHO` frame:
 
@@ -419,7 +424,7 @@ this question. The engine keeps a few snapshots (`COLI_PIN_SLOTS`, default 4) an
 always restores the deepest one that is a strict prefix of the new prompt.
 
 With a single snapshot you have to choose which level to keep, and the other is paid
-again on every request — measured on qwen36, 496 tokens per item instead of 176.
+again on every request: measured on qwen36, 496 tokens per item instead of 176.
 
 Send `pin=1` wherever you want a return point. The engine matches by token ids, so
 nothing needs to be declared in advance, and it refuses a snapshot whose attention
@@ -463,7 +468,7 @@ numbers alone would pass on an engine that quietly recomputed everything.
 
 qwen36 (22 GB, 40 layers) over the gateway, one KV slot:
 
-| task | brio | generation |
+| task | System One | generation |
 |---|---|---|
 | one question, 3 options | 65.7 s, 0 tokens generated | 79.6 s, 5 generated |
 | a 4-field JSON schema | 103.8 s, 104 tokens processed | 246.0 s, 226 processed |
@@ -471,7 +476,7 @@ qwen36 (22 GB, 40 layers) over the gateway, one KV slot:
 
 The gap widens with how much the alternative has to **write** and how much scaffolding
 it has to **re-read**. On the JSON case, generation also invented two field names that
-were not in the schema; brio mode cannot, because the field names are yours and only
+were not in the schema; System One mode cannot, because the field names are yours and only
 the values come from the model.
 
 Note that these are on a disk-streaming engine, where the prefill costs about
