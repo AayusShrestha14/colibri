@@ -3,7 +3,7 @@
 # Vulkan), one family per call so CI can run them side by side:
 #
 #   bash tests/vulkan_engines.sh qwen | inkling-olmoe | mimo-qwenimage | deepseek
-#   bash tests/vulkan_engines.sh shader    # the qmatmul formats alone, no engine
+#   bash tests/vulkan_engines.sh shader    # the qmatmul formats, the expert batch and the tier, no engine
 #
 # Needs libvulkan-dev, glslc and mesa-vulkan-drivers, plus the Python packages of
 # the family's tiny fixtures (see the vulkan-engines job in .github/workflows/ci.yml).
@@ -38,11 +38,48 @@ same_tokens() {  # <cpu log> <vk log> <tag>: the engines' "C engine" token lines
   { [ -s cpu.tok ] && cmp -s cpu.tok vk.tok; } || { cat cpu.tok vk.tok; fail "$3: Vulkan tokens differ from the CPU"; }
 }
 
-# The shader itself: every weight format against a CPU reference, before any engine.
+# The shader itself: every weight format against a CPU reference, before any engine;
+# then the expert batch and the weight pool in the same harness, and the routed-expert
+# tier (vk_tier.c) on a synthetic model in every source format.
 shader_formats() {
-  cc -O2 -DVK_TEST backend_vulkan.c -o vk_test -lvulkan -lm
+  cc -O2 -pthread -DVK_TEST backend_vulkan.c -o vk_test -lvulkan -lm
   COLI_VK_TEST_MATMUL_ONLY=1 ./vk_test shaders/qmatmul.spv | tee vk_test.log
   tail -1 vk_test.log | grep -qx PASS || fail "qmatmul format cases"
+  make tests/test_vk_tier VK=1
+  ./tests/test_vk_tier shaders/qmatmul.spv | tee vk_tier.log
+  tail -1 vk_tier.log | grep -qx PASS || fail "routed-expert tier"
+}
+
+# tier_count <engine> <log>: N from the last "[VK] tier <engine> run: device N of M" line;
+# tier_evictions <engine> <log>: the evictions of that line
+tier_count() {
+  local n
+  n=$(sed -n "s/^\[VK\] tier $1 run: device \([0-9][0-9]*\) of .*/\1/p" "$2" | tail -1)
+  echo "${n:-0}"
+}
+tier_evictions() {
+  local n
+  n=$(sed -n "s/^\[VK\] tier $1 run: .* evictions \([0-9][0-9]*\),.*/\1/p" "$2" | tail -1)
+  echo "${n:-0}"
+}
+
+# tier_gate <engine> <tag> <env...> -- <argv...>
+# The routed-expert tier (vk_tier.c) against the CPU: the same tokens as the CPU run
+# with the same settings, and the device served some of the routed experts. With
+# EVICT=1 the run must also have evicted (its budget is set below the hot set).
+# COLI_USAGE points at a fresh file: no warm start from an earlier run's history.
+tier_gate() {
+  local eng=$1 tag=$2; shift 2
+  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  rm -f tier.usage
+  env "${envs[@]}" ./"$eng" "$@" > cpu.log 2>&1 || true
+  env "${envs[@]}" COLI_USAGE=tier.usage COLI_VULKAN=1 ./"$eng" "$@" > vk.log 2>&1 || true
+  same_tokens cpu.log vk.log "$tag"
+  [ "$(tier_count "$eng" vk.log)" -gt 0 ] || { cat vk.log; fail "$tag: no routed expert ran on the device"; }
+  if [ "${EVICT:-0}" = 1 ]; then
+    [ "$(tier_evictions "$eng" vk.log)" -gt 0 ] || { grep '\[VK\] tier' vk.log; fail "$tag: the budget forced no eviction"; }
+  fi
+  echo "OK $tag: tokens = CPU, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' vk.log | tail -1), $(grep -a -o 'evictions [0-9]*' vk.log | tail -1)"
 }
 
 # vk_gate <engine> <placed-regex> <tag> <env...> -- <argv...>
@@ -88,6 +125,33 @@ family_qwen() {
     echo "OK qwen36 $fx int8: tokens = CPU, $(grep -o '[0-9]* matmuls on the GPU.*' vk.log | tail -1)"
   done
 
+  # The routed-expert tier on every expert container qwen36 reads (COLI_VULKAN=1 turns
+  # it on; the runs above already had it): int8 per row (fmt 1), the shared kernel's
+  # planar int4-g64 (fmt 4), int4 per row from the unpacked slots (fmt 2), int8 gs64
+  # (fmt 13) and the mixed int4 gate/up + int8 down container; the tier alone with the
+  # dense trunk on the CPU (COLI_VK_DENSE=0); and a budget of two experts, which must
+  # evict as the routing moves.
+  $PY tools/make_qwen36_tiny.py --out qwen36_tiny64 --ref-mode full --inter 64 --emit-ref qwen36_tiny64/ref_full.json
+  $PY tools/convert_qwen36.py --model qwen36_tiny64 --out qwen36_tiny64_c --ebits 4 --gs 64
+  $PY tools/convert_qwen36.py --model qwen36_tiny64 --out qwen36_tiny64_g8 --ebits 8 --gs 64
+  $PY tools/convert_qwen36.py --model qwen36_tiny64 --out qwen36_tiny64_d8 --ebits 4 --gs 64 --down-bits 8
+  $PY tools/convert_qwen36.py --model qwen36_tiny --out qwen36_tiny_i4r --ebits 4
+  for cap in 1 8; do
+    tier_gate qwen36 "qwen36 tier int8 cap=$cap" COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- $cap 8 qwen36_tiny/ref_full.json
+    tier_gate qwen36 "qwen36 tier int4-g64 planar cap=$cap" COLI_DENSE_I8=0 SNAP=qwen36_tiny64_c -- $cap 4 qwen36_tiny64/ref_full.json
+    tier_gate qwen36 "qwen36 tier int4 per row cap=$cap" COLI_DENSE_I8=0 SNAP=qwen36_tiny_i4r -- $cap 4 qwen36_tiny/ref_full.json
+    tier_gate qwen36 "qwen36 tier int8 gs64 cap=$cap" COLI_DENSE_I8=0 SNAP=qwen36_tiny64_g8 -- $cap 8 qwen36_tiny64/ref_full.json
+    tier_gate qwen36 "qwen36 tier mixed int4/int8 cap=$cap" COLI_DENSE_I8=0 SNAP=qwen36_tiny64_d8 -- $cap 4 qwen36_tiny64/ref_full.json
+  done
+  tier_gate qwen36 "qwen36 tier alone (COLI_VK_DENSE=0)" COLI_VK_DENSE=0 COLI_DENSE_I8=0 SNAP=qwen36_tiny64_c -- 8 4 qwen36_tiny64/ref_full.json
+  EVICT=1 tier_gate qwen36 "qwen36 tier, a budget of two experts" COLI_VK_TIER_GB=0.00002 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
+  # COLI_VK_TIER=0: the dense trunk alone, as before the tier
+  COLI_VK_TIER=0 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c ./qwen36 8 8 qwen36_tiny/ref_full.json > cpu.log 2>&1 || true
+  COLI_VK_TIER=0 COLI_VULKAN=1 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c ./qwen36 8 8 qwen36_tiny/ref_full.json > vk.log 2>&1 || true
+  same_tokens cpu.log vk.log "qwen36 COLI_VK_TIER=0"
+  ! grep -q '^\[VK\] tier' vk.log || { cat vk.log; fail "qwen36 COLI_VK_TIER=0: the tier started"; }
+  echo "OK qwen36 COLI_VK_TIER=0: tokens = CPU, no tier"
+
   # qwen38: one fixture, every resident format, with and without prefill batching
   $PY tools/make_qwen38_tiny.py --out qwen38_tiny
   local batch O
@@ -99,6 +163,30 @@ family_qwen() {
     vk_gate qwen38 'int8 [1-9].*bf16 [1-9]' "qwen38 int8 batch=$batch" $O Q38_TRUNK_MIN_KB=0 -- 1 8 qwen38_tiny/ref.json
     # Q38_NATIVE_BF16=0 expands the rows to f32 at load (fmt 10)
     vk_gate qwen38 'f32 [1-9]' "qwen38 f32 batch=$batch" $O Q38_TRUNK_CPU_INT8=0 Q38_NATIVE_BF16=0 -- 1 8 qwen38_tiny/ref.json
+  done
+
+  # The routed-expert tier on qwen38's three expert forms: BF16 (fmt 11), the release's
+  # FP8 with 128x128 block scales (fmt 12, gs 128), the experts-int4g64 sidecar's planar
+  # int4 (fmt 4); decode one row at a time and prefill batched; with the MTP head
+  # drafting (its verify rows take the device's per-row route); the tier alone; and a
+  # budget of two experts, which must evict.
+  $PY tools/make_qwen38_tiny.py --out qwen38_tiny_fp8 --fp8-experts
+  $PY tools/make_qwen38_tiny.py --out qwen38_tiny_int4 --fp8-experts --int4-experts --expert-gain 3
+  local fx ref
+  for fx in qwen38_tiny qwen38_tiny_fp8 qwen38_tiny_int4; do
+    ref=$fx/ref.json; [ $fx = qwen38_tiny_int4 ] && ref=$fx/ref_int4.json
+    for batch in 0 1; do for cap in 1 4; do
+      tier_gate qwen38 "qwen38 tier $fx batch=$batch cap=$cap" OMP_NUM_THREADS=2 Q38_PREFILL_BATCH=$batch SNAP=$fx -- $cap 8 $ref
+    done; done
+  done
+  tier_gate qwen38 "qwen38 tier alone (COLI_VK_DENSE=0)" OMP_NUM_THREADS=2 COLI_VK_DENSE=0 SNAP=qwen38_tiny_int4 -- 4 8 qwen38_tiny_int4/ref_int4.json
+  EVICT=1 tier_gate qwen38 "qwen38 tier, a budget of two experts" OMP_NUM_THREADS=2 Q38_PREFILL_BATCH=0 COLI_VK_TIER_GB=0.0000065 SNAP=qwen38_tiny_fp8 -- 1 8 qwen38_tiny_fp8/ref.json
+  $PY tools/make_qwen38_tiny.py --out qwen38_tiny_fp8_mtp --fp8-experts --mtp
+  $PY tools/make_qwen38_tiny.py --out qwen38_tiny_int4_mtp --fp8-experts --int4-experts --expert-gain 3 --mtp
+  for fx in qwen38_tiny_fp8_mtp qwen38_tiny_int4_mtp; do
+    for batch in 0 1; do
+      tier_gate qwen38 "qwen38 tier MTP $fx batch=$batch" OMP_NUM_THREADS=2 Q38_MTP=1 Q38_PREFILL_BATCH=$batch SNAP=$fx -- 2 8 $fx/ref.json
+    done
   done
 }
 
