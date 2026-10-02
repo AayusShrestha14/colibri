@@ -47,10 +47,10 @@ same_tokens() {  # <cpu log> <vk log> <tag>: the engines' "C engine" token lines
 # then the expert batch and the weight pool in the same harness, and the routed-expert
 # tier (vk_tier.c) on a synthetic model in every source format.
 shader_formats() {
+  make tests/test_vk_tier VK=1   # every shader too: the harness's expert batch needs them
   cc -O2 -pthread -DVK_TEST backend_vulkan.c -o vk_test -lvulkan -lm
   COLI_VK_TEST_MATMUL_ONLY=1 ./vk_test shaders/qmatmul.spv | tee vk_test.log
   tail -1 vk_test.log | grep -qx PASS || fail "qmatmul format cases"
-  make tests/test_vk_tier VK=1
   ./tests/test_vk_tier shaders/qmatmul.spv | tee vk_tier.log
   tail -1 vk_tier.log | grep -qx PASS || fail "routed-expert tier"
 }
