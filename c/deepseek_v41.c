@@ -4218,8 +4218,12 @@ static void vk_tier_start(Model *m, const char *snap, int cap) {
     else snprintf(g_vk_usage, sizeof g_vk_usage, "%s/.coli_usage", snap);
     int64_t h = rt_load(g_vk_usage);
     if (h > 0) fprintf(stderr, "[USAGE] expert history: %lld selections (%s)\n", (long long)h, g_vk_usage);
+    /* The device goes before the drivers unload, after the tier's teardown (atexit runs
+     * last-registered first), and whether or not the tier starts: vkt_init makes the
+     * expert batch's pipelines before it can refuse (no room), and a driver still
+     * compiling them at exit crashed one run in sixteen on Mesa's Dozen. */
+    atexit(coli_vk_shutdown);
     if (!vkt_init(&vc, rt_counts_all())) { rt_destroy(); g_vk_usage[0] = 0; return; }
-    atexit(coli_vk_shutdown);   /* runs after the tier's teardown: the device goes before the drivers unload */
     atexit(vkt_shutdown);
     int all = c->n_layers * c->n_routed;
     int *pl = malloc((size_t)all * sizeof(int)), *pe = malloc((size_t)all * sizeof(int));

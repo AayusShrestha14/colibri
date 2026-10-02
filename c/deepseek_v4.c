@@ -12583,8 +12583,11 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
                     .dense_bytes = coli_vk_dense()
                         ? (size_t)(engine->dense_resident.total_bytes + engine->head_cache.bytes) : 0,
                     .in_ram = v4_vkt_in_ram, .ram_ctx = store};
+    /* The device goes before the drivers unload, after the tier's teardown (atexit runs
+     * last-registered first), and whether or not the tier starts: vkt_init makes the
+     * expert batch's pipelines before it can refuse (no room). */
+    atexit(coli_vk_shutdown);
     if (!vkt_init(&vc, coli_v4_expert_store_history(store))) return;
-    atexit(coli_vk_shutdown);   /* runs after the tier's teardown: the device goes before the drivers unload */
     atexit(vkt_shutdown);
     g_v4_vkt = (ColiV4VkTier){store, v4_vkt_issue, v4_vkt_join, v4_vkt_note, v4_vkt_routed};
     int all = c->num_hidden_layers * c->n_routed_experts;
