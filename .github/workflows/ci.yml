@@ -168,6 +168,12 @@ jobs:
           # the routed-expert tier of qwen36 and qwen38 under ASan and UBSan
           - family: qwen-sanitize
             req: c/tools/requirements-qwen38-tiny.txt
+          # the dense chain (COLI_VK_CHAIN=1) of qwen36 and qwen38, and the same under
+          # ASan and UBSan
+          - family: qwen-chain
+            req: c/tools/requirements-qwen38-tiny.txt
+          - family: qwen-chain-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
           - family: inkling-olmoe
             req: c/tools/oracle-requirements.txt
           - family: mimo-qwenimage
