@@ -85,8 +85,8 @@ re-pin from history.
 
 Every engine links the same backend in a `VK=1` build (`make <engine> VK=1`;
 `make deepseek-v4 VK=1` for DeepSeek V4) and opens it with `COLI_VULKAN=1` once its
-weights are loaded. Kimi K3 has its own expert tier (`K3_VK`, see
-[ENVIRONMENT.md](ENVIRONMENT.md)) and glm53 its own section in
+weights are loaded. Kimi K3 also reads its older switch `K3_VK=1` (see
+[ENVIRONMENT.md](ENVIRONMENT.md)), and glm53 has its own section in
 [glm53-flash.md](glm53-flash.md). For the engines below, a missing device or missing
 shaders prints `[VK] <engine>: no usable Vulkan device ..., running on the CPU` and
 the run continues on the CPU. That differs from the GLM engine above, which exits.
@@ -101,16 +101,16 @@ runs the routed-expert tier ([below](#the-routed-expert-tier-vk_tierc)): there t
 stay on the CPU and the device takes the experts. On a Radeon 780M the dense matmuls,
 one synchronous call each at the GPU's 800 MHz floor, cost more than the tier gained
 (Qwen3.8 decode at 2.35 tok/s with them on the device, 3.80 without). Today that
-case is qwen36, qwen38, inkling and olmoe; an engine that moves to the tier inherits
-it. A discrete GPU keeps the dense matrices on the device by default. The GLM engine above reads
-the same variable through the same function with its own default, off.
+case is qwen36, qwen38, inkling, olmoe, kimi_k3 and mimo; an engine that moves to the
+tier inherits it. A discrete GPU keeps the dense matrices on the device by default. The
+GLM engine above reads the same variable through the same function with its own
+default, off.
 
 What these engines put on the device is their **resident** matrices, in the form
-they already hold in RAM, uploaded at the first multiply (MiMo uploads them at
-startup). Routed experts arrive from disk on every miss; qwen36, qwen38, inkling and
-olmoe keep a cache of them on the device with the shared expert tier
-([below](#the-routed-expert-tier-vk_tierc)), MiMo an opt-in one of its own, the
-others none yet.
+they already hold in RAM, uploaded at the first multiply (MiMo and Kimi K3 upload
+them at startup). Routed experts arrive from disk on every miss; qwen36, qwen38,
+inkling, olmoe, Kimi K3 and MiMo keep a cache of them on the device with the shared
+expert tier ([below](#the-routed-expert-tier-vk_tierc)), the others none yet.
 
 | Engine | On the device | Weight formats | Stays on the CPU |
 |---|---|---|---|
@@ -120,7 +120,8 @@ others none yet.
 | olmoe | attention q/k/v/o, router, lm_head; routed experts on the expert tier | f32; experts int8 per row | embedding, the experts the tier does not hold |
 | deepseek_v41 | the trunk, vision included | fp8 in 32x32 ue8m0 tiles, bf16 | routed experts |
 | deepseek_v4 | resident dense layers, head, router, compressors | fp8 in 128x128 blocks, bf16 | routed experts, the indexer's `weights_proj`, DSpark stages, the `--oracle` path |
-| mimo | trunk and vision tower; up to `MIMO_VK_EXPERTS=N` routed experts | native fp8/bf16, int8, f32 (`MIMO_DENSE_BITS`); experts as MXFP4 | router |
+| kimi_k3 (Kimi K3) | the shared experts' matrices (one row at a time: decode); routed experts on the expert tier | shared experts int8 rows, int4-g64, f32 (`K3_BITS`); experts MXFP4 with ue8m0 scales (fmt 7), SiTU-GLU in the latent space | KDA, MLA, the latent projections, router, head, prefill's shared experts, the experts the tier does not hold |
+| mimo | trunk and vision tower; routed experts on the expert tier | native fp8/bf16, int8, f32 (`MIMO_DENSE_BITS`); experts MXFP4 with e8m0 scales (fmt 7) | router, the experts the tier does not hold |
 | qwenimage | the DiT's matrices | int8, bf16, f32 (`COLI_IMG_BITS`) | text encoder, VAE, attention |
 
 Each engine ends a run, and each serve turn, with
@@ -138,7 +139,10 @@ them by f32 activations.
     kernel (`QWEN_EXPERT_ACT`, int8 by default): the expert tier's experts match
     `QWEN_EXPERT_ACT=f32`, to 2.5e-7 of the logits on the test fixture;
   - qwen38's int8 trunk;
-  - qwenimage's `COLI_IMG_ACT8`.
+  - qwenimage's `COLI_IMG_ACT8`;
+  - Kimi K3's routed-expert kernel (`K3_IDOT`, on by default): the tier's experts
+    match `K3_IDOT=0`, the configuration of its vendor oracle;
+  - MiMo's `MIMO_IDOT=1` (off by default).
 - Two engines keep the CPU's exact arithmetic instead:
   - deepseek_v4 rounds activations to E4M3 on the host before the call, as its CPU
     kernel does.
@@ -148,7 +152,7 @@ them by f32 activations.
 **Memory.** The host copy stays as the CPU fallback. On an integrated GPU or APU,
 which shares RAM with the CPU, the resident set is therefore held twice: size
 `RAM_GB`/caps with that in mind. Freed tensors give their device memory back (see
-the expert tier's section); MiMo's expert tier still never evicts by its own design.
+the expert tier's section).
 
 **Status.** CI checks every engine above on Lavapipe (`tests/vulkan_engines.sh`, the
 `vulkan-engines` job): each configuration gives the CPU run's tokens, and its matmul
@@ -303,15 +307,28 @@ of them on the device the way a GPU-equipped PC should use its card:
   qwen36 and qwen38 fixture configuration are the bytes of the build before the
   tier (110 configurations: bf16, FP8, int4-g64, int8, the MTP head, every prefill
   mode, both qwen36 expert kernels, the mixed container, four model geometries).
+  The same holds for kimi_k3 (30 configurations, every step's logits) and mimo (32,
+  text and picture, every prompt position's logits). One default moved with it: a
+  `VK=1` build of Kimi K3 used to open the device without being asked (`K3_VK=1` was
+  the default); it now waits for `COLI_VULKAN=1` (or `K3_VK=1`) like every engine.
 
 Engines on the tier today: **qwen36** (Qwen3.6, Qwen3-Coder, the 2.4T geometry: int8
 per row or gs64, int4 per row or gs64 from either expert kernel, the mixed int4/int8
 container) and **qwen38** (Qwen3.8 Flash Next: the int4-g64 sidecar, the release's
 FP8 with 128x128 block scales, BF16). The MTP head's layer of qwen38 stays on the CPU
 (its experts are FP8 beside an int4 sidecar). **inkling** and **olmoe** as well, see
-[Inkling and OLMoE](#inkling-and-olmoe). GLM-5.2's `COLI_VK_EXPERTS`, Kimi K3's
-`K3_VK` and MiMo's `MIMO_VK_EXPERTS` are the older per-engine tiers; the others move
-to this one in the next phase, see [Adding an engine](#adding-an-engine-to-the-tier).
+[Inkling and OLMoE](#inkling-and-olmoe). **kimi_k3** (Kimi K3: the checkpoint's
+MXFP4 with ue8m0 scales, SiTU-GLU on the device, the experts in the latent space,
+warm-started from its expert history) and **mimo** (MiMo-V2.6 Flash and Pro: the
+release's MXFP4, SwiGLU; no history, so the tier fills as experts pass by) joined
+it from their own tiers, which filled once and never evicted: Kimi K3's `K3_VK`,
+`K3_VK_GB`, `K3_VK_UP` and MiMo's `MIMO_VK_EXPERTS` are now read as this tier's
+switches ([ENVIRONMENT.md](ENVIRONMENT.md)). Both add every pair of a row in the
+CPU run's order (Kimi K3: its union's disk-offset order; MiMo: the row's routing
+order), and offer the experts the CPU computed after the join, so that a promotion
+that displaces a resident frees it at once. GLM-5.2's `COLI_VK_EXPERTS` is the older
+per-engine tier; the others move to this one in the next phase, see [Adding an
+engine](#adding-an-engine-to-the-tier).
 
 With the CUDA expert tier built and on (`COLI_CUDA=1`) as well, **CUDA wins**: the
 Vulkan tier stays off and says so (`[VK] tier <engine>: the CUDA expert tier is on
@@ -563,10 +580,8 @@ What each remaining engine needs, from reading its code:
 |---|---|---|---|---|
 | colibri.c (GLM-5.2) | int4 per row `I4U_PAIRS_ROW`, int4-gs `I4U_PAIRS_GS`, int3-g64 `I3_G64`; gate, up, down separate | SwiGLU | `moe()`'s Vulkan block replaces the `COLI_VK_EXPERTS` registry | sums per expert in union order today: move to rank order; fmt 6 (E8/IQ3, rotated input) stays on the CPU; the MTP layer is int8 (another format); the block now serves only S <= 4 |
 | glm53 | int4 gs64 `I4U_PAIRS_GS` 64 | SwiGLU with `swiglu_limit` | `ffn_layer` | its CPU clamps even at limit 0 (no guard), the shader treats 0 as no clamp: pass the config's value and check `L > 0` on the CPU side first; shared expert written first |
-| kimi_k3 | MXFP4 `MXFP4_E8M0` 32, gate `w1`, up `w3`, down `w2` | SiTU-GLU, a = 4, b = 25 (`VKT_ACT_SITU`) | `moe_forward` / `expert_apply` (experts in the latent space) | replaces `K3_VK` (synchronous, never evicts); the CPU's `K3_IDOT` rounds activations to int8 |
 | deepseek_v41 | MXFP4 `MXFP4_E8M0` 32 | SwiGLU with limit | `moe_run_at` (already sums per (row, rank) in rank order) | DSpark stages have caches of their own |
 | deepseek_v4 | FP4 + ue8m0/32 = `MXFP4_E8M0` 32; pinned experts are repacked rows16 | SwiGLU with limit, **plus** bf16 rounding of gate/up, the route weight applied before down and bf16 rounding of the output | `moe_token_pipeline` (ascending expert id), `v4_moe_batch_union` | needs an activation variant with those roundings and the host's E4M3 rounding of x (as its fp8 dense path does); undo rows16 or keep pinned experts off the tier; hash-routed layers |
-| mimo | MXFP4 `MXFP4_E8M0` 32, stored down, ds, gate, gs, up, us | SwiGLU | `moe` | replaces `MIMO_VK_EXPERTS` (synchronous, never evicts) |
 
 ## Correctness
 
@@ -594,7 +609,11 @@ What each remaining engine needs, from reading its code:
   format above, under the f32, bf16 and dense-int4g64 snapshots, `TOPP`) and olmoe
   (with `PILOT`'s worker), under eviction, with a warm start, and through both
   engines' serve tests (prefix reuse, the dashboard, Brio); `inkling-olmoe-sanitize`
-  runs them under ASan and UBSan.
+  runs them under ASan and UBSan. `kimi` and the mimo half of `mimo-qwenimage` do it
+  for Kimi K3 and MiMo: Moonshot's and Xiaomi's oracles with the tier on, the CPU's
+  tokens in every dense format with the trunk on the device and on the CPU, a budget
+  of two experts that must evict, the old switches, Kimi K3's warm start;
+  `kimi-mimo-sanitize` runs the tier's configurations under ASan and UBSan.
 - int4 weights decode as offset-binary (nibble−8), byte-identical layout to
   the CPU path — no repacking.
 - Khronos validation layers: the backend never enables them, so the loader

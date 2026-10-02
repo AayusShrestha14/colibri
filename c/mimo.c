@@ -65,12 +65,14 @@
 #if defined(__AVX2__)
 #include <immintrin.h>
 #endif
+#include "vk_tier.h"       /* the shared Vulkan routed-expert tier (COLI_VULKAN=1; stubs without VK=1) */
 #ifdef COLI_VULKAN
-/* VK=1 and COLI_VULKAN=1: the dense matrices of the trunk and of the vision
- * tower run on the GPU in whatever form MIMO_DENSE_BITS gave them (FP8, BF16,
- * int8 or f32), and with MIMO_VK_EXPERTS=N up to N routed experts are kept
- * there as MXFP4. The router, and every matrix whose upload fails, stays on
- * the CPU path below. The backend has one command buffer: main thread only. */
+/* VK=1 and COLI_VULKAN=1: the routed experts go to the shared expert tier
+ * (vk_tier.c) as the release's MXFP4, and the dense matrices of the trunk and of
+ * the vision tower to the device where coli_vk_dense() puts them, in whatever
+ * form MIMO_DENSE_BITS gave them (FP8, BF16, int8 or f32). The router, and every
+ * matrix whose upload fails, stays on the CPU path below. The backend's dense
+ * matmuls share one command buffer: main thread only. */
 #include "backend_vulkan.h"
 static int g_vk_ready;
 #endif
@@ -890,112 +892,136 @@ static void dense_mlp(Model *m, Layer *l, const float *xn, int n, float *out) {
     (void)m;
 }
 
-#ifdef COLI_VULKAN
-/* MIMO_VK_EXPERTS=N (off by default): up to N routed experts are copied to the
- * GPU the first time they are computed out of the RAM cache, and stay there for
- * the run. The release's MXFP4 is the shader's fmt 7 byte for byte (e2m1
- * nibbles, the low nibble the even column, bit 3 the sign, one group per 32
- * columns); only the e8m0 group exponents widen, to the f32 scales the shader
- * reads, 2^(e-127) as mx4_scale gives the CPU kernel. The tier never evicts:
- * the backend's weight arena does not take a freed tensor's memory back, so a
- * device copy that followed the LRU would leak device memory at every miss.
- * An expert runs on the GPU only while it is also in the RAM cache, so the CPU
- * can always take over a call the device refuses. */
-typedef struct { ColiVkTensor *down, *gate, *up; } VkExpert;
-static VkExpert *g_vkx;              /* [layer * n_experts + expert], NULL when off */
-static int g_vkx_left;               /* uploads the budget still allows */
-static int g_vkx_full;               /* an upload failed or the budget is reached: no more */
-static long g_vkx_resident;
-static unsigned long long g_vkx_calls;
-
-/* the device's own budget, when it reports one, with half a GB left over */
-static int vk_budget_full(void) {
-    double used = 0, budget = 0;
-    return coli_vk_mem_budget(&used, &budget) && used >= budget - 0.5;
-}
-
-static VkExpert *vk_expert(Model *m, int li, int eid, const uint8_t *buf) {
-    VkExpert *v = &g_vkx[(int64_t)li * m->c.n_experts + eid];
-    if (v->down) return v;
-    if (g_vkx_full || g_vkx_left <= 0) return NULL;
-    if (vk_budget_full()) {
-        g_vkx_full = 1;
-        fprintf(stderr, "[VK] mimo: device memory budget reached, %ld experts resident\n", g_vkx_resident);
-        return NULL;
-    }
-    int H = m->c.hidden, MI = m->c.moe_inter;
+/* An expert's bytes as the shared Vulkan tier reads them (buf: down, its
+ * scales, gate, its scales, up, its scales; one e8m0 byte per 32 columns). */
+static VktExpertSrc mimo_vk_src(const Model *m, const uint8_t *buf) {
     const uint8_t *dq = buf, *ds = dq + m->part[0], *gq = ds + m->part[1], *gs = gq + m->part[2],
                   *uq = gs + m->part[3], *us = uq + m->part[4];
-    int64_t ns = m->part[1] > m->part[3] ? m->part[1] : m->part[3];
-    float *sc = xmalloc((size_t)ns * sizeof(float), "expert scales");
-    for (int64_t i = 0; i < m->part[1]; i++) sc[i] = mx4_scale(ds[i]);
-    int ok = coli_vk_tensor_ensure(&v->down, dq, sc, 7, MI, H, 32);
-    if (ok) {
-        for (int64_t i = 0; i < m->part[3]; i++) sc[i] = mx4_scale(gs[i]);
-        ok = coli_vk_tensor_ensure(&v->gate, gq, sc, 7, H, MI, 32);
-    }
-    if (ok) {
-        for (int64_t i = 0; i < m->part[5]; i++) sc[i] = mx4_scale(us[i]);
-        ok = coli_vk_tensor_ensure(&v->up, uq, sc, 7, H, MI, 32);
-    }
-    free(sc);
-    if (!ok) {
-        coli_vk_tensor_free(v->down); coli_vk_tensor_free(v->gate); coli_vk_tensor_free(v->up);
-        v->down = v->gate = v->up = NULL;
-        g_vkx_full = 1;
-        fprintf(stderr, "[VK] mimo: no room for more experts on the GPU, %ld resident\n", g_vkx_resident);
-        return NULL;
-    }
-    g_vkx_left--;
-    g_vkx_resident++;
-    return v;
+    return (VktExpertSrc){gq, uq, dq, gs, us, ds};
 }
 
-/* gate and up of the experts of one group that can run on the GPU; on[j] says
- * which did, and the CPU tasks skip those */
-static void vk_experts_gate_up(Model *m, int li, const int *eids, int nb, Slot **slots, const int *first,
-                               const float *xg, float *g, float *u, unsigned char *on) {
-    for (int j = 0; j < nb; j++) on[j] = 0;
-    if (!g_vkx || !g_vk_ready || !vk_main_thread()) return;
-    int H = m->c.hidden, MI = m->c.moe_inter;
-    for (int j = 0; j < nb; j++) {
-        int r = first[j + 1] - first[j];
-        if (!r) continue;
-        VkExpert *v = vk_expert(m, li, eids[j], slots[j]->buf);
-        if (!v) continue;
-        const float *x = xg + (size_t)first[j] * H;
-        if (coli_vk_matmul(&v->gate, g + (size_t)first[j] * MI, x, NULL, NULL, 7, r, H, MI, 32) &&
-            coli_vk_matmul(&v->up, u + (size_t)first[j] * MI, x, NULL, NULL, 7, r, H, MI, 32)) {
-            on[j] = 1;
-            g_vkx_calls += 2;
+/* The CPU's experts of one MoE step: every (row, choice) pair i of sel -- or,
+ * with a mask, those whose mask[i] is mval -- runs its expert, and its output
+ * lands in y at row pair[i], numbered on from `total`; returns the new count.
+ *
+ * Each group of resident experts is computed in two parallel passes -- gate and
+ * up of every expert, then down of every expert -- split in row blocks, instead
+ * of three OpenMP regions per expert (a thousand a token on Flash, and every
+ * barrier costs a scheduling round on a busy machine). The kernel inside a
+ * task is the same matmul_mxfp4 on the same rows, so the numbers do not move.
+ *
+ * Every (row, choice) pair has its own slot in y, across all the groups of the
+ * block, so the weighted sum can wait for the last group and run row by row in
+ * that row's own routing order. With `note`, every expert computed here is
+ * offered to the Vulkan tier while its bytes are in RAM (vkt_note; nothing
+ * without the tier). */
+static int moe_cpu(Model *m, int li, const float *xn, int n, const int *sel,
+                   const uint8_t *mask, int mval, int *pair, float *y, int total, int note) {
+    Cfg *c = &m->c;
+    int H = c->hidden, E = c->n_experts, K = c->topk, MI = c->moe_inter;
+#define MIMO_WANT(i) (!mask || (mask[i] != 0) == mval)
+    /* the union of chosen experts, in first-use order */
+    int *uni = xmalloc((size_t)E * sizeof(int), "expert union");
+    int *seen = xcalloc((size_t)E, sizeof(int), "expert seen");
+    int nu = 0;
+    for (int i = 0; i < n * K; i++) if (MIMO_WANT(i) && !seen[sel[i]]) { seen[sel[i]] = 1; uni[nu++] = sel[i]; }
+    free(seen);
+    int cap = m->cache[li].cap;
+    int *row = xmalloc((size_t)n * K * sizeof(int), "expert rows index");
+    int *first = xmalloc((size_t)(cap + 1) * sizeof(int), "expert row offsets");
+    float *xg = xmalloc((size_t)n * K * H * sizeof(float), "expert inputs");
+    float *g = xmalloc((size_t)n * K * MI * sizeof(float), "expert gate");
+    float *u = xmalloc((size_t)n * K * MI * sizeof(float), "expert up");
+    void (*mm)(float *, const float *, const uint8_t *, const uint8_t *, int, int, int)
+        = m->idot ? matmul_mxfp4_i8 : matmul_mxfp4;
+    const int BLOCK_ROWS = 256;
+    Slot *slots[4096];
+    int base = total;                /* y rows before this call are someone else's */
+    for (int b = 0; b < nu; b += cap) {
+        int nb = nu - b < cap ? nu - b : cap;
+        experts_ensure(m, li, uni + b, nb, slots);
+        double t0 = now_s();
+        int from = total;
+        for (int j = 0; j < nb; j++) {
+            int e = uni[b + j];
+            first[j] = total - base;
+            for (int t = 0; t < n; t++)
+                for (int q = 0; q < K; q++)
+                    if (sel[(size_t)t * K + q] == e && MIMO_WANT((size_t)t * K + q)) {
+                        row[total - base] = t;
+                        pair[(size_t)t * K + q] = total;
+                        total++;
+                    }
         }
-    }
-}
-
-/* down of the experts whose gate and up ran on the GPU */
-static void vk_experts_down(Model *m, int li, const int *eids, int nb, const int *first,
-                            const float *g, float *y, const unsigned char *gate_up, unsigned char *on) {
-    for (int j = 0; j < nb; j++) on[j] = 0;
-    int H = m->c.hidden, MI = m->c.moe_inter;
-    for (int j = 0; j < nb; j++) {
-        if (!gate_up[j]) continue;
-        VkExpert *v = &g_vkx[(int64_t)li * m->c.n_experts + eids[j]];
-        int r = first[j + 1] - first[j];
-        if (coli_vk_matmul(&v->down, y + (size_t)first[j] * H, g + (size_t)first[j] * MI, NULL, NULL,
-                           7, r, MI, H, 32)) {
-            on[j] = 1;
-            g_vkx_calls++;
+        first[nb] = total - base;
+        for (int i = from; i < total; i++) memcpy(xg + (size_t)(i - base) * H, xn + (size_t)row[i - base] * H, (size_t)H * sizeof(float));
+        int up_blocks = (MI + BLOCK_ROWS - 1) / BLOCK_ROWS, down_blocks = (H + BLOCK_ROWS - 1) / BLOCK_ROWS;
+        int rb_mi = MI / 2, gb_mi = MI / 32, rb_h = H / 2, gb_h = H / 32;
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (int task = 0; task < nb * 2 * up_blocks; task++) {
+            int j = task / (2 * up_blocks), which = (task / up_blocks) % 2, blk = task % up_blocks;
+            int r = first[j + 1] - first[j];
+            if (!r) continue;
+            int o0 = blk * BLOCK_ROWS, rows = MI - o0 < BLOCK_ROWS ? MI - o0 : BLOCK_ROWS;
+            const uint8_t *buf = slots[j]->buf;
+            const uint8_t *q = buf + m->part[0] + m->part[1] + (which ? m->part[2] + m->part[3] : 0);
+            const uint8_t *sc = q + m->part[2];
+            float *dst = (which ? u : g) + (size_t)first[j] * MI;
+            /* rows [o0, o0+rows) of this expert's gate or up, for its r inputs; the
+             * kernel writes [r, rows] contiguously, so it goes through a scratch */
+            float tmp[4 * 256];
+            float *scratch = r * rows <= (int)(sizeof(tmp) / sizeof(tmp[0])) ? tmp
+                           : xmalloc((size_t)r * rows * sizeof(float), "expert scratch");
+            mm(scratch, xg + (size_t)first[j] * H, q + (size_t)o0 * rb_h, sc + (size_t)o0 * gb_h, r, H, rows);
+            for (int i = 0; i < r; i++)
+                memcpy(dst + (size_t)i * MI + o0, scratch + (size_t)i * rows, (size_t)rows * sizeof(float));
+            if (scratch != tmp) free(scratch);
         }
+        for (size_t i = (size_t)(from - base) * MI; i < (size_t)(total - base) * MI; i++) g[i] = silu(g[i]) * u[i];
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (int task = 0; task < nb * down_blocks; task++) {
+            int j = task / down_blocks, blk = task % down_blocks;
+            int r = first[j + 1] - first[j];
+            if (!r) continue;
+            int o0 = blk * BLOCK_ROWS, rows = H - o0 < BLOCK_ROWS ? H - o0 : BLOCK_ROWS;
+            const uint8_t *dq = slots[j]->buf, *ds = dq + m->part[0];
+            float tmp[4 * 256];
+            float *scratch = r * rows <= (int)(sizeof(tmp) / sizeof(tmp[0])) ? tmp
+                           : xmalloc((size_t)r * rows * sizeof(float), "expert scratch");
+            mm(scratch, g + (size_t)first[j] * MI, dq + (size_t)o0 * rb_mi, ds + (size_t)o0 * gb_mi, r, MI, rows);
+            float *dst = y + (size_t)(base + first[j]) * H;
+            for (int i = 0; i < r; i++)
+                memcpy(dst + (size_t)i * H + o0, scratch + (size_t)i * rows, (size_t)rows * sizeof(float));
+            if (scratch != tmp) free(scratch);
+        }
+        /* the group's bytes are still in RAM: the tier may promote them */
+        if (note && vkt_ready())
+            for (int j = 0; j < nb; j++) { VktExpertSrc vs = mimo_vk_src(m, slots[j]->buf); vkt_note(li, uni[b + j], &vs); }
+        m->t_expert += now_s() - t0;
     }
+#undef MIMO_WANT
+    free(first); free(xg); free(g); free(u); free(row); free(uni);
+    return total;
 }
-#endif
 
 /* Route every row, then run each chosen expert once over the rows that chose it.
- * `out` [n, H] receives the weighted sum. */
+ * `out` [n, H] receives the weighted sum.
+ *
+ * With the Vulkan tier on, vkt_issue first hands the pairs whose expert is
+ * resident on the device to one asynchronous batch; moe_cpu reads and computes
+ * the others meanwhile (an expert the device took entirely is never read from
+ * disk), and after the join every pair joins the sum in its row's routing order,
+ * the device's and the CPU's alike: the order never depends on which experts were
+ * resident. The experts the CPU computed are offered to the tier after the join
+ * (those still in the RAM cache), not while the batch runs: a promotion that
+ * displaces a resident then frees it at once, instead of at the next step, so
+ * its upload never meets a full pool (with COLI_VK_TIER_SYNC=1 such an upload
+ * would fail rather than wait, and the tier's budget would shrink). */
+#define MIMO_VK_ROWS 64              /* rows whose pairs one device batch carries at most */
 static void moe(Model *m, int li, const float *xn, int n, float *out) {
     Cfg *c = &m->c;
     Layer *l = &m->L[li];
-    int H = c->hidden, E = c->n_experts, K = c->topk, MI = c->moe_inter;
+    int H = c->hidden, E = c->n_experts, K = c->topk;
     int *sel = xmalloc((size_t)n * K * sizeof(int), "routing");
     float *wt = xmalloc((size_t)n * K * sizeof(float), "routing weights");
     float *logits = xmalloc((size_t)n * E * sizeof(float), "router logits");
@@ -1022,107 +1048,32 @@ static void moe(Model *m, int li, const float *xn, int n, float *out) {
         for (int j = 0; j < K; j++) m->ehit[li][s[j]] = 1;
     }
     free(logits);
-    /* the union of chosen experts, in first-use order */
-    int *uni = xmalloc((size_t)E * sizeof(int), "expert union");
-    int *seen = xcalloc((size_t)E, sizeof(int), "expert seen");
-    int nu = 0;
-    for (int i = 0; i < n * K; i++) if (!seen[sel[i]]) { seen[sel[i]] = 1; uni[nu++] = sel[i]; }
-    free(seen);
     memset(out, 0, (size_t)n * H * sizeof(float));
-    /* Each group of resident experts is computed in two parallel passes -- gate and
-     * up of every expert, then down of every expert -- split in row blocks, instead
-     * of three OpenMP regions per expert (a thousand a token on Flash, and every
-     * barrier costs a scheduling round on a busy machine). The kernel inside a
-     * task is the same matmul_mxfp4 on the same rows, so the numbers do not move.
-     *
-     * Every (row, choice) pair has its own slot in the buffers below, across all
-     * the groups of the block, so the weighted sum can wait for the last group
-     * and run row by row in that row's own routing order. */
-    int cap = m->cache[li].cap;
-    int *row = xmalloc((size_t)n * K * sizeof(int), "expert rows index");
-    float *rw = xmalloc((size_t)n * K * sizeof(float), "expert row weights");
     int *pair = xmalloc((size_t)n * K * sizeof(int), "expert pair of a choice");
-    int *first = xmalloc((size_t)(cap + 1) * sizeof(int), "expert row offsets");
-    float *xg = xmalloc((size_t)n * K * H * sizeof(float), "expert inputs");
-    float *g = xmalloc((size_t)n * K * MI * sizeof(float), "expert gate");
-    float *u = xmalloc((size_t)n * K * MI * sizeof(float), "expert up");
     float *y = xmalloc((size_t)n * K * H * sizeof(float), "expert out");
-    void (*mm)(float *, const float *, const uint8_t *, const uint8_t *, int, int, int)
-        = m->idot ? matmul_mxfp4_i8 : matmul_mxfp4;
-    const int BLOCK_ROWS = 256;
-    Slot *slots[4096];
-    int total = 0;                   /* pairs placed so far, over every group */
-    for (int b = 0; b < nu; b += cap) {
-        int nb = nu - b < cap ? nu - b : cap;
-        experts_ensure(m, li, uni + b, nb, slots);
-        double t0 = now_s();
-        int from = total;
-        for (int j = 0; j < nb; j++) {
-            int e = uni[b + j];
-            first[j] = total;
-            for (int t = 0; t < n; t++)
-                for (int q = 0; q < K; q++)
-                    if (sel[(size_t)t * K + q] == e) {
-                        row[total] = t; rw[total] = wt[(size_t)t * K + q];
-                        pair[(size_t)t * K + q] = total;
-                        total++;
-                    }
+    uint8_t *taken = NULL;
+    const float **dev = NULL;
+    int ndev = 0;
+    if (vkt_ready()) {
+        taken = xmalloc((size_t)n * K, "device pairs");
+        dev = xmalloc((size_t)n * K * sizeof(*dev), "device rows");
+        ndev = vkt_issue(li, xn, n, K, sel, taken);
+    }
+    int total = moe_cpu(m, li, xn, n, sel, ndev ? taken : NULL, 0, pair, y, 0, !ndev);
+    if (ndev && !vkt_join(dev)) {    /* the batch failed (the tier stops): those pairs here */
+        moe_cpu(m, li, xn, n, sel, taken, 1, pair, y, total, 0);
+        ndev = 0;
+    } else if (ndev) {               /* the CPU's experts still in RAM, now that nothing is in flight */
+        uint8_t *noted = xcalloc((size_t)E, 1, "noted experts");
+        int *by = m->cache[li].by_expert;
+        for (int i = 0; i < n * K; i++) {
+            int e = sel[i];
+            if (taken[i] || noted[e] || by[e] < 0) continue;
+            noted[e] = 1;
+            VktExpertSrc vs = mimo_vk_src(m, m->cache[li].s[by[e]].buf);
+            vkt_note(li, e, &vs);
         }
-        first[nb] = total;
-        for (int i = from; i < total; i++) memcpy(xg + (size_t)i * H, xn + (size_t)row[i] * H, (size_t)H * sizeof(float));
-        int up_blocks = (MI + BLOCK_ROWS - 1) / BLOCK_ROWS, down_blocks = (H + BLOCK_ROWS - 1) / BLOCK_ROWS;
-        int rb_mi = MI / 2, gb_mi = MI / 32, rb_h = H / 2, gb_h = H / 32;
-#ifdef COLI_VULKAN
-        unsigned char vk_gu[4096], vk_dn[4096];
-        vk_experts_gate_up(m, li, uni + b, nb, slots, first, xg, g, u, vk_gu);
-#endif
-        #pragma omp parallel for schedule(dynamic, 1)
-        for (int task = 0; task < nb * 2 * up_blocks; task++) {
-            int j = task / (2 * up_blocks), which = (task / up_blocks) % 2, blk = task % up_blocks;
-            int r = first[j + 1] - first[j];
-            if (!r) continue;
-#ifdef COLI_VULKAN
-            if (vk_gu[j]) continue;
-#endif
-            int o0 = blk * BLOCK_ROWS, rows = MI - o0 < BLOCK_ROWS ? MI - o0 : BLOCK_ROWS;
-            const uint8_t *buf = slots[j]->buf;
-            const uint8_t *q = buf + m->part[0] + m->part[1] + (which ? m->part[2] + m->part[3] : 0);
-            const uint8_t *sc = q + m->part[2];
-            float *dst = (which ? u : g) + (size_t)first[j] * MI;
-            /* rows [o0, o0+rows) of this expert's gate or up, for its r inputs; the
-             * kernel writes [r, rows] contiguously, so it goes through a scratch */
-            float tmp[4 * 256];
-            float *scratch = r * rows <= (int)(sizeof(tmp) / sizeof(tmp[0])) ? tmp
-                           : xmalloc((size_t)r * rows * sizeof(float), "expert scratch");
-            mm(scratch, xg + (size_t)first[j] * H, q + (size_t)o0 * rb_h, sc + (size_t)o0 * gb_h, r, H, rows);
-            for (int i = 0; i < r; i++)
-                memcpy(dst + (size_t)i * MI + o0, scratch + (size_t)i * rows, (size_t)rows * sizeof(float));
-            if (scratch != tmp) free(scratch);
-        }
-        for (size_t i = (size_t)from * MI; i < (size_t)total * MI; i++) g[i] = silu(g[i]) * u[i];
-#ifdef COLI_VULKAN
-        vk_experts_down(m, li, uni + b, nb, first, g, y, vk_gu, vk_dn);
-#endif
-        #pragma omp parallel for schedule(dynamic, 1)
-        for (int task = 0; task < nb * down_blocks; task++) {
-            int j = task / down_blocks, blk = task % down_blocks;
-            int r = first[j + 1] - first[j];
-            if (!r) continue;
-#ifdef COLI_VULKAN
-            if (vk_dn[j]) continue;
-#endif
-            int o0 = blk * BLOCK_ROWS, rows = H - o0 < BLOCK_ROWS ? H - o0 : BLOCK_ROWS;
-            const uint8_t *dq = slots[j]->buf, *ds = dq + m->part[0];
-            float tmp[4 * 256];
-            float *scratch = r * rows <= (int)(sizeof(tmp) / sizeof(tmp[0])) ? tmp
-                           : xmalloc((size_t)r * rows * sizeof(float), "expert scratch");
-            mm(scratch, g + (size_t)first[j] * MI, dq + (size_t)o0 * rb_mi, ds + (size_t)o0 * gb_mi, r, MI, rows);
-            float *dst = y + (size_t)first[j] * H;
-            for (int i = 0; i < r; i++)
-                memcpy(dst + (size_t)i * H + o0, scratch + (size_t)i * rows, (size_t)rows * sizeof(float));
-            if (scratch != tmp) free(scratch);
-        }
-        m->t_expert += now_s() - t0;
+        free(noted);
     }
     /* The weighted sum, row by row, each row's experts in the order ITS router
      * chose them. A row's sum used to follow the block's first-use order, which
@@ -1136,14 +1087,14 @@ static void moe(Model *m, int li, const float *xn, int n, float *out) {
     for (int t = 0; t < n; t++) {
         float *o = out + (size_t)t * H;
         for (int q = 0; q < K; q++) {
-            int i = pair[(size_t)t * K + q];
-            const float *yy = y + (size_t)i * H;
-            for (int d = 0; d < H; d++) o[d] += rw[i] * yy[d];
+            size_t i = (size_t)t * K + q;
+            const float *yy = ndev && taken[i] ? dev[i] : y + (size_t)pair[i] * H;
+            float w = wt[i];
+            for (int d = 0; d < H; d++) o[d] += w * yy[d];
         }
     }
     m->t_expert += now_s() - t1;
-    free(first); free(pair);
-    free(xg); free(g); free(u); free(y); free(row); free(rw); free(uni); free(sel); free(wt);
+    free(pair); free(y); free(taken); free(dev); free(sel); free(wt);
 }
 
 static void embed_rows(Model *m, const int *ids, int n, float *h) {
@@ -1301,6 +1252,75 @@ static int vk_dense_upload(Model *m) {
                  dw_upload(&v->b[i].up) + dw_upload(&v->b[i].down);
     }
     return n;
+}
+
+/* What vk_dense_upload will place, in bytes (the tier's budget leaves it room). */
+static size_t dw_bytes(const DW *d) {
+    if (!d->w) return 0;
+    size_t e = (size_t)d->O * d->I;
+    switch (d->fmt) {
+    case DW_F32:  return e * 4;
+    case DW_BF16: return e * 2;
+    case DW_FP8:  return e + (size_t)d->O * d->nblk * 4;
+    case DW_I8:   return e + (size_t)d->O * 4;
+    }
+    return 0;
+}
+static size_t vk_dense_bytes(const Model *m) {
+    size_t b = dw_bytes(&m->head);
+    for (int li = 0; li < m->c.n_layers; li++) {
+        const Layer *l = &m->L[li];
+        b += dw_bytes(&l->qkv) + dw_bytes(&l->o);
+        if (!m->c.moe[li]) b += dw_bytes(&l->gate) + dw_bytes(&l->up) + dw_bytes(&l->down);
+    }
+    if (g_vision) {
+        const Vision *v = g_vision;
+        b += dw_bytes(&v->embed) + dw_bytes(&v->fc1) + dw_bytes(&v->fc2);
+        for (int i = 0; i < v->depth; i++)
+            b += dw_bytes(&v->b[i].qkv) + dw_bytes(&v->b[i].proj) + dw_bytes(&v->b[i].gate) +
+                 dw_bytes(&v->b[i].up) + dw_bytes(&v->b[i].down);
+    }
+    return b;
+}
+
+/* Is the expert in this layer's RAM cache now (the tier's balance asks)? */
+static int vk_in_ram(void *ctx, int li, int e) {
+    const Model *m = ctx;
+    return m->cache[li].by_expert && m->cache[li].by_expert[e] >= 0;
+}
+
+/* The routed experts on the shared tier (vk_tier.c): the release's MXFP4 with its
+ * e8m0 group scales, SwiGLU. This engine keeps no expert history, so the tier
+ * starts empty and fills as experts pass by, evicting the coldest once its budget
+ * is full. MIMO_VK_EXPERTS, the switch of the per-engine tier before this one, is
+ * read as follows: 0 keeps the experts on the CPU (no tier), N > 0 sizes the
+ * budget at N experts (COLI_VK_TIER_GB, which wins when set); unset, the tier's own
+ * budget applies. */
+static void vk_tier_start(Model *m) {
+    Cfg *c = &m->c;
+    VktFmt f = {VKT_SRC_MXFP4_E8M0, 32};
+    const char *mx = getenv("MIMO_VK_EXPERTS"), *gb = getenv("COLI_VK_TIER_GB");
+    if (mx && *mx && atoi(mx) > 0 && !(gb && *gb)) {
+        size_t eb = vkt_expert_bytes(c->hidden, c->moe_inter, f, f);
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.12g", ((double)atoi(mx) * eb + eb / 2) / 1073741824.0);
+        setenv("COLI_VK_TIER_GB", buf, 1);
+        fprintf(stderr, "[VK] mimo: MIMO_VK_EXPERTS=%s read as a tier budget of %s experts (COLI_VK_TIER_GB=%s)\n",
+                mx, mx, buf);
+    }
+    int cap = 0, nmoe = 0;
+    for (int li = 0; li < c->n_layers; li++) if (c->moe[li]) { nmoe++; if (m->cache[li].cap > cap) cap = m->cache[li].cap; }
+    VktConfig vc = {.engine = "mimo", .layers = c->n_layers, .experts = c->n_experts,
+                    .hidden = c->hidden, .inter = c->moe_inter, .topk = c->topk,
+                    .gate_up = f, .down = f, .act = VKT_ACT_SWIGLU,
+                    .max_rows = MIMO_VK_ROWS * c->topk,
+                    .ram_reserve = (size_t)(m->e_bytes + 8192) * (size_t)cap * (size_t)nmoe,
+                    .dense_bytes = coli_vk_dense() ? vk_dense_bytes(m) : 0,
+                    .in_ram = vk_in_ram, .ram_ctx = m};
+    if (vkt_init(&vc, NULL)) {
+        atexit(coli_vk_shutdown);   /* runs after the tier's teardown: the device goes before the drivers unload */
+        atexit(vkt_shutdown);
+    }
 }
 #endif
 
@@ -1504,7 +1524,7 @@ static void serve_emap(Model *m) {
     for (int li = 0; li < c->n_layers; li++) {
         if (!c->moe[li]) continue;
         for (int e = 0; e < cols; e++) {
-            int byte = (m->cache[li].by_expert[e] >= 0) << 6;
+            int byte = (vkt_resident(li, e) ? 2 : m->cache[li].by_expert[e] >= 0) << 6;   /* 2 = on the Vulkan device */
             hex[w++] = "0123456789abcdef"[byte >> 4];
             hex[w++] = "0123456789abcdef"[byte & 15];
         }
@@ -1720,6 +1740,7 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *dir) {
                    (unsigned long long)(m->forwards - fw0));
         serve_hits(m);
         serve_emap(m);
+        vkt_report("turn", m->hits, m->miss);   /* the Vulkan tier's line, when it runs */
         coli_serve_command_dispose(&command);
     }
     free(ids); free(logits); free(pending);
@@ -1729,13 +1750,13 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *dir) {
 
 /* Once, at the end: how many products the GPU actually took, so a run that
  * asked for Vulkan and quietly stayed on the CPU says so. */
-static void vk_report(void) {
+static void vk_report(const Model *m) {
 #ifdef COLI_VULKAN
     if (!g_vk_ready) return;
     fprintf(stderr, "[VK] mimo: %llu matmuls on the GPU\n", coli_vk_matmul_calls());
-    if (g_vkx)
-        fprintf(stderr, "[VK] mimo: %ld experts resident on the GPU, %llu of those matmuls were theirs\n",
-                g_vkx_resident, g_vkx_calls);
+    vkt_report("run", m->hits, m->miss);
+#else
+    (void)m;
 #endif
 }
 
@@ -1790,18 +1811,24 @@ int main(int argc, char **argv) {
     Cfg *c = &m->c;
     g_vision = vision_load(m, dir);
 #ifdef COLI_VULKAN
-    /* after the weights, so a missing device costs one line and nothing else */
-    g_vk_ready = coli_vk_init_env("mimo");
+    /* after the weights, so a missing device costs one line and nothing else; the
+     * routed-expert tier first, then the dense matrices where coli_vk_dense() puts
+     * them (on a device that shares the CPU's RAM they stay on the CPU while the
+     * tier is on; COLI_VK_DENSE decides when set) */
+    {
+        int any_moe = 0;
+        for (int i = 0; i < c->n_layers; i++) any_moe |= c->moe[i];
+        const char *mx = getenv("MIMO_VK_EXPERTS");
+        int tier = vkt_wanted() && any_moe && !(mx && *mx && atoi(mx) <= 0);   /* MIMO_VK_EXPERTS=0: experts on the CPU */
+        g_vk_ready = coli_vk_init_env_tier("mimo", tier);
+        if (g_vk_ready && tier) vk_tier_start(m);
+        if (g_vk_ready && !vkt_ready() && !coli_vk_dense()) coli_vk_dense_decide("mimo", 0, 1);   /* no tier after all */
+    }
     if (g_vk_ready && coli_vk_dense()) {   /* COLI_VK_DENSE=0: the trunk stays on the CPU */
         int up = vk_dense_upload(m);
         size_t used = 0, count = 0;
         coli_vk_mem_info(&used, &count);
         fprintf(stderr, "[VK] mimo: %d dense matrices on the GPU (%.2f GB)\n", up, used / 1e9);
-    }
-    int vk_experts = env_int("MIMO_VK_EXPERTS", 0);
-    if (g_vk_ready && vk_experts > 0) {
-        g_vkx = xcalloc((size_t)c->n_layers * c->n_experts, sizeof(VkExpert), "GPU experts");
-        g_vkx_left = vk_experts;
     }
 #endif
     int swa = 0, shown_cap = 0;
@@ -1823,7 +1850,7 @@ int main(int argc, char **argv) {
     if (env_int("SERVE", 0)) {
         if (!have_tok) { fprintf(stderr, "[mimo] SERVE needs %s\n", tok_path); return 1; }
         serve_loop(m, &tokenizer, dir);
-        vk_report();
+        vk_report(m);
         return 0;
     }
     int *ids = xmalloc(((size_t)m->ctx + 1) * sizeof(int), "ids");
@@ -1899,6 +1926,6 @@ int main(int argc, char **argv) {
             (unsigned long long)m->hits, (unsigned long long)m->miss, m->bytes_read / 1e6, rss_gb(),
             m->t_disk, m->t_disk > 0 ? m->bytes_read / 1e9 / m->t_disk : 0.0, m->t_expert, m->t_attn,
             total - m->t_disk - m->t_expert - m->t_attn);
-    vk_report();
+    vk_report(m);
     return 0;
 }
