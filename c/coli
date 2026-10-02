@@ -1504,6 +1504,11 @@ def cmd_doctor(a):
         report=run_image_doctor(a.model, engine)
         print(json.dumps(report,indent=2) if a.json else format_doctor(report))
         return exit_code(report)
+    if is_decision_model(a.model) and engine_error is None:
+        from doctor import run_decision_doctor
+        report=run_decision_doctor(a.model, engine)
+        print(json.dumps(report,indent=2) if a.json else format_doctor(report))
+        return exit_code(report)
     report=run_doctor(
         # engine_path was hardcoded to GLM, so `coli doctor` inspected colibri
         # no matter which model it was pointed at: a built kimi_k3/inkling was

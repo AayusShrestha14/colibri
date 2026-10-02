@@ -313,6 +313,56 @@ class DecisionGateway(unittest.TestCase):
         self.assertIn("only 3 of its 30", error["error"]["message"])
 
 
+class DecisionRegistryAndLauncher(unittest.TestCase):
+    """A Laya checkpoint has no root config.json: the registry knows it by its
+    rl_agent_config.json and its encoder's config, and coli describes it and
+    refuses to chat with it."""
+
+    def checkpoint(self, encoder):
+        import tempfile
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        (root / "encoder").mkdir()
+        (root / "rl_agent_config.json").write_text(json.dumps({"head_layers": 2}), encoding="utf-8")
+        (root / "encoder" / "config.json").write_text(json.dumps(encoder), encoding="utf-8")
+        return root
+
+    def test_the_registry_knows_a_laya_checkpoint(self):
+        from family_registry import UnknownFamilyError, default_model_id, display_for, resolve_model
+        english = resolve_model(self.checkpoint({"model_type": "modernbert", "hidden_size": 1024,
+                                                 "num_hidden_layers": 28}))
+        self.assertEqual((english.descriptor.id, english.descriptor.modality), ("laya", "decision"))
+        self.assertTrue(english.descriptor.capabilities.decision)
+        self.assertEqual(display_for(english), ("Laya", "421M"))
+        multilingual = resolve_model(self.checkpoint({"model_type": "modernbert", "hidden_size": 768,
+                                                      "num_hidden_layers": 22}))
+        self.assertEqual(display_for(multilingual), ("Laya multilingual", "322M"))
+        self.assertEqual(default_model_id(multilingual), "laya-multilingual")
+        with self.assertRaises(UnknownFamilyError):
+            resolve_model(self.checkpoint({"model_type": "deberta-v2"}))
+
+    def test_coli_describes_it_and_refuses_to_chat(self):
+        import subprocess
+        if not (FIXTURE / "rl_agent_config.json").exists():
+            self.skipTest("laya_tiny missing")
+        def coli(*args):
+            return subprocess.run([sys.executable, str(HERE / "coli"), *args], capture_output=True,
+                                  text=True, timeout=120, cwd=str(HERE))
+        info = coli("info", "--model", str(FIXTURE))
+        self.assertIn("decision model", info.stdout)
+        plan = coli("plan", "--model", str(FIXTURE), "--json")
+        self.assertEqual(json.loads(plan.stdout)["modality"], "decision")
+        doctor = json.loads(coli("doctor", "--model", str(FIXTURE), "--json").stdout)
+        self.assertIn({"id": "model.family", "status": "pass"},
+                      [{"id": c["id"], "status": c["status"]} for c in doctor["checks"]])
+        for command in (("chat", "--model", str(FIXTURE), "--no-attach"),
+                        ("run", "--model", str(FIXTURE), "hello")):
+            refused = coli(*command)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("POST /v1/systemone", refused.stdout + refused.stderr)
+
+
 def _laya_ready():
     return (FIXTURE / "model.safetensors").exists() and BINARY.exists()
 
