@@ -626,7 +626,10 @@ class ServerControl(HomeTestCase):
         except (OSError, ValueError):
             pass
 
-    def wait_state(self, cfg, state, timeout=10):
+    def wait_state(self, cfg, state, timeout=60):
+        # A deadline, not a delay: a quick machine returns at once. A loaded CI
+        # runner (macOS, where the whole Python suite takes over 8 minutes) can
+        # need well over 10 s to start the stand-in server's interpreter.
         deadline = time.time() + timeout
         status = setup_flow.server_status(cfg)
         while status["state"] != state and time.time() < deadline:
