@@ -1394,6 +1394,9 @@ static void q38_pin_state_free(void *v){
 static int q38_pin_state_copy(Model *m, Q38PinState **slot, int to_state){
     const Cfg *c = &m->c;
     size_t rec = 0, conv = 0, ple = 0;
+#ifdef COLI_VULKAN
+    if (to_state) q38c_sync_host(m);   /* the dense chain keeps the newest state on the device */
+#endif
     if (!q38_prefix_geometry(m, &rec, &conv, &ple)) return 0;
     Q38PinState *st = *slot;
     if (st && st->n_layers != c->layers){ q38_pin_state_free(st); st = NULL; }
@@ -1443,6 +1446,9 @@ static int q38_pin_state_copy(Model *m, Q38PinState **slot, int to_state){
         }
     }
     q38_mtp_state_copy(m, st->mtp_pend, &st->mtp_len, &st->mtp_pend_n, &st->mtp_pend_tok, to_state);
+#ifdef COLI_VULKAN
+    if (!to_state) q38c_host_wrote(m, 0);   /* up to the device before the next chain step */
+#endif
     return 1;
 }
 
@@ -1542,6 +1548,10 @@ static int q38_prefix_ids_reserve(int len){
 }
 
 static void q38_prefix_copy_state(Model *m,int to_cache){
+#ifdef COLI_VULKAN
+    if(to_cache)q38c_sync_host(m);
+    else q38c_host_wrote(m,0);
+#endif
     for(int i=0;i<m->c.layers;i++)if(!m->c.is_attn[i]){
         float *rec=to_cache?g_q38_prefix.dn_rec[i]:m->DN_rec[i];
         float *conv=to_cache?g_q38_prefix.dn_conv[i]:m->DN_conv[i];
@@ -1900,6 +1910,7 @@ static void serve_loop(Model *m){
             int status=serve_one(m,&q);free(q.payload);
 #ifdef COLI_VULKAN
             q38_vk_report();   /* stderr: the wire protocol on stdout is untouched */
+            q38c_report(m);
             vkt_report("turn", m->hits, m->miss);
 #endif
             if(status<0){q38_prefix_cache_release(m);return;}
@@ -2044,6 +2055,13 @@ int main(int argc, char **argv) {
      * device (or COLI_VULKAN unset) leaves g_vk_ready 0, the CPU path. */
     g_vk_ready=coli_vk_init_env_tier("qwen38",vkt_wanted()&&m.c.experts>0&&!qt_ready());
     g_vk_dense=coli_vk_dense();   /* COLI_VK_DENSE; unset, off on a device sharing the CPU's RAM with the tier on */
+    /* COLI_VK_CHAIN: every layer's dense chain on the device (qwen38_chain.h); the CUDA
+     * tier keeps its priority */
+    /* measured on a Radeon 780M: prefill faster, decode slower in either mode, so opt-in
+     * on an integrated GPU (docs/vulkan.md, "The dense chain") */
+    if(g_vk_ready&&!qt_ready())
+        g_vk_chain=coli_vk_chain_decide("qwen38",vkt_wanted()&&m.c.experts>0,COLI_VK_CHAIN_OFF);
+    if(g_vk_chain&&!vkc_init())g_vk_chain=0;
 #endif
     if(is_ref)ref_logits=read_reference_logits(ref_root,m.c.vocab);
     g_capture_last_logit=ref_logits!=NULL||getenv("DUMP")!=NULL;
@@ -2056,6 +2074,7 @@ int main(int argc, char **argv) {
 #ifdef COLI_VULKAN
     q38_vk_tier_start(&m, cap);   /* COLI_VULKAN=1: hot routed experts on the device (vk_tier.c) */
     if(g_vk_ready&&!vkt_ready()&&!g_vk_dense)g_vk_dense=coli_vk_dense_decide("qwen38",0,1);   /* no tier after all */
+    if(g_vk_chain)atexit(vkc_shutdown);   /* registered after the tier's: runs before the device goes */
 #endif
     fprintf(stderr, "resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
 
@@ -2085,6 +2104,7 @@ int main(int argc, char **argv) {
         printf("Speed: %.2f tok/s (%.1fs for %d tokens) | PEAK RSS: %.2f GB\n", scored/dt, dt, scored, rss_gb());
 #ifdef COLI_VULKAN
         q38_vk_report();
+        q38c_report(&m);
         vkt_report("run", m.hits, m.miss);
 #endif
         rt_save(g_q38_usage,0);
@@ -2167,6 +2187,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Speed: %.2f tok/s (%.1fs for %d tokens)\n", n_new/dt, dt, n_new);
 #ifdef COLI_VULKAN
     q38_vk_report();
+    q38c_report(&m);
     vkt_report("run", m.hits, m.miss);
 #endif
     rt_save(g_q38_usage, 0);
@@ -2405,7 +2426,7 @@ static void q38_vk_dense_add(const Q38Weight *w,size_t *bytes){
 }
 static size_t q38_vk_dense_bytes(Model *m){
     size_t b=0;
-    if(!g_vk_dense)return 0;
+    if(!g_vk_dense&&!g_vk_chain)return 0;
     q38_vk_dense_add(&m->lm_head,&b);
     const GatedResidual *f=&m->final_gr;
     q38_vk_dense_add(&f->down,&b);q38_vk_dense_add(&f->up,&b);q38_vk_dense_add(&f->inject,&b);

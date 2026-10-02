@@ -220,6 +220,9 @@ typedef struct {
     float **snap_rec, **snap_conv, *snap_ple;
     int64_t snap_ple_history[2];
     int snap_ple_history_len;
+#ifdef COLI_VULKAN
+    void *vkchain;                 /* the dense chain's device state (qwen38_chain.h), NULL until it runs */
+#endif
 } Model;
 
 /* Layer rows of storage: the c.layers decoder layers, plus the MTP head's at
@@ -464,21 +467,32 @@ static int q38_vk_eligible(const Q38Weight *w) {
                      (w->kind==Q38_WEIGHT_BF16 || w->kind==Q38_WEIGHT_F32));
 }
 static unsigned g_q38_vk_placed[3];   /* uploads by format: int8 rows, bf16, f32 */
+/* The weight's device copy, uploaded on the first call; NULL when it is not eligible
+ * or the upload failed (vk_off). The dense chain (qwen38_chain.h) reads the same one. */
+static ColiVkTensor *q38_vk_tensor(const Q38Weight *weight) {
+    if(!weight||weight->vk_off||!q38_vk_eligible(weight))return NULL;
+    Q38Weight *w=(Q38Weight*)weight;   /* vk is a cache in a weight the forward pass treats as read-only */
+    ColiVkTensor **t=(ColiVkTensor**)&w->vk;
+    if(*t)return *t;
+    int fmt=w->q8?1:w->kind==Q38_WEIGHT_BF16?11:10;
+    const void *wq=w->q8?(const void*)w->q8:(const void*)w->data;
+    const float *sc=w->q8?w->q8sc:NULL;   /* fmt 10/11: no scales */
+    if(!coli_vk_tensor_ensure(t,wq,sc,fmt,w->cols,w->rows,0)){w->vk_off=1;return NULL;}
+    g_q38_vk_placed[fmt==1?0:fmt==11?1:2]++;
+    return *t;
+}
 static int q38_vk_matmul(float *y,const float *x,const Q38Weight *weight,int S,int I,int O) {
 #ifdef _OPENMP
     if(omp_in_parallel())return 0;
 #endif
     if(weight->vk_off||S<1||S>65535)return 0;
-    Q38Weight *w=(Q38Weight*)weight;   /* vk is a cache in a weight the forward pass treats as read-only */
-    ColiVkTensor **t=(ColiVkTensor**)&w->vk;
+    Q38Weight *w=(Q38Weight*)weight;
     int fmt=w->q8?1:w->kind==Q38_WEIGHT_BF16?11:10;
     const void *wq=w->q8?(const void*)w->q8:(const void*)w->data;
     const float *sc=w->q8?w->q8sc:NULL;   /* fmt 10/11: no scales */
-    if(!*t){
-        if(!coli_vk_tensor_ensure(t,wq,sc,fmt,I,O,0)){w->vk_off=1;return 0;}
-        g_q38_vk_placed[fmt==1?0:fmt==11?1:2]++;
-    }
-    return coli_vk_matmul(t,y,x,wq,sc,fmt,S,I,O,0);
+    ColiVkTensor *t=q38_vk_tensor(w);
+    if(!t)return 0;
+    return coli_vk_matmul(&t,y,x,wq,sc,fmt,S,I,O,0);
 }
 /* One line at the end of a run or a serve turn: how many matmuls the device
  * really answered, so a test can tell a used path from an initialised one. */
@@ -2593,7 +2607,12 @@ static void q38_expert_row(Model *m,int layer,int eid,const float *xs,float *eg,
     q38_tm_add(m,Q38_TM_ROUTED_EXPERT,started);
 }
 
-static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,float *out) {
+/* logits_in: the router's raw rows (S x E) when the caller has them, else NULL and the
+ * router runs here; routed_only = 1: `out` gets the routed experts' rank-order sum
+ * without the shared expert (the Vulkan dense chain runs the router and the shared
+ * expert on the device and adds them there). q38_moe passes NULL, 0: unchanged. */
+static void q38_moe_decode_ex(Model *m,Layer *l,int layer,const float *x,int S,float *out,
+                              const float *logits_in,int routed_only) {
     Cfg *c=&m->c;int H=c->hidden,E=c->experts,K=c->topk,I=c->inter,SI=c->shared_inter;
     float *logits=falloc(E),*sg=falloc(SI),*su=falloc(SI),*sh=falloc(SI),*shared=falloc(H);
     float *eg=falloc(I),*eu=falloc(I),*eh=falloc(I),*eo=falloc(H);
@@ -2601,7 +2620,9 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
     float *ebuf=vk?falloc((int64_t)K*H):NULL;
     for(int s=0;s<S;s++){
         const float *xs=x+(int64_t)s*H;float *ys=out+(int64_t)s*H;memset(ys,0,(size_t)H*sizeof(float));
-        q38_dense_matmul(m,logits,xs,&l->router,1,H,E);float mx=logits[0];for(int e=1;e<E;e++)if(logits[e]>mx)mx=logits[e];
+        if(logits_in)memcpy(logits,logits_in+(int64_t)s*E,(size_t)E*sizeof(float));
+        else q38_dense_matmul(m,logits,xs,&l->router,1,H,E);
+        float mx=logits[0];for(int e=1;e<E;e++)if(logits[e]>mx)mx=logits[e];
         double all=0;for(int e=0;e<E;e++){logits[e]=expf(logits[e]-mx);all+=logits[e];}
         int idx[Q38_MAX_TOPK];float val[Q38_MAX_TOPK];
         for(int z=0;z<K;z++){int best=-1;float bv=-1.f;for(int e=0;e<E;e++){int used=0;for(int j=0;j<z;j++)if(idx[j]==e)used=1;if(!used&&logits[e]>bv){bv=logits[e];best=e;}}idx[z]=rt_router_pick(best,z,E,layer);val[z]=logits[idx[z]];}
@@ -2621,10 +2642,13 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
         for(int z=0;z<K;z++)if(!((qmask>>z)&1u)&&!taken[z]){cpu_idx[cpu_n]=idx[z];cpu_rank[cpu_n]=z;cpu_n++;}
         q38_prefetch_experts(m,layer,cpu_idx,cpu_n);
         double phase_started=now_s();
+        float gate=0.f;
+        if(!routed_only){
         q38_weight_matmul(sg,xs,&l->sh_g,1,H,SI);q38_weight_matmul(su,xs,&l->sh_u,1,H,SI);
         for(int j=0;j<SI;j++)sh[j]=q38_silu(sg[j])*su[j];q38_weight_matmul(shared,sh,&l->sh_d,1,SI,H);
-        float gate=0.f;for(int d=0;d<H;d++)gate+=xs[d]*l->sh_gate[d];gate=q38_sigmoid(gate);
+        for(int d=0;d<H;d++)gate+=xs[d]*l->sh_gate[d];gate=q38_sigmoid(gate);
         q38_tm_add(m,Q38_TM_SHARED_EXPERT,phase_started);
+        }
         Slot *selected[Q38_MAX_TOPK];
         int loaded_batch=q38_expert_get_batch(m,layer,cpu_idx,cpu_n,selected);
         for(int i=0;i<cpu_n;i++){
@@ -2659,10 +2683,13 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
             fprintf(stderr,"qwen38: CUDA expert collection failed at layer %d; stopping inference\n",layer);
             exit(1);
         }
-        for(int d=0;d<H;d++)ys[d]+=gate*shared[d];
+        if(!routed_only)for(int d=0;d<H;d++)ys[d]+=gate*shared[d];
     }
     rt_trace_end();
     free(logits);free(sg);free(su);free(sh);free(shared);free(eg);free(eu);free(eh);free(eo);free(ebuf);
+}
+static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,float *out) {
+    q38_moe_decode_ex(m,l,layer,x,S,out,NULL,0);
 }
 
 typedef struct {
@@ -2717,7 +2744,7 @@ static void q38_prefill_expert_rows(Model *m,Slot *expert,const float *xc,int K,
  * weighted reduction still visits rank 0..top-k-1 for every row, preserving the
  * decode path's floating-point accumulation order. */
 static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
-                            int S,float *out) {
+                            int S,float *out,const float *logits_in,int routed_only) {
     Cfg *c=&m->c;
     int H=c->hidden,E=c->experts,K=c->topk,I=c->inter,SI=c->shared_inter;
     int rows_capacity=q38_moe_prefill_rows(c,S);
@@ -2765,7 +2792,8 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
         /* Route the complete chunk with one resident router matmul.  Selection
          * intentionally mirrors q38_moe_decode, including rt_router_pick's
          * deterministic fallback for invalid logits. */
-        q38_dense_matmul(m,logits,x+(int64_t)base*H,&l->router,rows,H,E);
+        if(logits_in)memcpy(logits,logits_in+(int64_t)base*E,(size_t)rows*E*sizeof(float));
+        else q38_dense_matmul(m,logits,x+(int64_t)base*H,&l->router,rows,H,E);
         for(int s=0;s<rows;s++) {
             float *probabilities=logits+(int64_t)s*E;
             float maximum=probabilities[0];
@@ -2844,6 +2872,7 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
         /* Shared expert work is independent across rows and remains resident;
          * batching it here also keeps its cost out of the routed groups. */
         double phase_started=now_s();
+        if(!routed_only){
         q38_weight_matmul(shared_g,x+(int64_t)base*H,&l->sh_g,rows,H,SI);
         q38_weight_matmul(shared_u,x+(int64_t)base*H,&l->sh_u,rows,H,SI);
         for(int s=0;s<rows;s++)
@@ -2859,6 +2888,7 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
             shared_gate[s]=q38_sigmoid(gate);
         }
         q38_tm_add(m,Q38_TM_SHARED_EXPERT,phase_started);
+        }
 
         /* A demand-set batch is particularly effective for native FP8: reserve
          * all slots before workers read the two coalesced ranges.  Other native
@@ -2939,7 +2969,7 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
                 for(int d=0;d<H;d++)ys[d]+=gate*expert_output[d];
             }
             const float *shared=shared_out+(int64_t)s*H;
-            for(int d=0;d<H;d++)ys[d]+=shared_gate[s]*shared[d];
+            if(!routed_only)for(int d=0;d<H;d++)ys[d]+=shared_gate[s]*shared[d];
         }
         base+=rows;
     }
@@ -2952,13 +2982,20 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
     free(vk_idx);free(vk_taken);free(vk_dev);free(vk_cpu);free(vk_sub);
 }
 
-static void q38_moe(Model *m,Layer *l,int layer,const float *x,int S,float *out) {
+static void q38_moe_ex(Model *m,Layer *l,int layer,const float *x,int S,float *out,
+                       const float *logits_in,int routed_only) {
     /* An MTP verify on the CUDA tier routes row by row as decode does, so
      * the tier's resident experts serve it (the batched path is CPU only). */
     if(S<=1||!m->prefill_batch||(g_q38_rowwise&&qt_ready()&&layer<m->c.layers))
-        q38_moe_decode(m,l,layer,x,S,out);
-    else q38_moe_prefill(m,l,layer,x,S,out);
+        q38_moe_decode_ex(m,l,layer,x,S,out,logits_in,routed_only);
+    else q38_moe_prefill(m,l,layer,x,S,out,logits_in,routed_only);
 }
+static void q38_moe(Model *m,Layer *l,int layer,const float *x,int S,float *out) {
+    q38_moe_ex(m,l,layer,x,S,out,NULL,0);
+}
+#ifdef COLI_VULKAN
+#include "qwen38_chain.h"  /* COLI_VK_CHAIN: every layer's dense chain on the device */
+#endif
 
 static void reset_recurrent(Model *m) {
     kv_prefix_clear(&m->kvp);
@@ -2969,6 +3006,9 @@ static void reset_recurrent(Model *m) {
     }
     memset(m->PLE_conv_state,0,(size_t)c->hc_width*(c->ple_convk-1)*c->ngram_size*sizeof(float));m->ple_history_len=0;
     m->mtp_len=0;m->mtp_pend_n=0;   /* the MTP head's rows go with the model's */
+#ifdef COLI_VULKAN
+    q38c_host_wrote(m,1);           /* zeros: the dense chain fills its copy with zeros */
+#endif
 }
 
 static void ensure_kv(Model *m) {
@@ -3073,25 +3113,58 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
         for(int b=1;b<C;b++)memcpy(e+(int64_t)b*H,e,(size_t)H*sizeof(float));
     }
     float *mixed=falloc((int64_t)S*H),*inject=falloc((int64_t)S*C),*block=falloc((int64_t)S*H);
+#ifdef COLI_VULKAN
+    /* COLI_VK_CHAIN: the layers, the final mixer and lm_head on the device; the streams
+     * come back for the MTP head, every row's mixed for the prefill read-out */
+    float *chain_logit=NULL;
+    if(g_vk_chain){
+        int echo=g_echo_k>0&&g_echo_id&&S>1;
+        chain_logit=falloc((int64_t)nlogits*c->vocab);
+        if(q38c_forward(m,ids,S,pos_base,nlogits,hyper,streams!=NULL,echo?mixed:NULL,chain_logit)){
+            free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;   /* consumed, as q38_layer_forward does */
+        } else {
+            free(chain_logit); chain_logit=NULL;
+            q38c_cpu_step(m,pos_base);
+        }
+    }
+    if(!chain_logit){
+#endif
     for(int i=0;i<c->layers;i++)
         q38_layer_forward(m,i,hyper,ids,S,pos_base,mixed,inject,block);
-    q38_gr_read(m,&m->final_gr,hyper,S,mixed,NULL);m->kv_len=pos_base+S;
+    q38_gr_read(m,&m->final_gr,hyper,S,mixed,NULL);
+#ifdef COLI_VULKAN
+    }
+#endif
+    m->kv_len=pos_base+S;
     /* Rewinding and writing a shorter branch invalidates its old tail. */
     if(m->kvp.len>pos_base)m->kvp.len=pos_base;
     kv_prefix_record(&m->kvp,ids,pos_base,S);
     if(m->vis_map && m->vis_rows_n>0)kv_prefix_taint(&m->kvp);
-    float *logit=falloc((int64_t)nlogits*c->vocab);double phase_started=now_s();
+    float *logit;
+#ifdef COLI_VULKAN
+    if(chain_logit)logit=chain_logit; else
+#endif
+    logit=falloc((int64_t)nlogits*c->vocab);
+    double phase_started=now_s();
     /* Lettura del prefill: la posizione p predice il token p+1. Il primo token
      * fresco lo predice la fotografia del prefisso, quando c'e. Pagata solo da
      * chi ha chiesto il canale. */
     if(g_echo_k>0&&g_echo_id&&S>0){
         if(g_echo_pin_logit)
             q38_echo(g_echo_id,pos_base,ids[0],g_echo_pin_logit,c->vocab,g_echo_k);
+        float *elog=logit;
+#ifdef COLI_VULKAN
+        if(chain_logit)elog=falloc(c->vocab);   /* logit already holds the chain's last rows */
+#endif
         for(int p=0;p+1<S;p++){
-            q38_weight_matmul(logit,mixed+(int64_t)p*H,&m->lm_head,1,H,c->vocab);
-            q38_echo(g_echo_id,pos_base+p+1,ids[p+1],logit,c->vocab,g_echo_k);
+            q38_weight_matmul(elog,mixed+(int64_t)p*H,&m->lm_head,1,H,c->vocab);
+            q38_echo(g_echo_id,pos_base+p+1,ids[p+1],elog,c->vocab,g_echo_k);
         }
+        if(elog!=logit)free(elog);
     }
+#ifdef COLI_VULKAN
+    if(!chain_logit)
+#endif
     q38_weight_matmul(logit,mixed+(int64_t)(S-nlogits)*H,&m->lm_head,nlogits,H,c->vocab);
     q38_tm_add(m,Q38_TM_LM_HEAD,phase_started);
     if(streams)*streams=hyper; else free(hyper);
@@ -3293,6 +3366,9 @@ typedef struct {
 /* Back to the state after the verify's first row, `len` positions fed. */
 static void q38_spec_rollback(Model *m,int len) {
     Cfg *c=&m->c;
+#ifdef COLI_VULKAN
+    q38c_rollback(m);   /* the dense chain's own copies: its device buffers swap too */
+#endif
     for(int i=0;i<c->layers;i++)if(!c->is_attn[i]){
         float *t=m->DN_rec[i];m->DN_rec[i]=m->snap_rec[i];m->snap_rec[i]=t;
         t=m->DN_conv[i];m->DN_conv[i]=m->snap_conv[i];m->snap_conv[i]=t;
