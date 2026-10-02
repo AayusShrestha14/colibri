@@ -201,9 +201,28 @@ GEMM, 0.7 s). Two things measured there hold it at parity:
   the samples during the Qwen3.8 runs): a GEMM that takes 1.1 ms back to back takes
   2.3 ms after a 3 ms CPU gap. Fewer, larger calls (512-row chunks) are what lift
   it to parity.
-- Per-token calls. Qwen3.6 without the CUDA tier projects its DeltaNet inputs one
+- Per-token calls. Qwen3.6 without the CUDA tier projected its DeltaNet inputs one
   token at a time (`deltanet()` in qwen36.c): 46,081 of its 46,281 device matmuls
-  are S = 1 and stay on the GEMV (20 s of its 56).
+  were S = 1 and stayed on the GEMV (20 s of its 56).
+
+The engines now project per block of rows wherever prefill used to call the device
+once per token, recurrences and gathers still consuming the rows in order, and with
+CPU outputs byte-identical to the per-token build: Qwen3.6's DeltaNet inputs and
+out_proj, Qwen3.8's PLE keys and values, DeepSeek V4.1's router, indexer, index keys,
+compressor and vision tower, DeepSeek V4's router, compressors and index queries,
+GLM-5.3's device-resident projections, Kimi K3's DSA index keys and Inkling's
+per-position heads. Same 780M, same runs:
+
+| | CPU | Vulkan, tiled GEMM | device matmuls (GEMV / GEMM) |
+|---|---|---|---|
+| Qwen3.6-35B-A3B, per token | 40.9 s | 56.3 s | 46,081 / 200 |
+| Qwen3.6-35B-A3B, per block | 36.0 s | 37.2 s | 1 / 380 |
+| Qwen3.8 Flash Next, per token | 50.7 s | 53.8 s | 2,273 / 5,054 |
+| Qwen3.8 Flash Next, per block | 52.8 s | 55.3 s | 1,249 / 5,086 |
+
+The CPU gains too where the block lets a matrix stay in cache across rows (Qwen3.6's
+DeltaNet: 7.1 to 2.5 s). Qwen3.8's block saves its 0.9 s of PLE GEMVs, inside the
+run-to-run spread of its expert reads (cold page cache, about 2 s).
 
 ## Correctness
 
