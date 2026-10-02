@@ -3466,6 +3466,7 @@ def main():
     plogs=sub.add_parser("logs",help="the last lines of the background server (or install) log")
     plogs.add_argument("-n","--lines",type=int,default=100)
     plogs.add_argument("--install",action="store_true",help="the install log instead of the server's")
+    sub.add_parser("mcp",help="Model Context Protocol server on stdio, for AI coding assistants")
     pb=sub.add_parser("bench", parents=[common]); pb.add_argument("tasks", nargs="*")
     pb.add_argument("--limit",type=int,default=40)
     if sys.platform == "win32":
@@ -3498,6 +3499,9 @@ def main():
         flow={"setup":setup_flow.cmd_setup,"start":setup_flow.cmd_start,
               "status":setup_flow.cmd_status,"logs":setup_flow.cmd_logs}[a.cmd]
         sys.exit(setup_flow.run(flow,a))
+    if a.cmd=="mcp":
+        import mcp_server
+        sys.exit(mcp_server.main())
     if a.cmd=="cluster":
         if a.cluster_cmd=="coordinator": handler=cmd_cluster_coordinator
         elif a.cluster_cmd=="worker": handler=cmd_cluster_worker
