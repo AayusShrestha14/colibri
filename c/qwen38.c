@@ -2448,6 +2448,12 @@ static int q38_vk_read_direct(Model *m,int layer,int e,uint8_t *buf,int64_t cap,
     *src=(VktExpertSrc){buf,buf+w[0]->nbytes,buf+pair,sc,sc+bank->scale_count,sc+2*bank->scale_count};
     return 1;
 }
+/* Is the expert in this layer's RAM cache now (the tier's balance asks)? */
+static int q38_vk_in_ram(void *ctx,int layer,int e){
+    Model *m=(Model*)ctx; LCache *lc=&m->cache[layer];
+    int si=lc->by_expert?lc->by_expert[e]:-1;
+    return si>=0&&si<lc->n&&lc->slots[si].eid==e;
+}
 static void q38_vk_tier_start(Model *m,int cap){
     if(!g_vk_ready||qt_ready()){
         if(g_vk_ready&&qt_ready())
@@ -2476,7 +2482,8 @@ static void q38_vk_tier_start(Model *m,int cap){
                   .gate_up=f,.down=f,.act=VKT_ACT_SWIGLU,
                   .max_rows=q38_moe_prefill_rows(c,q38_prefill_batch_rows())*c->topk,
                   .ram_reserve=ram_expert*(size_t)cap*(size_t)c->layers,
-                  .dense_bytes=q38_vk_dense_bytes(m)};
+                  .dense_bytes=q38_vk_dense_bytes(m),
+                  .in_ram=q38_vk_in_ram,.ram_ctx=m};
     if(vc.max_rows<64)vc.max_rows=64;
     uint32_t **heat=rt_counts_all();
     if(!vkt_init(&vc,heat))return;

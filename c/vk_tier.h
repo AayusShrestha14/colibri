@@ -35,6 +35,10 @@
  *                                      on the device after this call};
  *        if (vkt_init(&c, rt_counts_all())) atexit(vkt_shutdown);
  *
+ *    .in_ram (optional) lets the tier hand experts the CPU holds in RAM back to the
+ *    CPU when the device is the slower side of a step (an integrated GPU at its
+ *    floor clock): give it whenever the engine can answer cheaply.
+ *
  *    The heat table is [layers][experts] counts (route_trace.h's rows; NULL rows are
  *    layers without experts). Pick .gate_up/.down from the table below; gate and up
  *    must share one kind. A layer the tier should not serve (an MTP layer in another
@@ -117,6 +121,12 @@ typedef struct {
     int max_rows;                  /* most (row, expert) assignments one vkt_issue carries */
     size_t ram_reserve;            /* bytes the engine's RAM caches may still grow by */
     size_t dense_bytes;            /* dense weights the engine puts on the device after vkt_init */
+    /* Optional: is this expert in the engine's RAM cache right now? With it the tier
+     * balances a step: when the device keeps the CPU waiting, resident experts the
+     * CPU also holds in RAM go back to the CPU (never ones it would read from disk),
+     * and return to the device when it finishes early. Called on the engine thread. */
+    int (*in_ram)(void *ctx, int layer, int eid);
+    void *ram_ctx;
 } VktConfig;
 
 /* One expert as it sits in RAM: codes and scales of gate, up, down (float scales,

@@ -4521,6 +4521,14 @@ static size_t vk_dense_bytes(Model *m) {
     }
     return b;
 }
+/* Is the expert in this layer's RAM cache now (the tier's balance asks)? */
+static int vk_in_ram(void *ctx, int layer, int e) {
+    Model *m = ctx;
+    pthread_mutex_lock(&g_pilot_mx);
+    int r = slot_indexed(m, layer, e) != NULL;
+    pthread_mutex_unlock(&g_pilot_mx);
+    return r;
+}
 static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int4, int expert_mixed) {
     Cfg *c = &m->c;
     if (!g_vk_ready || c->n_experts == 0 || qq_active()) return;
@@ -4546,7 +4554,8 @@ static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int
                     .gate_up = gu, .down = dn, .act = VKT_ACT_SWIGLU,
                     .max_rows = QWEN_VK_ROWS * c->topk,
                     .ram_reserve = slot * (size_t)cap * (size_t)c->n_layers,
-                    .dense_bytes = vk_dense_bytes(m)};
+                    .dense_bytes = vk_dense_bytes(m),
+                    .in_ram = vk_in_ram, .ram_ctx = m};
     rt_init("qwen36", c->n_layers, c->n_experts);
     rt_drop_row(c->n_layers);   /* no MTP row */
     const char *up = getenv("COLI_USAGE");

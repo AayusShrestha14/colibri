@@ -63,6 +63,9 @@ static struct {
     const float **bx, **by; int *rowsrc; int cbx;
     int max_dev_rows;
     double t_issued;
+    /* the balance: the share of a step's resident experts the device takes, moved by
+     * what each join waited (the device was the slower side) or did not */
+    int balance, can_balance; float share; unsigned long long handed;
     /* accounting */
     unsigned long long routed, served, steps, uploads, upload_bytes, evictions, qfull, rated, refused, failed, warm;
     double dev_ms, cpu_ms, wait_ms;
@@ -507,6 +510,37 @@ int vkt_issue(int layer, const float *x, int S, int K, const int *idx, uint8_t *
         T.map[i] = g;                                   /* group for now, row index below */
     }
     if (!ng) return 0;
+    /* The balance: when the device has been the slower side, the experts the CPU
+     * also holds in RAM beyond the device's share of the step's rows go back to the
+     * CPU, whole experts (the CPU reads one once for all its rows); the ones only
+     * the device holds stay (the CPU would read them from disk). */
+    T.can_balance = 0;
+    if (T.balance) {
+        int cap = (int)(T.share * total + 0.999f), kept = 0, keep_n = 0;
+        uint8_t *gone = NULL;
+        for (int g = 0; g < ng; g++) {
+            if (!T.c.in_ram(T.c.ram_ctx, layer, T.touched[g])) { kept += T.brows[g]; continue; }
+            T.can_balance = 1;
+            if (kept + T.brows[g] <= cap) { kept += T.brows[g]; continue; }
+            if (!gone && !(gone = calloc((size_t)ng, 1))) break;
+            gone[g] = 1;
+        }
+        if (gone) {
+            int *newg = malloc((size_t)ng * sizeof(int));
+            if (newg) {
+                for (int g = 0; g < ng; g++) {
+                    if (gone[g]) { newg[g] = -1; T.grp[T.touched[g]] = -1; T.handed += (unsigned long long)T.brows[g]; total -= T.brows[g]; continue; }
+                    newg[g] = keep_n;
+                    T.bex[keep_n] = T.bex[g]; T.brows[keep_n] = T.brows[g]; T.touched[keep_n] = T.touched[g]; keep_n++;
+                }
+                for (int i = 0; i < n; i++) if (T.map[i] >= 0) T.map[i] = newg[T.map[i]];
+                ng = keep_n;
+                free(newg);
+            }
+            free(gone);
+        }
+        if (!ng) return 0;
+    }
     /* rows expert by expert, each expert's in routing order */
     if (!grow_rows(total)) {
         for (int g = 0; g < ng; g++) T.grp[T.touched[g]] = -1;
@@ -535,11 +569,21 @@ int vkt_issue(int layer, const float *x, int S, int K, const int *idx, uint8_t *
 
 int vkt_join(const float **rows) {
     if (!T.inflight) return 0;
-    double t0 = vkt_now_ms(), dms = 0;
-    T.cpu_ms += t0 - T.t_issued;
+    double t0 = vkt_now_ms(), dms = 0, tc = t0 - T.t_issued;
+    T.cpu_ms += tc;
     int ok = coli_vk_xb_join(T.by, &dms);
-    T.wait_ms += vkt_now_ms() - t0;
+    double tw = vkt_now_ms() - t0;
+    T.wait_ms += tw;
     T.dev_ms += dms;
+    /* The balance moves only on steps where it had a choice. Waiting for more than
+     * a tenth of the CPU's own time: give the CPU more. The device done well before
+     * the CPU (its timestamps say so; without them, nothing waited): take more. */
+    if (T.balance && T.can_balance) {
+        if (tw > 0.1 * tc + 0.02) T.share *= 0.92f;
+        else if (dms > 0 ? dms < 0.8 * tc : tw < 0.01) T.share = T.share * 1.04f + 0.01f;
+        if (T.share > 1.f) T.share = 1.f;
+        if (T.share < 0.05f) T.share = 0.05f;
+    }
     T.inflight = 0;
     int n = T.S * T.K;
     for (int i = 0; i < n; i++) rows[i] = ok && T.map[i] >= 0 ? T.by[T.map[i]] : NULL;
@@ -646,6 +690,9 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     T.max_resident = (int)fit;
     T.budget = (size_t)want;
     coli_vk_tier_pool_limit(T.budget);
+    const char *bal = getenv("COLI_VK_TIER_BALANCE");
+    T.balance = T.c.in_ram != NULL && !(bal && *bal == '0');
+    T.share = 1.f;
     const char *r = getenv("COLI_VK_TIER_RATE");
     T.rate = r && *r ? atoi(r) : 16;
     if (T.rate < 0) T.rate = 0;
@@ -678,9 +725,10 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     if (T.gu_gs) fprintf(stderr, " gs %d", T.gu_gs);
     fprintf(stderr, ", down fmt %d", T.dn_fmt);
     if (T.dn_gs) fprintf(stderr, " gs %d", T.dn_gs);
-    fprintf(stderr, "), %s, %s queue, up to %d promotions per forward\n",
+    fprintf(stderr, "), %s, %s queue, up to %d promotions per forward%s\n",
             T.uma ? (cap && *cap ? "shared RAM (COLI_VK_TIER_GB)" : "shared RAM: a quarter of what the expert cache leaves")
-                  : "device memory", coli_vk_xb_queue_shared() ? "shared" : "own", T.rate);
+                  : "device memory", coli_vk_xb_queue_shared() ? "shared" : "own", T.rate,
+            T.balance ? ", balanced against the CPU" : "");
     return 1;
 }
 
@@ -694,12 +742,14 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
     fprintf(stderr, "[VK] tier %s %s: device %llu of %llu routed experts (%.1f%%; this %s %llu of %llu) | "
             "CPU RAM hits %llu, disk loads %llu | resident %d (budget %d, %s of %s, %d blocks, frag %.2f) | "
             "uploads %llu (%s, %llu warm), evictions %llu, skipped %llu queue + %llu rate, failed %llu | "
-            "device %.1f ms, CPU share %.1f ms, waited %.1f ms (%.0f%% of device time hidden)\n",
+            "device %.1f ms, CPU share %.1f ms, waited %.1f ms (%.0f%% of device time hidden)",
             T.engine, scope, T.served, T.routed, T.routed ? 100.0 * T.served / T.routed : 0.0, scope, sv, r,
             ram_hits, disk_loads, T.resident, T.max_resident, human((double)ps.used, hu, sizeof hu),
             human((double)T.budget, hb, sizeof hb), ps.blocks, ps.frag, T.uploads,
             human((double)T.upload_bytes, hl, sizeof hl), T.warm, T.evictions, T.qfull, T.rated, T.failed,
             T.dev_ms, T.cpu_ms, T.wait_ms, T.dev_ms > 0 ? 100.0 * hidden / T.dev_ms : 0.0);
+    if (T.balance) fprintf(stderr, " | balance: device share %.2f, %llu rows handed to the CPU", T.share, T.handed);
+    fprintf(stderr, "\n");
 }
 
 void vkt_shutdown(void) {
