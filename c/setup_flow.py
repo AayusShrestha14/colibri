@@ -297,7 +297,7 @@ def choose_backend(hw, family, tc, requested="auto"):
         if tc.get("can_build_vulkan"):
             kind = vk.get("type")
             decision.update(backend="vulkan", gpu=vk["name"],
-                            reason=f"{vk['name']} ({kind}) through Vulkan")
+                            reason=f"{vk['name']}, {kind} GPU")
             return decision
         needs = ["vulkan"] if tc.get("can_build") else ["build", "vulkan"]
         decision["missing"].append(("vulkan", _gpu_hint(needs, hw, tc)))
@@ -584,6 +584,9 @@ def resolve_engine(family, entry, decision, tc, out=print, allow_prebuilt=True):
         raise SetupError(f"no compiler here to build {family.engine_artifact}: "
                          f"{package_hint(['build'])}")
     version = current_version()
+    if release_asset_suffix() is None:
+        raise SetupError(f"no compiler here, and no prebuilt engine is published for "
+                         f"{sys.platform}/{setup_hw.platform.machine()}: {package_hint(['build'])}")
     out("  no compiler found: using the prebuilt engine from the GitHub release")
     runtime, tag = fetch_release_archive(version, out=out)
     if entry is not None and setup_catalog.version_tuple(tag) < setup_catalog.version_tuple(entry.prebuilt_since):
@@ -819,6 +822,7 @@ def start_server(cfg, *, background=False, open_browser=True, out=print, wait=5.
     if not background:
         print_urls(cfg, out)
         out("  stop: press Ctrl+C here (or close this window)\n")
+        sys.stdout.flush()      # ours before the server's, when the output is a file
         process = subprocess.Popen(cmd, env=env)
         try:
             return process.wait()
@@ -995,6 +999,9 @@ def _fmt_eta(seconds):
     return f"{seconds / 3600:.1f} h"
 
 
+MENU_ROWS = 6
+
+
 def choose_model(ui, rows, wanted=None, show_all=False):
     if wanted:
         for row in rows:
@@ -1004,6 +1011,12 @@ def choose_model(ui, rows, wanted=None, show_all=False):
                 return row["entry"]
         raise SetupError(f"unknown model {wanted!r}; `coli setup --list` shows the choices")
     fitting = [r for r in rows if r["fits"]]
+    if not show_all:
+        # A short menu: the recommendation first, then the next smallest
+        # downloads. --all lists every model, --model picks any of them.
+        fitting, more = fitting[:MENU_ROWS], fitting[MENU_ROWS:]
+    else:
+        more = []
     if not fitting:
         raise SetupError("no model in the catalog fits this machine:\n" +
                          "\n".join(f"    {r['entry'].name}: {r['reason']}" for r in rows))
@@ -1015,10 +1028,12 @@ def choose_model(ui, rows, wanted=None, show_all=False):
         if entry.modality == "image":
             runs = "makes images"
         tag = "  [recommended]" if row["recommended"] else ""
-        ui.say(f"  {number:>2}) {entry.name:<28} {entry.disk_gb:>7.0f} GB   {runs:<20}{tag}")
+        ui.say(f"  {number:>2}) {entry.name:<28} {entry.disk_gb:>7.0f} GB   {runs:<20}{tag}".rstrip())
         ui.say(f"      {entry.summary}; {row['reason']}"
                + (f"; {entry.license_note}" if entry.license_note else ""))
     hidden = [r for r in rows if not r["fits"]]
+    if more:
+        ui.say(f"  ({len(more)} more fit too: `--all` lists them, `--model ID` picks one)")
     if hidden and show_all:
         ui.say("  Not offered here:")
         for row in hidden:
@@ -1266,7 +1281,7 @@ def cmd_setup(a, ui=None):
 
     tc = toolchain()
     decision = choose_backend(hw, family, tc, requested)
-    ui.say(f"\nEngine: {family.engine_artifact}, {decision['backend'].upper()} "
+    ui.say(f"\nEngine: {family.engine_artifact} with {decision['backend'].upper()} "
            f"({decision['reason']})")
     for kind, hint in decision["missing"]:
         ui.say(f"  to use the GPU through {kind.upper()}, first run:  {hint}")

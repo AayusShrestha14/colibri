@@ -540,6 +540,26 @@ class WholeSetup(HomeTestCase):
         self.assertIn(setup_catalog.FITS_EXPLAINED, menu)
         self.assertIn("type a number from 1", menu)
 
+    def test_json_mode_prints_the_configuration(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = setup_flow.run(lambda a: setup_flow.cmd_setup(a, ui=setup_flow.UI(False, quiet=True)),
+                                  setup_args(dir=self.models, pick="tiny", json=True))
+        self.assertEqual(code, 0)
+        result = json.loads(out.getvalue())
+        self.assertEqual(result["config"]["backend"], "vulkan")
+        self.assertEqual(result["config_path"], setup_flow.config_path())
+        self.assertNotIn("status", result)                     # --no-start
+
+    def test_no_compiler_and_no_prebuilt_says_what_to_install(self):
+        tc = dict(TC_ALL, source_checkout=False, can_build=False, can_build_vulkan=False)
+        os.remove(os.path.join(self.engines, "qwen36"))
+        with mock.patch.object(setup_flow, "release_asset_suffix", return_value=None):
+            with self.assertRaises(setup_flow.SetupError) as caught:
+                setup_flow.resolve_engine(family_by_id("qwen36"), None,
+                                          {"backend": "cpu", "missing": []}, tc, out=lambda *_: None)
+        self.assertIn("no prebuilt engine", str(caught.exception))
+
     def test_list_json(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):

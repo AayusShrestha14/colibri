@@ -62,12 +62,16 @@ Your machine
 Models that fit this machine
   (fits = the dense part, which always stays in RAM, plus a minimum expert cache fit in RAM, and the download fits on the disk)
    1) Qwen3.6-35B-A3B                   23 GB   runs from RAM         [recommended]
+      general chat with thinking, tools and images; int4-gs64 container; the whole model fits in RAM (20 GB)
    2) Qwen3-Coder-30B-A3B               19 GB   runs from RAM
+      coding model with tool calls, no thinking; int4-gs64 container; the whole model fits in RAM (18 GB)
    3) DeepSeek V4 Flash REAP 150B       85 GB   streams from the SSD
    ...
+  (2 more fit too: `--all` lists them, `--model ID` picks one)
+  (4 more need more RAM or disk: `coli setup --list` shows why)
 Choose a model [Enter = 1]:
 
-Engine: qwen36, VULKAN (Intel(R) Iris(R) Xe Graphics (integrated) through Vulkan)
+Engine: qwen36 with VULKAN (Intel(R) Iris(R) Xe Graphics, integrated GPU)
   building: make qwen36 ARCH=native VK=1
 Download: Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64 (23.1 GB); safe to interrupt, rerun to continue
   [##########..............]  41.0%  9.5 GB/23.1 GB  38.2 MB/s  6 min left
