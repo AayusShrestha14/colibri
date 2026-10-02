@@ -289,7 +289,7 @@ def choose_backend(hw, family, tc, requested="auto"):
             return decision
         if cuda_engine:
             needs = ["cuda"] if tc.get("can_build") else ["build", "cuda"]
-            decision["missing"].append(("cuda", package_hint(needs, hw.get("os"))))
+            decision["missing"].append(("cuda", _gpu_hint(needs, hw, tc)))
         elif requested == "cuda" and not cuda_engine:
             decision["missing"].append(("cuda", f"{family.display_name} has no CUDA path here; "
                                                 "Vulkan or the CPU run it"))
@@ -300,8 +300,7 @@ def choose_backend(hw, family, tc, requested="auto"):
                             reason=f"{vk['name']} ({kind}) through Vulkan")
             return decision
         needs = ["vulkan"] if tc.get("can_build") else ["build", "vulkan"]
-        if tc.get("source_checkout") or sys.platform == "win32":
-            decision["missing"].append(("vulkan", package_hint(needs, hw.get("os"))))
+        decision["missing"].append(("vulkan", _gpu_hint(needs, hw, tc)))
     if not vk and not nvidia:
         decision["reason"] = "no GPU found: the engine runs on the CPU"
     elif requested == "vulkan" and not vk:
@@ -309,6 +308,15 @@ def choose_backend(hw, family, tc, requested="auto"):
     else:
         decision["reason"] = "the GPU build is not possible yet: the engine runs on the CPU"
     return decision
+
+
+def _gpu_hint(needs, hw, tc):
+    hint = package_hint(needs, hw.get("os"))
+    if not tc.get("source_checkout"):
+        # A release archive has the engines but no Makefile to rebuild them.
+        hint += (" ; then run the setup from a source checkout "
+                 "(git clone https://github.com/JustVugg/colibri)")
+    return hint
 
 
 def binary_links(path, needles):
@@ -999,7 +1007,8 @@ def choose_model(ui, rows, wanted=None, show_all=False):
     if not fitting:
         raise SetupError("no model in the catalog fits this machine:\n" +
                          "\n".join(f"    {r['entry'].name}: {r['reason']}" for r in rows))
-    ui.say(f"Models that fit ({setup_catalog.FITS_EXPLAINED}):")
+    ui.say("Models that fit this machine")
+    ui.say(f"  ({setup_catalog.FITS_EXPLAINED})")
     for number, row in enumerate(fitting, 1):
         entry = row["entry"]
         runs = "runs from RAM" if entry.size_class == "small" else "streams from the SSD"
@@ -1152,6 +1161,17 @@ def describe_existing(cfg):
     return f"{model.get('name') or cfg.get('family')} in {cfg.get('model_dir')} ({cfg.get('backend')})"
 
 
+def gpu_now_buildable(cfg, tc=None):
+    """True when the last setup ran on the CPU for want of a GPU package and
+    that package is here now. Looks at the toolchain only: no hardware probe,
+    so a plain rerun stays a fast start."""
+    pending = cfg.get("gpu_pending") or []
+    if not pending or cfg.get("backend") != "cpu":
+        return False
+    tc = tc or toolchain()
+    return any(tc.get(f"can_build_{kind}") for kind in pending)
+
+
 def config_ready(cfg):
     if not cfg or cfg.get("status") != "ready":
         return False
@@ -1182,8 +1202,11 @@ def cmd_setup(a, ui=None):
         return 0
 
     if cfg and not picking and config_ready(cfg):
-        ui.say(f"Already set up: {describe_existing(cfg)}")
-        return _finish(ui, cfg, a)
+        if gpu_now_buildable(cfg):
+            ui.say("The GPU packages are installed now: rebuilding the engine for the GPU.\n")
+        else:
+            ui.say(f"Already set up: {describe_existing(cfg)}")
+            return _finish(ui, cfg, a)
     # A setup that stopped half way (pending), or a finished one whose engine or
     # files went missing (ready, but not runnable): continue with the same choice.
     resume = cfg if (cfg and cfg.get("status") in ("pending", "ready") and not picking) else None
@@ -1274,6 +1297,10 @@ def cmd_setup(a, ui=None):
     cfg = make_config(model_dir=model_dir, family=family, entry=entry, engine_info=engine_info,
                       hw=hw, host=host, port=port)
     cfg["requested_backend"] = requested
+    # A GPU this setup found but could not build for: a rerun checks whether
+    # the packages arrived and rebuilds (gpu_now_buildable).
+    cfg["gpu_pending"] = ([kind for kind, _hint in decision["missing"]]
+                          if engine_info["backend"] == "cpu" and requested == "auto" else [])
     cfg = save_config(cfg)
     write_state("ready", model=cfg["model"].get("id"), model_dir=model_dir)
     ui.say(f"\nSaved the run configuration: {config_path()}")

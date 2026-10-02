@@ -273,5 +273,5 @@ def as_dict(row):
     }
 
 
-FITS_EXPLAINED = ("fits = the always-resident weights (the dense part) plus a minimum "
-                  "expert cache fit in RAM, and the download fits on the disk")
+FITS_EXPLAINED = ("fits = the dense part, which always stays in RAM, plus a minimum expert "
+                  "cache fit in RAM, and the download fits on the disk")

@@ -140,6 +140,7 @@ class BackendChoice(unittest.TestCase):
         self.assertIn("msys2.org", hint)
         self.assertIn("mingw-w64-ucrt-x86_64-gcc", hint)
         self.assertIn("mingw-w64-ucrt-x86_64-shaderc", hint)
+        self.assertIn("source checkout", hint)      # a release archive cannot rebuild itself
 
 
 class PackageHints(unittest.TestCase):
@@ -468,6 +469,33 @@ class WholeSetup(HomeTestCase):
         self.assertIn("Download: already complete", text)
         build.assert_called_once()
         self.assertEqual(sum("/cdn/" in r["path"] for r in self.hub.requests), shard_fetches)
+
+    def test_a_rerun_switches_to_the_gpu_once_its_packages_are_there(self):
+        no_vulkan = dict(TC_ALL, vulkan_headers=False, glslc=None, can_build_vulkan=False)
+        Path(self.engines, "qwen36").write_bytes(b"\x7fELF plain")          # a CPU build
+        with mock.patch.object(setup_flow, "toolchain", return_value=no_vulkan):
+            code, text = self.run_setup(pick="tiny")
+        self.assertEqual(code, 0, text)
+        self.assertIn("to use the GPU through VULKAN, first run:", text)
+        cfg = setup_flow.load_config()
+        self.assertEqual((cfg["backend"], cfg["gpu_pending"]), ("cpu", ["vulkan"]))
+        # Still no packages: a rerun only starts.
+        with mock.patch.object(setup_flow, "toolchain", return_value=no_vulkan):
+            code, text = self.run_setup()
+        self.assertIn("Already set up", text)
+
+        def rebuild(family, backend, tc, out=print):
+            self.assertEqual(backend, "vulkan")
+            Path(self.engines, "qwen36").write_bytes(b"libvulkan.so.1")
+            return os.path.join(self.engines, "qwen36")
+
+        with mock.patch.object(setup_flow, "build_engine", side_effect=rebuild):
+            code, text = self.run_setup()                  # the packages are here now
+        self.assertEqual(code, 0, text)
+        self.assertIn("rebuilding the engine for the GPU", text)
+        cfg = setup_flow.load_config()
+        self.assertEqual((cfg["backend"], cfg["gpu_pending"]), ("vulkan", []))
+        self.assertEqual(cfg["env"]["COLI_VULKAN"], "1")
 
     def test_wsl_download_through_windows_when_faster(self):
         entry = setup_catalog.by_id("tiny")
