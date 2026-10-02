@@ -1574,9 +1574,9 @@ FAMILIES = (
         planner_geometry=_mimo_geometry,
         planner_unsupported_reason="",
         # No VRAM tier to plan: mimo.c links no CUDA/Metal backend. Its Vulkan path
-        # (#1830: the dense matrices, plus MIMO_VK_EXPERTS) is opt-in and outside
-        # the planner (see deepseek_v41 above for why the planner must not offer a
-        # VRAM tier the engine cannot use).
+        # (#1830's dense matrices, and the routed experts on the shared Vulkan tier,
+        # vk_tier.c) is opt-in and outside the planner (see deepseek_v41 above for
+        # why the planner must not offer a VRAM tier the engine cannot use).
         supports_accelerator=False,
         expert_inventory=_mimo_expert_inventory,
         resident_inventory=_mimo_resident_inventory,
