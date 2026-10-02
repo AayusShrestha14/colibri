@@ -4,6 +4,7 @@
 #
 #   bash tests/vulkan_engines.sh qwen | qwen-sanitize | inkling-olmoe | inkling-olmoe-sanitize
 #   bash tests/vulkan_engines.sh mimo-qwenimage | kimi | kimi-mimo-sanitize | deepseek | deepseek-sanitize
+#   bash tests/vulkan_engines.sh glm | glm-sanitize   # GLM-5.2 (colibri) and GLM-5.3 Flash (glm53)
 #   bash tests/vulkan_engines.sh shader    # the qmatmul formats, the expert batch and the tier, no engine
 #
 # Needs libvulkan-dev, glslc and mesa-vulkan-drivers, plus the Python packages of
@@ -940,6 +941,194 @@ family_kimi_mimo_sanitize() {
   make clean >/dev/null 2>&1 || true
 }
 
+# GLM-5.2 (colibri) and GLM-5.3 Flash (glm53) on the routed-expert tier: the fixtures.
+# colibri: the bf16 oracle, whose experts the loader quantizes to the bits asked for
+# (16: f32, fmt 10 on the device; 8: int8, fmt 1; 4: int4 per row, fmt 2; 3: int3-g64,
+# fmt 5), the int4-g64 and E8/IQ3 containers of the parity gate, and the FP8 oracle
+# converted to int4-g64 (its 32-wide down rows stay per row), int4 per row, int3-g64 and
+# int4-g64 with an int3-g64 down. glm53: the int4-gs64 streaming container.
+glm_fixtures() {
+  $PY tools/make_glm_oracle.py > /dev/null
+  $PY tools/make_glm_oracle.py --fmt4 > /dev/null
+  $PY tools/make_glm_oracle.py --fmt6 > /dev/null
+  mkdir -p glm_fp8 && (cd glm_fp8 && $PY ../tools/make_glm_oracle.py --fp8 > /dev/null)
+  local v
+  for v in "i4:" "i4r:--group-size 0" "i3:--xbits 3" "d3:--down-bits 3"; do
+    # shellcheck disable=SC2086
+    $PY tools/convert_fp8_to_int4.py --indir glm_fp8/glm_tiny --outdir glm_tiny_${v%%:*} \
+      --ebits 4 --io-bits 4 --n-layers 5 --min-free-gb 0 ${v#*:} > /dev/null
+    cp glm_fp8/ref_glm.json glm_tiny_${v%%:*}/
+  done
+  $PY tools/make_glm53_tiny.py --output glm53_tiny --force > /dev/null
+  $PY tools/make_glm53_streaming_pair.py --fixture glm53_tiny --output glm53_stream > /dev/null
+}
+
+# glm_tier <tag> <snap> <ref> <env...> -- <argv...>
+# colibri with the tier against its CPU run: the same greedy tokens (or teacher-forced
+# predictions, TF=1, mismatches included) and a "[VK] tier colibri run: device N" with
+# N > 0; EVICT=1: evictions too. The history the tier warms from is <snap>/.coli_usage:
+# none by default (the tier fills as experts pass by), HIST=1 writes one first from a
+# greedy run (the warm start, and the device in a teacher-forced prefill). DEV2=1: the
+# second device's registry served experts ("+ N vk" in the hit-rate line).
+glm_tier() {
+  local tag=$1 snap=$2 ref=$3; shift 3
+  local envs=() pre=() e; while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  for e in "${envs[@]}"; do [ "${e%%=*}" = TF ] || pre+=("$e"); done
+  rm -f "$snap/.coli_usage"
+  [ "${HIST:-0}" = 1 ] && { env "${pre[@]}" SNAP=$snap REF=$ref STATS=$snap/.coli_usage ./colibri "$@" > /dev/null 2>&1 || true; }
+  env "${envs[@]}" SNAP=$snap REF=$ref ./colibri "$@" > cpu.log 2>&1 || true
+  env "${envs[@]}" SNAP=$snap REF=$ref COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 ./colibri "$@" > vk.log 2>&1 || true
+  rm -f "$snap/.coli_usage"
+  grep -aE '^GLM C engine|^PREFILL|^\[ORACLE\] mismatch' cpu.log | sed 's/ | [0-9.]* pos\/s//' > cpu.tok || true
+  grep -aE '^GLM C engine|^PREFILL|^\[ORACLE\] mismatch' vk.log | sed 's/ | [0-9.]* pos\/s//' > vk.tok || true
+  { [ -s cpu.tok ] && cmp -s cpu.tok vk.tok; } || { cat cpu.tok vk.tok; tail -20 vk.log; fail "$tag: the tier's tokens differ from the CPU"; }
+  if [ "${DEV2:-0}" = 1 ]; then
+    grep -qaE 'lru \+ [1-9][0-9]* vk /' vk.log || { cat vk.log; fail "$tag: the second device served no expert"; }
+  else
+    [ "$(tier_count colibri vk.log)" -gt 0 ] || { cat vk.log; fail "$tag: no routed expert ran on the device"; }
+  fi
+  if [ "${EVICT:-0}" = 1 ]; then
+    [ "$(tier_evictions colibri vk.log)" -gt 0 ] || { grep '\[VK\] tier' vk.log; fail "$tag: the budget forced no eviction"; }
+  fi
+  echo "OK $tag: tokens = CPU, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' vk.log | tail -1)$(grep -a -o ' + [0-9]* vk' vk.log | tail -1), $(grep -a -o 'evictions [0-9]*' vk.log | tail -1), $(grep -a -o '(fmt [^)]*)' vk.log | head -1)"
+}
+
+# g53_tier <tag> <model dir> <env...> -- <argv...>: glm53, the same gate on its
+# teacher_forcing and greedy lines; the history is a fresh COLI_USAGE file (HIST=1: one
+# greedy run writes it first).
+g53_tier() {
+  local tag=$1 model=$2; shift 2
+  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  rm -f g53.usage
+  [ "${HIST:-0}" = 1 ] && { env "${envs[@]}" COLI_USAGE=g53.usage ./glm53 --model $model "$@" > /dev/null 2>&1 || true; }
+  env "${envs[@]}" COLI_USAGE=g53.usage USAGE_SAVE=0 ./glm53 --model $model "$@" > cpu.log 2>&1 || true
+  env "${envs[@]}" COLI_USAGE=g53.usage USAGE_SAVE=0 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 ./glm53 --model $model "$@" > vk.log 2>&1 || true
+  rm -f g53.usage
+  grep -aE '^teacher_forcing|^greedy' cpu.log > cpu.tok || true
+  grep -aE '^teacher_forcing|^greedy' vk.log > vk.tok || true
+  { [ -s cpu.tok ] && cmp -s cpu.tok vk.tok; } || { cat cpu.tok vk.tok; tail -20 vk.log; fail "$tag: the tier's tokens differ from the CPU"; }
+  [ "$(tier_count glm53 vk.log)" -gt 0 ] || { cat vk.log; fail "$tag: no routed expert ran on the device"; }
+  if [ "${EVICT:-0}" = 1 ]; then
+    [ "$(tier_evictions glm53 vk.log)" -gt 0 ] || { grep '\[VK\] tier' vk.log; fail "$tag: the budget forced no eviction"; }
+  fi
+  local where; where=$(dense_where glm53 vk.log "$tag" "${envs[@]}") || { echo "$where"; exit 1; }
+  echo "OK $tag: tokens = CPU, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' vk.log | tail -1), $(grep -a -o 'evictions [0-9]*' vk.log | tail -1), trunk on the $where"
+}
+
+# GLM-5.2 and GLM-5.3 Flash on the routed-expert tier, in every expert format the two
+# engines read, warm and cold, decode and teacher-forced prefill, under eviction (a
+# budget of two experts, by COLI_VK_TIER_GB and by the deprecated COLI_VK_EXPERTS), with
+# the trunk and the attention core on the device, beside COLI_VK_DEV2's second
+# (logical) device, and with the tier off. IDOT=0 gives the CPU's int8 and int4-per-row
+# experts the f32 activations the device uses (the CPU default rounds them to int8 on
+# some ISAs), so the two sides differ by summation order only.
+family_glm() {
+  make colibri glm53 VK=1
+  glm_fixtures
+  export OMP_NUM_THREADS=2 CAP_RAISE=0
+  local cap b
+  # the oracle with f32 experts (fmt 10): decode cold at a one-slot and a full cache,
+  # the teacher-forced prefill from a warm start
+  for cap in 1 64; do glm_tier "colibri f32 experts cap=$cap" glm_tiny ref_glm.json -- $cap 16 16; done
+  HIST=1 glm_tier "colibri f32 experts, prefill from a warm start" glm_tiny ref_glm.json TF=1 -- 64 16 16
+  # quantized at load: int8 (fmt 1), int4 per row (fmt 2), int3-g64 (fmt 5)
+  for b in 8 4 3; do
+    glm_tier "colibri ${b}-bit experts cap=2" glm_tiny ref_glm.json IDOT=0 -- 2 $b 4
+    HIST=1 glm_tier "colibri ${b}-bit experts, prefill warm" glm_tiny ref_glm.json IDOT=0 TF=1 -- 2 $b 4
+  done
+  # the containers: int4-g64 gate/up/down, int4-g64 with a per-row down, int4 per row,
+  # int3-g64, int4-g64 with an int3-g64 down
+  HIST=1 glm_tier "colibri int4-g64 container" glm_tiny_fmt4 glm_tiny_fmt4/ref_glm.json -- 2 16 16
+  HIST=1 glm_tier "colibri int4-g64 container, prefill" glm_tiny_fmt4 glm_tiny_fmt4/ref_glm.json TF=1 -- 2 16 16
+  local fx
+  for fx in i4 i4r i3 d3; do
+    HIST=1 glm_tier "colibri $fx container cap=1" glm_tiny_$fx glm_tiny_$fx/ref_glm.json IDOT=0 -- 1 4 4
+    HIST=1 glm_tier "colibri $fx container, prefill" glm_tiny_$fx glm_tiny_$fx/ref_glm.json IDOT=0 TF=1 -- 2 4 4
+  done
+  # PIPE's asynchronous loads and the PILOT prefetcher beside the tier
+  glm_tier "colibri PIPE=1" glm_tiny_i4 glm_tiny_i4/ref_glm.json IDOT=0 PIPE=1 -- 1 4 4
+  glm_tier "colibri PILOT=1" glm_tiny_i4 glm_tiny_i4/ref_glm.json IDOT=0 PILOT=1 -- 2 4 4
+  # the trunk and the MLA attention core on the device too
+  HIST=1 glm_tier "colibri tier + COLI_VK_DENSE=1 COLI_VK_ATTN=1" glm_tiny_i4 glm_tiny_i4/ref_glm.json IDOT=0 COLI_VK_DENSE=1 COLI_VK_ATTN=1 -- 2 4 4
+  # a budget of two experts must evict as the routing moves: COLI_VK_TIER_GB, and the
+  # deprecated COLI_VK_EXPERTS mapped onto the tier as a cap
+  EVICT=1 glm_tier "colibri, a budget of two experts" glm_tiny ref_glm.json COLI_VK_TIER_GB=0.0001 -- 64 16 16
+  EVICT=1 glm_tier "colibri, COLI_VK_EXPERTS=2" glm_tiny ref_glm.json COLI_VK_EXPERTS=2 -- 64 16 16
+  # COLI_VK_DEV2: a second logical device on Lavapipe holds what the capped tier does not
+  HIST=1 glm_tier "colibri tier + COLI_VK_DEV2" glm_tiny_i4r glm_tiny_i4r/ref_glm.json IDOT=0 COLI_VK_EXPERTS=4 COLI_VK_DEV2=0 -- 64 4 4
+  HIST=1 DEV2=1 glm_tier "colibri COLI_VK_DEV2 alone (COLI_VK_TIER=0)" glm_tiny_i4r glm_tiny_i4r/ref_glm.json IDOT=0 COLI_VK_TIER=0 COLI_VK_DEV2=0 -- 64 4 4
+  # E8/IQ3 (fmt 6) has no device form: the tier declines, the CPU computes them
+  SNAP=glm_tiny_fmt6 REF=glm_tiny_fmt6/ref_glm.json ./colibri 2 16 16 > cpu.log 2>&1 || true
+  SNAP=glm_tiny_fmt6 REF=glm_tiny_fmt6/ref_glm.json COLI_VULKAN=1 ./colibri 2 16 16 > vk.log 2>&1 || true
+  cmp -s <(grep -a '^GLM C engine' cpu.log) <(grep -a '^GLM C engine' vk.log) || { cat vk.log; fail "colibri fmt 6: tokens differ"; }
+  grep -qa 'tier colibri: experts in fmt 6/6/6' vk.log || { cat vk.log; fail "colibri fmt 6: the tier did not decline"; }
+  echo "OK colibri E8/IQ3 (fmt 6): the tier declines, tokens = CPU"
+  # COLI_VK_TIER=0: no tier, the trunk and the attention core on the device as before
+  SNAP=glm_tiny REF=ref_glm.json COLI_VK_DENSE=1 COLI_VK_ATTN=1 ./colibri 2 16 16 > cpu.log 2>&1 || true
+  SNAP=glm_tiny REF=ref_glm.json COLI_VK_DENSE=1 COLI_VK_ATTN=1 COLI_VK_TIER=0 COLI_VULKAN=1 ./colibri 2 16 16 > vk.log 2>&1 || true
+  cmp -s <(grep -a '^GLM C engine' cpu.log) <(grep -a '^GLM C engine' vk.log) || { cat vk.log; fail "colibri COLI_VK_TIER=0: tokens differ"; }
+  ! grep -qa '^\[VK\] tier colibri' vk.log || { cat vk.log; fail "colibri COLI_VK_TIER=0: the tier started"; }
+  echo "OK colibri COLI_VK_TIER=0: tokens = CPU, no tier"
+
+  # glm53: its int4-gs64 streaming container (swiglu_limit 10), dense matrices f32 and int4
+  local ids
+  ids=$($PY -c "print(','.join(str((i*37+5)%120+2) for i in range(100)))")
+  g53_tier "glm53 decode, cold" glm53_stream-i4 GLM53_BITS=32 -- --ids 5,7,9,11,13,17,19,23 --greedy 8
+  HIST=1 g53_tier "glm53 100-token prompt, warm (two blocks of rows)" glm53_stream-i4 GLM53_BITS=32 -- --ids $ids --greedy 4
+  HIST=1 g53_tier "glm53 prefill chunks of 7, one cache slot" glm53_stream-i4 GLM53_BITS=4 GLM53_PREFILL_CHUNK=7 GLM53_EXPERT_GB=0.000001 -- --ids $ids --greedy 4
+  HIST=1 g53_tier "glm53 trunk on the device (COLI_VK_DENSE=1)" glm53_stream-i4 GLM53_BITS=4 COLI_VK_DENSE=1 -- --ids $ids --greedy 4
+  EVICT=1 g53_tier "glm53, a budget of two experts" glm53_stream-i4 GLM53_BITS=32 COLI_VK_TIER_GB=0.00006 -- --ids $ids --greedy 6
+  # COLI_VK_TIER=0: the trunk alone, on the device by default, Lavapipe included
+  GLM53_BITS=4 COLI_USAGE=g53.usage USAGE_SAVE=0 ./glm53 --model glm53_stream-i4 --ids 5,7,9,11 --greedy 4 > cpu.log 2>&1 || true
+  GLM53_BITS=4 COLI_USAGE=g53.usage USAGE_SAVE=0 COLI_VK_TIER=0 COLI_VULKAN=1 ./glm53 --model glm53_stream-i4 --ids 5,7,9,11 --greedy 4 > vk.log 2>&1 || true
+  cmp -s <(grep -aE '^teacher_forcing|^greedy' cpu.log) <(grep -aE '^teacher_forcing|^greedy' vk.log) || { cat vk.log; fail "glm53 COLI_VK_TIER=0: tokens differ"; }
+  ! grep -qa '^\[VK\] tier glm53' vk.log || { cat vk.log; fail "glm53 COLI_VK_TIER=0: the tier started"; }
+  need_gpu glm53 vk.log "glm53 COLI_VK_TIER=0"
+  echo "OK glm53 COLI_VK_TIER=0: tokens = CPU, no tier, $(vk_count glm53 vk.log) matmuls on the GPU"
+  unset OMP_NUM_THREADS CAP_RAISE
+}
+
+# The same engines under ASan and UBSan with the tier on: memory safety is the gate, and
+# each run must still put experts on the device.
+family_glm_sanitize() {
+  make clean >/dev/null 2>&1 || true
+  make colibri glm53 VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  glm_fixtures
+  export OMP_NUM_THREADS=2 CAP_RAISE=0
+  gsan() {  # <engine> <tag> <history: colibri snap, or - for glm53's COLI_USAGE> <env and argv...>
+    local eng=$1 tag=$2 snap=$3; shift 3
+    rm -f g53.usage; [ "$snap" = - ] || rm -f "$snap/.coli_usage"
+    if [ "${HIST:-0}" = 1 ]; then   # a history from a greedy run (TF=1 writes none)
+      local a=() x; for x in "$@"; do [ "$x" = TF=1 ] || a+=("$x"); done
+      if [ "$snap" = - ]; then env COLI_USAGE=g53.usage "${a[@]}" > /dev/null 2>&1 || true
+      else env STATS=$snap/.coli_usage "${a[@]}" > /dev/null 2>&1 || true; fi
+    fi
+    env ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 COLI_USAGE=g53.usage \
+      COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 "$@" > san.log 2>&1 || true
+    rm -f g53.usage; [ "$snap" = - ] || rm -f "$snap/.coli_usage"
+    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    [ "$(tier_count $eng san.log)" -gt 0 ] || { cat san.log; fail "$tag: no routed expert ran on the device"; }
+    echo "OK $tag: sanitizers clean, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' san.log | tail -1), $(grep -a -o 'evictions [0-9]*' san.log | tail -1)"
+  }
+  gsan colibri "asan colibri f32 cap=1" glm_tiny SNAP=glm_tiny REF=ref_glm.json ./colibri 1 16 16
+  HIST=1 gsan colibri "asan colibri prefill, warm" glm_tiny SNAP=glm_tiny REF=ref_glm.json TF=1 ./colibri 64 16 16
+  gsan colibri "asan colibri eviction" glm_tiny SNAP=glm_tiny REF=ref_glm.json COLI_VK_EXPERTS=2 ./colibri 64 16 16
+  HIST=1 gsan colibri "asan colibri int4-g64, trunk + attention on the device" glm_tiny_i4 SNAP=glm_tiny_i4 REF=glm_tiny_i4/ref_glm.json COLI_VK_DENSE=1 COLI_VK_ATTN=1 ./colibri 2 4 4
+  HIST=1 gsan colibri "asan colibri int3-g64 prefill" glm_tiny_i3 SNAP=glm_tiny_i3 REF=glm_tiny_i3/ref_glm.json TF=1 ./colibri 2 4 4
+  HIST=1 gsan colibri "asan colibri int3-g64 down, cap=1" glm_tiny_d3 SNAP=glm_tiny_d3 REF=glm_tiny_d3/ref_glm.json ./colibri 1 4 4
+  HIST=1 gsan colibri "asan colibri tier + COLI_VK_DEV2" glm_tiny_i4r SNAP=glm_tiny_i4r REF=glm_tiny_i4r/ref_glm.json COLI_VK_EXPERTS=4 COLI_VK_DEV2=0 ./colibri 64 4 4
+  gsan colibri "asan colibri int4 at load, PIPE=1" glm_tiny SNAP=glm_tiny REF=ref_glm.json PIPE=1 ./colibri 1 4 4
+  gsan colibri "asan colibri int8 at load, PILOT=1" glm_tiny SNAP=glm_tiny REF=ref_glm.json PILOT=1 ./colibri 2 8 8
+  local ids
+  ids=$($PY -c "print(','.join(str((i*37+5)%120+2) for i in range(100)))")
+  gsan glm53 "asan glm53 decode" - GLM53_BITS=32 ./glm53 --model glm53_stream-i4 --ids 5,7,9,11,13,17,19,23 --greedy 20
+  HIST=1 gsan glm53 "asan glm53 100-token prompt, warm" - GLM53_BITS=32 ./glm53 --model glm53_stream-i4 --ids $ids --greedy 4
+  HIST=1 gsan glm53 "asan glm53 one slot, trunk on the device" - GLM53_BITS=4 GLM53_EXPERT_GB=0.000001 COLI_VK_DENSE=1 ./glm53 --model glm53_stream-i4 --ids $ids --greedy 4
+  gsan glm53 "asan glm53 eviction" - GLM53_BITS=32 COLI_VK_TIER_GB=0.00006 ./glm53 --model glm53_stream-i4 --ids $ids --greedy 6
+  unset OMP_NUM_THREADS CAP_RAISE
+  make clean >/dev/null 2>&1 || true
+}
+
 case "${1:-}" in
   shader)         shader_formats ;;
   qwen)           family_qwen ;;
@@ -951,5 +1140,7 @@ case "${1:-}" in
   deepseek-sanitize) family_deepseek_sanitize ;;
   kimi)           family_kimi ;;
   kimi-mimo-sanitize) family_kimi_mimo_sanitize ;;
-  *) echo "usage: $0 shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize" >&2; exit 2 ;;
+  glm)            family_glm ;;
+  glm-sanitize)   family_glm_sanitize ;;
+  *) echo "usage: $0 shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize" >&2; exit 2 ;;
 esac

@@ -188,6 +188,12 @@ jobs:
             req: c/tools/requirements-kimi-k3-tiny.txt
           - family: kimi-mimo-sanitize
             req: c/tools/requirements-mimo-tiny.txt
+          # GLM-5.2 (colibri) and GLM-5.3 Flash (glm53) on the routed-expert tier, and
+          # the same under ASan and UBSan
+          - family: glm
+            req: c/tools/requirements-glm53-tiny.txt
+          - family: glm-sanitize
+            req: c/tools/requirements-glm53-tiny.txt
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
