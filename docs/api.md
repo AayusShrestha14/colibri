@@ -165,8 +165,9 @@ the argmax. Per-token values are printed by the engine to six decimal digits of 
 Non-finite values (a degenerate all-`-inf` logit row, say) serialize as JSON `null`, never
 a clamped number.
 
-These endpoints request the numeric per-token channel only from a glm engine; on every
-other engine the request returns a named 400 rather than being silently ignored. That is a
+These endpoints request the numeric per-token channel only from a glm or a MiMo engine,
+the two that read out every prompt position `echo` needs; on every other engine the
+request returns a named 400 rather than being silently ignored. That is a
 statement about what these endpoints request, and about nothing else.
 
 Known limitations, current build:
