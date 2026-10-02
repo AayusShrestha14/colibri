@@ -313,12 +313,29 @@ class CommandsTest(unittest.TestCase):
             with urlopen(req, timeout=30) as r:
                 self.assertEqual(json.loads(r.read())["colibri"]["width"], 256)
         finally:
+            stop_process_tree(process)
+
+
+def stop_process_tree(process):
+    """Stop the gateway and the engine it spawned. On POSIX the gateway handles
+    SIGTERM and closes its engine itself. On Windows terminate() is
+    TerminateProcess on the gateway alone: the engine survives, still holding
+    the inherited serve.log, and the temporary directory cannot be removed
+    (WinError 32 in tearDown). taskkill /T takes the whole tree."""
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
             process.terminate()
-            try:
-                process.wait(timeout=20)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+    else:
+        process.terminate()
+    try:
+        process.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
 
 
 if __name__ == "__main__":
