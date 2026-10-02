@@ -2778,6 +2778,37 @@ int coli_v4_attention_window_batch_ref(
         }
     }
 #endif
+#ifdef COLI_VULKAN
+    /* The same whole-chunk projections on the Vulkan device (bf16, fmt 11): one
+     * S-row call per matrix where every token used to make its own; the per-token
+     * advance below consumes them as it does the CUDA tier's (the device's sums
+     * land where compressor_step's device branch put them, plus ape). Without the
+     * device every token projects on the CPU as before. */
+    if (!result && batch > 1 && coli_v4_vk_matmul && weights->plan.compression_ratio) {
+        if (!comp_kv_proj) {
+            const void *wkv = layer_data(weights, "attn.compressor.wkv.weight", NULL);
+            const void *wgate = layer_data(weights, "attn.compressor.wgate.weight", NULL);
+            comp_rows = (weights->plan.compression_ratio == 4 ? 2 : 1) * head_dim;
+            comp_kv_proj = v4_attn_scratch(13, (size_t)batch * comp_rows * sizeof(*comp_kv_proj), 0);
+            comp_gate_proj = v4_attn_scratch(14, (size_t)batch * comp_rows * sizeof(*comp_gate_proj), 0);
+            if (!comp_kv_proj || !comp_gate_proj || !wkv || !wgate ||
+                coli_v4_vk_matmul(11, wkv, NULL, 0, comp_rows, hidden, comp_kv_proj, inputs, batch) ||
+                coli_v4_vk_matmul(11, wgate, NULL, 0, comp_rows, hidden, comp_gate_proj, inputs, batch))
+                comp_kv_proj = comp_gate_proj = NULL;
+        }
+        if (weights->plan.has_indexer && !idx_kv_proj) {
+            const void *wkv = layer_data(weights, "attn.indexer.compressor.wkv.weight", NULL);
+            const void *wgate = layer_data(weights, "attn.indexer.compressor.wgate.weight", NULL);
+            idx_rows = 2 * config->index_head_dim;
+            idx_kv_proj = v4_attn_scratch(15, (size_t)batch * idx_rows * sizeof(*idx_kv_proj), 0);
+            idx_gate_proj = v4_attn_scratch(16, (size_t)batch * idx_rows * sizeof(*idx_gate_proj), 0);
+            if (!idx_kv_proj || !idx_gate_proj || !wkv || !wgate ||
+                coli_v4_vk_matmul(11, wkv, NULL, 0, idx_rows, hidden, idx_kv_proj, inputs, batch) ||
+                coli_v4_vk_matmul(11, wgate, NULL, 0, idx_rows, hidden, idx_gate_proj, inputs, batch))
+                idx_kv_proj = idx_gate_proj = NULL;
+        }
+    }
+#endif
 
     static int idx_batch = -1;
     if (idx_batch < 0) {
@@ -3888,6 +3919,36 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
             free(ref);
         }
     }
+#ifdef COLI_VULKAN
+    /* The Vulkan device takes every needed position's query in one call: each
+     * activation rounded to E4M3 per 128 as coli_fp8_matvec_ref rounds it, then one
+     * S-row GEMM instead of a GEMV per position. The CPU keeps the per-token matvec
+     * below: its batched kernel multiplies in another order, and the top-k boundary
+     * would see it. */
+    if (!result && !projected && need > 1 && coli_v4_vk_matmul) {
+        size_t columns = (size_t)wq.columns, groups = columns / 128;
+        float *xq = malloc((size_t)need * columns * sizeof(*xq));
+        float *yq = malloc((size_t)need * qn * sizeof(*yq));
+        uint8_t *xs = malloc((size_t)need * groups);
+        int ok = xq && yq && xs;
+        for (int t = 0, i = 0; ok && t < batch; t++) {
+            if (selected[t] >= 0) continue;
+            if (coli_fp8_activation_qdq_ref(xq + (size_t)i * columns, xs + (size_t)i * groups,
+                                            query_ranks + (size_t)t * columns, columns, 128))
+                ok = 0;
+            i++;
+        }
+        if (ok && coli_v4_vk_fp8(yq, &wq, xq, need)) {
+            for (int t = 0, i = 0; t < batch; t++) {
+                if (selected[t] >= 0) continue;
+                memcpy(queries + (size_t)t * qn, yq + (size_t)i * qn, qn * sizeof(*queries));
+                i++;
+            }
+            projected = 1;
+        }
+        free(xq); free(yq); free(xs);
+    }
+#endif
     if (!result && !projected)
         for (int t = 0; !result && t < batch; t++)
             if (selected[t] < 0 &&
@@ -4499,6 +4560,10 @@ int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
                        const uint16_t *gate, const float *bias,
                        const int *forced_indices, int experts, int dimension,
                        int topk, float route_scale);
+int coli_v4_route_bf16_logits(float *weights, int *indices, const float *hidden,
+                              const uint16_t *gate, const float *bias,
+                              const int *forced_indices, int experts, int dimension,
+                              int topk, float route_scale, const float *logits);
 #endif
 
 typedef struct {
@@ -5682,6 +5747,18 @@ static int v4_moe_batch_union(
     const int64_t *table = value(weights, "ffn.gate.tid2eid", NULL);
     const float *bias = value(weights, "ffn.gate.bias", NULL);
     int result = weights->plan.uses_hash_router && !table ? -1 : 0;
+    float *logits = NULL;
+#if defined(COLI_VULKAN) && !defined(COLI_V4_DISABLE_BF16_ROUTE)
+    /* every position's gate logits in one device call (a GEMM, not a GEMV per
+     * position); without the device each position computes its own on the CPU,
+     * as before */
+    if (!result && batch > 1 && coli_v4_vk_matmul) {
+        logits = malloc((size_t)batch * n * sizeof(*logits));
+        if (logits && coli_v4_vk_matmul(11, raw_gate, NULL, 0, n, d, logits, inputs, batch) != 0) {
+            free(logits); logits = NULL;
+        }
+    }
+#endif
     for (int item = 0; !result && item < batch; item++) {
         int *item_indices = indices + (size_t)item * topk;
         float *item_weights = route_weights + (size_t)item * topk;
@@ -5690,11 +5767,12 @@ static int v4_moe_batch_union(
                 item_indices[rank] =
                     (int)table[(size_t)tokens[item] * topk + rank];
 #ifndef COLI_V4_DISABLE_BF16_ROUTE
-        result = coli_v4_route_bf16(
+        result = coli_v4_route_bf16_logits(
             item_weights, item_indices, inputs + (size_t)item * d,
             raw_gate, bias,
             weights->plan.uses_hash_router ? item_indices : NULL,
-            n, d, topk, config->routed_scaling_factor);
+            n, d, topk, config->routed_scaling_factor,
+            logits ? logits + (size_t)item * n : NULL);
 #else
         result = coli_v4_route(
             item_weights, item_indices, inputs + (size_t)item * d,
@@ -5711,6 +5789,7 @@ static int v4_moe_batch_union(
                                       "the table", weights->plan.layer);
             }
     }
+    free(logits);
 
     ColiTensorView w1, w2, w3;
     if (!result &&
@@ -9419,10 +9498,12 @@ static float route_softplus(float value) {
     return fmaxf(value, 0.0f) + log1pf(expf(-fabsf(value)));
 }
 
-int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
-                       const uint16_t *gate, const float *bias,
-                       const int *forced_indices, int experts, int dimension,
-                       int topk, float route_scale) {
+/* `logits`, when not NULL, are this position's gate logits already computed (a
+ * prefill's batch projects them in one device call); NULL computes them here. */
+static int route_bf16_impl(float *weights, int *indices, const float *hidden,
+                           const uint16_t *gate, const float *bias,
+                           const int *forced_indices, int experts, int dimension,
+                           int topk, float route_scale, const float *logits) {
     if (!weights || !indices || !hidden || !gate || experts < 1 ||
         dimension < 1 || topk < 1 || topk > experts) return -1;
     float scores_buf[COLI_V4_ROUTE_STACK_EXPERTS];
@@ -9440,13 +9521,15 @@ int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
 #ifdef COLI_VULKAN
     /* The gate's logits on the Vulkan device when it takes them (bf16, fmt 11):
      * they land in `scores` and each is read back before it is overwritten. */
-    int on_device = coli_v4_vk_matmul &&
+    int on_device = !logits && coli_v4_vk_matmul &&
                     coli_v4_vk_matmul(11, gate, NULL, 0, experts, dimension,
                                       scores, hidden, 1) == 0;
 #endif
     for (int expert = 0; expert < experts; expert++) {
         float sum = 0.0f;
         const uint16_t *row = gate + (size_t)expert * dimension;
+        if (logits) sum = logits[expert];
+        else
 #ifdef COLI_VULKAN
         if (on_device) sum = scores[expert];
         else
@@ -9486,6 +9569,21 @@ int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
         weights[rank] = scores[indices[rank]] / total * route_scale;
     if (!on_stack) { free(selected); free(selection); free(scores); }
     return 0;
+}
+
+int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
+                       const uint16_t *gate, const float *bias,
+                       const int *forced_indices, int experts, int dimension,
+                       int topk, float route_scale) {
+    return route_bf16_impl(weights, indices, hidden, gate, bias, forced_indices,
+                           experts, dimension, topk, route_scale, NULL);
+}
+int coli_v4_route_bf16_logits(float *weights, int *indices, const float *hidden,
+                              const uint16_t *gate, const float *bias,
+                              const int *forced_indices, int experts, int dimension,
+                              int topk, float route_scale, const float *logits) {
+    return route_bf16_impl(weights, indices, hidden, gate, bias, forced_indices,
+                           experts, dimension, topk, route_scale, logits);
 }
 #endif /* COLI_V4_UNIT_ROUTE_BF16 */
 
