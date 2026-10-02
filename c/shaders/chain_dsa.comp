@@ -1,0 +1,112 @@
+#version 450
+// A DSA lightning indexer's top-k selection on the dense chain (vk_chain.c,
+// VKC_P_DSA), for the attention core's selection list (chain_mla.comp mode 0).
+//
+// mode 0, per token (GLM-5.2, colibri.c's attention_rows): one workgroup per query row
+// s, position pos = pos_base + s, nk = pos + 1 positions. When nk <= topk (and not
+// force) the row attends to every position: sel[s*sel_row] = -1. Otherwise each
+// position t scores
+//   score_t = (sum_h [d_h > 0] w_h * d_h) * wscale,   d_h = (q_h . k_t) * qscale
+// (q the row's IH index queries of ID floats, roped; w its IH head weights; k the
+// index-key cache), the CPU's sums in its order, and the row keeps keep = min(nk, topk)
+// positions as the CPU does: thr = the keep-th largest score, then the positions
+// scoring above thr in position order, then those scoring exactly thr in position
+// order until keep. The threshold is found by bisection on the scores' order-keeping
+// integer keys (32 counting passes); -0 counts as +0, as the float compare does.
+// sel[s*sel_row] = keep, then the positions. Scores live in sc[s*sc_row + t].
+// Limits: IH*ID <= 4096.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer IQ { float iq[]; };
+layout(std430, binding = 1) readonly buffer HW { float hw[]; };
+layout(std430, binding = 2) readonly buffer KC { float kc[]; };
+layout(std430, binding = 3) buffer SC { float sc[]; };
+layout(std430, binding = 4) buffer SL { int sel[]; };
+
+layout(push_constant) uniform P {
+    int mode, S, pos_base, IH, ID, topk, force;
+    int q_off, q_row, w_off, w_row, k_off, k_row, sc_row, sel_row;
+    float qscale, wscale;
+} p;
+
+shared float qs[4096];
+shared float ws[64];
+shared uint cnt[256];
+
+uint okey(float f) {
+    uint u = floatBitsToUint(f);
+    if (u == 0x80000000u) u = 0u;
+    return (u & 0x80000000u) != 0u ? ~u : (u | 0x80000000u);
+}
+
+// the workgroup's sum of v (every thread passes its own)
+uint wsum(uint v, int tid) {
+    cnt[tid] = v;
+    barrier();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off) cnt[tid] += cnt[tid + off];
+        barrier();
+    }
+    uint t = cnt[0];
+    barrier();
+    return t;
+}
+// exclusive prefix sum of v over the workgroup's threads, in thread order
+uint wscan(uint v, int tid) {
+    cnt[tid] = v;
+    barrier();
+    for (int off = 1; off < 256; off <<= 1) {
+        uint a = tid >= off ? cnt[tid - off] : 0u;
+        barrier();
+        cnt[tid] += a;
+        barrier();
+    }
+    uint incl = cnt[tid];
+    barrier();
+    return incl - v;
+}
+
+void main() {
+    int s = int(gl_WorkGroupID.x), tid = int(gl_LocalInvocationID.x);
+    int nk = p.pos_base + s + 1;
+    int lb = s * p.sel_row;
+    if (nk <= p.topk && p.force == 0) { if (tid == 0) sel[lb] = -1; return; }
+    int keep = min(nk, p.topk);
+    int nq = p.IH * p.ID, qb = p.q_off + s * p.q_row;
+    for (int i = tid; i < nq; i += 256) qs[i] = iq[qb + i];
+    for (int h = tid; h < p.IH; h += 256) ws[h] = hw[p.w_off + s * p.w_row + h];
+    barrier();
+    int sb = s * p.sc_row;
+    for (int t = tid; t < nk; t += 256) {
+        int kb = p.k_off + t * p.k_row;
+        float a = 0.0;
+        for (int h = 0; h < p.IH; h++) {
+            float d = 0.0;
+            for (int i = 0; i < p.ID; i++) d += qs[h * p.ID + i] * kc[kb + i];
+            d *= p.qscale;
+            if (d > 0.0) a += ws[h] * d;
+        }
+        sc[sb + t] = a * p.wscale;
+    }
+    memoryBarrierBuffer();
+    barrier();
+    // the keep-th largest key, bit by bit from the top
+    uint K = 0u;
+    for (int b = 31; b >= 0; b--) {
+        uint cand = K | (1u << uint(b));
+        uint c = 0u;
+        for (int t = tid; t < nk; t += 256) if (okey(sc[sb + t]) >= cand) c++;
+        if (wsum(c, tid) >= uint(keep)) K = cand;
+    }
+    // the positions in order: each thread a contiguous chunk, its place from a scan
+    int chunk = (nk + 255) / 256, c0 = tid * chunk, c1 = min(nk, c0 + chunk);
+    uint above = 0u, at = 0u;
+    for (int t = c0; t < c1; t++) { uint k = okey(sc[sb + t]); above += k > K ? 1u : 0u; at += k == K ? 1u : 0u; }
+    uint n1 = wsum(above, tid);
+    uint o = wscan(above, tid);
+    for (int t = c0; t < c1; t++) if (okey(sc[sb + t]) > K) sel[lb + 1 + int(o++)] = t;
+    o = n1 + wscan(at, tid);
+    for (int t = c0; t < c1 && o < uint(keep); t++) if (okey(sc[sb + t]) == K) sel[lb + 1 + int(o++)] = t;
+    if (tid == 0) sel[lb] = keep;
+}

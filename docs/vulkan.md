@@ -859,6 +859,43 @@ What each remaining architecture needs on top of today's shaders:
 | inkling | grouped attention, MoE with a shared expert | qwen36's attention and combine as they are; its per-position heads are matmuls of the residual rows |
 | olmoe | attention with q/k norm, MoE without a shared expert | qwen36's Qwen3-Coder geometry (all attention, no gate, no shared expert) is the same chain |
 
+### Multi-head latent attention on the chain (`vkc_mla`)
+
+The MLA layers (GLM-5.2, GLM-5.3, the DeepSeek V3 family's attention, Kimi K3's MLA
+layers) have chain ops of their own, in `vk_chain.h`, written for any geometry: H heads
+of Q no-position and R rotated query floats (R = 0 for NoPE), V value floats, a latent of
+K floats (`kv_lora`), q_lora from 0 (q straight from the hidden rows) up, RoPE as rotate
+-half or as interleaved pairs, the softmax scale and the cos/sin table from the caller (a
+YaRN model passes its scaled frequencies, its mscale on the table and mscale squared on
+the scale). The cache on the device holds, per position, the normalized latent and the
+rotated shared key; the engine owns it, mirrors the host's rows behind a watermark as the
+GQA engines do, and copies each step's new rows back.
+
+| Op | Shader | What it does |
+|---|---|---|
+| `vkc_mla_qkv` | `chain_norm`, `chain_mla` (mode 1) and `vkc_matmul` | q_a, its RMSNorm and q_b (or q_b alone), kv_a, the latent's RMSNorm into the cache row, RoPE on q's rotated part and on the shared key into the cache row, a copy of the new rows for the host |
+| `vkc_mla_attn` | `chain_hgemv`, `chain_mla` (mode 0) | the absorbed query (each head's Q values times its key rows of `kv_b`, read transposed, or a `[H*K x Q]` matrix), the attention core over the cache with an online softmax (the causal range or a selection list with skipped entries), the value rows on the softmax-weighted latent, an optional sigmoid gate, o_proj |
+| `vkc_mla_rope`, `vkc_mla_lnorm` | `chain_mla` (modes 1, 2) | RoPE over segments from a host table, in place or into another buffer; LayerNorm with weight and bias (an indexer's key norm) |
+| `vkc_dsa_select` | `chain_dsa` | a token-level DSA indexer: each position's score `(sum_h [d_h > 0] w_h d_h) * wscale`, `d_h = (q_h . k_t) * qscale`, and the top-k in the CPU's order (above the k-th score in position order, then the ties in position order), or "every position" while the context is within top-k |
+
+The weights stay in the format the engine already holds them in (int8 and int4 rows,
+int4 and int8 and fp8 in groups, int3-g64, MXFP4, f32, bf16): the per-head blocks read
+them where the backend uploaded them. Between `vkc_mla_qkv` and `vkc_mla_attn` an engine
+records what reads the projections (a DSA indexer reads the normalized q latent the first
+leaves in its scratch). Limits: K up to 1024, R up to 128, Q up to 1024 where kv_b's key
+rows are read transposed, an indexer of up to 64 heads and 4096 query floats.
+
+`make vk-chain-check VK=1` runs them against double-precision references of colibri.c's
+absorbed attention: every weight format both ways through the per-head blocks, RoPE in
+both styles in place and into a cache row, LayerNorm with and without a bias, and the
+layer op over eight geometries (q latent or none, NoPE, `kv_b` or the split halves,
+selection lists with skipped entries, a gate, prefill rows after earlier ones, a long
+context from a nonzero start, GLM-5.2's head shape, a latent of 1024). Measured on
+Lavapipe and on an Intel Iris Xe (Mesa's Dozen): the layer's output within 5e-7 of its
+largest value and the new cache rows within 7e-7 (the test's bound is 2e-5). The
+indexer's selection is checked bit for bit, ties included, on scores that are exact in
+float on both sides.
+
 ## Adding an engine to the tier
 
 Every MoE engine here is on the tier ([the table above](#the-routed-expert-tier-vk_tierc));
