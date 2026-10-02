@@ -329,6 +329,29 @@ context 点积改为累加整数乘积并只舍入一次，因此验证行中的
 你需要两样东西：**程序本体**（几百 KB）和**模型**（372 GB）。各平台的分步
 指引见 [Quick Start 指南](docs/quickstart.md)。
 
+### 一步完成
+
+**Windows：** 下载仓库（**Code** 中的 **Download ZIP**，或 `git clone`），解压后
+双击 **`START-HERE.bat`**。
+**Linux 和 macOS：**
+
+```bash
+git clone https://github.com/JustVugg/colibri && cd colibri
+./start-here.sh
+```
+
+它会检测内存、磁盘和 GPU，推荐一个适合这台机器的模型（按回车即采用推荐），在 GPU
+可用时用 Vulkan 或 CUDA 编译引擎（或获取预编译版本），以可续传的方式下载模型（随时
+可以中断，再次运行即从断点继续），并在浏览器中打开仪表盘。它还会打印供其他应用使用的
+OpenAI 和 Anthropic 基础 URL。之后再次运行，colibri 会直接启动；`c/coli stop` 可以
+停止它。每一步做什么：[quickstart.md](docs/quickstart.md#the-one-step-way)。
+
+在用 AI 编程助手？让它按照 [docs/AI_SETUP.md](docs/AI_SETUP.md) 来安装 colibri。
+支持 Model Context Protocol 的助手可以使用 `coli mcp`
+（[MCP_SERVER.md](docs/MCP_SERVER.md)）。
+
+下面是手动安装的步骤。
+
 ### 1. 获取 colibri
 
 **下载预编译版本**——Linux、macOS 与 Windows 均已提供，无需编译器。从
