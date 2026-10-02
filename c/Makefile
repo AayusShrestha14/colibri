@@ -1396,8 +1396,9 @@ qwen38-tiny-int4-check: qwen38-tiny-int4-generate qwen38-tiny-fp8-generate qwen3
 # model and its references do not change) and a byte tokenizer for the text
 # and serve gates. tests/test_qwen38_mtp.py checks:
 #  (a) the head's draft logits equal tools/qwen38_mtp_ref.py's float32
-#      reference for every Q38_MTP_WIRING, through the one-row and the
-#      two-row (after an accepted draft) paths, on BF16 and FP8 experts;
+#      reference for the default wiring b and the diagnostic a, through the
+#      one-row and the two-row (after an accepted draft) paths, on BF16 and
+#      FP8 experts;
 #  (b) decoding with drafts is byte-identical to Q38_MTP=0 (stdout and last
 #      logits) at caps 1/2/8, prefill batching on and off, BF16 and int8
 #      trunk, on BF16, FP8 and int4-g64 experts, in the normal mode and with

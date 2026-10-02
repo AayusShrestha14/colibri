@@ -2983,24 +2983,25 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
  * [hidden, hidden]; the token's embedding meets pre_fc_norm_embedding
  * [hidden] and fc_embedding [hidden, hidden]. Two square projections add (a
  * single fc over the concatenation [e; h] is the same sum split in two), and
- * the sum is a stream. Q38_MTP_WIRING picks one reading of the rest:
- *   a  (default) pre_fc_norm_hidden normalizes the 4*hidden vector as one
- *      vector -- q38_rms0 over all of it, the way pre_fc_norm_embedding
- *      normalizes its input; neither norm belongs to a GatedResidual -- then
- *      fc_hidden maps each stream and fc_embedding(norm(e)) is added to all
- *      four, as q38_forward puts a token's embedding in all four streams;
- *   b  as a, but the norm is per stream: q38_rms0 over each hidden-wide
- *      stream with its slice of the weight, the grouping hc_norm has in
+ * the sum is a stream: fc_hidden maps each of the four streams and
+ * fc_embedding(norm(e)) is added to all four, as q38_forward puts a token's
+ * embedding in all four streams. What the shapes do not say is how
+ * pre_fc_norm_hidden [4*hidden] groups its input; Q38_MTP_WIRING picks:
+ *   b  (default) a norm per stream: q38_rms0 over each hidden-wide stream
+ *      with its slice of the weight, the grouping hc_norm has in
  *      q38_gr_read;
- *   c  the per-stream norm of b, the four streams averaged into one vector,
- *      fc_hidden on that, plus fc_embedding(norm(e)), and the result copied
- *      into the four streams as q38_forward does with an embedding.
+ *   a  one norm over the whole 4*hidden vector, the way
+ *      pre_fc_norm_embedding normalizes its input.
  * The output is the same whichever is chosen (the verify decides every
- * token); the wirings differ in how often a draft is right, which only the
- * trained weights can say, and the acceptance rate measures. Each norm is
- * zero-centered (q38_rms0) like every Qwen4-Exp text RMSNorm but DeltaNet's
- * gated one; q38_mtp_attach prints the mean of each norm weight, near 0 for
- * that reading and near 1 for a plain norm. The pair (streams at p, token at
+ * token); only how often a draft is right differs, and only the trained
+ * weights can say which reading they were trained with. Measured on the
+ * release (docs/qwen38.md), b accepts 94-96% of the drafts and a 85-92%.
+ * A third reading, the normalized streams averaged into one vector before a
+ * single fc_hidden, accepted 63-78% and is gone. Each norm is zero-centered
+ * (q38_rms0) like every Qwen4-Exp text RMSNorm but DeltaNet's gated one;
+ * q38_mtp_attach prints the mean of each norm weight, which on the release
+ * are -0.76, -0.33 and 3.79 (embedding, hidden, mixer): far from the 1 a
+ * plain norm's weights start from. The pair (streams at p, token at
  * p+1) is the head's row p: its K/V row and its RoPE position are p.
  * Counting it at p+1 instead would change no score beyond rounding, since
  * RoPE and the indexer's block scores depend on distances only.
@@ -3010,7 +3011,7 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
  * forward waits in mtp_pend, a draft runs the pending rows with the token
  * the caller just picked, and the rows of a verify wait until the caller's
  * next pick settles which of them stand. */
-enum { Q38_MTP_WHOLE_NORM='a', Q38_MTP_STREAM_NORM='b', Q38_MTP_STREAM_MEAN='c' };
+enum { Q38_MTP_WHOLE_NORM='a', Q38_MTP_STREAM_NORM='b' };
 
 /* Q38_MTP_FORCE (tests): 'r' rejects every draft, a right one too, so the
  * rollback runs on every token; 'a' drafts the reference's next token
@@ -3035,25 +3036,12 @@ static void q38_mtp_input(Model *m,const float *streams,const int *next,int S,in
         else for(int b=0;b<C;b++)
             q38_rms0(y+(int64_t)b*H,x+(int64_t)b*H,m->mtp_norm_hid+(int64_t)b*H,H,c->eps);
     }
-    if(m->mtp_wiring==Q38_MTP_STREAM_MEAN){
-        float *mean=falloc((int64_t)S*H),*fh=falloc((int64_t)S*H);
-        for(int s=0;s<S;s++)for(int d=0;d<H;d++){
-            float v=0.f;for(int b=0;b<C;b++)v+=hn[(int64_t)s*W+(int64_t)b*H+d];
-            mean[(int64_t)s*H+d]=v/C;
-        }
-        q38_dense_matmul(m,fh,mean,&m->mtp_fc_hid,S,H,H);
-        for(int s=0;s<S;s++)for(int b=0;b<C;b++)for(int d=0;d<H;d++)
-            hyper[(int64_t)s*W+(int64_t)b*H+d]=fh[(int64_t)s*H+d]+fe[(int64_t)s*H+d];
-        free(mean);free(fh);
-    } else {
-        /* fc_hidden on every stream: S rows of four streams are S*C rows of hidden */
-        float *fh=falloc((int64_t)S*W);
-        q38_dense_matmul(m,fh,hn,&m->mtp_fc_hid,S*C,H,H);
-        for(int s=0;s<S;s++)for(int b=0;b<C;b++)for(int d=0;d<H;d++)
-            hyper[(int64_t)s*W+(int64_t)b*H+d]=fh[(int64_t)s*W+(int64_t)b*H+d]+fe[(int64_t)s*H+d];
-        free(fh);
-    }
-    free(en);free(fe);free(row);free(hn);
+    /* fc_hidden on every stream: S rows of four streams are S*C rows of hidden */
+    float *fh=falloc((int64_t)S*W);
+    q38_dense_matmul(m,fh,hn,&m->mtp_fc_hid,S*C,H,H);
+    for(int s=0;s<S;s++)for(int b=0;b<C;b++)for(int d=0;d<H;d++)
+        hyper[(int64_t)s*W+(int64_t)b*H+d]=fh[(int64_t)s*W+(int64_t)b*H+d]+fe[(int64_t)s*H+d];
+    free(fh);free(en);free(fe);free(row);free(hn);
 }
 
 /* The head over S pairs at rows pos_base..pos_base+S-1: their K/V/indexer
@@ -3271,10 +3259,9 @@ static void q38_mtp_attach(Model *m,int cap) {
         exit(1);
     }
     const char *wiring=getenv("Q38_MTP_WIRING");
-    m->mtp_wiring=wiring&&*wiring?wiring[0]:Q38_MTP_WHOLE_NORM;
-    if((wiring&&*wiring&&wiring[1])||(m->mtp_wiring!=Q38_MTP_WHOLE_NORM&&
-       m->mtp_wiring!=Q38_MTP_STREAM_NORM&&m->mtp_wiring!=Q38_MTP_STREAM_MEAN)){
-        fprintf(stderr,"Q38_MTP_WIRING must be a, b or c (qwen38_core.h, the MTP head)\n");exit(1);
+    m->mtp_wiring=wiring&&*wiring?wiring[0]:Q38_MTP_STREAM_NORM;
+    if((wiring&&*wiring&&wiring[1])||(m->mtp_wiring!=Q38_MTP_WHOLE_NORM&&m->mtp_wiring!=Q38_MTP_STREAM_NORM)){
+        fprintf(stderr,"Q38_MTP_WIRING must be b (the default) or a (qwen38_core.h, the MTP head)\n");exit(1);
     }
     /* the release keeps the head at the top level, next to model.* */
     char probe[96];const char *found=NULL;
@@ -3312,9 +3299,8 @@ static void q38_mtp_attach(Model *m,int cap) {
     snprintf(nm,sizeof nm,"%s.layers.0.mlp.experts.0.gate_proj.weight",found);
     st_tensor *expert=st_find(&m->S,nm);
     double expert_bytes=expert?3.0*(double)expert->nbytes:0.0;   /* gate, up and down are the same size */
-    const char *how=m->mtp_wiring==Q38_MTP_WHOLE_NORM?"one norm over the four streams, fc_hidden per stream":
-                    m->mtp_wiring==Q38_MTP_STREAM_NORM?"a norm per stream, fc_hidden per stream":
-                    "a norm per stream, the streams averaged, one fc_hidden";
+    const char *how=m->mtp_wiring==Q38_MTP_STREAM_NORM?"a norm per stream, fc_hidden per stream":
+                    "one norm over the four streams, fc_hidden per stream (diagnostic; b is the default)";
     fprintf(stderr,"[qwen38] MTP head %s.*: wiring %c (%s), RoPE base %g, %.2f MiB resident; "
                    "routed experts %s from the snapshot%s, cache %d (Q38_MTP_CAP) x %.2f MiB = %.2f GiB full\n",
             found,m->mtp_wiring,how,(double)c->mtp_theta,
@@ -3322,7 +3308,7 @@ static void q38_mtp_attach(Model *m,int cap) {
             expert?st_dtype_name(expert->dtype):"(fused)",m->x4?" (the int4-g64 sidecar covers the model's layers)":"",
             mtp_cap,expert_bytes/1048576.0,expert_bytes*mtp_cap/1073741824.0);
     fprintf(stderr,"[qwen38] MTP norm weights, mean: embedding %.4f, hidden %.4f, mixer %.4f "
-                   "(q38_rms0 scales by 1+w: near 0 fits it, near 1 would mean a plain norm)\n",
+                   "(q38_rms0 scales by 1+w; a plain norm's weights would sit near 1)\n",
             q38_mean(m->mtp_norm_emb,H),q38_mean(m->mtp_norm_hid,W),q38_mean(m->mtp_mixer.norm,W));
 }
 

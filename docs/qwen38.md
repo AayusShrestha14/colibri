@@ -285,17 +285,18 @@ order follows which experts are resident when.
 The head is built only from blocks the engine already runs for its own layers:
 the decoder layer is a QSA attention layer with its indexer, gated residuals,
 the MoE with its shared expert, the head's own hyper-connection mixer and the
-shared `lm_head`. How its two inputs become the four streams that layer reads
-is not fixed by the tensors, so `Q38_MTP_WIRING` selects a reading (`c/qwen38_core.h`,
-"the MTP head"): `a` (default) normalizes the 4 x 2560 streams as one vector,
-`b` normalizes each stream, `c` averages the normalized streams before
-`fc_hidden`. The output does not depend on the choice; the acceptance rate does,
-and it is what tells which reading the trained weights agree with.
+shared `lm_head`. The tensors do not say how `pre_fc_norm_hidden` (4 x 2560
+wide) groups the model's four streams before `fc_hidden` maps each of them, so
+`Q38_MTP_WIRING` selects it (`c/qwen38_core.h`, "the MTP head"): `b`, the
+default, normalizes each stream on its own, the way the hyper-connection norms
+do; `a` normalizes the four streams as one vector and stays as a diagnostic.
+The output does not depend on the choice. The acceptance rate does, and on the
+release it picks `b`.
 
 Every run prints its line, and a served request prints one per turn, on stderr:
 
 ```
-[qwen38 MTP] run: 1.75 tokens/forward (4 forwards per 7 tokens) | acceptance 100.0% (3/3 drafts) | wiring a
+[qwen38 MTP] run: 1.94 tokens/forward (51 forwards per 99 tokens) | acceptance 94.1% (48/51 drafts) | wiring b
 ```
 
 Tokens are the decode tokens after the prompt and forwards the forwards that
@@ -304,9 +305,46 @@ without the int4-g64 sidecar (one layer read for at most two rows per draft is
 a small share of the expert traffic); their cache holds `Q38_MTP_CAP` experts,
 by default the cap every layer has, and the startup line prints what it costs.
 
+### Measured
+
+On the release with the int4-g64 sidecar (Ryzen 7 PRO 8700GE, 16 threads,
+61 GiB, NVMe; model files dropped from the page cache before every run, load
+average under 2, `OMP_NUM_THREADS=8`, 100 new tokens). Greedy output was
+byte-identical to MTP off in every run.
+
+| prompt, cap | wiring | acceptance | tokens/forward | tok/s |
+|---|---|---|---|---|
+| raw text prompt, cap 96 | MTP off | | | 3.57 |
+| | a | 92.2% (47/51) | 1.90 | 3.97 |
+| | **b** | **96.0% (48/50)** | **1.94** | **4.01 (+12%)** |
+| | c | 78.2% (43/55) | 1.77 | 3.76 |
+| chat-template coding prompt, cap 170 | MTP off | | | 4.15 |
+| | a | 84.9% (45/53) | 1.83 | 4.58 |
+| | **b** | **94.1% (48/51)** | **1.94** | **4.74 (+14%)** |
+| | c | 63.3% (38/60) | 1.62 | 4.21 |
+
+`c` was a third reading (the normalized streams averaged into one vector
+before a single `fc_hidden`). It came last on both prompts and was removed.
+The means of the head's norm weights are -0.76 (embedding), -0.33 (hidden) and
+3.79 (mixer), consistent with norms that scale by 1 + w like every other norm
+of the model.
+
+Nearly two tokens per forward gives only 12-14% more tokens per second here
+because the forward is not where the time goes. A verify forward feeds two
+tokens, and each token routes its own 10 experts per layer. Consecutive tokens
+share on average 3.2 of their 10 experts per layer (measured on a
+`ROUTE_TRACE` of 199 tokens), so a pair needs almost twice the experts of a
+single token. At cap 170 the cache missed 74 experts per token whether the
+tokens went one at a time or in accepted pairs. The disk reads for experts are
+therefore the same with MTP and without it. What MTP saves is the dense part
+of the forward, read once per forward instead of once per token: the trunk
+matrices, DeltaNet, attention and `lm_head`. Where the routed experts fit in
+RAM, those disk reads go away and the dense part is a larger share of each
+token, so the gain should be larger. That case has not been measured.
+
 `make -C c qwen38-tiny-mtp-check` adds a head with random weights under the
 release's names to the three tiny fixtures and gates on the head's draft
-logits against a float32 reference of each wiring
+logits against a float32 reference of both wirings
 (`c/tools/qwen38_mtp_ref.py`), and on byte-identical output with drafts and
 without them across caps, prefill batching, both trunk formats, BF16, FP8 and
 int4 experts, text and serve, with drafts all rejected, all accepted and

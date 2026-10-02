@@ -7,8 +7,9 @@ qwen38_core.h documents next to q38_mtp_input (the MTP head):
 * the model's four hyper-connection streams at position p -- the
   ``hidden_size * hc_count`` vector the final mixer reads, captured here as the
   input of ``model.hyper_connection_mixer`` -- and the embedding of the token
-  at p+1 become four streams through ``pre_fc_norm_*`` and ``fc_*``, in one of
-  the wirings a, b or c (``fuse`` below);
+  at p+1 become four streams through ``pre_fc_norm_*`` and ``fc_*``, with
+  ``pre_fc_norm_hidden`` grouped per stream (wiring b, the engine's default)
+  or over the whole vector (wiring a; ``fuse`` below);
 * those streams run through one decoder layer with the tensors under
   ``mtp.layers.0`` -- the transformers ``Qwen4ExpTextDecoderLayer``, the oracle
   the engine's own layers are checked against, built as an attention layer
@@ -25,7 +26,7 @@ times the block's ``weight_scale_inv`` in f32, so the reference sees the
 engine's weights and not the BF16 rounding the fixture generator kept in
 memory.
 
-    python tools/qwen38_mtp_ref.py --model ./qwen38_tiny_mtp --wiring a
+    python tools/qwen38_mtp_ref.py --model ./qwen38_tiny_mtp --wiring b
 """
 
 import argparse
@@ -142,22 +143,21 @@ def rms0(x, weight, eps):
 
 def fuse(streams, embedded, weights, config, wiring):
     """The head's input streams [S, hc_count*H] from the model's streams at p
-    [S, hc_count*H] and the embeddings of the tokens at p+1 [S, H]."""
+    [S, hc_count*H] and the embeddings of the tokens at p+1 [S, H]: fc_hidden
+    on every normalized stream, fc_embedding of the normalized embedding added
+    to all four."""
     C, H, eps = config.hc_count, config.hidden_size, config.rms_norm_eps
     w_hid = weights["mtp.pre_fc_norm_hidden.weight"]
     fe = rms0(embedded, weights["mtp.pre_fc_norm_embedding.weight"], eps) @ weights["mtp.fc_embedding.weight"].T
     fc_hidden = weights["mtp.fc_hidden.weight"]
     S = streams.shape[0]
-    if wiring == "a":       # one norm over the whole vector, fc_hidden per stream, embedding into all four
+    if wiring == "b":       # a norm per stream
+        normed = rms0(streams.view(S, C, H), w_hid.view(C, H), eps)
+    elif wiring == "a":     # one norm over the whole vector
         normed = rms0(streams, w_hid, eps).view(S, C, H)
-        return (normed @ fc_hidden.T + fe[:, None, :]).reshape(S, C * H)
-    per_stream = rms0(streams.view(S, C, H), w_hid.view(C, H), eps)
-    if wiring == "b":       # a norm per stream, fc_hidden per stream, embedding into all four
-        return (per_stream @ fc_hidden.T + fe[:, None, :]).reshape(S, C * H)
-    if wiring == "c":       # a norm per stream, the streams' mean, one fc_hidden, copied to all four
-        one = per_stream.mean(1) @ fc_hidden.T + fe
-        return one.repeat(1, C)
-    raise ValueError(f"wiring {wiring!r}: a, b or c")
+    else:
+        raise ValueError(f"wiring {wiring!r}: b or a")
+    return (normed @ fc_hidden.T + fe[:, None, :]).reshape(S, C * H)
 
 
 def mtp_layer(config, cfg, weights):
@@ -211,7 +211,7 @@ def mtp_logits(model_dir, ids, wiring):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", required=True, type=Path)
-    parser.add_argument("--wiring", default="a", choices="abc")
+    parser.add_argument("--wiring", default="b", choices="ba")
     parser.add_argument("--ids", help="comma-separated ids (default: ref.json full_ids)")
     args = parser.parse_args()
     ids = ([int(x) for x in args.ids.split(",")] if args.ids else

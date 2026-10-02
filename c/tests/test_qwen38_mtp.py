@@ -7,9 +7,10 @@ serve). Gates:
 
   head      the engine's draft logits (Q38_MTP_DUMP, one record per draft)
             equal tools/qwen38_mtp_ref.py's float32 reference of the head to
-            float tolerance, for each wiring of Q38_MTP_WIRING, through the
-            one-row and the two-row (after an accepted draft) paths; and the
-            wirings really differ.
+            float tolerance, for the default wiring b and the diagnostic a
+            (Q38_MTP_WIRING), through the one-row and the two-row (after an
+            accepted draft) paths, each closer to its own reference than to
+            the other's.
   lossless  with the head drafting, stdout and the last logits (DUMP) are
             byte-identical to Q38_MTP=0 at caps 1/2/8, prefill batching on
             and off, BF16 and int8 trunk, in the normal mode and in the three
@@ -114,22 +115,22 @@ def check_head(engine, model):
     data = json.loads((model / "ref.json").read_text(encoding="utf-8"))
     ids, vocab = data["full_ids"], len(data["final_logits"])
     print(f"head: {model}")
-    references = {w: ref.mtp_logits(model, ids, w).numpy() for w in "abc"}
-    for a, b in (("a", "b"), ("a", "c"), ("b", "c")):
-        gap = float(np.abs(references[a] - references[b]).max())
-        check(gap > 2e-6, f"wirings {a} and {b} give different logits (max |diff| {gap:.3g})")
+    references = {w: ref.mtp_logits(model, ids, w).numpy() for w in "ba"}
+    gap = float(np.abs(references["a"] - references["b"]).max())
+    check(gap > 2e-6, f"wirings b and a give different logits (max |diff| {gap:.3g})")
     with tempfile.TemporaryDirectory() as tmp:
-        for wiring in "abc":
+        # b with Q38_MTP_WIRING unset, as the engine runs by default; a by name
+        for wiring, knob in (("b (default)", {}), ("a", {"Q38_MTP_WIRING": "a"})):
             rows_seen = set()
             for mode in ("reject", "mixed"):
-                dump = Path(tmp) / f"{wiring}-{mode}.f32"
+                dump = Path(tmp) / f"{wiring[0]}-{mode}.f32"
                 # reject drafts at every token (rows past the prompt, one pending
                 # row each); mixed reaches the head with two pending rows after
                 # each accepted draft. The BF16 trunk: every fixture matrix is
                 # under the 1 MiB int8 threshold.
                 r = run(engine, model, [2, 8, model / "ref.json"],
-                        {"Q38_MTP": "1", "Q38_MTP_WIRING": wiring, "Q38_MTP_FORCE": mode,
-                         "Q38_MTP_DUMP": str(dump), "Q38_TRUNK_MIN_KB": "1024"})
+                        dict(knob, Q38_MTP="1", Q38_MTP_FORCE=mode,
+                             Q38_MTP_DUMP=str(dump), Q38_TRUNK_MIN_KB="1024"))
                 if r.returncode:
                     check(False, f"wiring {wiring} {mode}: engine exit {r.returncode}\n"
                                  + r.stderr.decode(errors="replace")[-2000:])
@@ -140,15 +141,16 @@ def check_head(engine, model):
                         check(False, f"wiring {wiring} {mode}: draft row {row} paired token {token}, "
                                      f"the sequence has {ids[row + 1]}")
                         continue
-                    errors = {w: float(np.abs(logits - references[w][row]).max()) for w in "abc"}
-                    worst = max(worst, errors[wiring])
-                    nearest_other = min(nearest_other, *(e for w, e in errors.items() if w != wiring))
-                    argmax_ok &= int(logits.argmax()) == int(references[wiring][row].argmax())
+                    own = wiring[0]
+                    errors = {w: float(np.abs(logits - references[w][row]).max()) for w in "ba"}
+                    worst = max(worst, errors[own])
+                    nearest_other = min(nearest_other, *(e for w, e in errors.items() if w != own))
+                    argmax_ok &= int(logits.argmax()) == int(references[own][row].argmax())
                     rows += 1
                     rows_seen.add(row)
                 check(rows > 0 and worst <= 1e-6 and 20 * worst <= nearest_other and argmax_ok,
                       f"wiring {wiring} {mode}: {rows} draft rows within {worst:.2g} of the reference "
-                      f"(the other wirings' are {nearest_other:.2g} away), argmax {'equal' if argmax_ok else 'DIFFERS'}")
+                      f"(the other wiring's is {nearest_other:.2g} away), argmax {'equal' if argmax_ok else 'DIFFERS'}")
             check(rows_seen >= set(range(len(data["prompt_ids"]) - 1, len(ids) - 3)),
                   f"wiring {wiring}: rows {sorted(rows_seen)} compared")
 
@@ -191,7 +193,7 @@ def check_lossless(engine, model, ref_name, extra=None):
                                          + on.stdout.decode(errors="replace") + on.stderr.decode(errors="replace")[-1500:])
                         configs += 1
         off = run(engine, model, [8, 8, model / ref_name], dict(extra))
-        for knob in ({"Q38_MTP_WIRING": "b"}, {"Q38_MTP_WIRING": "c"}, {"Q38_MTP_CAP": "1"}):
+        for knob in ({"Q38_MTP_WIRING": "a"}, {"Q38_MTP_CAP": "1"}):
             on = run(engine, model, [8, 8, model / ref_name], dict(extra, Q38_MTP="1", **knob))
             name = " ".join(f"{k}={v}" for k, v in knob.items())
             check(on.returncode == 0 and on.stdout == off.stdout, f"{name}: output equals MTP off")
@@ -349,7 +351,7 @@ def main():
     if FAILS:
         print(f"qwen38 MTP: {len(FAILS)} check(s) failed")
         return 1
-    print("qwen38 MTP: head matches the reference for wirings a, b, c; decoding with drafts is "
+    print("qwen38 MTP: head matches the reference for wirings b (default) and a; decoding with drafts is "
           "byte-identical to decoding without them")
     return 0
 
