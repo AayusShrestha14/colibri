@@ -69,10 +69,11 @@ static int g_cuda = 0;
 static int g_metal = 0;
 #endif
 #ifdef COLI_VULKAN
-/* Vulkan (opt-in, VK=1 build + COLI_VULKAN=1): the RESIDENT dense matrices that
- * the dense-int4g64 container holds in a format the qmatmul shader reads as it is
- * (int8 per row -> fmt 1, int4-g64 -> fmt 4), uploaded on first use. Routed
- * experts, which arrive from disk, and bf16/f32 residents stay on the CPU. */
+/* Vulkan (opt-in, VK=1 build + COLI_VULKAN=1): the RESIDENT matrices, in the form
+ * they are kept in RAM, uploaded on first use -- the dense-int4g64 container's int8
+ * (fmt 1) and int4-g64 (fmt 4), and the f32 (fmt 10) and bf16 (fmt 11) residents of
+ * an unconverted snapshot. Routed experts, which arrive from disk, and the embedding
+ * row lookups stay on the CPU; CUDA keeps its own bf16 residents. */
 #include "backend_vulkan.h"
 static int g_vk_ready = 0;
 #endif
@@ -419,21 +420,32 @@ static void matmul_i8r(float *y, const float *x, const int8_t *q, const float *s
  * experts are read through wt_off_i views of one fused [ns][R,I] tensor, so the
  * cache cannot live in the copy matmul_w receives: it lives in a table the
  * loaded Wt points to and every view copies, one entry per view (keyed by the
- * view's first byte). Released with the tensor it belongs to. */
-typedef struct { const uint8_t *q; ColiVkTensor *t; int dead; } InkVkView;
+ * view's first weight). Released with the tensor it belongs to. */
+typedef struct { const void *q; ColiVkTensor *t; int dead; } InkVkView;
 typedef struct { int n; InkVkView e[]; } InkVk;
 
-/* Attach a table to a loaded tensor the shader reads exactly as the CPU kernel
- * does: int8 per row (matmul_i8r) is fmt 1, int4 group-scaled with +8 nibbles
- * and the low nibble on the even column (matmul_i4g) is fmt 4. */
+/* The shader format that reads a weight exactly as the CPU kernel does, 0 for none.
+ * int8 per row (matmul_i8r) is fmt 1; int4 group-scaled with +8 nibbles and the low
+ * nibble on the even column (matmul_i4g) is fmt 4; f32 (matmul) is fmt 10; bf16
+ * (matmul_h) is fmt 11 -- except where matmul_h rounds the activations to bf16
+ * (the AVX512-BF16 dot), which the shader does not: there bf16 stays on the CPU. */
+static int ink_vk_fmt(const Wt *w) {
+    if (w->q4) return w->qbits == 8 ? 1 : (w->qbits == 4 && w->gs >= 8 && w->gs % 8 == 0) ? 4 : 0;
+    if (w->f) return 10;
+#ifndef HAVE_BF16_DOT
+    if (w->h) return 11;
+#endif
+    return 0;
+}
+/* Attach a table to a loaded tensor the shader can read; returns its fmt, or 0. */
 static int ink_vk_attach(Wt *w, int views) {
-    if (!w->q4 || w->vk || views < 1) return 0;
-    if (w->qbits != 8 && !(w->qbits == 4 && w->gs >= 8 && w->gs % 8 == 0)) return 0;
+    int fmt = ink_vk_fmt(w);
+    if (!fmt || w->vk || views < 1) return 0;
     InkVk *v = calloc(1, sizeof(*v) + (size_t)views * sizeof(v->e[0]));
     if (!v) return 0;
     v->n = views;
     w->vk = v;
-    return 1;
+    return fmt;
 }
 static void ink_vk_release(Wt *w) {
     InkVk *v = w->vk;
@@ -450,13 +462,16 @@ static int ink_vk_matmul(float *y, const float *x, const Wt *W, int S, int I, in
 #ifdef _OPENMP
     if (omp_in_parallel()) return 0;
 #endif
+    int fmt = ink_vk_fmt(W);
+    const void *data = W->q4 ? (const void *)W->q4 : W->f ? (const void *)W->f : (const void *)W->h;
+    if (!fmt || !data) return 0;
     for (int k = 0; k < v->n; k++) {
         InkVkView *e = &v->e[k];
-        if (e->q && e->q != W->q4) continue;
+        if (e->q && e->q != data) continue;
         if (e->dead) return 0;
-        e->q = W->q4;
-        if (coli_vk_matmul(&e->t, y, x, W->q4, W->qs, W->qbits == 8 ? 1 : 4,
-                           S, I, O, W->gs))
+        e->q = data;
+        if (coli_vk_matmul(&e->t, y, x, data, W->q4 ? W->qs : NULL, fmt, S, I, O,
+                           W->q4 ? W->gs : 0))
             return 1;
         if (!e->t) e->dead = 1;          /* refused at upload: this view stays on the CPU */
         return 0;
@@ -497,6 +512,9 @@ static void matmul_w(float *y, const float *x, Wt W, int S, int I, int O) {
         else              matmul_i4g(y, x, W.q4, W.qs, S, I, O, W.gs);
         return;
     }
+#ifdef COLI_VULKAN
+    if (W.vk && ink_vk_matmul(y, x, &W, S, I, O)) return;
+#endif
     if (W.f) matmul(y, x, W.f, S, I, O);
     else     matmul_h(y, x, W.h, S, I, O);
 }
@@ -968,24 +986,31 @@ static double mem_avail_bytes(void);
 
 #ifdef COLI_VULKAN
 /* After the weights: open the device (COLI_VULKAN=1) and mark the resident
- * matrices it can take. Without the dense-int4g64 container every resident is
- * bf16 or f32, which the shader does not read, and the line says so. */
+ * matrices it can take, which upload on first use; the line says which. The host
+ * copy stays (it is the CPU fallback), so the device holds a second copy: on a GPU
+ * that shares RAM with the CPU the resident set costs twice. */
+static void ink_vk_mark(Wt *w, int views, int *by, int *cpu) {
+    if (!w->q4 && !w->f && !w->h) return;          /* absent, or a CUDA resident */
+    int fmt = ink_vk_attach(w, views);
+    if (fmt) by[fmt]++; else (*cpu)++;
+}
 static void ink_vk_init_model(Model *m, int layer_begin, int layer_end) {
     if (!g_vk_ready) g_vk_ready = coli_vk_init_env("inkling");
     if (!g_vk_ready) return;
-    int n = ink_vk_attach(&m->lm_head, 1);
+    int by[13] = {0}, cpu = 0;
+    ink_vk_mark(&m->lm_head, 1, by, &cpu);
     for (int i = layer_begin; i < layer_end; i++) {
         Layer *l = &m->L[i];
-        n += ink_vk_attach(&l->q, 1) + ink_vk_attach(&l->k, 1) + ink_vk_attach(&l->v, 1)
-           + ink_vk_attach(&l->r, 1) + ink_vk_attach(&l->o, 1);
-        n += ink_vk_attach(&l->dg, 1) + ink_vk_attach(&l->du, 1) + ink_vk_attach(&l->dd, 1);
-        int ns = m->c.n_shared;
-        n += ink_vk_attach(&l->sh_g, ns) + ink_vk_attach(&l->sh_u, ns) + ink_vk_attach(&l->sh_d, ns);
+        Wt *one[] = { &l->q, &l->k, &l->v, &l->r, &l->o, &l->dg, &l->du, &l->dd };
+        for (size_t j = 0; j < sizeof(one) / sizeof(one[0]); j++) ink_vk_mark(one[j], 1, by, &cpu);
+        ink_vk_mark(&l->sh_g, m->c.n_shared, by, &cpu);   /* one device copy per shared expert */
+        ink_vk_mark(&l->sh_u, m->c.n_shared, by, &cpu);
+        ink_vk_mark(&l->sh_d, m->c.n_shared, by, &cpu);
     }
-    if (n) fprintf(stderr, "[VK] inkling: %d resident tensors (int8, int4-g64) on the GPU; "
-                   "bf16/f32 residents and routed experts stay on the CPU\n", n);
-    else   fprintf(stderr, "[VK] inkling: no resident tensor in a format the GPU reads "
-                   "(int8, int4-g64: the dense-int4g64 container), everything stays on the CPU\n");
+    fprintf(stderr, "[VK] inkling: %d resident matrices go to the GPU on first use "
+            "(%d int8, %d int4-g64, %d f32, %d bf16), %d stay on the CPU; "
+            "routed experts and embedding lookups stay on the CPU\n",
+            by[1] + by[4] + by[10] + by[11], by[1], by[4], by[10], by[11], cpu);
 }
 #endif
 
