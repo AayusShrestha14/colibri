@@ -20,7 +20,7 @@
  * With COLI_VULKAN unset, COLI_VK_TIER=0, a CUDA tier active, or a build without
  * VK=1 (the inline stubs below), nothing here runs and the engine is unchanged.
  *
- * ---- integrating an engine (the phase-2 guide) -------------------------------
+ * ---- integrating an engine ----------------------------------------------------
  * 0. Open the device saying whether the tier will be tried, so the dense matrices
  *    get their default place (on a device that shares the CPU's RAM they stay on
  *    the CPU while the tier is on; COLI_VK_DENSE decides when set):

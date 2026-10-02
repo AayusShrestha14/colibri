@@ -56,7 +56,10 @@ shader_formats() {
 }
 
 # tier_count <engine> <log>: N from the last "[VK] tier <engine> run: device N of M" line;
-# tier_evictions <engine> <log>: the evictions of that line
+# tier_evictions <engine> <log>: the evictions of that line; tier_failed: its failed
+# uploads (an eviction case must have none: a promotion that displaces a resident
+# while a batch is in flight waits for the join to free it, even with
+# COLI_VK_TIER_SYNC=1, instead of failing and shrinking the budget)
 tier_count() {
   local n
   n=$(sed -n "s/^\[VK\] tier $1 run: device \([0-9][0-9]*\) of .*/\1/p" "$2" | tail -1)
@@ -65,6 +68,11 @@ tier_count() {
 tier_evictions() {
   local n
   n=$(sed -n "s/^\[VK\] tier $1 run: .* evictions \([0-9][0-9]*\),.*/\1/p" "$2" | tail -1)
+  echo "${n:-0}"
+}
+tier_failed() {
+  local n
+  n=$(sed -n "s/^\[VK\] tier $1 run: .* failed \([0-9][0-9]*\) |.*/\1/p" "$2" | tail -1)
   echo "${n:-0}"
 }
 
@@ -109,6 +117,7 @@ tier_gate() {
   [ "$(tier_count "$eng" vk.log)" -gt 0 ] || { cat vk.log; fail "$tag: no routed expert ran on the device"; }
   if [ "${EVICT:-0}" = 1 ]; then
     [ "$(tier_evictions "$eng" vk.log)" -gt 0 ] || { grep '\[VK\] tier' vk.log; fail "$tag: the budget forced no eviction"; }
+    [ "$(tier_failed "$eng" vk.log)" = 0 ] || { grep '\[VK\] tier' vk.log; fail "$tag: an upload failed (the budget shrank)"; }
   fi
   local where; where=$(dense_where "$eng" vk.log "$tag" "${envs[@]}") || { echo "$where"; exit 1; }
   echo "OK $tag: tokens = CPU, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' vk.log | tail -1), $(grep -a -o 'evictions [0-9]*' vk.log | tail -1), trunk on the $where"
@@ -660,6 +669,7 @@ family_deepseek() {
     [ "$(tier_count deepseek_v41 v41-vk.err)" -gt 0 ] || { cat v41-vk.err; fail "deepseek_v41 tier $tag: no routed expert ran on the device"; }
     if [ "${EVICT:-0}" = 1 ]; then
       [ "$(tier_evictions deepseek_v41 v41-vk.err)" -gt 0 ] || { grep '\[VK\] tier' v41-vk.err; fail "deepseek_v41 tier $tag: the budget forced no eviction"; }
+      [ "$(tier_failed deepseek_v41 v41-vk.err)" = 0 ] || { grep '\[VK\] tier' v41-vk.err; fail "deepseek_v41 tier $tag: an upload failed (the budget shrank)"; }
     fi
     echo "OK deepseek_v41 tier $tag: output = CPU, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' v41-vk.err | tail -1), $(grep -a -o 'evictions [0-9]*' v41-vk.err | tail -1)"
   }
@@ -736,6 +746,7 @@ PY
     [ "$(tier_count deepseek_v4 v4-vk.err)" -gt 0 ] || { cat v4-vk.err; fail "deepseek_v4 tier $tag: no routed expert ran on the device"; }
     if [ "${EVICT:-0}" = 1 ]; then
       [ "$(tier_evictions deepseek_v4 v4-vk.err)" -gt 0 ] || { grep '\[VK\] tier' v4-vk.err; fail "deepseek_v4 tier $tag: the budget forced no eviction"; }
+      [ "$(tier_failed deepseek_v4 v4-vk.err)" = 0 ] || { grep '\[VK\] tier' v4-vk.err; fail "deepseek_v4 tier $tag: an upload failed (the budget shrank)"; }
     fi
     if [ "${WARM:-0}" = 1 ]; then
       grep -q '^\[VK\] tier deepseek_v4: warm start' v4-vk.err || { grep '\[VK\] tier' v4-vk.err; fail "deepseek_v4 tier $tag: no warm start"; }
@@ -989,6 +1000,7 @@ glm_tier() {
   fi
   if [ "${EVICT:-0}" = 1 ]; then
     [ "$(tier_evictions colibri vk.log)" -gt 0 ] || { grep '\[VK\] tier' vk.log; fail "$tag: the budget forced no eviction"; }
+    [ "$(tier_failed colibri vk.log)" = 0 ] || { grep '\[VK\] tier' vk.log; fail "$tag: an upload failed (the budget shrank)"; }
   fi
   echo "OK $tag: tokens = CPU, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' vk.log | tail -1)$(grep -a -o ' + [0-9]* vk' vk.log | tail -1), $(grep -a -o 'evictions [0-9]*' vk.log | tail -1), $(grep -a -o '(fmt [^)]*)' vk.log | head -1)"
 }
@@ -1010,6 +1022,7 @@ g53_tier() {
   [ "$(tier_count glm53 vk.log)" -gt 0 ] || { cat vk.log; fail "$tag: no routed expert ran on the device"; }
   if [ "${EVICT:-0}" = 1 ]; then
     [ "$(tier_evictions glm53 vk.log)" -gt 0 ] || { grep '\[VK\] tier' vk.log; fail "$tag: the budget forced no eviction"; }
+    [ "$(tier_failed glm53 vk.log)" = 0 ] || { grep '\[VK\] tier' vk.log; fail "$tag: an upload failed (the budget shrank)"; }
   fi
   local where; where=$(dense_where glm53 vk.log "$tag" "${envs[@]}") || { echo "$where"; exit 1; }
   echo "OK $tag: tokens = CPU, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' vk.log | tail -1), $(grep -a -o 'evictions [0-9]*' vk.log | tail -1), trunk on the $where"
