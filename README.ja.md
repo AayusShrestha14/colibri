@@ -485,6 +485,7 @@ GLM-5.2 がリファレンスモデルですが、同じストリーミング手
 | **Qwen3-Coder-30B-A3B**（Alibaba） | 30B / 3B | [`Justvugg/Qwen3-Coder-30B-A3B-colibri-int4`](https://huggingface.co/Justvugg/Qwen3-Coder-30B-A3B-colibri-int4)（19 GB、int4-gs64）、[`Qwen/Qwen3-Coder-30B-A3B-Instruct`](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct) から変換。Qwen3.6 エンジンで動く全層アテンションの Qwen3 MoE で、128 エキスパートの top-8、独自の XML 形式のツール呼び出しを持ち、思考モードはなし。teacher forcing で、int4 コンテナは 96.9% の位置で bf16 リリースと同じ top-1 トークンを選ぶ | `make -C c qwen36` | [qwen36.md](docs/qwen36.md#qwen3-coder-30b-a3b) |
 | **OLMoE**（AI2） | 7B / 1B | `c/tools/convert_olmoe_merged.py` で変換 — **int8** コンテナ、約 7 GB | `make -C c olmoe` | — |
 | **Qwen-Image-2.1**（Alibaba） | 画像モデル | [`Qwen/Qwen-Image-2.1`](https://huggingface.co/Qwen/Qwen-Image-2.1)（約 33 GB）、公式 diffusers チェックポイント、**変換不要**: テキストエンコーダと拡散トランスフォーマーはロード時に int8 に量子化。`coli chat` では画像をインライン表示し、`coli serve` では `POST /v1/images/generations` で提供。Qwen Research License: 非商用利用のみ | `make -C c qwenimage` | [qwen-image.md](docs/qwen-image.md) |
+| **Laya**（Convai Innovations） | 判定モデル、421M | [`convaiinnovations/laya`](https://huggingface.co/convaiinnovations/laya)（842 MB）、公式チェックポイント、**変換不要**: ModernBERT エンコーダと判定ヘッドで、型付きの質問（choice、score、noul）に生成ではなく較正済みの確率で答える。`coli serve` の `POST /v1/systemone` で提供。Apache-2.0 | `make -C c laya` | [laya.md](docs/laya.md) |
 
 Qwen3.6 には変換済みコンテナが 3 つあります: **int4-gs64**（推奨 — int8 のアンカーに対するコサイン類似度は
 行単位と比べて 0.98777 → 0.99313、KL は 0.109 → 0.080 と計測されており、量子化誤差が約 44% 少ない）、
