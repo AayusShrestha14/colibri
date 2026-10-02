@@ -1939,44 +1939,63 @@ static void q38_ple_prefetch(Model *m,const int *ids,int S) {
     m->ple_pref=buffer; m->ple_pref_rows=S;
 }
 
+/* The key and value projections read only the token's n-gram embedding, so they
+ * run once for a block of rows: one S-row call (a device GEMM) instead of one
+ * GEMV per token. The embedding lookups walk the n-gram history and the
+ * convolution its ring, both in token order as before; every CPU kernel computes
+ * each row on its own, so a block gives the bits of the per-token calls. A
+ * projection the CUDA tier holds answers one row at a time (the tier serves
+ * S == 1, prefill rows would fall to the CPU), so with one the block is a row,
+ * as with Q38_PREFILL_BATCH=0. */
+static int q38_bounded_prefill_rows(int requested,uint64_t fixed,uint64_t per_row);
 static void q38_ple(Model *m,const int *ids,int S,const float *hyper,float *out) {
     double phase_started=now_s();
     Cfg *c=&m->c; Layer *l=&m->L[c->ple_layer]; int H=c->hidden,C=c->hc_count,W=c->hc_width,E=c->ple_dim;
-    float *emb=falloc(E),*keys=falloc(W),*value=falloc(H),*kn=falloc(W),*qn=falloc(W),*gated=falloc(W),*norm=falloc(W);
+    int B=!m->prefill_batch||l->ple_key.gpu||l->ple_value.gpu?1:
+          q38_bounded_prefill_rows(S,0,((uint64_t)E+(uint64_t)W+(uint64_t)H)*sizeof(float));
+    float *embs=falloc((int64_t)B*E),*keysb=falloc((int64_t)B*W),*valueb=falloc((int64_t)B*H);
+    float *kn=falloc(W),*qn=falloc(W),*gated=falloc(W),*norm=falloc(W);
     int state_len=(c->ple_convk-1)*c->ngram_size; float *ring=m->PLE_conv_state;
-    for(int s=0;s<S;s++){
-        int64_t p1=m->ple_history_len>=1?m->ple_history[m->ple_history_len-1]:c->eos_id;
-        int64_t p2=m->ple_history_len>=2?m->ple_history[m->ple_history_len-2]:c->eos_id;
-        if(m->ple_pref&&s<m->ple_pref_rows){
-            /* gia' in memoria: le ha portate q38_ple_prefetch mentre i primi
-             * layer calcolavano */
-            memcpy(emb,m->ple_pref+(int64_t)s*c->ngram_heads*c->ngram_head_dim,
-                   (size_t)c->ngram_heads*c->ngram_head_dim*sizeof(float));
-        } else for(int h=0;h<c->ngram_heads;h++){
-            int ng=h<c->heads_per_ngram?2:3; int64_t row=q38_hash_row(m,h,ng,ids[s],p1,p2);
-            q38_ple_row(m,row,emb+(int64_t)h*c->ngram_head_dim);
+    for(int base=0;base<S;base+=B){
+        int rows=S-base<B?S-base:B;
+        for(int r=0;r<rows;r++){
+            int s=base+r; float *emb=embs+(int64_t)r*E;
+            int64_t p1=m->ple_history_len>=1?m->ple_history[m->ple_history_len-1]:c->eos_id;
+            int64_t p2=m->ple_history_len>=2?m->ple_history[m->ple_history_len-2]:c->eos_id;
+            if(m->ple_pref&&s<m->ple_pref_rows){
+                /* gia' in memoria: le ha portate q38_ple_prefetch mentre i primi
+                 * layer calcolavano */
+                memcpy(emb,m->ple_pref+(int64_t)s*c->ngram_heads*c->ngram_head_dim,
+                       (size_t)c->ngram_heads*c->ngram_head_dim*sizeof(float));
+            } else for(int h=0;h<c->ngram_heads;h++){
+                int ng=h<c->heads_per_ngram?2:3; int64_t row=q38_hash_row(m,h,ng,ids[s],p1,p2);
+                q38_ple_row(m,row,emb+(int64_t)h*c->ngram_head_dim);
+            }
+            if(ids[s]==c->eos_id)m->ple_history_len=0;
+            else if(m->ple_history_len==0){m->ple_history[0]=ids[s];m->ple_history_len=1;}
+            else if(m->ple_history_len==1){m->ple_history[1]=ids[s];m->ple_history_len=2;}
+            else {m->ple_history[0]=m->ple_history[1];m->ple_history[1]=ids[s];}
         }
-        q38_dense_matmul(m,keys,emb,&l->ple_key,1,E,W);q38_dense_matmul(m,value,emb,&l->ple_value,1,E,H);
-        for(int b=0;b<C;b++){
-            q38_rms0(kn+(int64_t)b*H,keys+(int64_t)b*H,l->ple_norm_key+(int64_t)b*H,H,c->eps);
-            q38_rms0(qn+(int64_t)b*H,hyper+(int64_t)s*W+(int64_t)b*H,l->ple_norm_query+(int64_t)b*H,H,c->eps);
-            float dot=0.f;for(int d=0;d<H;d++)dot+=kn[(int64_t)b*H+d]*qn[(int64_t)b*H+d];dot/=sqrtf((float)H);
-            float shaped=copysignf(sqrtf(fmaxf(fabsf(dot),1e-6f)),dot),g=q38_sigmoid(shaped);
-            for(int d=0;d<H;d++)gated[(int64_t)b*H+d]=g*value[d];
-            q38_rms0(norm+(int64_t)b*H,gated+(int64_t)b*H,l->ple_norm_conv+(int64_t)b*H,H,c->eps);
+        q38_dense_matmul(m,keysb,embs,&l->ple_key,rows,E,W);q38_dense_matmul(m,valueb,embs,&l->ple_value,rows,E,H);
+        for(int r=0;r<rows;r++){
+            int s=base+r; const float *keys=keysb+(int64_t)r*W,*value=valueb+(int64_t)r*H;
+            for(int b=0;b<C;b++){
+                q38_rms0(kn+(int64_t)b*H,keys+(int64_t)b*H,l->ple_norm_key+(int64_t)b*H,H,c->eps);
+                q38_rms0(qn+(int64_t)b*H,hyper+(int64_t)s*W+(int64_t)b*H,l->ple_norm_query+(int64_t)b*H,H,c->eps);
+                float dot=0.f;for(int d=0;d<H;d++)dot+=kn[(int64_t)b*H+d]*qn[(int64_t)b*H+d];dot/=sqrtf((float)H);
+                float shaped=copysignf(sqrtf(fmaxf(fabsf(dot),1e-6f)),dot),g=q38_sigmoid(shaped);
+                for(int d=0;d<H;d++)gated[(int64_t)b*H+d]=g*value[d];
+                q38_rms0(norm+(int64_t)b*H,gated+(int64_t)b*H,l->ple_norm_conv+(int64_t)b*H,H,c->eps);
+            }
+            for(int d=0;d<W;d++){
+                float a=l->ple_conv[(int64_t)d*c->ple_convk+c->ple_convk-1]*norm[d];
+                for(int k=0;k<c->ple_convk-1;k++)a+=l->ple_conv[(int64_t)d*c->ple_convk+k]*ring[(int64_t)d*state_len+k*c->ngram_size];
+                out[(int64_t)s*W+d]=gated[d]+q38_silu(a);
+                float *rg=ring+(int64_t)d*state_len;for(int k=0;k<state_len-1;k++)rg[k]=rg[k+1];rg[state_len-1]=norm[d];
+            }
         }
-        for(int d=0;d<W;d++){
-            float a=l->ple_conv[(int64_t)d*c->ple_convk+c->ple_convk-1]*norm[d];
-            for(int k=0;k<c->ple_convk-1;k++)a+=l->ple_conv[(int64_t)d*c->ple_convk+k]*ring[(int64_t)d*state_len+k*c->ngram_size];
-            out[(int64_t)s*W+d]=gated[d]+q38_silu(a);
-            float *r=ring+(int64_t)d*state_len;for(int k=0;k<state_len-1;k++)r[k]=r[k+1];r[state_len-1]=norm[d];
-        }
-        if(ids[s]==c->eos_id)m->ple_history_len=0;
-        else if(m->ple_history_len==0){m->ple_history[0]=ids[s];m->ple_history_len=1;}
-        else if(m->ple_history_len==1){m->ple_history[1]=ids[s];m->ple_history_len=2;}
-        else {m->ple_history[0]=m->ple_history[1];m->ple_history[1]=ids[s];}
     }
-    free(emb);free(keys);free(value);free(kn);free(qn);free(gated);free(norm);
+    free(embs);free(keysb);free(valueb);free(kn);free(qn);free(gated);free(norm);
     q38_tm_add(m,Q38_TM_PLE,phase_started);
 }
 
