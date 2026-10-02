@@ -47,7 +47,9 @@ static struct {
     int last_layer, first_layer, promos, promo_cap;
     /* uploader */
     pthread_t th; int th_on, stop;
-    pthread_mutex_t mx; pthread_cond_t cv, cv_room;
+    pthread_mutex_t mx; pthread_cond_t cv, cv_room, cv_done;
+    int busy;                          /* the uploader is between taking an entry and push_done */
+    int sync;                          /* COLI_VK_TIER_SYNC=1: quiescent points wait for the uploader */
     VQ q[VKT_QCAP]; int qh, qn;
     VDone *done; int ndone, cdone;
     unsigned long room_gen;
@@ -224,6 +226,7 @@ static void push_done(int layer, int eid, int ok, ColiVkTensor *t[3]) {
         int nc = T.cdone ? 2 * T.cdone : 64;
         VDone *n = realloc(T.done, (size_t)nc * sizeof(*n));
         if (!n) {   /* cannot even record it: the slot stays queued and is never used */
+            T.busy = 0; pthread_cond_broadcast(&T.cv_done);
             pthread_mutex_unlock(&T.mx);
             for (int k = 0; k < 3; k++) if (t[k]) coli_vk_tensor_free(t[k]);
             return;
@@ -231,6 +234,7 @@ static void push_done(int layer, int eid, int ok, ColiVkTensor *t[3]) {
         T.done = n; T.cdone = nc;
     }
     T.done[T.ndone++] = (VDone){layer, eid, ok, t[0], t[1], t[2]};
+    T.busy = 0; pthread_cond_broadcast(&T.cv_done);
     pthread_mutex_unlock(&T.mx);
 }
 
@@ -240,7 +244,7 @@ static void *uploader(void *arg) {
         pthread_mutex_lock(&T.mx);
         while (!T.qn && !T.stop) pthread_cond_wait(&T.cv, &T.mx);
         if (T.stop) { pthread_mutex_unlock(&T.mx); return NULL; }
-        VQ e = T.q[T.qh]; T.qh = (T.qh + 1) % VKT_QCAP; T.qn--;
+        VQ e = T.q[T.qh]; T.qh = (T.qh + 1) % VKT_QCAP; T.qn--; T.busy = 1;
         pthread_mutex_unlock(&T.mx);
         const uint8_t *b = e.buf;
         const uint8_t *g = b, *u = g + T.gu_codes, *d = u + T.gu_codes;
@@ -254,7 +258,7 @@ static void *uploader(void *arg) {
          * minute (the engine stopped stepping), the pool is full for real. */
         for (int frees = 0, waited = 0; !ok; ) {
             ok = upload(g, u, d, gs, us, ds, t);
-            if (ok || frees >= 3 || waited >= 600) break;
+            if (ok || frees >= 3 || waited >= 600 || T.sync) break;   /* sync: the engine waits on us, not we on it */
             pthread_mutex_lock(&T.mx);
             unsigned long gen = T.room_gen;
             while (T.room_gen == gen && !T.stop && waited < 600) {
@@ -286,8 +290,11 @@ static void quiesce(void) {
     if (freed) {
         pthread_mutex_lock(&T.mx); T.room_gen++; pthread_cond_broadcast(&T.cv_room); pthread_mutex_unlock(&T.mx);
     }
-    /* finished uploads become resident */
+    /* finished uploads become resident; COLI_VK_TIER_SYNC=1 waits for every staged one
+     * first, so what is resident depends on the routing alone, not on thread timing
+     * (tests: a fixture's whole run can be over before the uploader is scheduled) */
     pthread_mutex_lock(&T.mx);
+    if (T.sync && T.th_on) while ((T.qn || T.busy) && !T.stop) pthread_cond_wait(&T.cv_done, &T.mx);
     int n = T.ndone; VDone *d = n ? malloc((size_t)n * sizeof(*d)) : NULL;
     if (d) { memcpy(d, T.done, (size_t)n * sizeof(*d)); T.ndone = 0; } else n = 0;
     pthread_mutex_unlock(&T.mx);
@@ -698,7 +705,12 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     }
     T.max_resident = (int)fit;
     T.budget = (size_t)want;
-    coli_vk_tier_pool_limit(T.budget);
+    /* Every expert fits in one block's worth: the pool's limit (and so its one block)
+     * is what they take, not the budget, so a small model does not hold a 256 MB
+     * block for a few experts. */
+    size_t lim = T.budget, need = (size_t)(all + 1) * T.exp_bytes;
+    if (fit == all && need < lim && need <= ((size_t)256 << 20)) lim = need;
+    coli_vk_tier_pool_limit(lim);
     const char *bal = getenv("COLI_VK_TIER_BALANCE");
     T.balance = T.c.in_ram != NULL && !(bal && *bal == '0');
     T.share = 1.f;
@@ -723,7 +735,9 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
             if (mx) for (int e = 0; e < T.c.experts; e++)
                 if (heat[l][e]) T.s[(size_t)l * T.c.experts + e].heat = 1 + (uint32_t)(31.0 * heat[l][e] / mx);
         }
-    if (pthread_mutex_init(&T.mx, NULL) || pthread_cond_init(&T.cv, NULL) || pthread_cond_init(&T.cv_room, NULL)) return 0;
+    if (pthread_mutex_init(&T.mx, NULL) || pthread_cond_init(&T.cv, NULL) || pthread_cond_init(&T.cv_room, NULL) ||
+        pthread_cond_init(&T.cv_done, NULL)) return 0;
+    { const char *sy = getenv("COLI_VK_TIER_SYNC"); T.sync = sy && *sy == '1'; }
     if (pthread_create(&T.th, NULL, uploader, NULL)) return 0;
     T.th_on = 1;
     T.on = 1;
@@ -734,10 +748,10 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     if (T.gu_gs) fprintf(stderr, " gs %d", T.gu_gs);
     fprintf(stderr, ", down fmt %d", T.dn_fmt);
     if (T.dn_gs) fprintf(stderr, " gs %d", T.dn_gs);
-    fprintf(stderr, "), %s, %s queue, up to %d promotions per token%s\n",
+    fprintf(stderr, "), %s, %s queue, up to %d promotions per token%s%s\n",
             T.uma ? (cap && *cap ? "shared RAM (COLI_VK_TIER_GB)" : "shared RAM: a quarter of what the expert cache leaves")
                   : "device memory", coli_vk_xb_queue_shared() ? "shared" : "own", T.rate,
-            T.balance ? ", balanced against the CPU" : "");
+            T.balance ? ", balanced against the CPU" : "", T.sync ? ", uploads awaited (COLI_VK_TIER_SYNC)" : "");
     return 1;
 }
 
@@ -764,7 +778,7 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
 void vkt_shutdown(void) {
     if (!T.s) return;
     if (T.th_on) {
-        pthread_mutex_lock(&T.mx); T.stop = 1; pthread_cond_broadcast(&T.cv); pthread_cond_broadcast(&T.cv_room); pthread_mutex_unlock(&T.mx);
+        pthread_mutex_lock(&T.mx); T.stop = 1; pthread_cond_broadcast(&T.cv); pthread_cond_broadcast(&T.cv_room); pthread_cond_broadcast(&T.cv_done); pthread_mutex_unlock(&T.mx);
         pthread_join(T.th, NULL);
         T.th_on = 0;
     }
@@ -776,7 +790,7 @@ void vkt_shutdown(void) {
         size_t n = (size_t)T.c.layers * T.c.experts;
         for (size_t i = 0; i < n; i++) if (T.s[i].ex) { coli_vk_xb_expert_free(T.s[i].ex); T.s[i].ex = NULL; }
     }
-    pthread_mutex_destroy(&T.mx); pthread_cond_destroy(&T.cv); pthread_cond_destroy(&T.cv_room);
+    pthread_mutex_destroy(&T.mx); pthread_cond_destroy(&T.cv); pthread_cond_destroy(&T.cv_room); pthread_cond_destroy(&T.cv_done);
     free(T.s); free(T.grp); free(T.map); free(T.touched); free(T.bex); free(T.brows); free(T.bfirst);
     free(T.bx); free(T.by); free(T.evict); free(T.done);
     memset(&T, 0, sizeof T);
