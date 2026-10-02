@@ -14519,6 +14519,35 @@ static int v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
     return 0;
 }
 
+/* Vulkan for the engine binary (Makefile.deepseek-v4 VK=1). The backend is
+ * touched from this unit only: it is the one the binary and its serve test link,
+ * while the parent Makefile links other units into its own tests without
+ * backend_vulkan, so a reference anywhere else would break those links under
+ * VK=1. Opened after the engine (CUDA, when built, has opened first), reported
+ * once at the end; v4_vk_fp8_matvec says why the count is 0 on this engine. */
+#ifdef COLI_VULKAN
+#include "backend_vulkan.h"
+static int g_v4_vk_ready = 0;
+#endif
+
+static void v4_vk_open(void) {
+#ifdef COLI_VULKAN
+    g_v4_vk_ready = coli_vk_init_env("deepseek_v4");
+    if (g_v4_vk_ready)
+        fprintf(stderr, "[VK] deepseek_v4: no resident matrix is in a format the "
+                        "shaders decode (dense E4M3 with 128x128 block scales, "
+                        "bf16), nothing is sent to the Vulkan device\n");
+#endif
+}
+
+static void v4_vk_report(void) {
+#ifdef COLI_VULKAN
+    if (g_v4_vk_ready)
+        fprintf(stderr, "[VK] deepseek_v4: %llu matmuls on the GPU\n",
+                coli_vk_matmul_calls());
+#endif
+}
+
 static int v4_serve_main(void) {
     const char *model_dir = getenv("SNAP");
     if (!model_dir || !*model_dir) {
@@ -14546,6 +14575,7 @@ static int v4_serve_main(void) {
         fprintf(stderr, "%s\n", error);
         return 1;
     }
+    v4_vk_open();
     context = engine->runtime.context_tokens;
     if (coli_v4_session_create(
             &session, engine,
@@ -14590,6 +14620,7 @@ static int v4_serve_main(void) {
             if (fatal < 0) break;
         }
     }
+    v4_vk_report();
     coli_v4_session_destroy(session);
     coli_v4_engine_destroy(engine);
     return 0;
@@ -14682,6 +14713,7 @@ int main(int argc, char **argv) {
             goto cleanup;
         }
     }
+    v4_vk_open();
     config = *coli_v4_engine_config(engine);
     index = coli_v4_engine_target_index(engine);
     experts = coli_v4_engine_expert_store(engine);
@@ -14941,6 +14973,7 @@ int main(int argc, char **argv) {
     }
     result = 0;
 cleanup:
+    v4_vk_report();
     v4_generate_cleanup(session, prompt_storage, engine, attention,
                         layers, prompt_ids, generated, state, next, hidden,
                         text, full_ids, tf_pred, tf_state,
@@ -17121,6 +17154,34 @@ static int fp8_matvec_compute(float *output, const ColiTensorView *weight,
     return 0;
 }
 
+#ifdef COLI_VULKAN
+/* The Vulkan hook of the resident dense projections (Makefile.deepseek-v4 VK=1),
+ * at the CUDA tier's place and tried after it. It sends nothing, and the reason is
+ * the format. qmatmul.comp decodes int8 rows (fmt 1), int4 rows (2), grouped int4
+ * (4), int3-g64 (5) and MXFP4 (7); every resident matrix here is E4M3 in 128x128
+ * blocks with f32 scales (attention, indexer wq_b, shared experts), bf16 (router,
+ * compressors, indexer projections, head) or f32, and requantising to int8 would
+ * change the numbers the tiny oracle holds this engine to. The routed experts are
+ * fp4 with a UE8M0 scale per 32 columns, which fmt 7 reads once the scales are
+ * expanded to f32, but they come from disk into the expert store's cache, which
+ * evicts and re-pins them: a device tier for them, like kimi_k3's or this engine's
+ * CUDA mirrors, is other work than this hook, and they stay on the CPU. The batched
+ * and paired fp8 entries (NATIVE_QUANT_BATCH, _DUAL) would take the same hook; with
+ * nothing to send, only these two single-vector entries carry it.
+ *
+ * What would turn this into a call: an E4M3 format in qmatmul.comp, one byte per
+ * weight (the fmt 1 row layout, unpacked from the rows8 tiles the AVX2 path keeps,
+ * as v4_gpu_upload_fp8_fmt does for CUDA) and one f32 scale per 128 inputs (the
+ * fmt 4/7 group layout, gs = 128, each block scale repeated over its 128 rows), with
+ * the input rounded to E4M3 per 128 first as coli_fp8_activation_qdq_ref does, and
+ * a call from the main thread only. Until then it declines and the CPU runs. */
+static int v4_vk_fp8_matvec(const ColiTensorView *weight, float *output,
+                            const float *input) {
+    (void)weight; (void)output; (void)input;
+    return -1;
+}
+#endif
+
 int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
                         const float *input) {
     if (!output || !input || fp8_matvec_validate(weight))
@@ -17134,6 +17195,10 @@ int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
      * only the activation vectors cross the boundary. Any backend failure falls
      * through to the CPU reference below. */
     if (weight->gpu && coli_v4_gpu_fp8_matvec(weight, output, input) == 0)
+        return 0;
+#endif
+#ifdef COLI_VULKAN
+    if (v4_vk_fp8_matvec(weight, output, input) == 0)
         return 0;
 #endif
     float *activation; uint8_t *activation_scales;
@@ -17160,6 +17225,10 @@ int coli_fp8_matvec_pre(float *output, const ColiTensorView *weight,
         return -1;
 #ifdef COLI_V4_GPU_TIER
     if (weight->gpu && coli_v4_gpu_fp8_matvec(weight, output, input) == 0)
+        return 0;
+#endif
+#ifdef COLI_VULKAN
+    if (v4_vk_fp8_matvec(weight, output, input) == 0)
         return 0;
 #endif
     return fp8_matvec_compute(output, weight, activation);
