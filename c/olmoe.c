@@ -823,8 +823,8 @@ static void olmoe_vk_tier_start(Model *m) {
                     .act = VKT_ACT_SWIGLU, .max_rows = OLMOE_VK_ROWS * c->topk,
                     .ram_reserve = slotb * (size_t)m->cache[0].cap * (size_t)c->n_layers,
                     .dense_bytes = dense, .in_ram = olmoe_vk_in_ram, .ram_ctx = m};
+    atexit(coli_vk_shutdown);   /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
     if (!vkt_init(&vc, m->freq)) return;
-    atexit(coli_vk_shutdown);   /* runs after the tier's teardown: the device goes before the drivers unload */
     atexit(vkt_shutdown);
     int all = c->n_layers * c->n_experts;
     int *pl = malloc((size_t)all * sizeof(int)), *pe = malloc((size_t)all * sizeof(int));

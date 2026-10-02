@@ -10767,10 +10767,10 @@ static void vk_tier_start(Model *m){
                   .dense_bytes=(size_t)dense,
                   .in_ram=vk_in_ram, .ram_ctx=m,
                   .max_experts=g_vk_experts>0 ? g_vk_experts : 0};
+    atexit(coli_vk_shutdown);   /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
     if(!vkt_init(&vc,m->eusage)) return;
     g_vkt.on=1; g_vkt.gu_fmt=f[0]; g_vkt.gu_gs=gs[0]; g_vkt.dn_fmt=f[2]; g_vkt.dn_gs=gs[2];
     g_vkt.exp_bytes=vkt_expert_bytes(c->hidden,c->moe_inter,gu,dn);
-    atexit(coli_vk_shutdown);   /* runs after the tier's teardown: the device goes before the drivers unload */
     atexit(vkt_shutdown);
     g_vk_model=m; atexit(vk_tier_report_run);   /* runs first: the tier is still up */
     /* warm start: the history's hottest experts, read in parallel (pinned ones from RAM) */

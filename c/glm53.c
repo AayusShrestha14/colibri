@@ -4020,8 +4020,8 @@ static void glm53_vk_tier_start(GModel *m) {
                         .ram_reserve = (size_t)cap * (size_t)sparse * (size_t)m->e_slot,
                         .dense_bytes = g_vk_dense ? glm53_dense_dev_bytes(m) : 0,
                         .in_ram = glm53_in_ram, .ram_ctx = m};
+        atexit(coli_vk_shutdown);   /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
         if (vkt_init(&vc, rt_counts_all())) {
-            atexit(coli_vk_shutdown);   /* runs after the tier's teardown: the device goes before the drivers unload */
             atexit(vkt_shutdown);
             const int all = c->n_layers * c->n_experts;
             int *pl = malloc((size_t)all * sizeof(int)), *pe = malloc((size_t)all * sizeof(int));

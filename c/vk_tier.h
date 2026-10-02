@@ -43,10 +43,12 @@
  *                       .ram_reserve = bytes the RAM expert cache may still grow by,
  *                       .dense_bytes = bytes of dense weights the engine will put
  *                                      on the device after this call};
- *        if (vkt_init(&c, rt_counts_all())) {
- *            atexit(coli_vk_shutdown);   // runs second: the device goes before
- *            atexit(vkt_shutdown);       // the drivers unload (a driver can still
- *        }                               // be compiling the tier's pipelines)
+ *        atexit(coli_vk_shutdown);       // runs last: the device goes before the
+ *        if (vkt_init(&c, rt_counts_all()))   // drivers unload (a driver can still
+ *            atexit(vkt_shutdown);       // be compiling the tier's pipelines), and
+ *                                        // whether or not the tier starts: vkt_init
+ *                                        // makes the expert batch's pipelines
+ *                                        // before it can refuse (no room)
  *
  *    .in_ram (optional) lets the tier hand experts the CPU holds in RAM back to the
  *    CPU when the device is the slower side of a step (an integrated GPU at its

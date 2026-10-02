@@ -1749,8 +1749,8 @@ static void ink_vk_tier_start(Model *m) {
                         .ram_reserve = (size_t)slotb * (size_t)m->cache[0].cap * (size_t)nsp,
                         .dense_bytes = ink_vk_dense_bytes(m),
                         .in_ram = ink_vk_in_ram, .ram_ctx = m};
+        atexit(coli_vk_shutdown);   /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
         if (vkt_init(&vc, m->eusage)) {
-            atexit(coli_vk_shutdown);   /* runs after the tier's teardown: the device goes before the drivers unload */
             atexit(vkt_shutdown);
             int all = c->n_layers * c->n_experts;
             int *pl = malloc((size_t)all * sizeof(int)), *pe = malloc((size_t)all * sizeof(int));
