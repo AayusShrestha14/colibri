@@ -101,14 +101,14 @@ runs the routed-expert tier ([below](#the-routed-expert-tier-vk_tierc)): there t
 stay on the CPU and the device takes the experts. On a Radeon 780M the dense matmuls,
 one synchronous call each at the GPU's 800 MHz floor, cost more than the tier gained
 (Qwen3.8 decode at 2.35 tok/s with them on the device, 3.80 without). Today that
-case is qwen36 and qwen38; an engine that moves to the tier inherits it. A discrete
-GPU keeps the dense matrices on the device by default. The GLM engine above reads
+case is qwen36, qwen38, inkling and olmoe; an engine that moves to the tier inherits
+it. A discrete GPU keeps the dense matrices on the device by default. The GLM engine above reads
 the same variable through the same function with its own default, off.
 
 What these engines put on the device is their **resident** matrices, in the form
 they already hold in RAM, uploaded at the first multiply (MiMo uploads them at
-startup). Routed experts arrive from disk on every miss; qwen36 and qwen38 keep a
-cache of them on the device with the shared expert tier
+startup). Routed experts arrive from disk on every miss; qwen36, qwen38, inkling and
+olmoe keep a cache of them on the device with the shared expert tier
 ([below](#the-routed-expert-tier-vk_tierc)), MiMo an opt-in one of its own, the
 others none yet.
 
@@ -116,8 +116,8 @@ others none yet.
 |---|---|---|---|
 | qwen36 (Qwen3.6, Qwen3-Coder, Qwen3.8-27B) | the dense trunk; routed experts on the expert tier | int8 rows; int4-g64 with `COLI_DENSE_BITS=4`; f32 with `COLI_DENSE_I8=0`; experts int4-g64, int4 per row, int8 per row or gs64 | DeltaNet `dn_a`/`dn_b`, vision tower, the experts the tier does not hold |
 | qwen38 (Qwen3.8 Flash Next) | the trunk; routed experts on the expert tier | int8 trunk rows, bf16, f32 (`Q38_NATIVE_BF16=0`); experts int4-g64 (sidecar), FP8 128x128 blocks, bf16 | the MTP head's experts, the experts the tier does not hold |
-| inkling | dense and shared-expert matrices | int8 and int4-g64 (dense-int4g64 container), f32, bf16 | routed experts, embedding and audio lookups, CUDA residents; bf16 on CPUs with the AVX512-BF16 dot (see below) |
-| olmoe | attention q/k/v/o, router, lm_head | f32 | routed experts, embedding |
+| inkling | dense and shared-expert matrices; routed experts on the expert tier | int8 and int4-g64 (dense-int4g64 container), f32, bf16; experts int4 or int8 per row (container or runtime quantization), f32 | embedding and audio lookups, CUDA residents (with CUDA or Metal on, the experts too); bf16 on CPUs with the AVX512-BF16 dot (see below); the experts the tier does not hold |
+| olmoe | attention q/k/v/o, router, lm_head; routed experts on the expert tier | f32; experts int8 per row | embedding, the experts the tier does not hold |
 | deepseek_v41 | the trunk, vision included | fp8 in 32x32 ue8m0 tiles, bf16 | routed experts |
 | deepseek_v4 | resident dense layers, head, router, compressors | fp8 in 128x128 blocks, bf16 | routed experts, the indexer's `weights_proj`, DSpark stages, the `--oracle` path |
 | mimo | trunk and vision tower; up to `MIMO_VK_EXPERTS=N` routed experts | native fp8/bf16, int8, f32 (`MIMO_DENSE_BITS`); experts as MXFP4 | router |
@@ -308,7 +308,8 @@ Engines on the tier today: **qwen36** (Qwen3.6, Qwen3-Coder, the 2.4T geometry: 
 per row or gs64, int4 per row or gs64 from either expert kernel, the mixed int4/int8
 container) and **qwen38** (Qwen3.8 Flash Next: the int4-g64 sidecar, the release's
 FP8 with 128x128 block scales, BF16). The MTP head's layer of qwen38 stays on the CPU
-(its experts are FP8 beside an int4 sidecar). GLM-5.2's `COLI_VK_EXPERTS`, Kimi K3's
+(its experts are FP8 beside an int4 sidecar). **inkling** and **olmoe** as well, see
+[Inkling and OLMoE](#inkling-and-olmoe). GLM-5.2's `COLI_VK_EXPERTS`, Kimi K3's
 `K3_VK` and MiMo's `MIMO_VK_EXPERTS` are the older per-engine tiers; the others move
 to this one in the next phase, see [Adding an engine](#adding-an-engine-to-the-tier).
 
@@ -512,6 +513,26 @@ converts `expert_ffn.h`'s planar int4 and spreads Qwen3.8's FP8 block scales). T
 backend enables the extension when the device has it; nothing outside the harness
 uses it.
 
+### Inkling and OLMoE
+
+Both run their routed experts on this tier with `COLI_VULKAN=1`, in the form their
+RAM caches hold them; nothing is requantized.
+
+| Engine | Experts in RAM (`VktSrc`) | Device | History for the warm start | Notes |
+|---|---|---|---|---|
+| inkling | int4 container `I4U_PAIRS_ROW`; int8 container `I8_ROW`; runtime-quantized int8 rows, `I8_AS_I4_ROW` at 2 to 4 bits and `I8_ROW` above; f32 at `bits=0` `F32`. Gate and up come from the fused `gate_up` tensor, up I rows in | fmt 2, 1, 2 or 1, 10 | `<snap>/.coli_usage`, or `PIN=<path>`, in the generate and serve modes; the ref.json oracle reads none and fills the tier as experts pass by | the two shared experts run beside the batch, on the CPU or, with the dense matrices, on the device; `TOPP`'s trimmed ranks reach neither side; with CUDA or Metal on, the Vulkan tier stays off |
+| olmoe | int8 rows `I8_ROW`, gate, up and down as the merged container holds them | fmt 1 | `COLI_USAGE` | `PILOT`'s prefetcher skips experts the device holds; a slot is handed to the tier only under the cache lock, while it still holds that expert |
+
+Each layer step routes every row first, then runs per block of 64 rows: the block's
+resident experts go to the device as one batch, the CPU computes the other pairs with
+the kernels and the cache rounds it always uses, and every rank joins its row in
+routing order. The device multiplies f32 activations, as both engines' default CPU
+kernels do; `IDOT=1` (opt-in on both) rounds the CPU's activations and the device's
+not. With `COLI_VULKAN` unset, or in a build without `VK=1`, the stdout and the
+stderr (timings aside) and every logit vector of 36 configurations per build (each
+expert format, caps 1 to 8, `TOPP`, `IDOT`, the generate and serve modes, `PPL`,
+`ROUTE_TRACE`) are the bytes of the build before the tier.
+
 ## Adding an engine to the tier
 
 The integration steps are in [`c/vk_tier.h`](../c/vk_tier.h); in short:
@@ -542,12 +563,10 @@ What each remaining engine needs, from reading its code:
 |---|---|---|---|---|
 | colibri.c (GLM-5.2) | int4 per row `I4U_PAIRS_ROW`, int4-gs `I4U_PAIRS_GS`, int3-g64 `I3_G64`; gate, up, down separate | SwiGLU | `moe()`'s Vulkan block replaces the `COLI_VK_EXPERTS` registry | sums per expert in union order today: move to rank order; fmt 6 (E8/IQ3, rotated input) stays on the CPU; the MTP layer is int8 (another format); the block now serves only S <= 4 |
 | glm53 | int4 gs64 `I4U_PAIRS_GS` 64 | SwiGLU with `swiglu_limit` | `ffn_layer` | its CPU clamps even at limit 0 (no guard), the shader treats 0 as no clamp: pass the config's value and check `L > 0` on the CPU side first; shared expert written first |
-| inkling | one `gate_up` tensor [2I, D], rows 0..I-1 gate: pass `g = p13`, `u = p13 + I rows`; int4 per row `I4U_PAIRS_ROW` or int8 `I8_ROW` | SwiGLU | `moe` | routed and shared weights normalized together, `route_scale x rgs` already in the weights |
 | kimi_k3 | MXFP4 `MXFP4_E8M0` 32, gate `w1`, up `w3`, down `w2` | SiTU-GLU, a = 4, b = 25 (`VKT_ACT_SITU`) | `moe_forward` / `expert_apply` (experts in the latent space) | replaces `K3_VK` (synchronous, never evicts); the CPU's `K3_IDOT` rounds activations to int8 |
 | deepseek_v41 | MXFP4 `MXFP4_E8M0` 32 | SwiGLU with limit | `moe_run_at` (already sums per (row, rank) in rank order) | DSpark stages have caches of their own |
 | deepseek_v4 | FP4 + ue8m0/32 = `MXFP4_E8M0` 32; pinned experts are repacked rows16 | SwiGLU with limit, **plus** bf16 rounding of gate/up, the route weight applied before down and bf16 rounding of the output | `moe_token_pipeline` (ascending expert id), `v4_moe_batch_union` | needs an activation variant with those roundings and the host's E4M3 rounding of x (as its fp8 dense path does); undo rows16 or keep pinned experts off the tier; hash-routed layers |
 | mimo | MXFP4 `MXFP4_E8M0` 32, stored down, ds, gate, gs, up, us | SwiGLU | `moe` | replaces `MIMO_VK_EXPERTS` (synchronous, never evicts) |
-| olmoe | int8 per row `I8_ROW`, one merged tensor g, u, d | SwiGLU | `moe` | history only with `COLI_USAGE` |
 
 ## Correctness
 
@@ -571,6 +590,11 @@ What each remaining engine needs, from reading its code:
   in flight. `tests/vulkan_engines.sh qwen` gives the CPU's tokens with the tier on
   in every qwen36 and qwen38 expert format, under eviction, with MTP and with the
   trunk on the CPU; `qwen-sanitize` runs the same under ASan and UBSan.
+  `tests/vulkan_engines.sh inkling-olmoe` does the same for inkling (every expert
+  format above, under the f32, bf16 and dense-int4g64 snapshots, `TOPP`) and olmoe
+  (with `PILOT`'s worker), under eviction, with a warm start, and through both
+  engines' serve tests (prefix reuse, the dashboard, Brio); `inkling-olmoe-sanitize`
+  runs them under ASan and UBSan.
 - int4 weights decode as offset-binary (nibble−8), byte-identical layout to
   the CPU path — no repacking.
 - Khronos validation layers: the backend never enables them, so the loader
