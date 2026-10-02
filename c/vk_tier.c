@@ -43,8 +43,8 @@ static struct {
     size_t exp_bytes, budget;
     int max_resident, resident, queued, rate, uma;
     VSlot *s;
-    uint32_t tick, decay_at;
-    int last_layer, promos;
+    uint32_t tick, decay_at;          /* tokens seen (rows of the forward's first layer) */
+    int last_layer, first_layer, promos;
     /* uploader */
     pthread_t th; int th_on, stop;
     pthread_mutex_t mx; pthread_cond_t cv, cv_room;
@@ -244,16 +244,21 @@ static void *uploader(void *arg) {
         ColiVkTensor *t[3];
         int ok = 0;
         /* Refused: the pool is at its budget until the engine thread frees the victim
-         * this promotion displaced, at its next join. Wait for that, a bounded number
-         * of times: a pool that stays full is full for real (fragmentation). */
-        for (int tries = 0; tries < 20 && !ok; tries++) {
+         * this promotion displaced, at its next quiescent point (a join: every layer
+         * in decode, after a chunk's CPU work in prefill). Wait for room to be made
+         * and try again; refused again after three frees, or nothing freed for a
+         * minute (the engine stopped stepping), the pool is full for real. */
+        for (int frees = 0, waited = 0; !ok; ) {
             ok = upload(g, u, d, gs, us, ds, t);
-            if (ok) break;
+            if (ok || frees >= 3 || waited >= 600) break;
             pthread_mutex_lock(&T.mx);
             unsigned long gen = T.room_gen;
-            struct timespec until; clock_gettime(CLOCK_REALTIME, &until);
-            until.tv_nsec += 50 * 1000000L; if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
-            while (T.room_gen == gen && !T.stop && pthread_cond_timedwait(&T.cv_room, &T.mx, &until) != ETIMEDOUT) {}
+            while (T.room_gen == gen && !T.stop && waited < 600) {
+                struct timespec until; clock_gettime(CLOCK_REALTIME, &until);
+                until.tv_nsec += 100 * 1000000L; if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
+                if (pthread_cond_timedwait(&T.cv_room, &T.mx, &until) == ETIMEDOUT) waited++;
+            }
+            if (T.room_gen != gen) frees++;
             int stop = T.stop;
             pthread_mutex_unlock(&T.mx);
             if (stop) break;
@@ -334,8 +339,10 @@ static int pick_victim(uint64_t hs) {
     return -1;
 }
 
-static void new_forward(int S) {
-    T.tick += (uint32_t)(S > 0 ? S : 1);
+/* A forward starts when the layer index goes back (a layer that issues several
+ * blocks of rows, or rows one by one, is the same forward). The tick counts tokens:
+ * the rows of the forward's first layer, every block of them. */
+static void new_forward(void) {
     T.promos = 0;
     if (T.tick >= T.decay_at) {
         size_t n = (size_t)T.c.layers * T.c.experts;
@@ -359,7 +366,10 @@ void vkt_note(int layer, int eid, const VktExpertSrc *src) {
         victim = pick_victim(score(v));
         if (victim < 0) return;
     }
-    if (T.qn >= VKT_QCAP) { T.qfull++; return; }
+    pthread_mutex_lock(&T.mx);
+    int full = T.qn >= VKT_QCAP;
+    pthread_mutex_unlock(&T.mx);
+    if (full) { T.qfull++; return; }
     if (T.gu_scales && (!src->gs || !src->us || !src->ds)) return;
     uint8_t *buf = malloc(T.stage_bytes);
     if (!buf) return;
@@ -471,7 +481,8 @@ int vkt_issue(int layer, const float *x, int S, int K, const int *idx, uint8_t *
         if (T.on) { fprintf(stderr, "[VK] tier %s: the device stopped answering, the experts stay on the CPU\n", T.engine); T.on = 0; }
         return 0;
     }
-    if (layer <= T.last_layer) new_forward(S);
+    if (layer < T.last_layer) { T.first_layer = layer; new_forward(); }
+    if (layer == T.first_layer) T.tick += (uint32_t)S;
     T.last_layer = layer;
     quiesce();
     int E = T.c.experts, H = T.c.hidden, n = S * K;
@@ -643,7 +654,7 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     if (!T.s || !T.grp) { free(T.s); free(T.grp); return 0; }
     for (int e = 0; e < T.c.experts; e++) T.grp[e] = -1;
     T.max_dev_rows = T.c.max_rows > 0 ? T.c.max_rows : 1 << 20;
-    T.last_layer = 1 << 30; T.decay_at = VKT_DECAY_TOKENS;
+    T.last_layer = 1 << 30; T.first_layer = -1; T.decay_at = VKT_DECAY_TOKENS;
     /* The history, scaled: the hottest expert of a layer starts at 32 and the rest in
      * proportion, so a few minutes of a new workload can displace it (raw counts
      * from a long history would hold the tier for hours). */
