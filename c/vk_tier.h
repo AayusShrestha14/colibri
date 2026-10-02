@@ -140,6 +140,9 @@ typedef struct {
      * and return to the device when it finishes early. Called on the engine thread. */
     int (*in_ram)(void *ctx, int layer, int eid);
     void *ram_ctx;
+    /* Optional: at most this many experts resident whatever the budget holds (0 = no
+     * cap); for an engine whose users already size its device tier in experts. */
+    int max_experts;
 } VktConfig;
 
 /* One expert as it sits in RAM: codes and scales of gate, up, down (float scales,

@@ -703,6 +703,7 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
                 eng, human(want, hb, sizeof hb), human((double)T.exp_bytes, he, sizeof he));
         return 0;
     }
+    if (T.c.max_experts > 0 && fit > T.c.max_experts) fit = T.c.max_experts;   /* the engine's count cap */
     T.max_resident = (int)fit;
     T.budget = (size_t)want;
     /* Every expert fits in one block's worth: the pool's limit (and so its one block)
