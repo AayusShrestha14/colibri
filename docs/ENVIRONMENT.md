@@ -19,8 +19,8 @@ what follows, but the sister engines read their own:
 | `qwen36` | `c/qwen36.c` | `QWEN_*`, `Q36_*`, its dense/CUDA-tier controls, the `CACHE_ROUTE` family (VRAM tier over RAM cache), and the Vulkan expert tier's `COLI_VK_TIER*` — see [Qwen3.6 engine](#qwen36-engine-qwen36) |
 | `qwen38` | `c/qwen38.c` | `Q38_MAXT`, `Q38_EOS`, `Q38_NATIVE_FP8`, `Q38_NATIVE_BF16`, `Q38_EXPERT_INT4`, `Q38_MTP`, `Q38_PREFILL_BATCH`, `Q38_TRUNK_CPU_INT8`, `Q38_FP8_KERNEL`, `COLI_TIMERS`, the Vulkan expert tier's `COLI_VK_TIER*` — see [Qwen3.8 engine](#qwen38-engine-qwen38) |
 | `olmoe` | `c/olmoe.c` | `HOT`, `WIDE`, `SMOOTH`, `CONF_LIMIT`, `MAX_NEW`, `CHAT`, `EXPERT_DROP`, `WARMUP` — see [OLMoE engine](#olmoe-engine-olmoe) |
-| `deepseek_v4` | `c/deepseek_v4.c` | `CTX`, the `V4_*` / `DSV4_*` families and the two `COLI_CUDA_*_BATCH` gates — see [DeepSeek V4 engine](#deepseek-v4-engine-deepseek_v4); note that the CUDA section below describes `colibri.c` knobs (`COLI_CUDA`, `CUDA_DENSE`, ...) which the V4 engine does not read — its GPU switch is `DSV4_CUDA` |
-| `deepseek_v41` | `c/deepseek_v41.c` | the `V41_*` family: see [DeepSeek V4.1 engine](#deepseek-v41-engine-deepseek_v41) |
+| `deepseek_v4` | `c/deepseek_v4.c` | `CTX`, the `V4_*` / `DSV4_*` families, the two `COLI_CUDA_*_BATCH` gates and the Vulkan expert tier's `COLI_VK_TIER*` — see [DeepSeek V4 engine](#deepseek-v4-engine-deepseek_v4); note that the CUDA section below describes `colibri.c` knobs (`COLI_CUDA`, `CUDA_DENSE`, ...) which the V4 engine does not read — its GPU switch is `DSV4_CUDA` |
+| `deepseek_v41` | `c/deepseek_v41.c` | the `V41_*` family and the Vulkan expert tier's `COLI_VK_TIER*`: see [DeepSeek V4.1 engine](#deepseek-v41-engine-deepseek_v41) |
 | `mimo` | `c/mimo.c` | the `MIMO_*` family: see [MiMo-V2.6 engine](#mimo-v26-engine-mimo) |
 
 Setting an `INK_*` variable while running `colibri` does nothing, and vice
@@ -244,7 +244,7 @@ With `COLI_VULKAN=1` the engines on the shared tier keep a cache of routed exper
 | `COLI_VK_TIER_BALANCE` | on | `0`: the device takes every resident expert of a step. On, when a join keeps waiting for the device, the step's resident experts the CPU also holds in RAM go back to the CPU beyond the device's share, which moves with every join (down when the CPU waited more than a tenth of its own time, up when the device finished before 80% of it). |
 | `COLI_VK_TIER_GEMM_ROWS` | `16` | Rows from which an expert of a step takes the tiled GEMM (prefill) instead of the per-row GEMV; `0` never. Below it a row's bits do not depend on how many rows share the dispatch. |
 | `COLI_VK_TIER_QUEUE` | a second queue | `0`: the tier's batches share the main queue with the dense matmuls (they then serialize). Unset: a second queue of the main family, else a compute-only family's (RADV), else shared (Lavapipe). |
-| `COLI_VK_DENSE` | on; off on a device sharing the CPU's RAM while the tier is on | Where the dense (non-expert) matrices of qwen36, qwen38, inkling, olmoe, mimo, deepseek_v41, deepseek_v4 and qwenimage run. `0`: on the CPU (with the tier on, the device takes the routed experts only); `1`: on the device whatever the device. Unset: on the device, except on an integrated GPU or a CPU device (Lavapipe) while the engine runs the expert tier (today qwen36 and qwen38), where they stay on the CPU: there the dense matmuls cost more than the tier gains (measured on a Radeon 780M). The `[VK] <engine>: device ready, dense matrices on the ...` line says which and why. The GLM engine reads it through the same rule with its own default, off (see above). |
+| `COLI_VK_DENSE` | on; off on a device sharing the CPU's RAM while the tier is on | Where the dense (non-expert) matrices of qwen36, qwen38, inkling, olmoe, mimo, deepseek_v41, deepseek_v4 and qwenimage run. `0`: on the CPU (with the tier on, the device takes the routed experts only); `1`: on the device whatever the device. Unset: on the device, except on an integrated GPU or a CPU device (Lavapipe) while the engine runs the expert tier (today qwen36, qwen38, deepseek_v41 and deepseek_v4), where they stay on the CPU: there the dense matmuls cost more than the tier gains (measured on a Radeon 780M). The `[VK] <engine>: device ready, dense matrices on the ...` line says which and why. The GLM engine reads it through the same rule with its own default, off (see above). |
 
 ### Second Vulkan device (opt-in)
 
@@ -495,6 +495,7 @@ usage rewrite; the shared `USAGE_SAVE=0` covers this engine too.
 
 | Variable | Default | Effect |
 |---|---|---|
+| `COLI_VULKAN` | `0` | `make deepseek-v4 VK=1` build: the resident dense layers, head, router and compressors on the Vulkan device, and the routed experts on the shared expert tier (`COLI_VK_TIER*`, `COLI_VK_DENSE`, see [Vulkan](#vulkan-any-gpu-with-a-vulkan-12-driver)) with DeepSeek V4's own activation, which makes the CPU kernel's bf16 and E4M3 roundings on the device ([vulkan.md](vulkan.md#deepseek-v4s-activation)). The tier's history is the store's `<model>/.coli_usage`; a routing the device served counts in it as one the CPU computed. With the CUDA tier on (`DSV4_CUDA`), CUDA wins and the Vulkan tier stays off. |
 | `COLI_V4_ROWS16` | `1` (on) | Repack hot-pinned experts into the vectorized `rows16` layout. **While this is on, greedy output varies run to run on the same machine** (#1136): rows16 and the reference matvec accumulate in different orders, and which experts take which kernel follows the expert-cache state. `=0` runs the reference matvec for every expert — slower, but the kernel variable is gone. **Set `=0` for any quality A/B on this engine**; throughput A/Bs do not need it. |
 
 **Reproducible greedy runs (#1136):** greedy text on this engine varies with
@@ -517,6 +518,7 @@ Read **only** by `c/deepseek_v41.c`. See [deepseek-v41.md](deepseek-v41.md).
 | Variable | Default | Effect |
 |---|---|---|
 | `V41_ENGRAM_ROWS` | 65536 | DeepSeek V4.1: rows of engram cache per table. The n-gram traffic is Zipfian, so a small cache absorbs most of it; 65536 rows is 64 MB per table on the released head_dim. |
+| `COLI_VULKAN` | `0` | DeepSeek V4.1, `VK=1` build: the trunk (vision tower included) on the Vulkan device, and the backbone's routed experts on the shared expert tier (`COLI_VK_TIER*`, `COLI_VK_DENSE`, see [Vulkan](#vulkan-any-gpu-with-a-vulkan-12-driver)); the DSpark stages keep their experts on the CPU. With the tier on, the engine keeps the expert history `COLI_USAGE` (default `<snap>/.coli_usage`), saved at every run and serve turn end; it keeps none otherwise. |
 | `V41_INDEX_OWNER` | unset | DeepSeek V4.1: score each layer against its OWN index keys instead of the last published cache. The default reproduces the released inference code; this changes the model's behaviour, see docs/deepseek-v41.md. |
 | `V41_MAX_IMAGE_TOKENS` | the checkpoint's `max_image_tokens` | DeepSeek V4.1: ceiling on what one image costs in prompt tokens. |
 | `V41_TRACE` | unset | DeepSeek V4.1: print per-sublayer checksums, matching tools/dsv41_ref.py's, to locate a divergence by diffing two columns. `2` follows the first row of a speculative step rather than the last. |
