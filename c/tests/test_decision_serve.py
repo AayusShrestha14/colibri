@@ -263,9 +263,34 @@ class DecisionGateway(unittest.TestCase):
         self.serve(FakeDecisionEngine({}))
         with urlopen(self.base + "/v1/models", timeout=10) as response:
             card = json.loads(response.read())["data"][0]
-        self.assertEqual(card["capabilities"], ["decision"])
+        self.assertEqual(card["capabilities"], ["systemone", "decision"])
         with urlopen(self.base + "/health", timeout=10) as response:
-            self.assertEqual(json.loads(response.read())["capabilities"], ["decision"])
+            self.assertEqual(json.loads(response.read())["capabilities"], ["systemone", "decision"])
+
+    def test_colibris_options_on_a_decision_engine(self):
+        """normalize and pin_state act on a language model's logprobs and photos;
+        a decision engine has neither and ignores them. A prefix is refused: it
+        would be text the model never reads. cache_slot reaches the engine."""
+        engine = FakeDecisionEngine({"q": [0.5, 0.5]})
+        engine.kv_slots = 2
+        engine.slots = []
+        decide = engine.decide
+        engine.decide = lambda record, cache_slot=0, cancelled=None: (
+            engine.slots.append(cache_slot), decide(record, cache_slot, cancelled))[1]
+        self.engine = engine
+        self.server = APIServer(("127.0.0.1", 0), engine, "laya", kv_slots=2)
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+        question = {"q": {"type": "noul", "instructions": "?"}}
+        out, _ = self.post("/v1/systemone", {"state": "x", "questions": question,
+                                             "normalize": "mean", "pin_state": True, "cache_slot": 1})
+        self.assertEqual(out["answers"]["q"]["noul"], 0.5)
+        self.assertEqual(engine.slots, [1])
+        status, error = self.post_error("/v1/systemone", {"state": "x", "questions": question,
+                                                          "prefix": "rules"})
+        self.assertEqual((status, error["error"]["param"]), (422, "prefix"))
 
     def test_validation_is_the_routes_own(self):
         self.serve(FakeDecisionEngine({}))

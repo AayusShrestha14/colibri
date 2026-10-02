@@ -3479,7 +3479,8 @@ def main():
     ps.add_argument("--host",default="127.0.0.1"); ps.add_argument("--port",type=int,default=8000)
     ps.add_argument("--model-id",default=os.environ.get("COLI_MODEL_ID"))
     ps.add_argument("--api-key",default=os.environ.get("COLI_API_KEY"))
-    ps.add_argument("--cors-origin",action="append",default=None)
+    ps.add_argument("--cors-origin",action="append",default=None,
+                    help="allowed browser origin, repeatable; plain values replace the default list, +ORIGIN adds to it")
     ps.add_argument("--max-queue",type=int,default=int(os.environ.get("COLI_MAX_QUEUE","8")))
     ps.add_argument("--queue-timeout",type=float,default=float(os.environ.get("COLI_QUEUE_TIMEOUT","300")))
     ps.add_argument("--kv-slots",type=int,default=int(os.environ.get("COLI_KV_SLOTS","1")))
@@ -3506,7 +3507,8 @@ def main():
     for arg,kw in (("--host",dict(default="127.0.0.1")),("--port",dict(type=int,default=8000)),
                    ("--model-id",dict(default=os.environ.get("COLI_MODEL_ID"))),
                    ("--api-key",dict(default=os.environ.get("COLI_API_KEY"))),
-                   ("--cors-origin",dict(action="append",default=None)),
+                   ("--cors-origin",dict(action="append",default=None,
+                                         help="allowed browser origin, repeatable; plain values replace the default list, +ORIGIN adds to it")),
                    ("--max-queue",dict(type=int,default=int(os.environ.get("COLI_MAX_QUEUE","8")))),
                    ("--queue-timeout",dict(type=float,default=float(os.environ.get("COLI_QUEUE_TIMEOUT","300")))),
                    ("--kv-slots",dict(type=int,default=int(os.environ.get("COLI_KV_SLOTS","1")))),

@@ -5777,6 +5777,19 @@ IMAGE_OPTION_KEYS = ("default_width", "default_height", "default_steps", "min_si
                      "max_side", "multiple")
 
 
+def cors_origin_list(given):
+    """The allowed browser origins from --cors-origin values. None keeps the
+    defaults. A value written `+origin` adds to the list instead of replacing
+    it: only `+` values extend the defaults, and plain values replace them as
+    they always have, with any `+` values added after."""
+    if given is None:
+        return DEFAULT_CORS_ORIGINS
+    plain = [origin for origin in given if not origin.startswith("+")]
+    added = [origin[1:] for origin in given if origin.startswith("+") and origin[1:]]
+    base = list(DEFAULT_CORS_ORIGINS) if not plain else plain
+    return tuple(dict.fromkeys(base + added))
+
+
 def _positive_env(name, default):
     try:
         value = int(os.environ.get(name, "") or default)
@@ -5826,6 +5839,12 @@ class APIServer(ThreadingHTTPServer):
         self.allowed_hosts = tuple(
             h.strip().lower() for h in allowed_hosts if h and h.strip())
         self.created = int(time.time())
+        # Hashes of the states /v1/systemone scored lately: a state seen again is
+        # worth a photo, one seen once is probably a feed (systemone's pin rule).
+        self._states_seen = collections.OrderedDict()
+        self._states_lock = threading.Lock()
+        # slot -> (fixed prefix, its tokens) photographed by /v1/systemone
+        self.pinned_prefixes = {}
         self._conn_lock = threading.Lock()
         self._conn_live = 0
         self._conn_by_ip = {}
@@ -5837,13 +5856,32 @@ class APIServer(ThreadingHTTPServer):
         without trial and error."""
         entry = model_object(self.model_id, self.created)
         entry["input_modalities"] = self.input_modalities()
+        entry["capabilities"] = self.capabilities()
         if is_image_engine(self.engine):
             info = getattr(self.engine, "info", None) or {}
-            entry["capabilities"] = ["image_generation"]
             entry["image"] = {key: info.get(key) for key in IMAGE_OPTION_KEYS}
-        elif engine_decides(self.engine) and not engine_chats(self.engine):
-            entry["capabilities"] = ["decision"]
         return entry
+
+    def state_seen(self, state, capacity=256):
+        """True if `state` was scored before (and remember it either way)."""
+        key = hashlib.sha1(state.encode("utf-8", "replace")).digest()
+        with self._states_lock:
+            seen = key in self._states_seen
+            self._states_seen[key] = True
+            self._states_seen.move_to_end(key)
+            while len(self._states_seen) > capacity:
+                self._states_seen.popitem(last=False)
+        return seen
+
+    def capabilities(self):
+        """What the served model does, for /v1/models and /health: an image model
+        draws (image_generation); every text engine answers POST /v1/systemone
+        (systemone), and a decision engine does only that (decision)."""
+        if is_image_engine(self.engine):
+            return ["image_generation"]
+        if engine_decides(self.engine) and not engine_chats(self.engine):
+            return ["systemone", "decision"]
+        return ["chat", "systemone"]
 
     def jev_model_card(self):
         """The served model as Jev's GET /v1/models lists it. colibri does not know a
@@ -5971,6 +6009,12 @@ class _DeadlineReader:
 
 class APIHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    # TCP_NODELAY on every connection. A response is the header block and the
+    # body in two writes; with Nagle on, the body waits for the client's delayed
+    # ACK of the headers on a kept-alive connection, about 40 ms per request
+    # (measured: 44 ms median for a /v1/systemone round trip on loopback, 1 ms
+    # without). That is most of a decision's time on a fast engine.
+    disable_nagle_algorithm = True
     timeout = 30   # per socket OPERATION. On its own this does not stop a slowloris:
                    # it restarts on every byte received, so a drip renews it forever.
                    # READ_DEADLINE below is the cumulative bound that actually does.
@@ -6100,7 +6144,8 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, x-api-key, anthropic-version, "
                          "X-TypeSafe-SDK, X-TypeSafe-Runtime, X-TypeSafe-Retry-Count")
         self.send_header("Access-Control-Expose-Headers",
-                         "x-request-id, x-typesafe-request-id, x-colibri-queue-wait-ms, Retry-After")
+                         "x-request-id, x-typesafe-request-id, x-colibri-queue-wait-ms, "
+                         "x-colibri-elapsed-ms, x-colibri-engine-ms, Retry-After")
         self.send_header("Access-Control-Max-Age", "600")
         if "*" not in self.server.cors_origins:
             self.send_header("Vary", "Origin")
@@ -6262,11 +6307,9 @@ class APIHandler(BaseHTTPRequestHandler):
                     if tiers: payload["tiers"] = tiers
                     hwinfo = getattr(self.server.engine, "hwinfo", None) if self.server.engine else None
                     if hwinfo: payload["hwinfo"] = hwinfo
+                    payload["capabilities"] = self.server.capabilities()
                     if is_image_engine(self.server.engine):
-                        payload["capabilities"] = ["image_generation"]
                         payload["image"] = dict(getattr(self.server.engine, "info", None) or {})
-                    elif engine_decides(self.server.engine) and not engine_chats(self.server.engine):
-                        payload["capabilities"] = ["decision"]
                 self.send_json(200, payload, request_id)
                 return
             if path == "/experts":
@@ -6520,7 +6563,15 @@ class APIHandler(BaseHTTPRequestHandler):
                 or not 0 <= cache_slot < self.server.kv_slots:
             raise APIError(400, "Invalid cache slot.", "cache_slot")
 
-        state_prefix = f"Context:\n{state}\n\n" if state else ""
+        # /v1/systemone's two knobs, private keys like _max_options: `_prefix`
+        # is a fixed text the client sends before a changing state (a game's
+        # rules), photographed so only the state and the question are read;
+        # `_pin_state` False skips the photo of the state, which costs a round
+        # trip and a snapshot and pays only if the state comes back.
+        fixed = body.get("_prefix") or ""
+        fixed_prefix = f"{fixed}\n\n" if fixed else ""
+        pin_state = body.get("_pin_state", True)
+        state_prefix = fixed_prefix + (f"Context:\n{state}\n\n" if state else "")
         started = time.time()
         read_total = 0
         prompt_max = 0
@@ -6552,8 +6603,13 @@ class APIHandler(BaseHTTPRequestHandler):
                 """Fotografa `prefix`, poi un giro per opzione: ognuna paga solo
                 i propri token. Torna (scored, entropia, token del prefisso)."""
                 nonlocal read_total, prompt_max
-                n_prefix, _ = score(prefix, True)
+                n_prefix, fresh = score(prefix, True)
                 prompt_max = max(prompt_max, n_prefix)
+                known = self.server.pinned_prefixes.get(cache_slot)
+                if known and known[0] == fixed_prefix and len(fresh) > n_prefix - known[1]:
+                    # The engine read the fixed prefix again: its photo was
+                    # evicted. Forget it, so the next request takes it anew.
+                    self.server.pinned_prefixes.pop(cache_slot, None)
                 scored = []
                 for option in choices:
                     # Il cliente se n'e andato: smettere subito invece di
@@ -6608,7 +6664,16 @@ class APIHandler(BaseHTTPRequestHandler):
             # modalita. Con essa, ogni domanda successiva paga solo i propri
             # token. Il costo e' uno snapshot in piu' su una richiesta one-shot,
             # riusato o sfrattato.
-            if state_prefix:
+            # The fixed prefix is photographed once per slot, not per request:
+            # sending it again would read it again (an identical prompt is not a
+            # strict prefix of itself, so no photo can resume it), which is the
+            # cost the prefix exists to save. If the photo is evicted, the next
+            # question shows it (it reads the prefix fresh) and it is retaken.
+            if fixed_prefix and self.server.pinned_prefixes.get(cache_slot, ("",))[0] != fixed_prefix:
+                n_fixed, _ = score(fixed_prefix, True)
+                prompt_max = max(prompt_max, n_fixed)
+                self.server.pinned_prefixes[cache_slot] = (fixed_prefix, n_fixed)
+            if state_prefix and state_prefix != fixed_prefix and pin_state:
                 n_state, _ = score(state_prefix, True)
                 prompt_max = max(prompt_max, n_state)
 
@@ -6784,16 +6849,40 @@ class APIHandler(BaseHTTPRequestHandler):
                              [self._systemone_legend(c, i) for i, c in enumerate(criteria)]))
             else:
                 raise APIError(422, f"`{where}.type` must be \"noul\", \"choice\" or \"score\".", f"{where}.type")
+        options = self._systemone_options(body)
         if engine_decides(self.server.engine):
-            self._systemone_decide(body, plan, request_id)
+            if options["prefix"]:
+                raise APIError(422, "`prefix` is a language-model option (a fixed text photographed "
+                                    "before a changing state); a decision engine reads the whole "
+                                    "request in one pass: put that text in `state` or `instructions`.",
+                               "prefix")
+            self._systemone_decide(body, plan, request_id, options["cache_slot"])
             return
         # A question with one option has its answer already: nothing to score.
         asked = [entry for entry in plan if len(entry[3]) > 1]
         result = {"answers": [], "usage": {"prompt_tokens": 0, "read_tokens": 0}}
         if asked:
+            # Photograph the state when it can pay: within this request (two or
+            # more questions read it), or because it came back from an earlier
+            # one. A state that changes on every call (a game, a feed) is read
+            # straight through instead. `pin_state` says it explicitly.
+            if options["pin_state"] is None:
+                options["pin_state"] = len(asked) > 1 or self.server.state_seen(state or "")
+            else:
+                self.server.state_seen(state or "")
             inner = {"state": state or "", "_max_options": 255, "_empty_state_ok": True,
-                     "questions": [{"question": text, "options": options}
-                                   for _, _, text, options, _ in asked]}
+                     "normalize": options["normalize"], "_pin_state": options["pin_state"],
+                     "questions": [{"question": text, "options": choices}
+                                   for _, _, text, choices, _ in asked]}
+            if options["prefix"]:
+                inner["_prefix"] = options["prefix"]
+            if options["cache_slot"] is not None:
+                inner["cache_slot"] = options["cache_slot"]
+            elif options["prefix"]:
+                # The photo of the prefix lives in a slot: route by the part
+                # that does not change, as the state is routed without one.
+                inner["cache_slot"] = conversation_cache_slot(
+                    [{"role": "system", "content": options["prefix"]}], self.server.kv_slots)
             result = self.brio(inner, request_id, send=False)
         scored = iter(result["answers"])
         answers = {}
@@ -6821,6 +6910,36 @@ class APIHandler(BaseHTTPRequestHandler):
                                                   result["usage"]["read_tokens"]),
                        request_id, result.get("_headers"))
 
+    def _systemone_options(self, body):
+        """colibri's optional fields on /v1/systemone, none of which a Jev client
+        sends (docs/brio.md lists them):
+
+          normalize   "sum" (default) or "mean": how a language model's option
+                      log-probabilities become one score per option
+          pin_state   true / false: photograph the state for the next request;
+                      omitted, the server decides (see systemone)
+          prefix      a fixed text read before the state and always photographed
+          cache_slot  the KV slot, as on the chat endpoints
+
+        On a decision engine normalize and pin_state have nothing to act on and
+        are ignored; prefix is refused."""
+        normalize = body.get("normalize", "sum")
+        if normalize not in ("sum", "mean"):
+            raise APIError(422, "`normalize` must be \"sum\" or \"mean\".", "normalize")
+        pin_state = body.get("pin_state")
+        if pin_state is not None and not isinstance(pin_state, bool):
+            raise APIError(422, "`pin_state` must be true or false.", "pin_state")
+        prefix = body.get("prefix")
+        if prefix is not None and (not isinstance(prefix, str) or not prefix.strip()):
+            raise APIError(422, "`prefix` must be a non-empty string.", "prefix")
+        cache_slot = body.get("cache_slot")
+        if cache_slot is not None and (isinstance(cache_slot, bool) or not isinstance(cache_slot, int)
+                                       or not 0 <= cache_slot < self.server.kv_slots):
+            raise APIError(422, f"`cache_slot` must be an integer from 0 to {self.server.kv_slots - 1}.",
+                           "cache_slot")
+        return {"normalize": normalize, "pin_state": pin_state, "prefix": prefix,
+                "cache_slot": cache_slot}
+
     def _systemone_reply(self, answers, request_id, input_tokens, output_tokens):
         """The reply both paths send, in the Jev shape: `model` is the served
         model, `provider` says who answered, and `usage.cost` is what this server
@@ -6830,13 +6949,14 @@ class APIHandler(BaseHTTPRequestHandler):
                 "usage": {"input_tokens": int(input_tokens), "output_tokens": int(output_tokens),
                           "cost": 0}}
 
-    def _systemone_decide(self, body, plan, request_id):
+    def _systemone_decide(self, body, plan, request_id, cache_slot=None):
         """The native path: the request as one DECIDE record, the engine's
         probabilities back, shaped exactly like the LLM path's reply. No prompt is
         rendered and no option is scored on its own: one round trip, one forward."""
         record = systemone_decision_record(body)
-        cache_slot = conversation_cache_slot([{"role": "system", "content": record["state"]}],
-                                             self.server.kv_slots)
+        if cache_slot is None:
+            cache_slot = conversation_cache_slot([{"role": "system", "content": record["state"]}],
+                                                 self.server.kv_slots)
         started = time.time()
         with self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission:
             queue_wait, cache_slot = admission
@@ -7942,7 +8062,7 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
     if allowed_hosts and "*" in allowed_hosts:
         print("WARNING: --allowed-host '*' accepts ANY Host header "
               "(DNS-rebinding guard disabled)", file=sys.stderr)
-    origins = DEFAULT_CORS_ORIGINS if cors_origins is None else tuple(cors_origins)
+    origins = cors_origin_list(cors_origins)
     # Bind before starting the 744B engine. A stale/occupied port must fail in
     # milliseconds rather than loading hundreds of GB and leaking a child.
     server = APIServer((host, port), None, model_id, api_key, max_tokens, origins,
@@ -8023,7 +8143,8 @@ def main():
     parser.add_argument("--model-id", default=os.environ.get("COLI_MODEL_ID"))
     parser.add_argument("--api-key", default=os.environ.get("COLI_API_KEY"))
     parser.add_argument("--cors-origin", action="append", default=None,
-                        help="allowed browser origin; repeat as needed (use '*' for any origin)")
+                        help="allowed browser origin; repeat as needed (use '*' for any origin). "
+                             "Plain values replace the default list; +ORIGIN adds to it")
     # Absent = not explicitly set: mirrors coli's --cap (see cap_for_arch and issue
     # #379 -- glm arch resolves platform-aware, non-glm gets the legacy 8). An
     # explicit value, 0 included, reaches the engine verbatim.

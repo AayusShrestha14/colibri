@@ -9,14 +9,17 @@ each primitive puts in the prompt, what comes back, the confidence formula
 their docs give, that any model name is accepted on this route, and that the
 state is still photographed once for all the questions.
 """
+import http.client
 import json
 import math
 import threading
+import time
 import unittest
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from openai_server import APIServer
+import openai_server
+from openai_server import APIServer, cors_origin_list
 if __package__:
     from .test_brio_api import ScoringEngine
 else:
@@ -31,10 +34,22 @@ def confidence(ps):
     return (n * max(ps) - 1.0) / (n - 1)
 
 
+class SlotScoringEngine(ScoringEngine):
+    """ScoringEngine that also writes down the KV slot of every call."""
+
+    def __init__(self, table, kv_slots=1):
+        super().__init__(table)
+        self.kv_slots = kv_slots
+
+    def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0, *args, **kwargs):
+        super().generate(prompt, max_tokens, temperature, top_p, on_text, cache_slot, *args, **kwargs)
+        self.calls[-1]["slot"] = cache_slot
+
+
 class SystemOneApi(unittest.TestCase):
-    def serve(self, table):
-        self.engine = ScoringEngine(table)
-        self.server = APIServer(("127.0.0.1", 0), self.engine, "test-model")
+    def serve(self, table, kv_slots=1):
+        self.engine = SlotScoringEngine(table, kv_slots)
+        self.server = APIServer(("127.0.0.1", 0), self.engine, "test-model", kv_slots=kv_slots)
         self.addCleanup(self.server.shutdown)
         self.addCleanup(self.server.server_close)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -75,7 +90,7 @@ class SystemOneApi(unittest.TestCase):
             "q": {"type": "noul", "instructions": "Is the customer at risk of churning?",
                   "criteria": {"true": "they threaten to leave or mention losses",
                                "false": "a routine question"}}}})
-        pinned = self.pins()[1]
+        pinned = self.pins()[-1]
         self.assertIn("yes: they threaten to leave", pinned)
         self.assertIn("no: a routine question", pinned)
 
@@ -94,7 +109,7 @@ class SystemOneApi(unittest.TestCase):
         self.assertAlmostEqual(answer["confidence"],
                                confidence(list(answer["probabilities"].values())), places=5)
         # the descriptions are in the question, the labels are the options scored
-        pinned = self.pins()[1]
+        pinned = self.pins()[-1]
         self.assertIn("- billing: payments, invoices, Stripe", pinned)
         self.assertIn("- sales: pricing and plans", pinned)
         scored = [c["prompt"] for c in self.engine.calls if not c["pin"]]
@@ -105,7 +120,7 @@ class SystemOneApi(unittest.TestCase):
         out = self.post({"model": "jev-latest", "state": STATE, "questions": {
             "q": {"type": "choice", "criteria": {"a": None, "b": None}}}})
         self.assertEqual(out["answers"]["q"]["choice"], "a")
-        self.assertIn("- a\n- b", self.pins()[1])
+        self.assertIn("- a\n- b", self.pins()[-1])
 
     def test_score_expected_value_legend_and_confidence(self):
         # Jev numbers the levels from zero ("Each description's position determines
@@ -123,7 +138,7 @@ class SystemOneApi(unittest.TestCase):
         self.assertAlmostEqual(answer["score"], sum(int(k) * v for k, v in ps.items()), places=5)
         self.assertGreater(answer["score"], 2.9)             # the mass sits on level 3, "high"
         self.assertAlmostEqual(answer["confidence"], confidence(list(ps.values())), places=5)
-        self.assertIn("4: high", self.pins()[1])
+        self.assertIn("4: high", self.pins()[-1])
 
     def test_legend_gives_back_the_criteria_as_sent(self):
         self.serve({"1": -0.1, "2": -3.0})
@@ -173,9 +188,9 @@ class SystemOneApi(unittest.TestCase):
                          "questions": {"q": {"type": "noul",
                                              "instructions": {"ask": "is this about money?"}}}})
         self.assertEqual(out["model"], "test-model")       # the served model answers
-        state_pin = self.pins()[0]
-        self.assertIn('"ticket": 4711', state_pin)
-        self.assertIn('"ask": "is this about money?"', self.pins()[1])
+        question_pin = self.pins()[-1]                    # the state, then the question
+        self.assertIn('"ticket": 4711', question_pin)
+        self.assertIn('"ask": "is this about money?"', question_pin)
 
     def test_state_is_photographed_once_for_all_questions(self):
         self.serve({"yes": -0.1, "no": -2.0, "a": -0.1, "b": -1.0})
@@ -210,6 +225,100 @@ class SystemOneApi(unittest.TestCase):
         code, body = self.post_error({"model": "jev-latest", "state": STATE, "questions": []})
         self.assertEqual(code, 422)
 
+    # ---- colibri's options (none of which a Jev client sends) --------------
+    def test_normalize_defaults_to_sum_and_mean_can_be_asked(self):
+        # "a b" reads two tokens at -1.0 each, "c" one at -1.5: the joint
+        # probability (sum, -2.0 vs -1.5) picks "c", the per-token mean "a b".
+        question = {"q": {"type": "choice", "criteria": {"a b": None, "c": None}}}
+        self.serve({"a b": -1.0, "c": -1.5})
+        self.assertEqual(self.post({"state": STATE, "questions": question})["answers"]["q"]["choice"], "c")
+        out = self.post({"state": STATE, "questions": question, "normalize": "mean"})
+        self.assertEqual(out["answers"]["q"]["choice"], "a b")
+        code, body = self.post_error({"state": STATE, "questions": question, "normalize": "max"})
+        self.assertEqual((code, body["error"]["param"]), (422, "normalize"))
+
+    def test_a_state_seen_once_is_not_photographed(self):
+        self.serve({"yes": -0.1, "no": -2.0})
+        question = {"q": {"type": "noul", "instructions": "Urgent?"}}
+        state_pins = lambda: [p for p in self.pins() if p.endswith("\n\n") and "Question:" not in p]
+        self.post({"state": "frame 1", "questions": question})
+        self.post({"state": "frame 2", "questions": question})
+        self.assertEqual(state_pins(), [])                  # a feed: never read twice
+        self.post({"state": "frame 2", "questions": question})
+        self.assertEqual(state_pins(), ["Context:\nframe 2\n\n"])   # it came back: worth it
+        self.post({"state": "frame 3", "questions": dict(question, other={"type": "noul"})})
+        self.assertEqual(state_pins()[-1], "Context:\nframe 3\n\n")  # two questions share it
+        before = len(state_pins())
+        self.post({"state": "frame 4", "questions": dict(question, other={"type": "noul"}),
+                   "pin_state": False})
+        self.assertEqual(len(state_pins()), before)
+        self.post({"state": "frame 5", "questions": question, "pin_state": True})
+        self.assertEqual(state_pins()[-1], "Context:\nframe 5\n\n")
+        code, body = self.post_error({"state": "x", "questions": question, "pin_state": "yes"})
+        self.assertEqual((code, body["error"]["param"]), (422, "pin_state"))
+
+    def test_a_fixed_prefix_is_photographed_before_the_state(self):
+        self.serve({"yes": -0.1, "no": -2.0})
+        rules = "You play Flappy Bird. Flap when the pipe gap is above the bird."
+        for frame in ("bird y=10, gap y=40", "bird y=12, gap y=40"):
+            self.post({"state": frame, "prefix": rules,
+                       "questions": {"flap": {"type": "noul", "instructions": "Flap now?"}}})
+        pins = self.pins()
+        self.assertEqual(pins.count(rules + "\n\n"), 2)
+        question_pins = [p for p in pins if "Question:" in p]
+        self.assertTrue(all(p.startswith(rules + "\n\nContext:\nbird y=") for p in question_pins))
+        code, body = self.post_error({"state": "x", "prefix": "", "questions": {"q": {"type": "noul"}}})
+        self.assertEqual((code, body["error"]["param"]), (422, "prefix"))
+
+    def test_cache_slot_is_forwarded_and_the_default_is_unchanged(self):
+        self.serve({"yes": -0.1, "no": -2.0}, kv_slots=2)
+        question = {"q": {"type": "noul", "instructions": "Urgent?"}}
+        self.post({"state": STATE, "questions": question, "cache_slot": 1})
+        self.assertEqual({c["slot"] for c in self.engine.calls}, {1})
+        self.engine.calls.clear()
+        self.post({"state": STATE, "questions": question})
+        want = openai_server.conversation_cache_slot([{"role": "system", "content": STATE}], 2)
+        self.assertEqual({c["slot"] for c in self.engine.calls}, {want})
+        code, body = self.post_error({"state": STATE, "questions": question, "cache_slot": 2})
+        self.assertEqual((code, body["error"]["param"]), (422, "cache_slot"))
+
+    def test_models_says_the_model_answers_systemone(self):
+        self.serve({})
+        with urlopen(self.base + "/v1/models", timeout=10) as response:
+            card = json.loads(response.read())["data"][0]
+        self.assertEqual(card["capabilities"], ["chat", "systemone"])
+
+    def test_a_browser_can_read_the_timing_headers(self):
+        self.serve({"yes": -0.1, "no": -2.0})
+        request = Request(self.base + "/v1/systemone",
+                          data=json.dumps({"state": STATE, "questions": {
+                              "q": {"type": "noul", "instructions": "Urgent?"}}}).encode(),
+                          headers={"Content-Type": "application/json",
+                                   "Origin": "http://localhost:5173"})
+        with urlopen(request, timeout=10) as response:
+            exposed = {h.strip().lower() for h in
+                       response.headers["Access-Control-Expose-Headers"].split(",")}
+            self.assertIn("x-colibri-elapsed-ms", response.headers)
+        self.assertTrue({"x-colibri-elapsed-ms", "x-colibri-queue-wait-ms",
+                         "x-colibri-engine-ms", "x-typesafe-request-id"} <= exposed)
+
+    def test_a_kept_alive_round_trip_does_not_wait_for_a_delayed_ack(self):
+        """The header block and the body are two writes. With Nagle on, the body
+        waits for the client's delayed ACK of the headers: about 40 ms per request
+        on loopback (measured 44 ms median before TCP_NODELAY, 1 ms after)."""
+        self.serve({"yes": -0.1, "no": -2.0})
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=10)
+        self.addCleanup(connection.close)
+        body = json.dumps({"state": STATE, "questions": {"q": {"type": "noul", "instructions": "?"}}})
+        times = []
+        for _ in range(15):
+            started = time.perf_counter()
+            connection.request("POST", "/v1/systemone", body, {"Content-Type": "application/json"})
+            connection.getresponse().read()
+            times.append((time.perf_counter() - started) * 1e3)
+        median = sorted(times[3:])[len(times[3:]) // 2]
+        self.assertLess(median, 20.0, f"keep-alive round trips: {[round(t, 1) for t in times]} ms")
+
     def test_validation_errors_carry_jevs_detail_list(self):
         self.serve({})
         code, body = self.post_error({"model": "jev-latest", "state": STATE, "questions": {
@@ -238,6 +347,17 @@ class SystemOneApi(unittest.TestCase):
         with self.assertRaises(HTTPError) as caught:
             urlopen(request, timeout=10)
         self.assertEqual(caught.exception.code, 404)
+
+
+class CorsOrigins(unittest.TestCase):
+    def test_plus_adds_to_the_defaults_and_plain_values_replace_them(self):
+        defaults = openai_server.DEFAULT_CORS_ORIGINS
+        self.assertEqual(cors_origin_list(None), defaults)
+        self.assertEqual(cors_origin_list(["+http://game.local:8080"]),
+                         (*defaults, "http://game.local:8080"))
+        self.assertEqual(cors_origin_list(["https://ui.example"]), ("https://ui.example",))
+        self.assertEqual(cors_origin_list(["https://ui.example", "+http://game.local:8080"]),
+                         ("https://ui.example", "http://game.local:8080"))
 
 
 if __name__ == "__main__":
