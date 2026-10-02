@@ -13,6 +13,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/stat.h>
+#ifdef __linux__
+#include <unistd.h>
+#endif
 static double vk_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1000.0 + t.tv_nsec/1e6; }
 
 #define VKCHECK(x, what) do { VkResult _r = (x); if (_r != VK_SUCCESS) { \
@@ -584,6 +588,8 @@ static void vkprof_tick(void) {
         fprintf(stderr, "[VK_PROF sub] n=%ld | submit %.0f | wait %.0f ms\n", g_vsub_n, g_vsub_ms, g_vwait_ms);
 }
 
+static unsigned long long g_vk_matmul_calls;   /* successful coli_vk_matmul calls */
+
 int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
                    const void *weights, const float *scales,
                    int fmt, int S, int I, int O, int gs) {
@@ -661,7 +667,46 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
             fprintf(stderr, "[VK_PROF dense] n=%ld | memcpy_x %.0f | desc %.0f | record %.0f | submit %.0f | wait %.0f | memcpy_y %.0f ms\n",
                     p_n, p_x, p_desc, p_rec, p_sub, p_wait, p_y);
     }
+    g_vk_matmul_calls++;
     return 1;
+}
+
+unsigned long long coli_vk_matmul_calls(void) { return g_vk_matmul_calls; }
+
+/* The shader path every engine resolves the same way (#523): COLI_VK_SHADERS may be the
+ * qmatmul.spv file or the directory holding it; unset, the shaders/ directory next to the
+ * binary (the build layout), then the historical path relative to the working directory. */
+const char *coli_vk_shader_path(char *buf, size_t n) {
+    const char *env = getenv("COLI_VK_SHADERS");
+    struct stat st;
+    if (env && *env) {
+        if (!stat(env, &st) && S_ISDIR(st.st_mode)) { snprintf(buf, n, "%s/qmatmul.spv", env); return buf; }
+        return env;
+    }
+#ifdef __linux__
+    ssize_t k = readlink("/proc/self/exe", buf, n - 1);
+    if (k > 0) {
+        buf[k] = 0;
+        char *sl = strrchr(buf, '/');
+        if (sl && (size_t)(sl + 1 - buf) + sizeof("shaders/qmatmul.spv") <= n) {
+            strcpy(sl + 1, "shaders/qmatmul.spv");
+            if (!stat(buf, &st)) return buf;
+        }
+    }
+#endif
+    return "shaders/qmatmul.spv";
+}
+
+int coli_vk_init_env(const char *engine) {
+    const char *on = getenv("COLI_VULKAN");
+    if (!on || !atoi(on)) return 0;
+    char buf[1024];
+    const char *spv = coli_vk_shader_path(buf, sizeof buf);
+    int ok = coli_vk_init(spv) && coli_vk_available();
+    if (ok) fprintf(stderr, "[VK] %s: resident matrices on the GPU\n", engine);
+    else fprintf(stderr, "[VK] %s: no usable Vulkan device (shaders %s), running on the CPU\n",
+                 engine, spv);
+    return ok;
 }
 
 /* Fused first half of the expert MLP: hidden = silu(gate(x)) * up(x), computed in ONE

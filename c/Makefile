@@ -1181,8 +1181,8 @@ tests/bench_cuda_resident_batch$(EXE): tests/bench_cuda_resident_batch.cu backen
 # the GPU sits idle. Same guard #783 put on kimi_k3, which since gaining an
 # MXFP4 expert path no longer needs it. tests/test_makefile_cuda_scope.py
 # asserts this shape.
-olmoe$(EXE): olmoe.c
-	$(CC) $(NOCUDA_CFLAGS) olmoe.c -o olmoe$(EXE) $(NOCUDA_LDFLAGS)
+olmoe$(EXE): olmoe.c $(VK_OBJ) $(VK_SPV)
+	$(CC) $(NOCUDA_CFLAGS) olmoe.c $(VK_OBJ) -o olmoe$(EXE) $(NOCUDA_LDFLAGS)
 
 # Qwen3.6-35B-A3B engine (hybrid Gated Attention + Gated DeltaNet + streaming
 # MoE). With CUDA=1 the optional VRAM expert tier (qwen36_tier.c) is compiled
@@ -1236,8 +1236,8 @@ qpack.o: qpack.c .build-config
 	$(CC) $(QWEN36_CFLAGS) -c qpack.c -o $@
 # Rebuild when CUDA_DLL changes; otherwise an existing CPU-only executable can
 # be reported as up to date despite selecting the Windows CUDA DLL tier.
-qwen36$(EXE): qwen36.c $(QWEN36_TIER_OBJ) $(QWEN36_QPACK_OBJ) $(CUDA_OBJ) $(METAL_OBJ) .build-config
-	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_OBJ) $(QWEN36_QPACK_OBJ) $(CUDA_OBJ) $(METAL_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
+qwen36$(EXE): qwen36.c $(QWEN36_TIER_OBJ) $(QWEN36_QPACK_OBJ) $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_OBJ) $(QWEN36_QPACK_OBJ) $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
 
 # Qwen-Image-2.1 text-to-image (docs/qwen-image.md). It reads the diffusers
 # checkpoint as it is: no conversion step. qi_gemm.h is its one matrix kernel.
@@ -1245,8 +1245,8 @@ ifneq ($(EXE),)
 .PHONY: qwenimage
 qwenimage: qwenimage$(EXE)
 endif
-qwenimage$(EXE): qwenimage.c .build-config
-	$(CC) $(CFLAGS) qwenimage.c -o qwenimage$(EXE) $(LDFLAGS)
+qwenimage$(EXE): qwenimage.c $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) qwenimage.c $(VK_OBJ) -o qwenimage$(EXE) $(LDFLAGS)
 
 # In make check: every format and ragged edges against the naive product, and
 # the int8 x int8 VNNI path against the exact integer sum.
@@ -1256,8 +1256,8 @@ tests/test_qi_gemm$(EXE): tests/test_qi_gemm.c
 # DeepSeek V4.1 Flash: one file, like every other portable engine. The fp4 experts
 # stream from the official checkpoint and quant.h's mxfp4 kernel reads them as they
 # are, so there is no conversion target here to go with it.
-deepseek_v41$(EXE): deepseek_v41.c .build-config
-	$(CC) $(CFLAGS) deepseek_v41.c -o deepseek_v41$(EXE) $(LDFLAGS)
+deepseek_v41$(EXE): deepseek_v41.c $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) deepseek_v41.c $(VK_OBJ) -o deepseek_v41$(EXE) $(LDFLAGS)
 
 # Xiaomi MiMo-V2.6 (Flash 309B, Pro 1.02T): one file plus its ViT header, reading the
 # release as it is -- MXFP4 experts streamed per layer, FP8/BF16 dense resident.
@@ -1265,8 +1265,8 @@ ifneq ($(EXE),)
 .PHONY: mimo
 mimo: mimo$(EXE)
 endif
-mimo$(EXE): mimo.c .build-config
-	$(CC) $(CFLAGS) mimo.c -o mimo$(EXE) $(LDFLAGS)
+mimo$(EXE): mimo.c $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) mimo.c $(VK_OBJ) -o mimo$(EXE) $(LDFLAGS)
 
 # Tiny MiMo fixture + vendor oracle, the Kimi K3 pattern: the generator is numpy (and
 # Pillow for the test picture) and deterministic; ref.json is committed and comes from
@@ -1283,8 +1283,8 @@ mimo-tiny-check: mimo-tiny-generate mimo$(EXE)
 # loader and SERVE=1 protocol. With CUDA=1 it links the same expert tier as
 # qwen36 (fp8 streaming mode: hot experts get VRAM copies, the RAM LRU stays);
 # without it the tier header's inline stubs keep the build toolkit-free.
-qwen38$(EXE): qwen38.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ)
-	$(CC) $(QWEN36_CFLAGS) qwen38.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) -o qwen38$(EXE) $(QWEN36_LDFLAGS)
+qwen38$(EXE): qwen38.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV)
+	$(CC) $(QWEN36_CFLAGS) qwen38.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o qwen38$(EXE) $(QWEN36_LDFLAGS)
 
 .PHONY: qwen38-tiny-generate qwen38-tiny-check
 qwen38-tiny-generate:
@@ -1404,8 +1404,8 @@ tests/bench_qwen36_dense_batch$(EXE): tests/bench_qwen36_dense_batch.c qwen36.c 
 		$(QWEN36_TIER_OBJ) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
-inkling$(EXE): inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ)
-	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) -o inkling$(EXE) $(LDFLAGS)
+inkling$(EXE): inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV)
+	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o inkling$(EXE) $(LDFLAGS)
 
 # ENGINES WITHOUT A CUDA BACKEND (#783).
 # kimi_k3.c contains no COLI_CUDA code at all — its GPU path is Vulkan. But

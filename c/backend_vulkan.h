@@ -133,6 +133,16 @@ size_t coli_vk_tensor_bytes(const ColiVkTensor *t);
  * the host), 0 otherwise or when no device is selected. */
 int coli_vk_device_integrated(void);
 
+/* For engines: COLI_VULKAN=1 opens the device with the shaders found by
+ * coli_vk_shader_path() and prints one line naming the engine; 0 (and one line) when
+ * Vulkan is not asked for or no device is usable, so the engine stays on the CPU. */
+int coli_vk_init_env(const char *engine);
+/* COLI_VK_SHADERS (the .spv or its directory), else shaders/ next to the binary, else
+ * shaders/ in the working directory. buf holds the result when it is not a literal. */
+const char *coli_vk_shader_path(char *buf, size_t n);
+/* How many coli_vk_matmul calls ran on the device: a check that a path is really used. */
+unsigned long long coli_vk_matmul_calls(void);
+
 #ifdef __cplusplus
 }
 #endif
