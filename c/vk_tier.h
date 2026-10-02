@@ -20,7 +20,7 @@
  * With COLI_VULKAN unset, COLI_VK_TIER=0, a CUDA tier active, or a build without
  * VK=1 (the inline stubs below), nothing here runs and the engine is unchanged.
  *
- * ---- integrating an engine (the phase-2 guide) -------------------------------
+ * ---- integrating an engine ----------------------------------------------------
  * 0. Open the device saying whether the tier will be tried, so the dense matrices
  *    get their default place (on a device that shares the CPU's RAM they stay on
  *    the CPU while the tier is on; COLI_VK_DENSE decides when set):
@@ -43,10 +43,12 @@
  *                       .ram_reserve = bytes the RAM expert cache may still grow by,
  *                       .dense_bytes = bytes of dense weights the engine will put
  *                                      on the device after this call};
- *        if (vkt_init(&c, rt_counts_all())) {
- *            atexit(coli_vk_shutdown);   // runs second: the device goes before
- *            atexit(vkt_shutdown);       // the drivers unload (a driver can still
- *        }                               // be compiling the tier's pipelines)
+ *        atexit(coli_vk_shutdown);       // runs last: the device goes before the
+ *        if (vkt_init(&c, rt_counts_all()))   // drivers unload (a driver can still
+ *            atexit(vkt_shutdown);       // be compiling the tier's pipelines), and
+ *                                        // whether or not the tier starts: vkt_init
+ *                                        // makes the expert batch's pipelines
+ *                                        // before it can refuse (no room)
  *
  *    .in_ram (optional) lets the tier hand experts the CPU holds in RAM back to the
  *    CPU when the device is the slower side of a step (an integrated GPU at its
@@ -108,7 +110,13 @@
  *   VKT_SRC_BF16, VKT_SRC_F32                                    -> fmt 11, 10
  * Activations (VktConfig.act): VKT_ACT_SWIGLU silu(g)*u, act_limit > 0 clamps the
  * gate from above and up to [-limit, limit] first (GLM-5.3, DeepSeek V4/V4.1);
- * VKT_ACT_SITU a*tanh(g/a)*sigmoid(g) * b*tanh(u/b) with act_a, act_b (Kimi K3). */
+ * VKT_ACT_SITU a*tanh(g/a)*sigmoid(g) * b*tanh(u/b) with act_a, act_b (Kimi K3);
+ * VKT_ACT_SWIGLU_V4 DeepSeek V4's expert with its CPU kernel's roundings: gate and
+ * up to bf16, the clamped SwiGLU, times the route weight (vkt_issue_w) and to bf16,
+ * then E4M3 and back per 128 inputs before down. The engine hands in x already
+ * rounded to E4M3 per 128 (as its kernel rounds it), adds a device row with no
+ * weight of its own (the weight is in it) and rounds the row to bf16 first, as
+ * its CPU expert rounds its output. */
 #ifndef COLI_VK_TIER_H
 #define COLI_VK_TIER_H
 #include <stdint.h>
@@ -125,6 +133,7 @@ typedef struct { VktSrc kind; int gs; } VktFmt;     /* gs: group (block) size, 0
 
 #define VKT_ACT_SWIGLU 0
 #define VKT_ACT_SITU   1
+#define VKT_ACT_SWIGLU_V4 2
 
 typedef struct {
     const char *engine;            /* names the [VK] tier lines */
@@ -140,6 +149,9 @@ typedef struct {
      * and return to the device when it finishes early. Called on the engine thread. */
     int (*in_ram)(void *ctx, int layer, int eid);
     void *ram_ctx;
+    /* Optional: at most this many experts resident whatever the budget holds (0 = no
+     * cap); for an engine whose users already size its device tier in experts. */
+    int max_experts;
 } VktConfig;
 
 /* One expert as it sits in RAM: codes and scales of gate, up, down (float scales,
@@ -163,8 +175,20 @@ int  vkt_put(int layer, int eid, const VktExpertSrc *src);   /* any thread */
 void vkt_put_done(void);
 void vkt_note(int layer, int eid, const VktExpertSrc *src);
 int  vkt_issue(int layer, const float *x, int S, int K, const int *idx, uint8_t *taken);
+/* vkt_issue with the route weights w[S*K] (beside idx), for VKT_ACT_SWIGLU_V4, which
+ * applies them on the device; the other activations ignore them. */
+int  vkt_issue_w(int layer, const float *x, int S, int K, const int *idx, const float *w, uint8_t *taken);
+/* 1 when vkt_note would take this expert now (not on the device or on its way, the
+ * promotion rate not spent, room or a colder resident to displace): for an engine
+ * whose RAM form must be converted before vkt_note can read it, so it converts only
+ * the experts the tier will take. No side effects. */
+int  vkt_wants(int layer, int eid);
 int  vkt_join(const float **rows);
 int  vkt_resident(int layer, int eid);
+/* The next vkt_issue starts a forward (promotion rate, decay, eviction candidates).
+ * Optional: the tier tells forwards apart by the layer index going back, which a model
+ * with a single MoE layer never does; such an engine calls this at its first MoE layer. */
+void vkt_begin_forward(void);
 void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long long disk_loads);
 /* Sizing helpers for engines: bytes one expert takes on the device in a source format. */
 size_t vkt_expert_bytes(int hidden, int inter, VktFmt gate_up, VktFmt down);
@@ -178,8 +202,11 @@ static inline int  vkt_put(int l,int e,const VktExpertSrc *s){(void)l;(void)e;(v
 static inline void vkt_put_done(void){}
 static inline void vkt_note(int l,int e,const VktExpertSrc *s){(void)l;(void)e;(void)s;}
 static inline int  vkt_issue(int l,const float *x,int S,int K,const int *i,uint8_t *t){(void)l;(void)x;(void)S;(void)K;(void)i;(void)t;return 0;}
+static inline int  vkt_issue_w(int l,const float *x,int S,int K,const int *i,const float *w,uint8_t *t){(void)l;(void)x;(void)S;(void)K;(void)i;(void)w;(void)t;return 0;}
+static inline int  vkt_wants(int l,int e){(void)l;(void)e;return 0;}
 static inline int  vkt_join(const float **r){(void)r;return 0;}
 static inline int  vkt_resident(int l,int e){(void)l;(void)e;return 0;}
+static inline void vkt_begin_forward(void){}
 static inline void vkt_report(const char *s,unsigned long long r,unsigned long long d){(void)s;(void)r;(void)d;}
 static inline size_t vkt_expert_bytes(int h,int i,VktFmt a,VktFmt b){(void)h;(void)i;(void)a;(void)b;return 0;}
 #endif

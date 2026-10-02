@@ -252,6 +252,35 @@ picture's path at the start of the line, and `coli web` with the upload button:
 
 ![MiMo-V2.6 Pro in coli web, reading a picture made by Qwen-Image](media/mimo-pro-web.png)
 
+## On a GPU (Vulkan)
+
+A `make mimo VK=1` build run with `COLI_VULKAN=1` puts the routed experts on the
+shared Vulkan expert tier ([vulkan.md](vulkan.md#the-routed-expert-tier-vk_tierc)):
+the release's MXFP4 bytes as they sit in RAM, the e8m0 group exponents widened to
+the f32 scales the shader reads, SwiGLU on the device. Each MoE step sends the
+(row, choice) pairs whose expert is resident to the device as one batch, and the
+CPU reads and computes the others meanwhile; an expert the device holds is not read
+from disk. Every row then adds its experts in its own routing order, the device's
+and the CPU's alike, as the CPU run does. The engine keeps no expert history, so
+the tier starts empty and fills as experts pass by: the experts the CPU computed are
+offered to it after each step (at most `COLI_VK_TIER_RATE` per token), and once its
+budget is full a hotter expert displaces the coldest resident. The router stays on
+the CPU, so the experts chosen are the CPU's.
+
+The dense matrices follow the backend's one rule (`COLI_VK_DENSE`): on a discrete
+GPU they go to the device; on an integrated GPU or Lavapipe, whose memory is the
+CPU's RAM, they stay on the CPU while the tier runs. `COLI_VK_TIER=0` (or
+`MIMO_VK_EXPERTS=0`) keeps the experts on the CPU and the dense matrices on the
+device, as before the tier.
+
+The device computes with f32 activations, as the CPU does by default: a run with the
+tier gives the CPU run's tokens on the tiny fixture in every dense format, text and
+picture, and passes Xiaomi's oracle (`tests/vulkan_engines.sh mimo-qwenimage`). Its
+logits differ from the CPU's in the last digits, which depend on which experts were
+resident: the byte-exact properties above (block invariance, a prompt resumed from a
+photo equal to the same prompt computed cold) are the CPU's, and hold with
+`COLI_VULKAN` unset, where the engine is the bytes it was before the tier.
+
 ## Environment
 
 | Variable | Default | Effect |
@@ -267,5 +296,5 @@ picture's path at the start of the line, and `coli web` with the upload button:
 | `MIMO_LOGITS` | unset | Oracle: dump every prompt position's logits (f32) to this file. |
 | `MIMO_TRACE` | unset | Oracle: dump the residual after every sublayer of the first block. |
 | `MIMO_DIRS` | unset | Extra directories holding shards (multi-disk). |
-| `COLI_VULKAN` | 0 | 1, in a `make mimo VK=1` build: the dense matrices (qkv, o_proj, the dense MLP, lm_head, and the vision tower's) are uploaded at start-up and run on the GPU in the form `MIMO_DENSE_BITS` gave them: FP8 with its 128-column block scales and BF16 by default, int8 with 8, f32 with 32. The router stays on the CPU, so the experts chosen and read from disk are the CPU's. A matrix that does not fit stays on the CPU. |
-| `MIMO_VK_EXPERTS` | 0 | With `COLI_VULKAN=1`: up to this many routed experts are copied to the GPU, as the release's MXFP4, the first time they run from the RAM cache, and stay there for the rest of the run; uploads stop at this count or when the device's memory budget (less half a GB) is reached. 0 keeps every expert on the CPU. |
+| `COLI_VULKAN` | 0 | 1, in a `make mimo VK=1` build: the routed experts go to the shared Vulkan expert tier, and the dense matrices (qkv, o_proj, the dense MLP, lm_head, and the vision tower's) to the device where `COLI_VK_DENSE` puts them, uploaded at start-up in the form `MIMO_DENSE_BITS` gave them: FP8 with its 128-column block scales and BF16 by default, int8 with 8, f32 with 32. See [On a GPU](#on-a-gpu-vulkan). |
+| `MIMO_VK_EXPERTS` | unset | With `COLI_VULKAN=1`: 0 keeps every routed expert on the CPU (no tier); N sizes the expert tier's budget at N experts (`COLI_VK_TIER_GB`, which wins when set). Unset: the tier's own budget. Kept from the engine's own tier before the shared one, which filled up to N and never evicted. |

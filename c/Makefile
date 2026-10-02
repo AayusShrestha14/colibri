@@ -707,7 +707,8 @@ endif
 # that does not call it links nothing from it.
 VK_OBJ    = backend_vulkan.o vk_tier.o
 VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/attention_absorb.spv shaders/rmsnorm.spv \
-            shaders/qmatmul_gemm.spv shaders/qmatmul_coop.spv shaders/expert_act.spv
+            shaders/qmatmul_gemm.spv shaders/qmatmul_coop.spv shaders/expert_act.spv \
+            shaders/expert_act_v4.spv
 endif
 
 # Optional AMD XDNA2 (Ryzen AI NPU) lane, Windows. Same opt-in shape as VK=1:
