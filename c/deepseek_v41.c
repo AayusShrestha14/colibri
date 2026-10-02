@@ -73,6 +73,11 @@
 #include "tok.h"
 #include "serve_codec.h"
 #include "serve_poll.h"
+#ifdef COLI_VULKAN
+#include "backend_vulkan.h"
+/* 1 once COLI_VULKAN=1 opened a device, after the weights load (a VK=1 build). */
+static int g_vk_ready = 0;
+#endif
 
 #define V41_MAX_LAYERS 64
 #define V41_MAX_ENGRAM 4
@@ -364,6 +369,32 @@ static inline float ue8m0(uint8_t byte) {
     return value.f;
 }
 
+#ifdef COLI_VULKAN
+/* The Vulkan hook of the dense trunk. mv8 and mv8_rows are where every resident
+ * fp8 matrix passes, as mv() is in glm53, so this is where one would leave for the
+ * device. None does, and the reason is the format. qmatmul.comp decodes int8 rows
+ * (fmt 1), int4 rows (2), grouped int4 (4), int3-g64 (5) and MXFP4 (7). A W8 is e4m3
+ * with one ue8m0 scale per 32x32 tile, and what else stays in RAM is bf16 (embed,
+ * head, router, compressor, indexer, vision; mvb) or f32. Requantising e4m3 to int8
+ * at load would change the numbers tools/dsv41_ref.py holds this engine to, so it is
+ * not done here. The routed experts are MXFP4, which fmt 7 reads once their ue8m0
+ * scales are expanded to f32, but they come from disk into an LRU slot and leave it
+ * again: a device tier for them, like kimi_k3's, is other work than this hook, and
+ * they stay on the CPU.
+ *
+ * What would turn this into a call: an e4m3 format in qmatmul.comp that reads one
+ * byte per weight (the fmt 1 row layout) and one f32 scale per 32 inputs (the fmt 4/7
+ * group layout, gs = 32), each tile's ue8m0 expanded to its 32 rows at upload. This
+ * would then send contiguous blocks only (xstride == I, ystride == O), from the main
+ * thread only (one command buffer: never under omp_in_parallel()), and keep the
+ * device copy in a `vk` field of the W8. Until then it declines and the CPU kernels
+ * run, exactly as in a build without VK=1. */
+static int w8_vk(float *y, int ystride, const W8 *w, const float *x, int xstride, int rows) {
+    (void)y; (void)ystride; (void)w; (void)x; (void)xstride; (void)rows;
+    return 0;
+}
+#endif
+
 /* y[O] = W [O, I] x[I], W in e4m3 with one ue8m0 scale per 32x32 tile.
  *
  * The dense trunk's matvec, and the reason it is worth vectorising: V4.1's
@@ -372,6 +403,9 @@ static inline float ue8m0(uint8_t byte) {
  * checkpoint, the attention block was 41% of a turn's wall clock -- more than
  * the expert reads from disk. A scalar byte-at-a-time decode was most of it. */
 static void mv8(float *y, const W8 *w, const float *x) {
+#ifdef COLI_VULKAN
+    if (g_vk_ready && w8_vk(y, w->O, w, x, w->I, 1)) return;
+#endif
     int I = w->I, tiles_i = (I + FP8_TILE - 1) / FP8_TILE;
     #pragma omp parallel for schedule(static)
     for (int o = 0; o < w->O; o++) {
@@ -420,6 +454,9 @@ static int mv_block_rows(int I) {
 }
 
 static void mv8_rows(float *y, int ystride, const W8 *w, const float *x, int xstride, int rows) {
+#ifdef COLI_VULKAN
+    if (g_vk_ready && w8_vk(y, ystride, w, x, xstride, rows)) return;
+#endif
     int I = w->I, tiles_i = (I + FP8_TILE - 1) / FP8_TILE;
     int block = mv_block_rows(I);
     for (int r0 = 0; r0 < rows; r0 += block) {
@@ -3901,6 +3938,17 @@ static int *load_ids(jval *root, const char *key, int *count) {
     return out;
 }
 
+/* One line at the end of a run with COLI_VULKAN=1: how many matmuls the device ran.
+ * coli_vk_matmul_calls() counts only calls that completed there, so a path that
+ * initialised and never ran cannot pass for one that did. */
+static void vk_report(void) {
+#ifdef COLI_VULKAN
+    if (g_vk_ready)
+        fprintf(stderr, "[VK] deepseek_v41: %llu matmuls on the GPU\n",
+                coli_vk_matmul_calls());
+#endif
+}
+
 int main(int argc, char **argv) {
     /* Size the team to PHYSICAL cores before anything else touches the model.
      * This engine issues ~720 OpenMP regions per decoded token -- three per
@@ -3930,6 +3978,16 @@ int main(int argc, char **argv) {
                     "window %d, engram %s — loaded in %.2fs\n",
             c->n_layers, c->n_routed, c->n_activated, c->dim, c->hc_mult, c->window,
             m.engram.active ? "on" : "off", now_s() - started);
+#ifdef COLI_VULKAN
+    /* After the weights, as in glm53: the device is an option, never a requirement.
+     * The shared line says resident matrices go to the GPU; on this engine none can
+     * (see w8_vk), and the second line says so rather than let the first stand. */
+    g_vk_ready = coli_vk_init_env("deepseek_v41");
+    if (g_vk_ready)
+        fprintf(stderr, "[VK] deepseek_v41: no resident matrix is in a format the "
+                        "shaders decode (dense e4m3 with 32x32 ue8m0 tiles, bf16), "
+                        "every matmul stays on the CPU\n");
+#endif
 
     if (getenv("SERVE") && atoi(getenv("SERVE"))) {
         char path[1024];
@@ -3939,6 +3997,7 @@ int main(int argc, char **argv) {
         const char *seed = getenv("SEED");
         srand(seed ? (unsigned)strtoul(seed, NULL, 10) : (unsigned)time(NULL));
         serve_loop(&m, &tokenizer, snap);
+        vk_report();
         return 0;
     }
     if (!ref_path) {
@@ -4120,6 +4179,7 @@ int main(int argc, char **argv) {
                         "verification path was NOT exercised\n");
         spec_failed = 1;
     }
+    vk_report();
     free(confidence); free(draft);
     free(logits); free(prompt); free(expected); json_free(root); free(arena); free(text);
     return (matched == n_expected && !vision_failed && !spec_failed) ? 0 : 1;
