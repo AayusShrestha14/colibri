@@ -325,19 +325,20 @@ static void refresh_candidates(void) {
         T.cand[at] = (int)i; T.cand_score[at] = sc;
     }
 }
-/* The resident a newcomer of score hs displaces, or -1: the coldest candidate still
- * resident, when the newcomer beats it by tier.h's LFRU margin (25% + 4 counts). */
-static int pick_victim(uint64_t hs) {
+/* The resident a newcomer of score hs would displace, or -1: the coldest candidate
+ * still resident, when the newcomer beats it by tier.h's LFRU margin (25% + 4
+ * counts). It stays first in the list until drop_victim takes it. */
+static void drop_victim(void) {
+    memmove(T.cand, T.cand + 1, (size_t)--T.ncand * sizeof(int));
+    memmove(T.cand_score, T.cand_score + 1, (size_t)T.ncand * sizeof(uint64_t));
+}
+static int peek_victim(uint64_t hs) {
     while (T.ncand) {
         int i = T.cand[0];
         VSlot *v = &T.s[i];
-        if (v->state != VS_RESIDENT) { memmove(T.cand, T.cand + 1, (size_t)--T.ncand * sizeof(int));
-                                       memmove(T.cand_score, T.cand_score + 1, (size_t)T.ncand * sizeof(uint64_t)); continue; }
+        if (v->state != VS_RESIDENT) { drop_victim(); continue; }
         uint64_t cs = score(v);
-        if (hs <= cs + (cs >> 2) + (4u << 8)) return -1;
-        memmove(T.cand, T.cand + 1, (size_t)--T.ncand * sizeof(int));
-        memmove(T.cand_score, T.cand_score + 1, (size_t)T.ncand * sizeof(uint64_t));
-        return i;
+        return hs > cs + (cs >> 2) + (4u << 8) ? i : -1;
     }
     return -1;
 }
@@ -363,19 +364,16 @@ void vkt_note(int layer, int eid, const VktExpertSrc *src) {
     VSlot *v = slot(layer, eid);
     if (v->state != VS_NONE || !src->g || !src->u || !src->d) return;
     if (T.promos >= T.promo_cap) { T.rated++; return; }
-    int victim = -1;
-    if (T.resident + T.queued >= T.max_resident) {
-        if (!v->heat) return;
-        victim = pick_victim(score(v));
-        if (victim < 0) return;
-    }
-    pthread_mutex_lock(&T.mx);
-    int full = T.qn >= VKT_QCAP;
-    pthread_mutex_unlock(&T.mx);
-    if (full) { T.qfull++; return; }
     if (T.gu_scales && (!src->gs || !src->us || !src->ds)) return;
+    int victim = -1;
+    if (T.resident + T.queued >= T.max_resident && (!v->heat || (victim = peek_victim(score(v))) < 0)) return;
+    pthread_mutex_lock(&T.mx);
+    int qfull = T.qn >= VKT_QCAP;
+    pthread_mutex_unlock(&T.mx);
+    if (qfull) { T.qfull++; return; }
     uint8_t *buf = malloc(T.stage_bytes);
     if (!buf) return;
+    if (victim >= 0) drop_victim();
     uint8_t *p = buf;
     memcpy(p, src->g, T.gu_codes); p += T.gu_codes;
     memcpy(p, src->u, T.gu_codes); p += T.gu_codes;
