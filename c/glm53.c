@@ -1000,13 +1000,21 @@ static void mv(float *out, const Mat *w, const float *x) {
  * gets the same bits as S separate mv calls. What changes is the traffic: W is
  * read once for the whole batch instead of once per token, which is the whole
  * cost of a prefill, since at one token the dense matrices are bandwidth-bound.
- * Matrices that live on a GPU keep the per-row path they already have. */
+ * A matrix on the Vulkan device takes the S rows in one call (the backend's GEMM);
+ * Metal keeps the per-row path it already has. */
 static void mm(float *out, const Mat *w, const float *x, int S) {
     int gpu = 0;
 #ifdef COLI_METAL
     gpu |= g_metal_ready && w->resident && (w->fmt == 1 || w->fmt == 4);
 #endif
 #ifdef COLI_VULKAN
+    if (S > 1 && g_vk_ready && w->resident && (w->fmt == 1 || w->fmt == 4)) {
+        Mat *mutable_w = (Mat *)w;
+        if (coli_vk_matmul((ColiVkTensor **)&mutable_w->vk, out, x,
+                           w->fmt == 4 ? (const void *)w->q4 : (const void *)w->q8,
+                           w->s, w->fmt, S, w->columns, w->rows, w->gs))
+            return;
+    }
     gpu |= g_vk_ready && w->resident && (w->fmt == 1 || w->fmt == 4);
 #endif
     if (S == 1 || gpu) {
