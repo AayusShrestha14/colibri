@@ -165,6 +165,9 @@ jobs:
         include:
           - family: qwen
             req: c/tools/requirements-qwen38-tiny.txt
+          # the routed-expert tier of qwen36 and qwen38 under ASan and UBSan
+          - family: qwen-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
           - family: inkling-olmoe
             req: c/tools/oracle-requirements.txt
           - family: mimo-qwenimage
