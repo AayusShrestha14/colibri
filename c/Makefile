@@ -705,7 +705,7 @@ LDFLAGS  += -lvulkan
 endif
 VK_OBJ    = backend_vulkan.o
 VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/attention_absorb.spv shaders/rmsnorm.spv \
-            shaders/qmatmul_gemm.spv shaders/qmatmul_coop.spv
+            shaders/qmatmul_gemm.spv shaders/qmatmul_coop.spv shaders/expert_act.spv
 endif
 
 # Optional AMD XDNA2 (Ryzen AI NPU) lane, Windows. Same opt-in shape as VK=1:
@@ -1935,6 +1935,11 @@ tests/test_sparse_attn$(EXE): tests/test_sparse_attn.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_expert_ffn$(EXE): tests/test_expert_ffn.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# The Vulkan weight pool's offset allocator (vk_alloc.h): bookkeeping only, no
+# device, so it is an ordinary gate.
+tests/test_vk_alloc$(EXE): tests/test_vk_alloc.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_rans$(EXE): tests/test_rans.c

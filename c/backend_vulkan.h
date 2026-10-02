@@ -128,12 +128,82 @@ int  coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const f
                               float *out, const float *q, int layer, int S, int H,
                               int Q, int R, int V, int K, int st0, int T, float scale, int Dout);
 
+/* Frees the tensor and gives its device memory back to its pool (the next upload
+ * reuses it). Safe from any thread; a free while async work is in flight on the
+ * tensor's device takes effect when that work has been joined. */
 void   coli_vk_tensor_free(ColiVkTensor *t);
 size_t coli_vk_tensor_bytes(const ColiVkTensor *t);
+
+/* ---- weight memory -----------------------------------------------------------
+ * Resident tensors live in a few big device-memory blocks per pool, handed out by
+ * an offset allocator (vk_alloc.h) that takes freed ranges back. Pool 0 holds every
+ * engine's resident weights (what coli_vk_mem_info counts), pool 1 the routed-expert
+ * tier's experts, pool 2 COLI_VK_DEV2's. */
+typedef struct {
+    int blocks, live;                 /* device-memory blocks; ranges handed out */
+    size_t total, used, free;         /* block bytes; in ranges; between them */
+    size_t largest_free, peak_used;
+    size_t limit;                     /* the pool's byte limit (0 = none) */
+    size_t tensors, payload;          /* live tensors and their row + scale bytes */
+    unsigned long long allocs, frees, refusals;   /* refusals: a block over the limit */
+    double frag;                      /* 1 - largest free extent / free bytes */
+} ColiVkPoolStats;
+void coli_vk_pool_stats(int pool, ColiVkPoolStats *st);
+/* The expert tier's budget: its pool never holds more block bytes than this. */
+void coli_vk_tier_pool_limit(size_t bytes);
+/* A tensor in the tier's pool, to fill in place: O rows of coli_vk_tensor_row_bytes
+ * at *stride apart (padding zeroed) and coli_vk_tensor_scale_count floats of scales
+ * (fmt 10/11: one, set it to 1). Thread-safe. Returns 0 at the budget or when the
+ * device is out of memory. */
+int    coli_vk_tier_tensor(ColiVkTensor **t, int fmt, int I, int O, int gs,
+                           uint8_t **rows, size_t *stride, float **scales);
+size_t coli_vk_tensor_row_bytes(int fmt, int I);
+size_t coli_vk_tensor_scale_count(int fmt, int I, int O, int gs);
+
+/* ---- async expert batch (the routed-expert tier) ------------------------------
+ * One layer step of resident experts in one submit on the tier queue (a second
+ * queue when the device has one, so the synchronous dense matmuls do not wait
+ * behind it). Every expert: hidden = act(gate(x), up(x)), y = down(hidden), for
+ * each of its rows. act: COLI_VK_ACT_SWIGLU (silu(g)*u, limit > 0 clamps the gate
+ * from above and up to [-limit, limit]) or COLI_VK_ACT_SITU (a*tanh(g/a)*sigmoid(g) *
+ * b*tanh(u/b)). One geometry per process: hidden D, intermediate I.
+ * Threading: engine thread only, except where noted. */
+#define COLI_VK_ACT_SWIGLU 0
+#define COLI_VK_ACT_SITU   1
+typedef struct ColiVkExpert ColiVkExpert;
+int  coli_vk_xb_init(int D, int I, int act, float limit, float a, float b);   /* again: same D, I, new act */
+int  coli_vk_xb_ready(void);
+int  coli_vk_xb_queue_shared(void);   /* 1 = the batch shares the main queue */
+/* A resident expert from three tensors (gate/up [I x D] in one format, down [D x I]
+ * in any): writes its descriptor sets once. NULL when the shapes do not match the
+ * geometry. Not while a batch is in flight. */
+ColiVkExpert *coli_vk_xb_expert(ColiVkTensor *gate, ColiVkTensor *up, ColiVkTensor *down);
+/* Its sets and its three tensors. Not while a batch is in flight. */
+void coli_vk_xb_expert_free(ColiVkExpert *e);
+/* Submit and return: count experts, rows[c] activation rows each, the rows given as
+ * sum(rows) pointers to D floats, expert by expert. 0 = nothing was submitted (the
+ * caller computes those experts itself). One batch in flight at a time. */
+int  coli_vk_xb_issue(ColiVkExpert *const *ex, const int *rows, int count, const float *const *xrows);
+/* Wait for it: yrows[j] points at the D outputs of input row j (same order), valid
+ * until the next issue; *device_ms is its device time when timestamps exist (else 0).
+ * 0 = the batch failed (device lost): the caller computes those rows itself. */
+int  coli_vk_xb_join(const float **yrows, double *device_ms);
+typedef struct {
+    unsigned long long batches, experts, rows, gemm_experts;
+    double device_ms;                 /* summed batch device time (timestamps) */
+    int timestamps, queue_shared, gemm_rows;
+    size_t scratch_bytes;
+} ColiVkXbStats;
+void coli_vk_xb_stats(ColiVkXbStats *st);
 
 /* 1 if the selected device is an integrated GPU (shares physical memory with
  * the host), 0 otherwise or when no device is selected. */
 int coli_vk_device_integrated(void);
+/* 1 for an integrated GPU or a CPU device (Lavapipe): device memory is host RAM. */
+int coli_vk_device_shares_ram(void);
+/* The largest DEVICE_LOCAL heap in bytes (for a budget without VK_EXT_memory_budget). */
+size_t coli_vk_device_local_bytes(void);
+const char *coli_vk_device_name(void);
 
 /* For engines: COLI_VULKAN=1 opens the device with the shaders found by
  * coli_vk_shader_path() and prints one line naming the engine; 0 (and one line) when

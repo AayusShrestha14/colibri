@@ -12,7 +12,7 @@
 //   - each thread accumulates a TM x TN block whose rows are strided by BM/TM and
 //     BN/TN, so neighbouring threads read neighbouring rows and store neighbouring
 //     outputs (coalesced y writes);
-//   - the grouped formats (4, 5, 7, 12) fold their group scale into the weight as it
+//   - the grouped formats (4, 5, 7, 12, 13) fold their group scale into the weight as it
 //     enters shared memory, which frees the tile from group boundaries; the per-row
 //     formats (1, 2) multiply scale[o] at the end, as the GEMV does.
 // The tile shape is a set of specialization constants; backend_vulkan.c picks it, and
@@ -37,10 +37,10 @@ layout(std430, binding = 2) readonly buffer Sc { float scale[]; };
 layout(std430, binding = 3) writeonly buffer Y { float y[]; };
 
 layout(push_constant) uniform P {
-    int fmt;        // as qmatmul.comp: 1, 2, 4, 5, 7, 10, 11, 12
+    int fmt;        // as qmatmul.comp: 1, 2, 4, 5, 7, 10, 11, 12, 13
     int S, I, O;
     int rowWords;   // uint32 words per weight row
-    int gs;         // group size of fmt 4/7 (multiple of 8) and 12 (multiple of 4)
+    int gs;         // group size of fmt 4/7 (multiple of 8) and 12/13 (multiple of 4)
 } p;
 
 const int KQ  = BK / 4 + 1;          // quads per shared row, one of padding
@@ -82,11 +82,11 @@ float e4m3(uint word, int lane) {    // OCP E4M3-FN, arithmetic decode (qmatmul.
 void fetch8(int o, int k, out uvec4 lo, out uvec4 hi, out vec2 sc) {
     uint rb = uint(o) * uint(p.rowWords);
     lo = uvec4(0u); hi = uvec4(0u); sc = vec2(0.0);
-    if (p.fmt == 1 || p.fmt == 12) {            // 4 bytes per word
+    if (p.fmt == 1 || p.fmt == 12 || p.fmt == 13) {   // 4 bytes per word
         if ((p.rowWords & 1) == 0) lo.xy = w2[(rb >> 1) + uint(k >> 3)];
         else { lo.x = w[rb + uint(k >> 2)]; if (k + 4 < p.I) lo.y = w[rb + uint(k >> 2) + 1u]; }
         if (k + 4 >= p.I) lo.y = 0u;
-        if (p.fmt == 12) {                       // gs % 4 == 0: a word never straddles
+        if (p.fmt != 1) {                        // gs % 4 == 0: a word never straddles
             uint sb = uint(o) * uint((p.I + p.gs - 1) / p.gs);
             sc.x = scale[sb + uint(k / p.gs)];
             if (k + 4 < p.I) sc.y = scale[sb + uint((k + 4) / p.gs)];
@@ -121,6 +121,9 @@ void decode8(uvec4 a, uvec4 b, vec2 sc, out vec4 lo, out vec4 hi) {
     } else if (p.fmt == 12) {
         lo = vec4(e4m3(a.x, 0), e4m3(a.x, 1), e4m3(a.x, 2), e4m3(a.x, 3)) * sc.x;
         hi = vec4(e4m3(a.y, 0), e4m3(a.y, 1), e4m3(a.y, 2), e4m3(a.y, 3)) * sc.y;
+    } else if (p.fmt == 13) {                    // int8, one scale per gs inputs
+        lo = vec4(i8(a.x, 0), i8(a.x, 1), i8(a.x, 2), i8(a.x, 3)) * sc.x;
+        hi = vec4(i8(a.y, 0), i8(a.y, 1), i8(a.y, 2), i8(a.y, 3)) * sc.y;
     } else if (p.fmt == 10) {
         lo = uintBitsToFloat(a); hi = uintBitsToFloat(b);
     } else if (p.fmt == 11) {                    // low half = even column
