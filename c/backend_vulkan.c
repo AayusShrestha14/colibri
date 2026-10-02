@@ -205,6 +205,11 @@ static int scratch_reserve_mt(Scratch *s, size_t bytes, uint32_t memtype) {
     if (s->cap >= bytes) return 1;
     if (s->buf) { vkDestroyBuffer(G.dev, s->buf, NULL); vkFreeMemory(G.dev, s->mem, NULL); }
     s->buf = VK_NULL_HANDLE; s->cap = 0; s->ptr = NULL;
+    /* The driver may hand the next buffer the destroyed one's handle value, so the
+     * matmul binding cache cannot tell them apart by handle: drop it on every regrow.
+     * (Same tensor, growing S, e.g. a prefill chunk after decode, left the descriptor
+     * on the freed memory: a GPUVM fault on RADV.) */
+    G.bound_tensor = NULL; G.cmd_ready = 0;
     float p0 = G.prio; G.prio = 1.0f;            /* scratches ride every submit: never evict */
     int ok = alloc_hostvis_mt(bytes, &s->buf, &s->mem, &s->ptr, memtype);
     G.prio = p0;
