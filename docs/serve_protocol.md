@@ -38,6 +38,13 @@ declares a tower whose tensors are not in the container). Engines that say nothi
 leave the server's flag unknown. glm53, qwen38, qwen36 and deepseek_v41 emit it;
 `openai_server.py` derives `/v1/models` `input_modalities` from it.
 
+Two more keys say what kind of engine answers. `decide=1`: the engine takes
+`DECIDE` (below), and the gateway sends `POST /v1/systemone` to it as one record
+instead of scoring options through the logprob channel. `chat=0`: it has nothing
+else, so the generating endpoints answer 400 with a pointer to `/v1/systemone`.
+A decision engine (laya) says `decide=1 chat=0`; an engine that chats and also
+decides natively would say `decide=1` alone.
+
 ## Requests (server → engine)
 
 ```
@@ -45,6 +52,7 @@ SUBMIT <id> <slot> <bytes> <max_tokens> <temperature> <top_p>\n<payload>\n
 IMAGE <id> <bytes> <grid_h> <grid_w>\n<payload>\n
 STOP <id>\n
 CANCEL <id>\n
+DECIDE <id> <slot> <bytes>\n<payload>\n
 ```
 
 - `id` — non-zero u64, unique among in-flight requests.
@@ -67,6 +75,14 @@ CANCEL <id>\n
   usage history, and KV state are persisted; the HTTP gateway uses it after a
   client-provided stop sequence matches.
 - `CANCEL` aborts a request after its client disconnects and returns `CANCELLED`.
+- `DECIDE` (only to an engine that announced `decide=1`) carries one decision
+  record, UTF-8 JSON: the state and the typed questions with their options in
+  order. The engine answers with one `DECISION` frame and `DONE`, or with
+  `ERROR <id> DECIDE_INVALID <reason>` for a record it refuses (the client's
+  422; the reason starts with the field, `questions.<id>: ...`) and
+  `ERROR <id> DECIDE_FAILED <reason>` for its own failure. The record and the
+  answer are specified in [docs/brio.md, Decision engines](brio.md#decision-engines);
+  `c/decide_serve.h` parses one and writes the other.
 - EOF on stdin = graceful shutdown: in-flight requests finish first.
 
 Prefill is serial; decode is continuously batched — every active slot contributes
@@ -86,6 +102,13 @@ REPIN <layer> <eid> <old_tier> <gpu>       # live re-pin swap events, as they ha
 DONE <id> STAT <emitted> <tok_s> <hit_pct> <rss_gb> <prompt_tokens> <length_limited>
 ```
 
+and for `DECIDE`:
+
+```
+DECISION <id> <n>\n<n bytes of JSON>\n    # once
+DONE <id> STAT 0 <tok_s> 0.0 <rss_gb> <tokens_read> 0
+```
+
 Kimi K3 emits a zero-byte `TOOL` frame immediately after `ACCEPT` for every
 chat request. That frame declares the sideband authoritative even when no tool
 call follows. Real K3 special-token structure and its enclosed tool payload use
@@ -94,7 +117,8 @@ only resembles an XTML marker cannot be promoted into a client tool call.
 
 Errors replace the stream: `ERROR <id> <CODE>` with codes `BAD_FRAME`, `BAD_REQUEST`,
 `SLOT_BUSY`, `DUPLICATE_ID`, `EMPTY_PROMPT`, `NOT_FOUND` (CANCEL of unknown id),
-`CANCELLED`. A `CANCEL` is acknowledged by `ERROR <id> CANCELLED` after the slot's KV
+`CANCELLED`, and for decision engines `DECIDE_INVALID`, `DECIDE_FAILED` and
+`NOT_SUPPORTED` (a `SUBMIT` to an engine that does not generate). A `CANCEL` is acknowledged by `ERROR <id> CANCELLED` after the slot's KV
 is persisted.
 
 Immediately before each `DONE` the engine emits a telemetry block for the finished

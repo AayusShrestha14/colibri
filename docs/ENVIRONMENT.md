@@ -561,6 +561,15 @@ Read **only** by `c/olmoe.c`. This is the sister engine used for streaming-cache
 | `CONF_LIMIT` | `0.92` | Confidence ceiling for the router prediction. Clamped to [0.1, 1.0]. |
 | `EXPERT_DROP` | `0` (off) | Drop experts below the confidence threshold instead of loading them (quality/speed experiment). |
 
+## Laya engine (`laya`)
+
+Read **only** by `c/laya.c`, the decision engine ([laya.md](laya.md)).
+
+| Variable | Default | Effect |
+|---|---|---|
+| `COLI_LAYA_MAX_LEN` | the checkpoint's `max_len` | Tokens per question sequence (512 on the English checkpoint, capped at the encoder's 8192 positions). |
+| `COLI_LAYA_HEAD_MAX_LEN` | the checkpoint's `head_max_len` | Tokens shared by a question's instructions and options; raise it for questions with many options. |
+
 ---
 
 ## Server / CLI (`openai_server.py`, `coli`)

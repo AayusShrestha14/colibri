@@ -181,12 +181,38 @@ const { json, fields } = await r.json();
 // json.queue, json.urgent are guaranteed to be values from your lists
 ```
 
-### For code written against Jev: `POST /v1/systemone`
+### Switching from Jev: change the base URL, keep your code
 
-If your application already speaks TypeSafe's Jev API, point it at colibri
-and change the base URL; the request and the reply are the same shape. The
-route accepts any `model` name (a Jev client sends `jev-latest`) and answers
-with the model the server actually runs.
+colibri answers `POST /v1/systemone` with the request and the reply of
+TypeSafe's Jev API. Code written against Jev keeps working: point it at
+colibri and change nothing else. The two official SDKs, unmodified, are
+tested against `coli serve` on a language model and on a decision engine
+(`tests/test_jev_sdk.py`, `make -C c jev-sdk-check`).
+
+Python, `typesafe_sdk`:
+
+```python
+from typesafe_sdk import TypeSafeClient
+
+client = TypeSafeClient(api_key="your-colibri-key", base_url="http://127.0.0.1:8000")
+result = client.system_one(model="jev-latest", state=ticket, questions=questions)
+print(result.choices["department"].choice, result.nouls["urgency"].noul)
+```
+
+TypeScript, `@typesafe-ai/sdk`:
+
+```ts
+import { TypeSafeClient } from "@typesafe-ai/sdk";
+
+const client = new TypeSafeClient({ apiKey: "your-colibri-key", baseURL: "http://127.0.0.1:8000" });
+const { answers } = await client.systemOne({ state: ticket, questions });
+```
+
+Or leave the code as it is and set `TYPESAFE_BASE_URL=http://127.0.0.1:8000`
+and `TYPESAFE_API_KEY` (the server's `COLI_API_KEY`; the SDKs want a
+non-empty key, and a server started without one accepts any). The SDKs
+POST to `<base_url>/v1/systemone` and list models at `<base_url>/v1/models`;
+both routes accept any `model` name (a Jev client sends `jev-latest`).
 
 ```bash
 curl -s http://127.0.0.1:8000/v1/systemone \
@@ -210,44 +236,64 @@ The reply, from Qwen3.6-35B-A3B on a CPU box (1m46 with the experts streamed
 from disk, the state read once for the three questions):
 
 ```json
-{"model": "qwen36",
+{"id": "req_5f0c...", "model": "qwen36", "provider": "colibri",
  "answers": {
    "urgency":    {"type": "noul", "noul": 0.847606},
    "department": {"type": "choice", "choice": "technical",
                   "probabilities": {"billing": 0.059806, "technical": 0.939983, "sales": 0.000211},
                   "confidence": 0.909974},
-   "severity":   {"type": "score", "score": 3.831772,
-                  "legend": {"1": "no impact", "2": "minor inconvenience", "3": "blocked on one task",
-                             "4": "losing money", "5": "business down"},
-                  "probabilities": {"1": 0.044403, "2": 0.02624, "3": 0.034899, "4": 0.842097, "5": 0.052361},
+   "severity":   {"type": "score", "score": 2.831772,
+                  "legend": {"0": "no impact", "1": "minor inconvenience", "2": "blocked on one task",
+                             "3": "losing money", "4": "business down"},
+                  "probabilities": {"0": 0.044403, "1": 0.02624, "2": 0.034899, "3": 0.842097, "4": 0.052361},
                   "confidence": 0.802621}},
- "usage": {"input_tokens": 86, "output_tokens": 15}}
+ "usage": {"input_tokens": 86, "output_tokens": 15, "cost": 0}}
 ```
 
-How the three primitives map onto the `questions` form above, so you know
-what the model is actually asked:
+How the three primitives map onto a language model, so you know what it is
+actually asked:
 
 | Jev primitive | what is scored | what goes into the question text | reply |
 |---|---|---|---|
 | `noul` | `yes` / `no` | `instructions`, then `yes: <criteria.true>` and `no: <criteria.false>` when given, then "Answer yes or no." | `noul` = probability of yes |
 | `choice` | the labels of `criteria` (up to 255) | `instructions`, then one line per label with its description | `choice`, `probabilities` by label, `confidence` |
-| `score` | the level numbers `"1".."n"` (2 to 10 levels) | `instructions`, then `k: <description>` per level, then "Answer with the number." | `score` = expected value under the distribution, `legend` by number, `probabilities`, `confidence` |
+| `score` | the level numbers `"1".."n"` (1 to 255 levels) | `instructions`, then `k: <description>` per level, then "Answer with the number." | `score` = expected level under the distribution, `legend` and `probabilities` keyed `"0".."n-1"` as Jev numbers them, `confidence` |
 
-`state` and `instructions` may be a string, an object or an array; JSON is
-serialized as text. `confidence` is the formula their documentation gives,
-`(n * peak - 1) / (n - 1)`: 1 when all the mass sits on one label, 0 when
-flat; `noul` carries none, as in theirs.
+`state`, `instructions` and every criterion may be a string, an object or an
+array; JSON is serialized as text. `confidence` is the formula their
+documentation gives, `(n * peak - 1) / (n - 1)`: 1 when all the mass sits on
+one label, 0 when flat; `noul` carries none, as in theirs. A question with a
+single label or level is answered without asking the model.
 
 What differs, stated rather than hidden:
 
-- `model` in the reply is the served model, not a Jev version.
-- `usage.output_tokens` counts the option tokens the engine **read**; nothing
-  is generated. `input_tokens` is the longest prompt of the request.
+- `model` is the served model, `provider` is `"colibri"`, `usage.cost` is 0,
+  and `id` is the request id (also the `x-typesafe-request-id` header).
+- `usage.output_tokens` counts the option tokens a language model **read**;
+  nothing is generated. `input_tokens` is the longest prompt of the request.
+  A decision engine reports the tokens it read as `input_tokens` and 0 output.
 - Validation errors are `422`, as theirs, with this server's error envelope
-  (`error.message`, `error.param`).
+  (`error.message`, `error.param`) and Jev's `detail` list beside it.
+- `GET /v1/models` lists the Jev card (`models`: name, description,
+  release_date) next to OpenAI's `data`.
 - The probabilities are this model's, normalised over the options with the
-  `mean` rule above. The numbers will not match Jev's on the same input; the
+  `sum` rule below. The numbers will not match Jev's on the same input; the
   contract is the same, the model is yours.
+
+#### colibri's options
+
+None of these is sent by a Jev client; each is optional.
+
+| field | meaning |
+|---|---|
+| `normalize` | `"sum"` (default) or `"mean"`: how a language model's option log-probabilities become one score per option, see below |
+| `pin_state` | `true` / `false`: photograph the state for the next request. Left out, the server photographs it when two or more questions read it, or when the same state came back from an earlier request. A state that changes on every call (a game, a sensor feed) is read straight through, one engine call fewer per request |
+| `prefix` | a fixed text read before the state, photographed once per KV slot and retaken if the engine evicted it. For rules or instructions that stay while the state changes: on the tiny MiMo fixture, rules of 690 positions plus a frame cost 143 positions per request instead of 690 |
+| `cache_slot` | the KV slot, as on the chat endpoints; by default it is derived from the state (from the prefix, when there is one) |
+
+A decision engine has no log-probabilities and no photos: it ignores
+`normalize` and `pin_state` and refuses `prefix` (put that text in `state` or
+`instructions`); `cache_slot` reaches it as the DECIDE slot.
 
 ### Do not put the options in the prompt
 
@@ -256,13 +302,18 @@ real case that list was 48 tokens of 123, and it is about half of what the mode
 saves. Naming the options in the text also biases the scoring towards whichever one
 the sentence happens to mention last.
 
-### `mean` or `sum`
+### `sum` or `mean`
 
-`logprob` is the log probability of the whole option string, so a two-token option
-is penalised against a one-token option simply for being longer. Measured on qwen36:
-summing picked `merge` where the same model's own greedy decoding said
-`request changes`; the mean per token agreed with generation. `mean` is therefore
-the default. `sum` is available when you want the literal probability of the string.
+`logprob` is the log probability of the whole option string; `mean_logprob`
+divides it by the option's tokens. `sum` is the default. Measured on a
+30-case code-review benchmark (ALLOW / REVIEW / DENY), `mean` answered DENY on
+all 30, a one-word README fix included, because DENY is two tokens and ALLOW
+one: a per-token average favours whichever option has more tokens. With `sum`
+the same suite scored ALLOW 10/10 and DENY 9/10. `mean` stays available, and
+the server warns when it is asked for options whose token counts differ. On
+qwen36 one case went the other way (`sum` picked `merge` where the model's
+own greedy answer was `request changes`), so when your options have very
+different lengths, look at both.
 
 ## Reading the entropy
 
@@ -440,3 +491,110 @@ Note that these are on a disk-streaming engine, where the prefill costs about
   interleaved clients evict each other.
 - **`normalize` is a policy, not a fact.** Neither mean nor sum is right for every
   option set; if your options have very different lengths, look at both.
+
+## Decision engines
+
+A language model answers `/v1/systemone` by scoring each option through its
+logprob channel: a prompt per question, a read-out per option. A **decision
+engine** is a model built for the question itself. It reads the state and the
+typed questions and returns a probability per option in one forward pass,
+with the calibration its authors fitted. colibri serves it on the same
+endpoint and with the same reply, so a Jev client, the SDKs and the dashboard
+cannot tell which kind answered.
+
+| engine | model | doc |
+|---|---|---|
+| `c/laya` | Laya (Convai Innovations): ModernBERT encoder + decision head | [laya.md](laya.md) |
+
+A decision engine serves `POST /v1/systemone` only. Chat, completions,
+messages and `/v1/brio` answer 400 with a pointer to `/v1/systemone`, and
+`/v1/models` lists the model with `capabilities: ["systemone", "decision"]`
+(a language model says `["chat", "systemone"]`). The path is one round trip:
+the gateway checks the request, sends it to the engine as one record, and
+shapes the answer. Nothing is rendered into a prompt and no option is scored
+on its own. On Laya the gateway's share is about 2 ms per request: 8.1 ms at
+the client for three questions on the tiny fixture, 6.1 of them in the
+engine; 882 ms on the real checkpoint, 879.5 in the engine. The engine's own
+time is in the `x-colibri-engine-ms` header.
+
+### The contract, for an engine author
+
+Everything below is generic; `c/decide_serve.h` implements the engine side,
+so a new engine writes only its model and one function.
+
+**Handshake.** The engine announces itself on the `CAPS` line of the serve
+protocol: `decide=1` (it takes `DECIDE`) and `chat=0` (it generates nothing).
+An engine that also chats leaves `chat` out; the gateway then sends
+`/v1/systemone` to `DECIDE` and the chat endpoints to `SUBMIT` as before.
+
+**Request.** `DECIDE <id> <slot> <bytes>` followed by one JSON record:
+
+```json
+{"state": "{\"subject\": \"Duplicate charge\", \"body\": \"...\"}",
+ "state_type": "object",
+ "questions": [
+   {"id": "department", "type": "choice", "instructions": "Which department?",
+    "options": [{"label": "billing", "text": "invoices, payments, refunds"},
+                {"label": "other", "text": null}]},
+   {"id": "urgency", "type": "score", "instructions": "How urgent is this?",
+    "options": [{"label": "0", "text": "not urgent"}, {"label": "1", "text": "blocking"}]},
+   {"id": "churn", "type": "noul", "instructions": "Does the user threaten to leave?",
+    "options": [{"label": "false", "text": null}, {"label": "true", "text": null}]}]}
+```
+
+- Every text is already text. A string is kept exactly as sent; an object or
+  an array (a state, instructions, a criterion) is written as
+  `json.dumps(value, ensure_ascii=False)`, the serialization the reference
+  packages apply, so the engine reads the bytes its model was trained on.
+  `state_type` says what the caller sent (`string`, `object`, `array`, ...),
+  because a model may treat a list (a conversation) differently.
+- Options come in the caller's order: a choice's labels with their
+  descriptions (`null` for none), a score's levels from 0, a noul's `false`
+  then `true` with the optional criteria. Missing instructions get the same
+  default text the language-model path asks with.
+- `slot` is the KV slot, for an engine that keeps state between requests.
+
+**Answer.** One `DECISION <id> <bytes>` frame, then `DONE`:
+
+```json
+{"answers": [{"id": "department", "logits": [4.68, -2.78], "probs": [0.9804, 0.0196],
+              "temperature": 1.906, "actions": {"act": 1.0, "escalate": 0.0},
+              "tokens": 96, "state_tokens": 50, "state_dropped": 0}],
+ "input_tokens": 348, "engine_ms": 879.5}
+```
+
+`probs` are the engine's final probabilities, one per option in the record's
+order; the gateway builds the Jev answer from them alone (argmax for
+`choice`, the expected level for `score`, `probs[1]` for `noul`). `logits`,
+`temperature` and `actions` (a policy head such as Laya's act / escalate) are
+the engine's own record of how it got there. A record the engine refuses is
+`ERROR <id> DECIDE_INVALID <field>: <reason>`, which the client receives as a
+422 naming that field; `DECIDE_FAILED` is the engine's own failure (500).
+
+**Registry.** A family with `modality="decision"` and
+`FamilyCapabilities(decision=True)` in `c/family_registry.py`, and a way for
+`resolve_model` to recognise its checkpoint (Laya: `rl_agent_config.json`
+plus `encoder/config.json`, keyed `laya_<encoder model_type>`). `coli serve`
+and `coli web` then serve it, `coli info` and `coli plan` describe it, and
+`coli chat` / `coli run` refuse it with a pointer to the endpoint.
+
+**Tests.** A tiny fixture whose reference answers come from the model's own
+package (`tools/make_laya_tiny.py`, `tools/make_laya_ref.py`,
+`tests/test_laya_tiny.py`), and the fixture behind the real gateway
+(`tests/test_decision_serve.py`, `tests/test_jev_sdk.py`).
+
+### The next two
+
+- **GLiNER2.5-Decide** (DeBERTa-v3 encoder, GLiNER2 heads): a second encoder
+  engine on the same contract. It needs the DeBERTa-v3 encoder (relative
+  position buckets and disentangled attention, a SentencePiece tokenizer) and
+  its heads, its own rendering of a record into its input, and a
+  `resolve_model` rule for its checkpoint. `decide_serve.h`, the gateway and
+  the SDK tests stay as they are.
+- **Clef** (a joint schema head over Qwen3.8-27B, dense, with vision): the
+  backbone is the qwen36 engine's. It would answer `DECIDE` in that engine's
+  serve loop next to `SUBMIT`, announce `decide=1` without `chat=0` (the same
+  process still chats), run the backbone over the rendered record and apply
+  the head to its final hidden states. The record already carries what a
+  schema head needs (every question with its typed options); a picture in the
+  state would need the record to carry image parts, which today it does not.
