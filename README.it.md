@@ -400,6 +400,31 @@ Ti servono due cose: **il programma** (poche centinaia di KB) e **il modello**
 (372 GB). Guida passo passo per tutte le piattaforme nella
 [Quick Start](docs/quickstart.md).
 
+### In un solo passo
+
+**Windows:** scarica il repository (**Code**, poi **Download ZIP**, oppure
+`git clone`), scompattalo e fai doppio clic su **`START-HERE.bat`**.
+**Linux e macOS:**
+
+```bash
+git clone https://github.com/JustVugg/colibri && cd colibri
+./start-here.sh
+```
+
+Rileva RAM, disco e GPU, consiglia un modello adatto a questa macchina (Invio
+lo accetta), compila il motore con Vulkan o CUDA quando la tua GPU può usarli
+(oppure scarica quello già compilato), scarica il modello con ripresa
+(interrompilo quando vuoi, rilancialo per continuare) e apre la dashboard nel
+browser. Stampa anche gli URL base OpenAI e Anthropic per le altre app.
+Rilancialo più tardi e colibri parte subito; `c/coli stop` lo ferma. Cosa fa
+ogni passo: [quickstart.md](docs/quickstart.md#the-one-step-way).
+
+Usi un assistente di programmazione AI? Chiedigli di installare colibri seguendo [docs/AI_SETUP.md](docs/AI_SETUP.md).
+Gli assistenti che parlano il Model Context Protocol possono usare `coli mcp`
+([MCP_SERVER.md](docs/MCP_SERVER.md)).
+
+Segue il percorso manuale.
+
 ### 1. Procurati colibri
 
 **Scarica una release già compilata** — Linux, macOS e Windows, nessun
