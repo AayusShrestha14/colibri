@@ -205,25 +205,36 @@ class DownloadTest(unittest.TestCase):
         path.write_bytes(b"\1" * len(self.files[name]))
         self.assertFalse(setup_download.verify_file(str(path), self.spec(name)))
 
-    @unittest.skipUnless(os.name == "posix", "the stand-in curl.exe is a script")
-    def test_windows_curl_transport(self):
-        """WSL's slow-network path: Windows' curl.exe writes the .part file, then
-        the same size and hash checks decide whether it becomes the file."""
-        fake_curl = Path(self.tmp.name, "curl.exe")
-        fake_curl.write_text(
-            "#!" + sys.executable + "\n"
+    def stand_in_curl(self):
+        """A curl.exe that does what the transport asks of it: fetch the last
+        argument into the file after -o. A script with a shebang on POSIX, a
+        .cmd around the same script on Windows."""
+        script = Path(self.tmp.name, "curl_stand_in.py")
+        script.write_text(
             "import sys, urllib.request\n"
             "args = sys.argv[1:]\n"
             "out = args[args.index('-o') + 1]\n"
             "data = urllib.request.urlopen(args[-1]).read()\n"
             "open(out, 'wb').write(data)\n")
-        fake_curl.chmod(0o755)
+        if os.name == "nt":
+            wrapper = Path(self.tmp.name, "curl.cmd")
+            wrapper.write_text(f'@"{sys.executable}" "{script}" %*\r\n')
+            return str(wrapper)
+        wrapper = Path(self.tmp.name, "curl.exe")
+        wrapper.write_text("#!" + sys.executable + "\n" + script.read_text())
+        wrapper.chmod(0o755)
+        return str(wrapper)
+
+    def test_windows_curl_transport(self):
+        """WSL's slow-network path: Windows' curl.exe writes the .part file, then
+        the same size and hash checks decide whether it becomes the file."""
+        fake_curl = self.stand_in_curl()
         name = "model-00000.safetensors"
         dest = os.path.join(self.dst, name)
         seen = []
         with mock.patch.object(setup_download, "wsl_windows_path", side_effect=lambda p: p):
             result = setup_download.download_file_windows(
-                self.url(name), dest, self.spec(name), str(fake_curl),
+                self.url(name), dest, self.spec(name), fake_curl,
                 progress=lambda done, total: seen.append((done, total)))
         self.assertEqual(result, "downloaded")
         self.assertEqual(Path(dest).read_bytes(), self.files[name])
@@ -234,7 +245,7 @@ class DownloadTest(unittest.TestCase):
         with mock.patch.object(setup_download, "wsl_windows_path", side_effect=lambda p: p), \
                 self.assertRaises(setup_download.DownloadError):
             setup_download.download_file_windows(self.url(other), os.path.join(self.dst, other),
-                                                 bad, str(fake_curl))
+                                                 bad, fake_curl)
         self.assertFalse(os.path.exists(os.path.join(self.dst, other)))
 
     def test_token_from_file(self):

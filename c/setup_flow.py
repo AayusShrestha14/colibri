@@ -50,11 +50,26 @@ import setup_hw  # noqa: E402
 from family_registry import family_by_id  # noqa: E402
 
 GB = 1_000_000_000
-EXE = ".exe" if sys.platform == "win32" else ""
 CONFIG_VERSION = 1
 DEFAULT_PORT = 8000
 DEFAULT_HOST = "127.0.0.1"
 RELEASES_API = "https://api.github.com/repos/JustVugg/colibri/releases"
+
+
+def host_os():
+    """The OS whose conventions decide what to build, fetch and call things:
+    engine file names, the release asset, the package commands, the make
+    invocation. One function, so a test can model Windows on Linux and the
+    reverse; everything that calls an OS API checks sys.platform itself."""
+    return sys.platform
+
+
+def host_machine():
+    return setup_hw.platform.machine().lower()
+
+
+def exe_suffix():
+    return ".exe" if host_os() == "win32" else ""
 
 
 class SetupError(RuntimeError):
@@ -241,7 +256,7 @@ TEXT_HINTS = {
 def package_hint(kinds, os_info=None, platform_name=None):
     """One line the user can run to get `kinds` (build, vulkan, cuda, python)."""
     kinds = [kinds] if isinstance(kinds, str) else list(kinds)
-    platform_name = platform_name or sys.platform
+    platform_name = platform_name or host_os()
     if platform_name == "darwin":
         return " ; ".join(TEXT_HINTS.get(f"{k}-darwin", TEXT_HINTS.get(k, k)) for k in kinds)
     if platform_name == "win32":
@@ -281,7 +296,7 @@ def choose_backend(hw, family, tc, requested="auto"):
     if requested == "cpu":
         decision["reason"] = "CPU only, as requested"
         return decision
-    cuda_engine = family.supports_accelerator and sys.platform.startswith("linux")
+    cuda_engine = family.supports_accelerator and host_os().startswith("linux")
     if nvidia and requested in ("auto", "cuda"):
         if cuda_engine and tc.get("can_build_cuda"):
             decision.update(backend="cuda", gpu=nvidia[0]["name"],
@@ -341,7 +356,7 @@ def binary_backend(path):
 
 
 def engine_path(directory, family):
-    return os.path.join(directory, family.engine_artifact + EXE)
+    return os.path.join(directory, family.engine_artifact + exe_suffix())
 
 
 # ---------------------------------------------------------------- building
@@ -355,7 +370,7 @@ def make_command(family, backend, tc):
         args.append("VK=1")
     elif backend == "cuda":
         args += ["CUDA=1", f"CUDA_ARCH={os.environ.get('CUDA_ARCH') or 'native'}"]
-    if sys.platform == "win32" and tc.get("msys2"):
+    if host_os() == "win32" and tc.get("msys2"):
         bash = os.path.join(tc["msys2"], "usr", "bin", "bash.exe")
         script = 'cd "$(cygpath -u "$1")" && shift && exec make "$@"'
         env = dict(os.environ, MSYSTEM="UCRT64", CHERE_INVOKING="1", MSYS2_PATH_TYPE="inherit")
@@ -370,7 +385,7 @@ def build_engine(family, backend, tc, out=print):
     write_state("build", engine=family.engine_artifact, backend=backend)
     with open(_ensure_log("build"), "w", encoding="utf-8", errors="replace") as log:
         process = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE,
-                                   stderr=subprocess.STDOUT, text=True, errors="replace")
+                                   stderr=subprocess.STDOUT, encoding="utf-8", errors="replace")
         tail = []
         for line in process.stdout:
             log.write(line)
@@ -393,8 +408,8 @@ def _ensure_log(name):
 
 
 def release_asset_suffix(os_name=None, machine=None):
-    os_name = os_name or sys.platform
-    machine = (machine or setup_hw.platform.machine()).lower()
+    os_name = os_name or host_os()
+    machine = (machine or host_machine()).lower()
     if os_name.startswith("linux") and machine in ("x86_64", "amd64"):
         return "linux-x86_64.tar.gz"
     if os_name == "darwin" and machine in ("arm64", "aarch64"):
@@ -465,7 +480,7 @@ def extract_archive(archive, dest, only_prefix=None):
     if not only_prefix:
         for name in os.listdir(dest):
             path = os.path.join(dest, name)
-            if os.path.isfile(path) and sys.platform != "win32" and "." not in name:
+            if os.path.isfile(path) and os.name == "posix" and "." not in name:
                 os.chmod(path, 0o755)
 
 
@@ -586,7 +601,7 @@ def resolve_engine(family, entry, decision, tc, out=print, allow_prebuilt=True):
     version = current_version()
     if release_asset_suffix() is None:
         raise SetupError(f"no compiler here, and no prebuilt engine is published for "
-                         f"{sys.platform}/{setup_hw.platform.machine()}: {package_hint(['build'])}")
+                         f"{host_os()}/{host_machine()}: {package_hint(['build'])}")
     out("  no compiler found: using the prebuilt engine from the GitHub release")
     runtime, tag = fetch_release_archive(version, out=out)
     if entry is not None and setup_catalog.version_tuple(tag) < setup_catalog.version_tuple(entry.prebuilt_since):
@@ -680,7 +695,7 @@ def launcher_in(directory):
 def equivalent_command(cfg):
     env = " ".join(f"{k}={_quote(v)}" for k, v in cfg.get("env", {}).items())
     cmd = " ".join(_quote(a) for a in ["coli"] + cfg.get("args", []))
-    if sys.platform == "win32":
+    if host_os() == "win32":
         sets = "".join(f'set "{k}={v}" && ' for k, v in cfg.get("env", {}).items())
         return f"{sets}{cmd}"
     return f"{env} {cmd}".strip()
@@ -706,7 +721,12 @@ def _pid_alive(pid):
             import ctypes
             from ctypes import wintypes
             k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
             k32.OpenProcess.restype = wintypes.HANDLE
+            k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+            k32.GetExitCodeProcess.restype = wintypes.BOOL
+            k32.CloseHandle.argtypes = [wintypes.HANDLE]
+            k32.CloseHandle.restype = wintypes.BOOL
             handle = k32.OpenProcess(0x1000, False, pid)
             if not handle:
                 return False
@@ -898,8 +918,10 @@ def stop_server(cfg, out=print):
     coli = COLI_SCRIPT
     if not os.path.isfile(coli):
         coli = cfg["launcher"]
+    # coli prints UTF-8 (it reconfigures stdout on Windows); the locale codec
+    # (cp1252 there) would raise on its box-drawing characters.
     result = subprocess.run([sys.executable, coli, "stop", "--port", str(cfg["port"])],
-                            capture_output=True, text=True, timeout=120,
+                            capture_output=True, encoding="utf-8", errors="replace", timeout=120,
                             env=dict(os.environ, COLI_COLOR="0"))
     text = (result.stdout + result.stderr).strip()
     lines = [re.sub(r"\x1b\[[0-9;]*m", "", line).strip() for line in text.splitlines()]
@@ -1152,7 +1174,8 @@ def run_post_install(entry, launcher_dir, model_dir, ui):
             continue
         script = os.path.join(launcher_dir, "tools", f"{tool}.py")
         ui.say(f"  writing {creates} (tools/{tool}.py)")
-        result = subprocess.run([sys.executable, script, model_dir], capture_output=True, text=True)
+        result = subprocess.run([sys.executable, script, model_dir], capture_output=True,
+                                encoding="utf-8", errors="replace")
         if result.returncode != 0 or not os.path.exists(os.path.join(model_dir, creates)):
             raise SetupError(f"tools/{tool}.py failed: {(result.stderr or result.stdout).strip()[-400:]}")
 
@@ -1332,7 +1355,7 @@ def _recommend_for(hw, explicit_dir):
         if manifest:
             downloaded[entry.id] = setup_download.bytes_present(os.path.join(root, entry.id),
                                                                 manifest.get("files", []))
-    return setup_catalog.recommend(hw["memory"].get("total"), free, os_name=sys.platform,
+    return setup_catalog.recommend(hw["memory"].get("total"), free, os_name=host_os(),
                                    machine=hw["os"].get("machine"), downloaded=downloaded)
 
 

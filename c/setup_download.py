@@ -272,7 +272,7 @@ def windows_curl():
 def wsl_windows_path(path):
     try:
         out = subprocess.run(["wslpath", "-w", os.path.abspath(path)], capture_output=True,
-                             text=True, timeout=10).stdout.strip()
+                             text=True, errors="replace", timeout=10).stdout.strip()
         return out or None
     except (OSError, subprocess.SubprocessError):
         return None
@@ -311,7 +311,8 @@ def probe_throughput_windows(url, curl, *, token=None, max_bytes=4 << 20, max_se
     if token:
         cmd[1:1] = ["-H", f"Authorization: Bearer {token}"]
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=max_seconds + 20).stdout
+        out = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                             timeout=max_seconds + 20).stdout
     except (OSError, subprocess.SubprocessError):
         return None
     speed = parse_curl_speed(out)

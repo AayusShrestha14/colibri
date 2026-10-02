@@ -24,6 +24,7 @@ import glob
 import json
 import os
 import platform
+import posixpath
 import re
 import shutil
 import struct
@@ -32,6 +33,12 @@ import sys
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 GB = 1_000_000_000
+
+
+def host_os():
+    """The OS whose conventions decide which probes apply (WSL driver search,
+    no Vulkan on macOS). Patchable, so tests model any OS on any host."""
+    return sys.platform
 
 # ---------------------------------------------------------------- memory
 
@@ -267,10 +274,19 @@ def disk_free(path):
 
 
 def path_warnings(path, wsl):
-    """Advice about where a model lives; the engine streams it, so it matters."""
+    """Advice about where a model lives; the engine streams it, so it matters.
+
+    The WSL check is about a Linux path, so it is normalized with POSIX rules
+    whatever Python runs it: os.path on Windows would turn /mnt/c/x into
+    C:\\mnt\\c\\x and the check would silently pass everything."""
     warnings = []
-    absolute = os.path.abspath(os.path.expanduser(path))
-    if wsl and re.match(r"^/mnt/[a-zA-Z](/|$)", absolute):
+    if not wsl:
+        return warnings
+    expanded = os.path.expanduser(path)
+    if not expanded.startswith("/"):
+        expanded = posixpath.join(os.getcwd(), expanded)
+    absolute = posixpath.normpath(expanded)
+    if re.match(r"^/mnt/[a-zA-Z](/|$)", absolute):
         warnings.append(
             f"{absolute} is a Windows drive seen from WSL: reading it is many times "
             "slower than the Linux disk, and the engine streams the model from it. "
@@ -617,7 +633,7 @@ def detect_vulkan(wsl=None, home=None):
     usable GPU there, each user manifest is tried in turn and the first one that
     yields a usable device is reported with its path, so the run configuration
     can point the engine at the same driver."""
-    if sys.platform == "darwin":
+    if host_os() == "darwin":
         return {"devices": [], "icd": None, "source": None}
     wsl = is_wsl() if wsl is None else wsl
     probe = _probe_vulkan_child()
@@ -627,7 +643,7 @@ def detect_vulkan(wsl=None, home=None):
         summary = _run(["vulkaninfo", "--summary"], timeout=20) if shutil.which("vulkaninfo") else ""
         result = {"devices": parse_vulkaninfo_summary(summary), "icd": None,
                   "source": "vulkaninfo" if summary else None}
-    if not any(vulkan_usable(d) for d in result["devices"]) and sys.platform.startswith("linux") \
+    if not any(vulkan_usable(d) for d in result["devices"]) and host_os().startswith("linux") \
             and not os.environ.get("VK_ICD_FILENAMES") and not os.environ.get("VK_DRIVER_FILES"):
         for manifest in find_user_icds(home):
             extra = _probe_vulkan_child({"VK_ICD_FILENAMES": manifest, "VK_DRIVER_FILES": manifest})
@@ -672,7 +688,10 @@ def detect_windows_video():
 
 def _run(cmd, timeout=10):
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+        # errors="replace": a GPU name in the console code page must not turn
+        # into a UnicodeDecodeError that throws the whole probe away.
+        return subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                              timeout=timeout).stdout
     except (OSError, subprocess.SubprocessError, ValueError):
         return ""
 

@@ -168,9 +168,20 @@ class SystemParsing(unittest.TestCase):
         self.assertEqual(info["PRETTY_NAME"], "Ubuntu 24.04 LTS")
 
     def test_windows_drive_from_wsl_is_flagged(self):
+        # POSIX rules whatever the host: on Windows os.path would read
+        # /mnt/c/... as C:\\mnt\\c\\... and flag nothing.
         self.assertTrue(setup_hw.path_warnings("/mnt/c/Users/me/models", wsl=True))
+        self.assertTrue(setup_hw.path_warnings("/mnt/d", wsl=True))
+        self.assertTrue(setup_hw.path_warnings("/home/me/../../mnt/e/x", wsl=True))
         self.assertFalse(setup_hw.path_warnings("/home/me/colibri-models", wsl=True))
+        self.assertFalse(setup_hw.path_warnings("/mnt/wslg/x", wsl=True))
         self.assertFalse(setup_hw.path_warnings("/mnt/c/Users/me/models", wsl=False))
+
+    def test_a_relative_folder_is_resolved_against_the_wsl_cwd(self):
+        with mock.patch.object(setup_hw.os, "getcwd", return_value="/mnt/c/Users/me"):
+            self.assertTrue(setup_hw.path_warnings("models", wsl=True))
+        with mock.patch.object(setup_hw.os, "getcwd", return_value="/home/me"):
+            self.assertFalse(setup_hw.path_warnings("models", wsl=True))
 
     def test_fixed_drives(self):
         kinds = {"C:\\": 3, "D:\\": 3, "E:\\": 2, "Z:\\": 4}      # fixed, fixed, removable, network
@@ -290,7 +301,7 @@ class VulkanParsing(unittest.TestCase):
                if k not in ("VK_ICD_FILENAMES", "VK_DRIVER_FILES")}
         with mock.patch.object(setup_hw, "_probe_vulkan_child", side_effect=probe), \
              mock.patch.object(setup_hw, "find_user_icds", return_value=["/home/u/dzn.json"]), \
-             mock.patch.object(setup_hw.sys, "platform", "linux"), \
+             mock.patch.object(setup_hw, "host_os", return_value="linux"), \
              mock.patch.dict(os.environ, env, clear=True):
             result = setup_hw.detect_vulkan(wsl=True)
         self.assertEqual(result["icd"], "/home/u/dzn.json")
@@ -301,7 +312,7 @@ class VulkanParsing(unittest.TestCase):
              mock.patch.object(setup_hw.shutil, "which", return_value="/usr/bin/vulkaninfo"), \
              mock.patch.object(setup_hw, "_run", return_value=VULKANINFO_SUMMARY), \
              mock.patch.object(setup_hw, "find_user_icds", return_value=[]), \
-             mock.patch.object(setup_hw.sys, "platform", "linux"):
+             mock.patch.object(setup_hw, "host_os", return_value="linux"):
             result = setup_hw.detect_vulkan(wsl=False)
         self.assertEqual(result["source"], "vulkaninfo")
         self.assertEqual(len(result["devices"]), 2)

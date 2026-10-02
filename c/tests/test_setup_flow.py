@@ -5,6 +5,11 @@ No network, no real model, no real build: the hub is tests/fake_hub.py, the
 hardware report is canned, the engine is a file that names the Vulkan loader,
 and the server is a twenty-line stand-in that answers /health like `coli web`
 does and writes the same pidfile, so the real `coli stop` can stop it.
+
+Every test that depends on an OS models it with modeled(): it patches the
+setup's host_os()/host_machine(), never sys.platform, so a Linux test runs the
+same on Windows and a Windows test the same on Linux (engine names, release
+assets, package commands, the make invocation).
 """
 import argparse
 import contextlib
@@ -38,6 +43,21 @@ from fake_hub import FakeHub  # noqa: E402
 from family_registry import family_by_id  # noqa: E402
 
 REPO = "tester/tiny-model"
+
+
+def modeled(os_name, machine="x86_64"):
+    """Run the setup as if on `os_name` ("linux", "win32", "darwin"). The
+    patches apply from the call; the returned stack undoes them on close or
+    at the end of a `with`."""
+    stack = contextlib.ExitStack()
+    stack.enter_context(mock.patch.object(setup_flow, "host_os", return_value=os_name))
+    stack.enter_context(mock.patch.object(setup_flow, "host_machine", return_value=machine))
+    stack.enter_context(mock.patch.object(setup_hw, "host_os", return_value=os_name))
+    return stack
+
+
+def engine_name(os_name):
+    return "qwen36.exe" if os_name == "win32" else "qwen36"
 
 
 def free_port():
@@ -93,7 +113,7 @@ class HomeTestCase(unittest.TestCase):
 
 class BackendChoice(unittest.TestCase):
     def choose(self, hw, family="qwen36", tc=None, requested="auto", platform="linux"):
-        with mock.patch.object(setup_flow.sys, "platform", platform):
+        with modeled(platform):
             return setup_flow.choose_backend(hw, family_by_id(family), tc or TC_ALL, requested)
 
     def test_no_gpu_is_cpu(self):
@@ -108,6 +128,9 @@ class BackendChoice(unittest.TestCase):
 
     def test_nvidia_with_toolkit_takes_cuda(self):
         self.assertEqual(self.choose(hw_report(vulkan=IGPU, nvidia=[RTX]))["backend"], "cuda")
+        # The Windows CUDA build is a separate MSVC build: Vulkan there.
+        self.assertEqual(self.choose(hw_report(vulkan=IGPU, nvidia=[RTX]), platform="win32")["backend"],
+                         "vulkan")
 
     def test_nvidia_without_toolkit_falls_to_vulkan_and_says_how(self):
         tc = dict(TC_ALL, nvcc=None, can_build_cuda=False)
@@ -196,8 +219,11 @@ class RunConfiguration(HomeTestCase):
         self.assertEqual(loaded["urls"], {"browser": "http://127.0.0.1:8123/",
                                           "openai_base_url": "http://127.0.0.1:8123/v1",
                                           "anthropic_base_url": "http://127.0.0.1:8123"})
-        self.assertIn("COLI_VULKAN=1", setup_flow.equivalent_command(loaded))
-        self.assertIn("--port 8123", setup_flow.equivalent_command(loaded))
+        with modeled("linux"):
+            self.assertTrue(setup_flow.equivalent_command(loaded).startswith("COLI_VULKAN=1 "))
+            self.assertIn("--port 8123", setup_flow.equivalent_command(loaded))
+        with modeled("win32"):
+            self.assertTrue(setup_flow.equivalent_command(loaded).startswith('set "COLI_VULKAN=1" && '))
         self.assertEqual(setup_flow.configured_port(), 8123)
         # an unknown layout is not trusted
         Path(setup_flow.config_path()).write_text(json.dumps({"version": 99}))
@@ -219,28 +245,52 @@ class EngineResolution(HomeTestCase):
             self.assertEqual(setup_flow.binary_backend(str(path)), expected)
 
     def test_present_engine_with_the_right_backend_is_not_rebuilt(self):
-        Path(self.tmp.name, "qwen36").write_bytes(b"libvulkan.so.1")
-        decision = {"backend": "vulkan", "missing": []}
-        with mock.patch.object(setup_flow, "HERE", self.tmp.name), \
-             mock.patch.object(setup_flow, "build_engine") as build:
-            info = setup_flow.resolve_engine(family_by_id("qwen36"), None, decision, TC_ALL,
-                                             out=lambda *_: None)
-        build.assert_not_called()
-        self.assertEqual(info["source"], "present")
+        for os_name, loader in (("linux", b"libvulkan.so.1"), ("win32", b"vulkan-1.dll")):
+            with self.subTest(os=os_name), modeled(os_name), \
+                    tempfile.TemporaryDirectory() as engines:
+                Path(engines, engine_name(os_name)).write_bytes(loader)
+                decision = {"backend": "vulkan", "missing": []}
+                with mock.patch.object(setup_flow, "HERE", engines), \
+                     mock.patch.object(setup_flow, "build_engine") as build:
+                    info = setup_flow.resolve_engine(family_by_id("qwen36"), None, decision, TC_ALL,
+                                                     out=lambda *_: None)
+                build.assert_not_called()
+                self.assertEqual(info["source"], "present")
+                self.assertEqual(os.path.basename(info["engine"]), engine_name(os_name))
+
+    def test_an_engine_without_the_exe_suffix_is_not_the_windows_engine(self):
+        Path(self.tmp.name, "qwen36").write_bytes(b"vulkan-1.dll")
+        with modeled("win32"), mock.patch.object(setup_flow, "HERE", self.tmp.name), \
+             mock.patch.object(setup_flow, "build_engine", return_value="x") as build:
+            setup_flow.resolve_engine(family_by_id("qwen36"), None,
+                                      {"backend": "vulkan", "missing": []}, TC_ALL, out=lambda *_: None)
+        build.assert_called_once()
 
     def test_a_cpu_engine_is_rebuilt_for_vulkan(self):
-        Path(self.tmp.name, "qwen36").write_bytes(b"plain")
-        decision = {"backend": "vulkan", "missing": []}
-        with mock.patch.object(setup_flow, "HERE", self.tmp.name), \
-             mock.patch.object(setup_flow, "build_engine", return_value="/built/qwen36") as build:
-            info = setup_flow.resolve_engine(family_by_id("qwen36"), None, decision, TC_ALL,
-                                             out=lambda *_: None)
-        build.assert_called_once()
-        self.assertEqual(info["source"], "built")
+        for os_name in ("linux", "win32"):
+            with self.subTest(os=os_name), modeled(os_name), \
+                    tempfile.TemporaryDirectory() as engines:
+                Path(engines, engine_name(os_name)).write_bytes(b"plain")
+                decision = {"backend": "vulkan", "missing": []}
+                with mock.patch.object(setup_flow, "HERE", engines), \
+                     mock.patch.object(setup_flow, "build_engine", return_value="/built/qwen36") as build:
+                    info = setup_flow.resolve_engine(family_by_id("qwen36"), None, decision, TC_ALL,
+                                                     out=lambda *_: None)
+                build.assert_called_once()
+                self.assertEqual(info["source"], "built")
+
+    def test_make_command_through_msys2_on_windows(self):
+        tc = dict(TC_ALL, msys2=r"C:\msys64")
+        with modeled("win32"), mock.patch.dict(os.environ, {"ARCH": ""}):
+            cmd, _cwd, env = setup_flow.make_command(family_by_id("qwen36"), "vulkan", tc)
+        self.assertTrue(cmd[0].endswith("bash.exe"))
+        self.assertEqual(cmd[1], "-lc")
+        self.assertIn("cygpath", cmd[2])
+        self.assertEqual(cmd[-3:], ["qwen36", "ARCH=native", "VK=1"])
+        self.assertEqual(env["MSYSTEM"], "UCRT64")
 
     def test_make_command(self):
-        with mock.patch.object(setup_flow.sys, "platform", "linux"), \
-             mock.patch.dict(os.environ, {"ARCH": ""}):
+        with modeled("linux"), mock.patch.dict(os.environ, {"ARCH": ""}):
             cmd, _cwd, _env = setup_flow.make_command(family_by_id("deepseek_v4"), "vulkan", TC_ALL)
             self.assertEqual(cmd[-3:], ["deepseek-v4", "ARCH=native", "VK=1"])
             cmd, _cwd, _env = setup_flow.make_command(family_by_id("qwen36"), "cuda", TC_ALL)
@@ -290,9 +340,9 @@ class Releases(HomeTestCase):
             setup_flow.extract_archive(evil_tar, os.path.join(self.tmp.name, "out2"))
         self.assertFalse(Path(self.tmp.name, "escape.txt").exists())
 
-    def serve_release(self, files):
+    def serve_release(self, files, folder="release"):
         """A local release: the archive and SHA256SUMS.txt over HTTP."""
-        folder = os.path.join(self.tmp.name, "release")
+        folder = os.path.join(self.tmp.name, folder)
         os.makedirs(folder)
         for name, data in files.items():
             Path(folder, name).write_bytes(data)
@@ -308,29 +358,46 @@ class Releases(HomeTestCase):
         base = f"http://127.0.0.1:{server.server_address[1]}"
         return {name: f"{base}/{name}" for name in files}
 
-    def make_archive(self, tag):
+    #: What the release workflow packs, per OS (.github/workflows/release.yml).
+    LAYOUTS = {"linux": ("linux-x86_64.tar.gz", ("coli", "qwen36")),
+               "win32": ("windows-x86_64.zip", ("coli", "coli.cmd", "qwen36.exe"))}
+
+    def make_archive(self, os_name):
+        suffix, binaries = self.LAYOUTS[os_name]
+        members = [(name, b"engine" if name.startswith("qwen36") else b"# launcher") for name in binaries]
+        members += [("web/dist/index.html", b"<html></html>"), ("tools/k3_tokenizer.py", b"")]
         buffer = io.BytesIO()
-        with tarfile.open(fileobj=buffer, mode="w:gz") as tf:
-            for name, data in (("coli", b"# launcher"), ("qwen36", b"engine"),
-                               ("web/dist/index.html", b"<html></html>"), ("tools/k3_tokenizer.py", b"")):
-                info = tarfile.TarInfo(name)
-                info.size = len(data)
-                tf.addfile(info, io.BytesIO(data))
+        if suffix.endswith(".zip"):
+            with zipfile.ZipFile(buffer, "w") as zf:
+                for name, data in members:
+                    zf.writestr(name, data)
+        else:
+            with tarfile.open(fileobj=buffer, mode="w:gz") as tf:
+                for name, data in members:
+                    info = tarfile.TarInfo(name)
+                    info.size = len(data)
+                    tf.addfile(info, io.BytesIO(data))
         return buffer.getvalue()
 
     def test_prebuilt_engine_when_there_is_no_compiler(self):
+        for os_name in ("linux", "win32"):
+            with self.subTest(os=os_name):
+                self.check_prebuilt(os_name)
+
+    def check_prebuilt(self, os_name):
         tag = "v1.12.1"
-        name = f"colibri-{tag}-linux-x86_64.tar.gz"
-        archive = self.make_archive(tag)
+        name = f"colibri-{tag}-{self.LAYOUTS[os_name][0]}"
+        archive = self.make_archive(os_name)
         sums = f"{hashlib.sha256(archive).hexdigest()}  {name}\n".encode()
-        urls = self.serve_release({name: archive, "SHA256SUMS.txt": sums})
+        urls = self.serve_release({name: archive, "SHA256SUMS.txt": sums}, folder=os_name)
         getter = lambda url: {"tag_name": tag, "assets": [{"name": n, "browser_download_url": u}
                                                           for n, u in urls.items()]}
         tc = dict(TC_ALL, source_checkout=False, can_build=False, can_build_vulkan=False)
-        empty = os.path.join(self.tmp.name, "nothing-here")
+        empty = os.path.join(self.tmp.name, f"nothing-here-{os_name}")
         os.makedirs(empty)
-        with mock.patch.object(setup_flow, "HERE", empty), \
-             mock.patch.object(setup_flow, "release_asset_suffix", return_value="linux-x86_64.tar.gz"), \
+        home = os.path.join(self.tmp.name, f"home-{os_name}")
+        with modeled(os_name), mock.patch.object(setup_flow, "HERE", empty), \
+             mock.patch.dict(os.environ, {"COLI_SETUP_HOME": home}), \
              mock.patch.object(setup_flow, "_api_get", side_effect=getter):
             out = []
             info = setup_flow.resolve_engine(family_by_id("qwen36"), setup_catalog.by_id("qwen36-35b"),
@@ -338,6 +405,8 @@ class Releases(HomeTestCase):
             self.assertEqual(info["backend"], "cpu")               # prebuilt engines are CPU builds
             self.assertTrue(info["source"].startswith("release v1.12.1"))
             self.assertTrue(os.path.isfile(info["engine"]))
+            self.assertEqual(os.path.basename(info["engine"]), engine_name(os_name))
+            self.assertTrue(os.path.isfile(setup_flow.launcher_in(info["launcher_dir"])))
             self.assertTrue(os.path.isfile(os.path.join(info["launcher_dir"], "web", "dist", "index.html")))
             # A model newer than the release is refused with the way forward.
             with self.assertRaises(setup_flow.SetupError) as caught:
@@ -348,11 +417,11 @@ class Releases(HomeTestCase):
     def test_bad_checksum_is_refused(self):
         tag = "v1.12.1"
         name = f"colibri-{tag}-linux-x86_64.tar.gz"
-        urls = self.serve_release({name: self.make_archive(tag),
+        urls = self.serve_release({name: self.make_archive("linux"),
                                    "SHA256SUMS.txt": f"{'0' * 64}  {name}\n".encode()})
         getter = lambda url: {"tag_name": tag, "assets": [{"name": n, "browser_download_url": u}
                                                           for n, u in urls.items()]}
-        with mock.patch.object(setup_flow, "release_asset_suffix", return_value="linux-x86_64.tar.gz"):
+        with modeled("linux"):
             with self.assertRaises(setup_flow.SetupError) as caught:
                 setup_flow.fetch_release_archive("1.12.1", out=lambda *_: None, getter=getter)
         self.assertIn("checksum", str(caught.exception))
@@ -384,6 +453,7 @@ class WholeSetup(HomeTestCase):
         Path(self.engines, "qwen36").write_bytes(b"\x7fELF libvulkan.so.1")
         Path(self.engines, "coli").write_text("# launcher\n")
         self.models = os.path.join(self.tmp.name, "models")
+        self.addCleanup(modeled("linux").close)       # patches from here on
         for patcher in (
                 mock.patch.dict(os.environ, {"HF_ENDPOINT": self.hub.base,
                                              "COLI_SETUP_CATALOG": catalog}),
@@ -451,6 +521,24 @@ class WholeSetup(HomeTestCase):
         self.assertEqual(ranges[-1], "bytes=150000-")
         self.assertEqual(Path(self.models, "tiny", "model-00000.safetensors").read_bytes(), self.shard)
         self.assertEqual(setup_flow.load_config()["status"], "ready")
+
+    def test_install_on_windows_names_the_exe_engine(self):
+        os.remove(os.path.join(self.engines, "qwen36"))
+        Path(self.engines, "qwen36.exe").write_bytes(b"MZ vulkan-1.dll")
+        windows = hw_report(vulkan=IGPU)
+        windows["os"] = {"platform": "win32", "machine": "amd64", "wsl": False,
+                         "pretty_name": "Windows 11"}
+        with modeled("win32", machine="amd64"), \
+             mock.patch.object(setup_hw, "detect", return_value=windows):
+            code, text = self.run_setup(pick="tiny")
+        self.assertEqual(code, 0, text)
+        cfg = setup_flow.load_config()
+        self.assertEqual(os.path.basename(cfg["engine"]), "qwen36.exe")
+        self.assertEqual(cfg["backend"], "vulkan")
+        self.assertNotIn("VK_ICD_FILENAMES", cfg["env"])        # the loader finds Windows drivers itself
+        self.assertIn('same as: set "COLI_VULKAN=1" && set "COLI_VK_SHADERS=', text)
+        self.assertIn(" && coli web --model ", text)
+        self.assertIn("System  Windows 11", text)
 
     def test_a_missing_engine_is_rebuilt_without_asking_again(self):
         code, text = self.run_setup(pick="tiny")
@@ -554,7 +642,7 @@ class WholeSetup(HomeTestCase):
     def test_no_compiler_and_no_prebuilt_says_what_to_install(self):
         tc = dict(TC_ALL, source_checkout=False, can_build=False, can_build_vulkan=False)
         os.remove(os.path.join(self.engines, "qwen36"))
-        with mock.patch.object(setup_flow, "release_asset_suffix", return_value=None):
+        with modeled("linux", machine="riscv64"):               # no release archive for it
             with self.assertRaises(setup_flow.SetupError) as caught:
                 setup_flow.resolve_engine(family_by_id("qwen36"), None,
                                           {"backend": "cpu", "missing": []}, tc, out=lambda *_: None)
@@ -599,8 +687,10 @@ http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
 '''
 
 
-@unittest.skipUnless(os.name == "posix", "the stand-in server is stopped with SIGTERM")
 class ServerControl(HomeTestCase):
+    """Runs on Windows too: `coli stop` ends the stand-in with TerminateProcess
+    there (its SIGTERM handler simply never runs) and removes the pidfile itself."""
+
     def setUp(self):
         super().setUp()
         self.launcher = os.path.join(self.tmp.name, "fake_coli.py")
@@ -622,8 +712,12 @@ class ServerControl(HomeTestCase):
         pidfile = setup_flow.serve_pidfile(self.port)
         try:
             pid = int(Path(pidfile).read_text().split()[0])
-            os.kill(pid, 15)
+            os.kill(pid, 15)        # TerminateProcess on Windows: the handler never runs
         except (OSError, ValueError):
+            pass
+        try:
+            os.unlink(pidfile)      # so no stale pidfile outlives the test there
+        except OSError:
             pass
 
     def wait_state(self, cfg, state, timeout=60):
