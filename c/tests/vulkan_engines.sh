@@ -2,8 +2,8 @@
 # Every engine's Vulkan path against its own CPU run, on Lavapipe (Mesa's software
 # Vulkan), one family per call so CI can run them side by side:
 #
-#   bash tests/vulkan_engines.sh qwen | qwen-sanitize | inkling-olmoe | mimo-qwenimage | deepseek
-#   bash tests/vulkan_engines.sh kimi | kimi-mimo-sanitize
+#   bash tests/vulkan_engines.sh qwen | qwen-sanitize | inkling-olmoe | inkling-olmoe-sanitize
+#   bash tests/vulkan_engines.sh mimo-qwenimage | kimi | kimi-mimo-sanitize | deepseek | deepseek-sanitize
 #   bash tests/vulkan_engines.sh shader    # the qmatmul formats, the expert batch and the tier, no engine
 #
 # Needs libvulkan-dev, glslc and mesa-vulkan-drivers, plus the Python packages of
@@ -624,6 +624,8 @@ family_deepseek() {
   # deepseek_v41: fp8 dense in 32x32 ue8m0 tiles (fmt 12, gs 32, the tile scale
   # repeated over its rows) and bf16 (fmt 11). The engine exits non-zero on any
   # token mismatch with the reference; the CPU run must print the same stream.
+  # These arms test the dense trunk: COLI_VK_DENSE=1, because on Lavapipe the trunk
+  # otherwise stays on the CPU while the expert tier is on; the tier runs beside it.
   $PY tools/make_dsv41_tiny.py --out dsv41_tiny --emit-ref dsv41_tiny/ref.json
   $PY tools/make_dsv41_tiny.py --out dsv41_long --emit-ref dsv41_long/ref.json --prompt-len 40 --max-new 6
   v41() {  # <tag> <env and argv...>
@@ -632,27 +634,55 @@ family_deepseek() {
     env COLI_VULKAN=1 "$@" > v41-vk.txt 2> v41-vk.err || { cat v41-vk.err; fail "deepseek_v41 $tag: Vulkan run misses the oracle"; }
     cmp -s v41-cpu.txt v41-vk.txt || { diff v41-cpu.txt v41-vk.txt | head; fail "deepseek_v41 $tag: Vulkan output differs from the CPU"; }
     need_gpu deepseek_v41 v41-vk.err "deepseek_v41 $tag"
-    echo "OK deepseek_v41 $tag: output = CPU, $(vk_count deepseek_v41 v41-vk.err) matmuls on the GPU"
+    echo "OK deepseek_v41 $tag: output = CPU, $(vk_count deepseek_v41 v41-vk.err) matmuls on the GPU, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' v41-vk.err | tail -1)"
   }
   local cap force
-  for cap in 1 2 8; do v41 "cap=$cap" SNAP=dsv41_tiny ./deepseek_v41 $cap dsv41_tiny/ref.json; done
-  for cap in 2 8; do v41 "40-token prompt cap=$cap" SNAP=dsv41_long ./deepseek_v41 $cap dsv41_long/ref.json; done
+  for cap in 1 2 8; do v41 "cap=$cap" COLI_VK_DENSE=1 SNAP=dsv41_tiny ./deepseek_v41 $cap dsv41_tiny/ref.json; done
+  for cap in 2 8; do v41 "40-token prompt cap=$cap" COLI_VK_DENSE=1 SNAP=dsv41_long ./deepseek_v41 $cap dsv41_long/ref.json; done
   for force in 1 2 3 4 5; do
-    v41 "DSpark spec=$force" SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=$force ./deepseek_v41 8 dsv41_tiny/ref.json
+    v41 "DSpark spec=$force" COLI_VK_DENSE=1 SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=$force ./deepseek_v41 8 dsv41_tiny/ref.json
   done
+
+  # The routed-expert tier (vk_tier.c) on deepseek_v41's experts, fp4 with a ue8m0
+  # scale per 32 (fmt 7), the clamped SwiGLU; the trunk where the default puts it (the
+  # CPU here). Each run must pass the oracle, print the CPU run's stream and have
+  # served routed experts from the device; with EVICT=1 the budget (below the hot set)
+  # must also have evicted. COLI_USAGE points at a fresh history, COLI_VK_TIER_SYNC=1
+  # awaits each staged upload at the next step (as in tier_gate).
+  v41_tier() {  # <tag> <env and argv...>
+    local tag=$1; shift
+    rm -f tier.usage
+    env "$@" > v41-cpu.txt 2> v41-cpu.err || { cat v41-cpu.err; fail "deepseek_v41 tier $tag: CPU run"; }
+    env COLI_USAGE=tier.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 "$@" > v41-vk.txt 2> v41-vk.err ||
+      { cat v41-vk.err; fail "deepseek_v41 tier $tag: Vulkan run misses the oracle"; }
+    cmp -s v41-cpu.txt v41-vk.txt || { diff v41-cpu.txt v41-vk.txt | head; fail "deepseek_v41 tier $tag: Vulkan output differs from the CPU"; }
+    [ "$(tier_count deepseek_v41 v41-vk.err)" -gt 0 ] || { cat v41-vk.err; fail "deepseek_v41 tier $tag: no routed expert ran on the device"; }
+    if [ "${EVICT:-0}" = 1 ]; then
+      [ "$(tier_evictions deepseek_v41 v41-vk.err)" -gt 0 ] || { grep '\[VK\] tier' v41-vk.err; fail "deepseek_v41 tier $tag: the budget forced no eviction"; }
+    fi
+    echo "OK deepseek_v41 tier $tag: output = CPU, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' v41-vk.err | tail -1), $(grep -a -o 'evictions [0-9]*' v41-vk.err | tail -1)"
+  }
+  for cap in 1 2 8; do v41_tier "cap=$cap" SNAP=dsv41_tiny ./deepseek_v41 $cap dsv41_tiny/ref.json; done
+  for cap in 2 8; do v41_tier "40-token prompt cap=$cap" SNAP=dsv41_long ./deepseek_v41 $cap dsv41_long/ref.json; done
+  # DSpark: the drafts stay on the CPU, the verify rows of the backbone take the device
+  for force in 1 2 3 4 5; do
+    v41_tier "DSpark spec=$force" SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=$force ./deepseek_v41 1 dsv41_tiny/ref.json
+  done
+  EVICT=1 v41_tier "a budget of three experts" COLI_VK_TIER_GB=0.00005 SNAP=dsv41_long ./deepseek_v41 8 dsv41_long/ref.json
+  v41_tier "trunk on the device too" COLI_VK_DENSE=1 SNAP=dsv41_long ./deepseek_v41 2 dsv41_long/ref.json
 
   # deepseek_v4: fp8 128x128 blocks (fmt 12, gs 128) and the bf16 router, compressors
   # and head (fmt 11). The GPU gets the activations after the CPU's own E4M3 rounding,
   # so the two runs do the same arithmetic. The tiny check builds the VK=1 binary and
-  # keeps passing with the device open; its --oracle path reloads the dense weights
-  # every forward and so stays on the CPU, which is why the device is checked on the
-  # session path below: ids and teacher-forced predictions equal to the CPU's and to
-  # the reference's greedy stream.
+  # keeps passing with the device open (the expert tier on, the trunk on the CPU);
+  # its --oracle path reloads the dense weights every forward and so stays on the CPU,
+  # which is why the device is checked on the session path below: ids and
+  # teacher-forced predictions equal to the CPU's and to the reference's greedy stream.
   COLI_VULKAN=1 make deepseek-v4-tiny-check VK=1
   local prompt
   prompt=$($PY -c 'import json; c=json.load(open("deepseek_v4_tiny/ref.json"))["cases"]["long"]; print("".join("<t%03d>" % t for t in c["prompt_ids"]))')
   ./deepseek_v4 ./deepseek_v4_tiny "$prompt" --raw-prompt --max-tokens 4 --record-oracle v4-cpu.json > /dev/null
-  COLI_VULKAN=1 ./deepseek_v4 ./deepseek_v4_tiny "$prompt" --raw-prompt --max-tokens 4 --record-oracle v4-vk.json > /dev/null 2> v4-vk.err
+  COLI_VK_DENSE=1 COLI_VULKAN=1 ./deepseek_v4 ./deepseek_v4_tiny "$prompt" --raw-prompt --max-tokens 4 --record-oracle v4-vk.json > /dev/null 2> v4-vk.err
   $PY - <<'PY' || fail "deepseek_v4: the Vulkan session differs from the CPU's"
 import json, sys
 a, b = json.load(open("v4-cpu.json")), json.load(open("v4-vk.json"))
@@ -662,7 +692,145 @@ print("OK deepseek_v4 session: ids = CPU = reference" if ok else ("CPU", a, "VK"
 sys.exit(0 if ok else 1)
 PY
   need_gpu deepseek_v4 v4-vk.err "deepseek_v4 session"
-  echo "OK deepseek_v4: $(vk_count deepseek_v4 v4-vk.err) matmuls on the GPU"
+  echo "OK deepseek_v4: $(vk_count deepseek_v4 v4-vk.err) matmuls on the GPU, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' v4-vk.err | tail -1)"
+
+  # The routed-expert tier on deepseek_v4's fp4 experts (fmt 7) with its own
+  # activation (VKT_ACT_SWIGLU_V4: the CPU kernel's bf16 and E4M3 roundings and the
+  # route weight before down, on the device). Every oracle case against the CPU run:
+  # ids equal to the CPU's and the reference's, teacher-forced predictions equal,
+  # routed experts served by the device. The history is the store's own .coli_usage
+  # in the fixture, removed before each run unless WARM=1 (the tier then warm-starts
+  # from the CPU run's): the runs use a copy of the fixture, whose committed history
+  # stays as it is. An 8-expert variant of the fixture has room for pinned hot
+  # experts, which the store keeps in its rows16 layout: the tier gets them unpacked.
+  rm -rf deepseek_v4_tiny_t && cp -r deepseek_v4_tiny deepseek_v4_tiny_t
+  $PY - tools/make_deepseek_v4_tiny.py deepseek_v4_tiny_e8 <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("gen", sys.argv[1])
+gen = importlib.util.module_from_spec(spec); spec.loader.exec_module(gen)
+gen.EXPERTS = 8          # 8 routed experts a layer: two cache slots a layer for pins
+sys.argv = ["make_deepseek_v4_tiny.py", "--output", sys.argv[2], "--force"]
+gen.main()
+PY
+  v4_tier() {  # <tag> <fixture> <case> <env...>
+    local tag=$1 fx=$2 c=$3; shift 3
+    local p mt
+    p=$($PY -c 'import json,sys; c=json.load(open(sys.argv[1]+"/ref.json"))["cases"][sys.argv[2]]; print("".join("<t%03d>" % t for t in c["prompt_ids"]))' $fx $c)
+    mt=$($PY -c 'import json,sys; print(json.load(open(sys.argv[1]+"/ref.json"))["cases"][sys.argv[2]]["max_new_tokens"])' $fx $c)
+    rm -f $fx/.coli_usage
+    env "$@" ./deepseek_v4 ./$fx "$p" --raw-prompt --max-tokens $mt --record-oracle v4-cpu.json > /dev/null 2> v4-cpu.err ||
+      { cat v4-cpu.err; fail "deepseek_v4 tier $tag: CPU run"; }
+    [ "${WARM:-0}" = 1 ] || rm -f $fx/.coli_usage
+    env "$@" COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 ./deepseek_v4 ./$fx "$p" --raw-prompt --max-tokens $mt --record-oracle v4-vk.json > /dev/null 2> v4-vk.err ||
+      { cat v4-vk.err; fail "deepseek_v4 tier $tag: Vulkan run"; }
+    rm -f $fx/.coli_usage
+    $PY - $fx $c <<'PY' || fail "deepseek_v4 tier $tag: the Vulkan session differs from the CPU's"
+import json, sys
+a, b = json.load(open("v4-cpu.json")), json.load(open("v4-vk.json"))
+ref = json.load(open(sys.argv[1] + "/ref.json"))["cases"][sys.argv[2]]["greedy_full_ids"]
+ok = a["full_ids"] == b["full_ids"] == ref and a["tf_pred"] == b["tf_pred"]
+if not ok: print("CPU", a, "VK", b, "ref", ref)
+sys.exit(0 if ok else 1)
+PY
+    [ "$(tier_count deepseek_v4 v4-vk.err)" -gt 0 ] || { cat v4-vk.err; fail "deepseek_v4 tier $tag: no routed expert ran on the device"; }
+    if [ "${EVICT:-0}" = 1 ]; then
+      [ "$(tier_evictions deepseek_v4 v4-vk.err)" -gt 0 ] || { grep '\[VK\] tier' v4-vk.err; fail "deepseek_v4 tier $tag: the budget forced no eviction"; }
+    fi
+    if [ "${WARM:-0}" = 1 ]; then
+      grep -q '^\[VK\] tier deepseek_v4: warm start' v4-vk.err || { grep '\[VK\] tier' v4-vk.err; fail "deepseek_v4 tier $tag: no warm start"; }
+    fi
+    echo "OK deepseek_v4 tier $tag ($c): ids = CPU = reference, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' v4-vk.err | tail -1), $(grep -a -o 'evictions [0-9]*' v4-vk.err | tail -1), $(grep -a -o 'packed_slots=[0-9]*' v4-vk.err) rows16"
+  }
+  for c in short compressed long; do
+    v4_tier "4 experts" deepseek_v4_tiny_t $c
+    v4_tier "8 experts, pinned rows16" deepseek_v4_tiny_e8 $c
+  done
+  EVICT=1 v4_tier "a budget of three experts" deepseek_v4_tiny_e8 long COLI_VK_TIER_GB=0.00009
+  v4_tier "trunk on the device too" deepseek_v4_tiny_t long COLI_VK_DENSE=1
+  v4_tier "the GEMM route from 2 rows" deepseek_v4_tiny_t long COLI_VK_TIER_GEMM_ROWS=2
+  WARM=1 v4_tier "warm start from the CPU run's history" deepseek_v4_tiny_e8 long
+  # A served prompt with every routed expert on the device (warm start from the CPU
+  # run's history): its per-position logprob echoes against the CPU's. Measured on
+  # Lavapipe they are the same bytes; the gate allows 1e-3, for an exp() that rounds
+  # one hidden value to the other bf16 neighbour on another driver.
+  $PY - deepseek_v4_tiny_e8 <<'PY' || fail "deepseek_v4 tier: served logprobs differ from the CPU's"
+import json, os, sys
+from pathlib import Path
+sys.path.insert(0, "tests")
+import test_deepseek_v4_brio as b
+fx = Path(sys.argv[1])
+case = json.load(open(fx / "ref.json"))["cases"]["long"]
+def echoes(vk):
+    os.environ.pop("COLI_VULKAN", None)
+    if vk: os.environ.update(COLI_VULKAN="1", COLI_VK_TIER_SYNC="1")
+    else:
+        try: os.remove(fx / ".coli_usage")
+        except FileNotFoundError: pass
+    s = b.Serve(Path("deepseek_v4").resolve(), fx)
+    try: return s.submit(b.token_prompt(case["prompt_ids"]), 0, logprobs=5).echoes
+    finally:
+        s.close()
+        tier = [l for l in s.process.stderr.read().decode(errors="replace").splitlines() if "tier deepseek_v4 turn:" in l]
+        if vk: print("  ", tier[-1][:90] if tier else "no tier line")
+cpu, dev = echoes(False), echoes(True)
+os.environ.pop("COLI_VULKAN", None)
+same = sum(cpu[p] == dev.get(p) for p in cpu)
+worst = max(abs(cpu[p]["lp"] - dev[p]["lp"]) for p in cpu) if len(cpu) == len(dev) else 1.0
+print(f"OK deepseek_v4 tier served: {same} of {len(cpu)} positions' logprob echoes identical to the CPU's, worst |delta| {worst:.2e}")
+sys.exit(0 if len(cpu) == len(dev) and worst <= 1e-3 else 1)
+PY
+  rm -rf deepseek_v4_tiny_t deepseek_v4_tiny_e8
+}
+
+# The routed-expert tier of both deepseek engines under ASan and UBSan: sanitized VK=1
+# builds, the tier's configurations on Lavapipe (decode and prefill, eviction, DSpark,
+# pinned rows16 experts, the warm start, the trunk on the device). Memory safety is
+# the gate; each run must still put experts on the device.
+family_deepseek_sanitize() {
+  local SAN="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  make clean >/dev/null 2>&1 || true
+  make deepseek_v41 VK=1 EXTRA_CFLAGS="$SAN"
+  make deepseek-v4 VK=1 LTO=0 EXTRA_CFLAGS="$SAN" EXTRA_LDFLAGS="$SAN"
+  $PY tools/make_dsv41_tiny.py --out dsv41_tiny --emit-ref dsv41_tiny/ref.json
+  $PY tools/make_dsv41_tiny.py --out dsv41_long --emit-ref dsv41_long/ref.json --prompt-len 40 --max-new 6
+  $PY tools/make_deepseek_v4_tiny.py --output deepseek_v4_tiny_t --force
+  $PY - tools/make_deepseek_v4_tiny.py deepseek_v4_tiny_e8 <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("gen", sys.argv[1])
+gen = importlib.util.module_from_spec(spec); spec.loader.exec_module(gen)
+gen.EXPERTS = 8
+sys.argv = ["make_deepseek_v4_tiny.py", "--output", sys.argv[2], "--force"]
+gen.main()
+PY
+  san() {  # <engine> <tag> <env and argv...>
+    local eng=$1 tag=$2; shift 2
+    rm -f tier.usage deepseek_v4_tiny_t/.coli_usage deepseek_v4_tiny_e8/.coli_usage
+    env ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2 \
+      COLI_USAGE=tier.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 "$@" > san.log 2>&1 || true
+    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    [ "$(tier_count "$eng" san.log)" -gt 0 ] || { cat san.log; fail "$tag: no routed expert ran on the device"; }
+    echo "OK $tag: sanitizers clean, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' san.log | tail -1), $(grep -a -o 'evictions [0-9]*' san.log | tail -1)"
+  }
+  local cap force p
+  for cap in 1 8; do san deepseek_v41 "asan deepseek_v41 cap=$cap" SNAP=dsv41_long ./deepseek_v41 $cap dsv41_long/ref.json; done
+  for force in 2 4; do san deepseek_v41 "asan deepseek_v41 DSpark spec=$force" SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=$force ./deepseek_v41 1 dsv41_tiny/ref.json; done
+  san deepseek_v41 "asan deepseek_v41 eviction" COLI_VK_TIER_GB=0.00005 SNAP=dsv41_long ./deepseek_v41 8 dsv41_long/ref.json
+  san deepseek_v41 "asan deepseek_v41 trunk on the device" COLI_VK_DENSE=1 SNAP=dsv41_tiny ./deepseek_v41 2 dsv41_tiny/ref.json
+  p=$($PY -c 'import json; c=json.load(open("deepseek_v4_tiny_t/ref.json"))["cases"]["long"]; print("".join("<t%03d>" % t for t in c["prompt_ids"]))')
+  san deepseek_v4 "asan deepseek_v4" ./deepseek_v4 ./deepseek_v4_tiny_t "$p" --raw-prompt --max-tokens 4 --record-oracle san.json
+  san deepseek_v4 "asan deepseek_v4 pinned rows16" ./deepseek_v4 ./deepseek_v4_tiny_e8 "$p" --raw-prompt --max-tokens 4 --record-oracle san.json
+  san deepseek_v4 "asan deepseek_v4 eviction" COLI_VK_TIER_GB=0.00009 ./deepseek_v4 ./deepseek_v4_tiny_e8 "$p" --raw-prompt --max-tokens 4 --record-oracle san.json
+  san deepseek_v4 "asan deepseek_v4 trunk on the device" COLI_VK_DENSE=1 ./deepseek_v4 ./deepseek_v4_tiny_t "$p" --raw-prompt --max-tokens 4
+  # the warm start: a run that leaves its history, then one that starts from it
+  ./deepseek_v4 ./deepseek_v4_tiny_e8 "$p" --raw-prompt --max-tokens 4 > /dev/null 2>&1 || true
+  env ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 \
+    ./deepseek_v4 ./deepseek_v4_tiny_e8 "$p" --raw-prompt --max-tokens 4 > san.log 2>&1 || true
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan deepseek_v4 warm start: sanitizer diagnostic"; fi
+  grep -q '^\[VK\] tier deepseek_v4: warm start' san.log || { cat san.log; fail "asan deepseek_v4 warm start: no warm start"; }
+  echo "OK asan deepseek_v4 warm start: sanitizers clean, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' san.log | tail -1)"
+  rm -rf deepseek_v4_tiny_t deepseek_v4_tiny_e8 san.json
+  make clean >/dev/null 2>&1 || true
+  make deepseek-v4-clean >/dev/null 2>&1 || true
 }
 
 # Kimi K3: the routed experts on the shared tier (MXFP4 with ue8m0 scales, fmt 7,
@@ -780,7 +948,8 @@ case "${1:-}" in
   inkling-olmoe-sanitize) family_inkling_olmoe_sanitize ;;
   mimo-qwenimage) family_mimo_qwenimage ;;
   deepseek)       family_deepseek ;;
+  deepseek-sanitize) family_deepseek_sanitize ;;
   kimi)           family_kimi ;;
   kimi-mimo-sanitize) family_kimi_mimo_sanitize ;;
-  *) echo "usage: $0 shader|qwen|qwen-sanitize|inkling-olmoe|mimo-qwenimage|deepseek|kimi|kimi-mimo-sanitize" >&2; exit 2 ;;
+  *) echo "usage: $0 shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize" >&2; exit 2 ;;
 esac

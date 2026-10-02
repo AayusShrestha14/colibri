@@ -63,6 +63,7 @@ static struct {
     int *grp; int *touched;              /* expert -> group of this step, and the groups' experts */
     ColiVkExpert **bex; int *brows; int *bfirst; int cb;
     const float **bx, **by; int *rowsrc; int cbx;
+    float *bw;                           /* the rows' route weights (vkt_issue_w), beside bx */
     int max_dev_rows;
     double t_issued;
     /* the balance: the share of a step's resident experts the device takes, moved by
@@ -407,6 +408,18 @@ void vkt_note(int layer, int eid, const VktExpertSrc *src) {
     pthread_mutex_unlock(&T.mx);
 }
 
+/* vkt_note's decision without its copy: the same tests, in the same order. */
+int vkt_wants(int layer, int eid) {
+    if (!T.on || layer < 0 || layer >= T.c.layers || eid < 0 || eid >= T.c.experts) return 0;
+    VSlot *v = slot(layer, eid);
+    if (v->state != VS_NONE || T.promos >= T.promo_cap) return 0;
+    if (T.resident + T.queued >= T.max_resident && (!v->heat || peek_victim(score(v)) < 0)) return 0;
+    pthread_mutex_lock(&T.mx);
+    int qfull = T.qn >= VKT_QCAP;
+    pthread_mutex_unlock(&T.mx);
+    return !qfull;
+}
+
 /* ---- warm start ------------------------------------------------------------------ */
 static const uint32_t *const *g_plan_heat;
 static int g_plan_E;
@@ -478,12 +491,13 @@ static int grow_rows(int need) {
     int nc = grow_to(need, &T.cbx);
     const float **a = realloc(T.bx, (size_t)nc * sizeof(*a)); if (a) T.bx = a;
     const float **b = realloc(T.by, (size_t)nc * sizeof(*b)); if (b) T.by = b;
-    if (!a || !b) return 0;
+    float *c = realloc(T.bw, (size_t)nc * sizeof(*c)); if (c) T.bw = c;
+    if (!a || !b || !c) return 0;
     T.cbx = nc;
     return 1;
 }
 
-int vkt_issue(int layer, const float *x, int S, int K, const int *idx, uint8_t *taken) {
+static int issue(int layer, const float *x, int S, int K, const int *idx, const float *w, uint8_t *taken) {
     if (S > 0 && K > 0) memset(taken, 0, (size_t)S * K);
     if (!T.on || T.inflight || layer < 0 || layer >= T.c.layers || S < 1 || K < 1) return 0;
     if (!coli_vk_xb_ready()) {
@@ -566,10 +580,11 @@ int vkt_issue(int layer, const float *x, int S, int K, const int *idx, uint8_t *
         if (g < 0) continue;
         int j = T.bfirst[g] + T.brows[g]++;
         T.bx[j] = x + (size_t)(i / K) * H;
+        T.bw[j] = w ? w[i] : 1.0f;
         T.map[i] = j;
     }
     for (int g = 0; g < ng; g++) T.grp[T.touched[g]] = -1;
-    if (!coli_vk_xb_issue(T.bex, T.brows, ng, T.bx)) {
+    if (!coli_vk_xb_issue_w(T.bex, T.brows, ng, T.bx, w ? T.bw : NULL)) {
         for (int i = 0; i < n; i++) T.map[i] = -1;
         return 0;
     }
@@ -577,6 +592,12 @@ int vkt_issue(int layer, const float *x, int S, int K, const int *idx, uint8_t *
     T.inflight = 1; T.S = S; T.K = K; T.steps++; T.served += (unsigned long long)total;
     T.t_issued = vkt_now_ms();
     return total;
+}
+int vkt_issue(int layer, const float *x, int S, int K, const int *idx, uint8_t *taken) {
+    return issue(layer, x, S, K, idx, NULL, taken);
+}
+int vkt_issue_w(int layer, const float *x, int S, int K, const int *idx, const float *w, uint8_t *taken) {
+    return issue(layer, x, S, K, idx, w, taken);
 }
 
 int vkt_join(const float **rows) {
@@ -651,7 +672,8 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
                 eng, T.c.gate_up.kind, T.c.down.kind, T.c.gate_up.gs, T.c.down.gs);
         return 0;
     }
-    int act = T.c.act == VKT_ACT_SITU ? COLI_VK_ACT_SITU : COLI_VK_ACT_SWIGLU;
+    int act = T.c.act == VKT_ACT_SITU ? COLI_VK_ACT_SITU
+            : T.c.act == VKT_ACT_SWIGLU_V4 ? COLI_VK_ACT_SWIGLU_V4 : COLI_VK_ACT_SWIGLU;
     if (!coli_vk_xb_init(T.c.hidden, T.c.inter, act, T.c.act_limit, T.c.act_a, T.c.act_b)) {
         fprintf(stderr, "[VK] tier %s: no expert batch on this device (shaders?), the experts stay on the CPU\n", eng);
         return 0;
@@ -792,7 +814,7 @@ void vkt_shutdown(void) {
     }
     pthread_mutex_destroy(&T.mx); pthread_cond_destroy(&T.cv); pthread_cond_destroy(&T.cv_room); pthread_cond_destroy(&T.cv_done);
     free(T.s); free(T.grp); free(T.map); free(T.touched); free(T.bex); free(T.brows); free(T.bfirst);
-    free(T.bx); free(T.by); free(T.evict); free(T.done);
+    free(T.bx); free(T.by); free(T.bw); free(T.evict); free(T.done);
     memset(&T, 0, sizeof T);
 }
 #endif /* COLI_VULKAN */

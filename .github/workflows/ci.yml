@@ -178,6 +178,10 @@ jobs:
           - family: deepseek
             req: c/tools/requirements-deepseek-v4-tiny.txt
             extra: sympy pillow   # the V4.1 fixture's reference and its vision tower
+          # the routed-expert tier of deepseek_v41 and deepseek_v4 under ASan and UBSan
+          - family: deepseek-sanitize
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
           # Kimi K3's routed experts on the shared tier, and its and MiMo's tier under
           # ASan and UBSan (MiMo's tier runs in mimo-qwenimage)
           - family: kimi

@@ -2200,7 +2200,12 @@ static struct {
     size_t *yoff; int nrows, cyoff;
     unsigned long long batches, experts, rows, gemm_experts;
     double dev_ms;
+    /* COLI_VK_ACT_SWIGLU_V4: expert_act_v4.spv between the activation and down, its
+     * row weights in the x buffer after each expert's rows (xb_v4_init) */
+    VkShaderModule sh_v4; VkDescriptorSetLayout dsl_v4; VkPipelineLayout pl_v4; VkPipeline p_v4;
+    VkDescriptorPool v4_pool; VkDescriptorSet v4_set;
 } XB;
+struct PCV4 { int rows, n; };
 
 static size_t xb_up(size_t v, size_t a) { return (v + a - 1) / a * a; }
 
@@ -2252,6 +2257,16 @@ static void xb_write_act_set(void) {
             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, .pBufferInfo = &bi[b]};
     vkUpdateDescriptorSets(G.dev, 3, w, 0, NULL);
 }
+/* expert_act_v4's set: the hidden rows in place, the weights from the x buffer */
+static void xb_write_v4_set(void) {
+    VkDescriptorBufferInfo bi[2] = {{XB.h.buf, 0, XB.h.region}, {XB.x.buf, 0, XB.x.region}};
+    VkWriteDescriptorSet w[2];
+    for (int b = 0; b < 2; b++)
+        w[b] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = XB.v4_set,
+            .dstBinding = (uint32_t)b, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, .pBufferInfo = &bi[b]};
+    vkUpdateDescriptorSets(G.dev, 2, w, 0, NULL);
+}
 
 /* Make every scratch region hold `xr`/`ir`/`yr` bytes (offsets of a batch stay below
  * its region; the buffer is twice that, so offset + window always fits). Grows by
@@ -2279,6 +2294,7 @@ static int xb_reserve(size_t xr, size_t ir, size_t yr) {
     }
     for (ColiVkExpert *e = XB.live; e; e = e->next) xb_write_sets(e);
     xb_write_act_set();
+    if (XB.v4_set) xb_write_v4_set();
     return 1;
 }
 
@@ -2304,9 +2320,30 @@ static int xb_pipeline(VkShaderModule sh, VkPipelineLayout pl, const VkSpecializ
     return 1;
 }
 
+/* COLI_VK_ACT_SWIGLU_V4's pass (expert_act_v4.spv), made the first time that
+ * activation is asked for; 0 when its shader is missing. */
+static int xb_v4_init(void) {
+    if (XB.p_v4) return 1;
+    char path[1100];
+    derive_dir_file(G.spv_path, "expert_act_v4.spv", path, sizeof path);
+    if (!(XB.sh_v4 = load_spv(G.dev, path))) return 0;
+    if (!xb_layout(2, 3u, sizeof(struct PCV4), &XB.dsl_v4, &XB.pl_v4) ||
+        !xb_pipeline(XB.sh_v4, XB.pl_v4, NULL, &XB.p_v4)) return 0;
+    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 2};
+    VkDescriptorPoolCreateInfo dp = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps};
+    VKCHECK(vkCreateDescriptorPool(G.dev, &dp, NULL, &XB.v4_pool), "xb v4 pool");
+    VkDescriptorSetAllocateInfo da = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = XB.v4_pool, .descriptorSetCount = 1, .pSetLayouts = &XB.dsl_v4};
+    VKCHECK(vkAllocateDescriptorSets(G.dev, &da, &XB.v4_set), "xb v4 set");
+    if (XB.h.buf && XB.x.buf) xb_write_v4_set();
+    return 1;
+}
+
 int coli_vk_xb_init(int D, int I, int act, float limit, float a, float b) {
     if (XB.ready) {   /* the geometry stays; the activation rides the push constants */
         if (XB.D != D || XB.I != I || XB.inflight) return 0;
+        if (act == COLI_VK_ACT_SWIGLU_V4 && !xb_v4_init()) return 0;
         XB.act = act; XB.limit = limit > 0.f ? limit : 0.f; XB.a = a; XB.b = b;
         return 1;
     }
@@ -2358,6 +2395,7 @@ int coli_vk_xb_init(int D, int I, int act, float limit, float a, float b) {
     /* a first scratch for 64 rows of 16 experts; grows with the first prefill */
     if (!xb_reserve(64 * (size_t)D * 4 + 16 * XB.align, 64 * (size_t)I * 4 + 16 * XB.align,
                     64 * (size_t)D * 4 + 16 * XB.align)) return 0;
+    if (act == COLI_VK_ACT_SWIGLU_V4 && !xb_v4_init()) return 0;
     XB.ready = 1;
     return 1;
 }
@@ -2421,10 +2459,13 @@ static void xb_barrier(VkCommandBuffer c) {
                          0, 1, &mb, 0, NULL, 0, NULL);
 }
 
-int coli_vk_xb_issue(ColiVkExpert *const *ex, const int *rows, int count, const float *const *xrows) {
+static int xb_issue(ColiVkExpert *const *ex, const int *rows, int count, const float *const *xrows,
+                    const float *wrows) {
     if (!XB.ready || XB.inflight || count < 1) return 0;
     const int D = XB.D, I = XB.I;
     const size_t a = XB.align, dr = (size_t)D * 4, ir = (size_t)I * 4;
+    /* COLI_VK_ACT_SWIGLU_V4: each expert's row weights follow its x rows */
+    const int v4 = XB.act == COLI_VK_ACT_SWIGLU_V4 && XB.p_v4;
     size_t *off = malloc((size_t)count * 3 * sizeof(size_t));
     if (!off) return 0;
     size_t xo = 0, io = 0, yo = 0; int total = 0;
@@ -2432,6 +2473,7 @@ int coli_vk_xb_issue(ColiVkExpert *const *ex, const int *rows, int count, const 
         if (!ex[c] || rows[c] < 1 || rows[c] > 65535) { free(off); return 0; }
         off[3 * c] = xo; off[3 * c + 1] = io; off[3 * c + 2] = yo;
         xo += xb_up((size_t)rows[c] * dr, a); io += xb_up((size_t)rows[c] * ir, a); yo += xb_up((size_t)rows[c] * dr, a);
+        if (v4) xo += xb_up((size_t)rows[c] * 4, a);
         total += rows[c];
     }
     if (!xb_reserve(xo, io, yo)) { free(off); return 0; }
@@ -2446,6 +2488,7 @@ int coli_vk_xb_issue(ColiVkExpert *const *ex, const int *rows, int count, const 
         for (int r = 0; r < rows[c]; r++, j++) {
             memcpy((uint8_t *)XB.x.ptr + off[3 * c] + (size_t)r * dr, xrows[j], dr);
             XB.yoff[j] = off[3 * c + 2] + (size_t)r * dr;
+            if (v4) ((float *)((uint8_t *)XB.x.ptr + off[3 * c] + xb_up((size_t)rows[c] * dr, a)))[r] = wrows ? wrows[j] : 1.0f;
         }
     XB.nrows = total;
 
@@ -2511,6 +2554,17 @@ int coli_vk_xb_issue(ColiVkExpert *const *ex, const int *rows, int count, const 
         }
     }
     xb_barrier(cmd);
+    if (v4) {   /* DeepSeek V4: route weight, bf16 and E4M3 per 128 on the hidden rows */
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, XB.p_v4);
+        for (int c = 0; c < count; c++) {
+            uint32_t dyn[2] = {(uint32_t)off[3 * c + 1], (uint32_t)(off[3 * c] + xb_up((size_t)rows[c] * dr, a))};
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, XB.pl_v4, 0, 1, &XB.v4_set, 2, dyn);
+            struct PCV4 pc = {rows[c], I};
+            vkCmdPushConstants(cmd, XB.pl_v4, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+            vkCmdDispatch(cmd, (uint32_t)((I + 127) / 128), (uint32_t)rows[c], 1);
+        }
+        xb_barrier(cmd);
+    }
     /* phase 3: down of every expert */
     int bound = -2;
     for (int c = 0; c < count; c++) {
@@ -2543,6 +2597,13 @@ int coli_vk_xb_issue(ColiVkExpert *const *ex, const int *rows, int count, const 
     XB.batches++; XB.experts += (unsigned long long)count; XB.rows += (unsigned long long)total;
     XB.gemm_experts += (unsigned long long)ngemm;
     return 1;
+}
+int coli_vk_xb_issue(ColiVkExpert *const *ex, const int *rows, int count, const float *const *xrows) {
+    return xb_issue(ex, rows, count, xrows, NULL);
+}
+int coli_vk_xb_issue_w(ColiVkExpert *const *ex, const int *rows, int count, const float *const *xrows,
+                       const float *wrows) {
+    return xb_issue(ex, rows, count, xrows, wrows);
 }
 
 int coli_vk_xb_join(const float **yrows, double *device_ms) {
@@ -2596,6 +2657,11 @@ static void xb_shutdown(void) {
     if (XB.dsl6) vkDestroyDescriptorSetLayout(G.dev, XB.dsl6, NULL);
     if (XB.dsl4) vkDestroyDescriptorSetLayout(G.dev, XB.dsl4, NULL);
     if (XB.dsl3) vkDestroyDescriptorSetLayout(G.dev, XB.dsl3, NULL);
+    if (XB.p_v4) vkDestroyPipeline(G.dev, XB.p_v4, NULL);
+    if (XB.sh_v4) vkDestroyShaderModule(G.dev, XB.sh_v4, NULL);
+    if (XB.pl_v4) vkDestroyPipelineLayout(G.dev, XB.pl_v4, NULL);
+    if (XB.dsl_v4) vkDestroyDescriptorSetLayout(G.dev, XB.dsl_v4, NULL);
+    if (XB.v4_pool) vkDestroyDescriptorPool(G.dev, XB.v4_pool, NULL);
     if (XB.qpool) vkDestroyQueryPool(G.dev, XB.qpool, NULL);
     if (XB.fence) vkDestroyFence(G.dev, XB.fence, NULL);
     if (XB.cpool) vkDestroyCommandPool(G.dev, XB.cpool, NULL);
@@ -3443,6 +3509,123 @@ static int run_tier_pool(void) {
     return bad;
 }
 
+/* COLI_VK_ACT_SWIGLU_V4 bit for bit. Experts whose sums are exact in f32 (f32 weights,
+ * one input that is a power of two, the others zero) and whose gate is at least 24, so
+ * that its sigmoid is exactly 1 on both sides: the device and the reference below then
+ * compute the same numbers through every rounding the activation makes -- gate and up
+ * to bf16, their product, the route weight and bf16 again, each block's power-of-two
+ * E4M3 scale (amax exactly 448 x 2^k among them) and every E4M3 rounding (ties to
+ * even, subnormal codes and their ties, values under half the smallest, the 448
+ * clamp), a 32-input tail block. Down is the identity, so a row of y IS the hidden
+ * row after the pass. Rows 1 and 3 take the GEMV route, 20 the GEMM. The reference is
+ * DeepSeek V4's CPU arithmetic (coli_bf16_round, coli_fp8_activation_qdq_ref), written
+ * out again here. */
+static float v4r_bf16(float v) {
+    uint32_t b; memcpy(&b, &v, 4);
+    if ((b & 0x7f800000u) != 0x7f800000u) b += 0x7fffu + ((b >> 16) & 1u);
+    b &= 0xffff0000u; memcpy(&v, &b, 4);
+    return v;
+}
+static float v4r_e4m3(float value) {   /* encode (nearest even) then decode */
+    int neg = signbit(value) != 0;
+    float a = fabsf(value), r;
+    if (!a) return value;
+    if (a >= 448.0f) r = 448.0f;
+    else if (a < 0.015625f) {
+        float sc = a * 512.0f; unsigned q = (unsigned)sc; float fr = sc - (float)q;
+        if (fr > 0.5f || (fr == 0.5f && (q & 1))) q++;
+        r = ldexpf((float)q, -9);
+    } else {
+        uint32_t b; memcpy(&b, &a, 4);
+        int E = (int)((b >> 23) & 0xff) - 127;
+        uint32_t sig = 0x800000u | (b & 0x7fffffu), q = sig >> 20, rem = sig & 0xfffffu;
+        if (rem > 0x80000u || (rem == 0x80000u && (q & 1u))) q++;
+        r = ldexpf((float)q, E - 3);
+    }
+    return neg ? -r : r;
+}
+static void v4r_qdq(float *v, int n) {
+    for (int base = 0; base < n; base += 128) {
+        int cnt = n - base < 128 ? n - base : 128;
+        float mx = 0.0f;
+        for (int i = 0; i < cnt; i++) mx = fmaxf(mx, fabsf(v[base + i]));
+        mx = fmaxf(mx, 1e-4f);
+        int ex; float fr = frexpf(mx / 448.0f, &ex);
+        int e = fr == 0.5f ? ex - 1 : ex;
+        if (e < -127) e = -127;
+        if (e > 127) e = 127;
+        float scale = ldexpf(1.0f, e);
+        for (int i = 0; i < cnt; i++)
+            v[base + i] = v4r_e4m3(fmaxf(-448.0f, fminf(448.0f, v[base + i] / scale))) * scale;
+    }
+}
+static int run_xbatch_v4(void) {
+    enum { D = 160, I = 160, K = 3 };   /* one block of 128 and a tail of 32 */
+    static const int rows[K] = {1, 3, 20};
+    if (!coli_vk_xb_init(D, I, COLI_VK_ACT_SWIGLU_V4, 0.f, 0.f, 0.f)) {
+        printf("xbatch v4: no pass (expert_act_v4.spv missing beside the main shader?)\n"); return 1;
+    }
+    /* special values of the hidden row (x 2^-4: the block's amax 28 makes its scale
+     * 2^-4): 448, ties of the normal and the subnormal codes, under half the smallest */
+    static const float tval[] = {448.0f, 1.0625f, 1.1875f, -2.125f, 15.5f, -15.5f, 447.0f, 440.0f,
+                                 3.5f / 512, 2.5f / 512, -1.5f / 512, 0.4f / 512, 0.75f / 512, 0.0f, 300.0f, -0.5f};
+    const int nt = (int)(sizeof tval / sizeof *tval);
+    float *gw[K], *uw[K], *dw = calloc((size_t)D * I, sizeof(float));
+    ColiVkExpert *ex[K];
+    int bad = 0;
+    for (int d = 0; d < D; d++) dw[(size_t)d * I + d] = 1.0f;
+    for (int c = 0; c < K; c++) {
+        gw[c] = calloc((size_t)I * D, sizeof(float)); uw[c] = calloc((size_t)I * D, sizeof(float));
+        for (int o = 0; o < I; o++) {
+            /* column 0 only: g = 24..63 with few bits, u random -- or, in expert 0's
+             * first block, g = 32 and u = t / 512 (h = t / 16) for the special values
+             * and the rest under them, so the block's amax is 28 */
+            float g = 24.0f + (float)(rand() % 40), u = ((float)rand() / RAND_MAX - 0.5f) * ldexpf(1.0f, rand() % 12 - 8);
+            if (c == 0 && o < 128) u = ((float)rand() / RAND_MAX - 0.5f) * ldexpf(1.0f, -(rand() % 12) - 6);
+            if (c == 0 && o < nt) { g = 32.0f; u = tval[o] / 512.0f; }
+            gw[c][(size_t)o * D] = g; uw[c][(size_t)o * D] = u;
+        }
+        ColiVkTensor *t[3]; const float *src[3] = {gw[c], uw[c], dw};
+        for (int k = 0; k < 3; k++) {
+            uint8_t *rws; size_t stride; float *sc;
+            if (!coli_vk_tier_tensor(&t[k], 10, k < 2 ? D : I, k < 2 ? I : D, 0, &rws, &stride, &sc)) {
+                printf("xbatch v4: no tensor\n"); return 1;
+            }
+            for (int o = 0; o < (k < 2 ? I : D); o++) memcpy(rws + (size_t)o * stride, src[k] + (size_t)o * D, (size_t)D * 4);
+            sc[0] = 1.0f;
+        }
+        if (!(ex[c] = coli_vk_xb_expert(t[0], t[1], t[2]))) { printf("xbatch v4: no expert\n"); return 1; }
+    }
+    int total = 0; for (int c = 0; c < K; c++) total += rows[c];
+    float *x = calloc((size_t)total * D, sizeof(float)), *w = malloc((size_t)total * sizeof(float));
+    const float **xr = malloc((size_t)total * sizeof(*xr)), **yr = malloc((size_t)total * sizeof(*yr));
+    static const float xs[4] = {1.0f, 2.0f, 0.5f, 1.0f}, ws[5] = {1.0f, 0.75f, 1.5f, 0.3f, 1.0f};
+    for (int j = 0; j < total; j++) { x[(size_t)j * D] = j == 0 ? 1.0f : xs[j % 4]; w[j] = j == 0 ? 1.0f : ws[j % 5]; xr[j] = x + (size_t)j * D; }
+    int mism = 0, sub = 0; double dms = 0;
+    if (!coli_vk_xb_issue_w(ex, rows, K, xr, w) || !coli_vk_xb_join(yr, &dms)) { printf("xbatch v4: issue/join failed\n"); bad = 1; }
+    float h[I];
+    for (int c = 0, j = 0; !bad && c < K; c++)
+        for (int r = 0; r < rows[c]; r++, j++) {
+            for (int o = 0; o < I; o++) {
+                float g = v4r_bf16(x[(size_t)j * D] * gw[c][(size_t)o * D]), u = v4r_bf16(x[(size_t)j * D] * uw[c][(size_t)o * D]);
+                float sg = g >= 0.0f ? 1.0f / (1.0f + expf(-g)) : expf(g) / (1.0f + expf(g));
+                h[o] = v4r_bf16(g * sg * u * w[j]);
+            }
+            v4r_qdq(h, I);
+            for (int o = 0; o < I; o++) {
+                if (yr[j][o] != h[o]) { if (mism < 5) printf("  v4 mismatch: expert %d row %d [%d]: device %.9g, reference %.9g\n", c, r, o, yr[j][o], h[o]); mism++; }
+                if (c == 0 && j == 0 && o < nt) sub += h[o] != 0.0f && fabsf(h[o]) < ldexpf(1.0f, -10);   /* subnormal codes */
+            }
+        }
+    printf("xbatch v4 D=%d I=%d, rows 1/3/20 (GEMM from %d) | %d of %d values differ from the CPU's arithmetic | device %.3f ms\n",
+           D, I, XB.gemm_rows, mism, total * I, dms);
+    if (mism || !sub) bad = 1;
+    for (int c = 0; c < K; c++) { coli_vk_xb_expert_free(ex[c]); free(gw[c]); free(uw[c]); }
+    free(dw); free(x); free(w); free(xr); free(yr);
+    xb_shutdown();
+    return bad;
+}
+
 /* Every format through the batch, both routes, the two activations, a hidden size
  * past the gate_up staging array, odd widths and a down format other than gate/up's. */
 static int run_xbatch_all(void) {
@@ -3469,6 +3652,7 @@ static int run_xbatch_all(void) {
     if (!coli_vk_xb_init(6400, 64, COLI_VK_ACT_SWIGLU, 0.f, 0.f, 0.f)) return 1;
     bad |= run_xbatch(4, 4, 64, 6400, 64, COLI_VK_ACT_SWIGLU, 0.f);
     xb_shutdown();
+    bad |= run_xbatch_v4();   /* DeepSeek V4's activation, bit for bit */
     return bad;
 }
 

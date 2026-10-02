@@ -219,7 +219,9 @@ endif
 # MAKEFLAGS. The object has its own name because the parent builds
 # backend_vulkan.o with its own CFLAGS while these carry -flto and the units'
 # flags stamp: one file written by two builds is #1702 again. Independent of
-# CUDA=1, whose tier keeps running first when both are built.
+# CUDA=1, whose tier keeps running first when both are built. vk_tier_v4.o is the
+# routed-expert tier (vk_tier.c) under the same rule, and expert_act*.spv are its
+# shaders (expert_act_v4.spv: DeepSeek V4's activation).
 VK ?= 0
 GLSLC ?= glslc
 V4_VK_OBJ =
@@ -233,10 +235,11 @@ LDFLAGS += -Wl,-Bdynamic -lvulkan-1 -Wl,-Bstatic
 else
 LDFLAGS += -lvulkan
 endif
-V4_VK_OBJ = backend_vulkan_v4.o
+V4_VK_OBJ = backend_vulkan_v4.o vk_tier_v4.o
 V4_VK_SPV = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv \
 	shaders/attention_absorb.spv shaders/rmsnorm.spv \
-	shaders/qmatmul_gemm.spv shaders/qmatmul_coop.spv
+	shaders/qmatmul_gemm.spv shaders/qmatmul_coop.spv \
+	shaders/expert_act.spv shaders/expert_act_v4.spv
 endif
 
 include Makefile.deepseek-v4.units
@@ -310,6 +313,8 @@ $(V4_BINARY): $(V4_OBJS) $(V4_VK_SPV)
 # VK=1: the Vulkan backend compiled with this engine's flags, and the shaders.
 backend_vulkan_v4.o: backend_vulkan.c backend_vulkan.h $(V4_FLAGS_STAMP)
 	$(CC) $(CFLAGS) -c backend_vulkan.c -o $@
+vk_tier_v4.o: vk_tier.c vk_tier.h backend_vulkan.h tier.h $(V4_FLAGS_STAMP)
+	$(CC) $(CFLAGS) -c vk_tier.c -o $@
 shaders/%.spv: shaders/%.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@
@@ -327,7 +332,7 @@ $(REGISTRY_OBJ): expert_store_registry.c expert_store_registry.h expert_store.h 
 
 $(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
 	deepseek_v4_internal.h deepseek_v4_dspark.inc st.h json.h compat.h tensor.h quant.h fp8_format.h sse41_kernels.h \
-	route_trace.h \
+	route_trace.h vk_tier.h \
 	native_quant.h native_quant_batch.h native_quant_dual.h \
 	native_quant_fp4_rows16.h expert_store_registry.h $(V4_FLAGS_STAMP)
 	$(CC) $(CFLAGS) -D$* -c deepseek_v4.c -o $@
@@ -379,4 +384,4 @@ deepseek-v4-clean:
 	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) $(V4_HOT_TEST_OBJ) \
 		$(V4_BATCH_TEST_OBJ) \
 		$(V4_SERVE_TEST) test_expert_store_registry $(V4_FLAGS_STAMP) \
-		$(V4_CUDA_FLAGS_STAMP) backend_vulkan_v4.o
+		$(V4_CUDA_FLAGS_STAMP) backend_vulkan_v4.o vk_tier_v4.o
