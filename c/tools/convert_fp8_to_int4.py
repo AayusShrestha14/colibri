@@ -58,6 +58,7 @@ OTHER_FAMILY_PATHS = {
     "qwen3_5_moe_text":"Qwen3.6: use tools/convert_qwen36.py",
     "qwen3_5":         "Qwen3.8-27B (dense): use tools/convert_qwen36.py, see docs/qwen36.md",
     "qwen3_5_text":    "Qwen3.8-27B (dense): use tools/convert_qwen36.py, see docs/qwen36.md",
+    "qwen3_moe":       "Qwen3-Coder-30B-A3B: use tools/convert_qwen36.py, see docs/qwen36.md",
     "inkling_mm_model":"Inkling: use tools/convert_inkling_int4.py",
     "inkling":         "Inkling: use tools/convert_inkling_int4.py",
     "olmoe":           "OLMoE: use tools/convert_olmoe.py",

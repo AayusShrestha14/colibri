@@ -1011,9 +1011,12 @@ gemm-test: tests/test_gemm_largebatch.mm backend_metal.mm backend_metal.h affine
 # the tiny hybrid stack. Needs QWEN36_QPACK_FIXTURE=<dir> pointing at a real
 # swiftlet-repack output of tiny-model-q4; without it the binary skips with a
 # distinct marker instead of pretending to pass.
-qwen36-metal-test: tests/test_qwen36_qpack_metal.c qwen36.c qwen36_qpack.c qwen36_qpack.h qpack.c qpack.h affine_quant.h qwen36_tier.h st.h json.h compat.h backend_metal.o
-	$(CC) $(CFLAGS) -DCOLI_METAL -DQWEN36_QPACK tests/test_qwen36_qpack_metal.c qwen36_qpack.c qpack.c backend_metal.o -o qwen36_qpack_metal_test -framework Metal -framework Foundation -lc++ $(LDFLAGS)
+# The binary has a rule of its own, named after it, so VK=1 can list $(VK_OBJ) as
+# a prerequisite of the link that needs it (qwen36.c calls the backend).
+qwen36-metal-test: qwen36_qpack_metal_test
 	./qwen36_qpack_metal_test
+qwen36_qpack_metal_test: tests/test_qwen36_qpack_metal.c qwen36.c qwen36_qpack.c qwen36_qpack.h qpack.c qpack.h affine_quant.h qwen36_tier.h st.h json.h compat.h backend_metal.o $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_METAL -DQWEN36_QPACK tests/test_qwen36_qpack_metal.c qwen36_qpack.c qpack.c backend_metal.o $(VK_OBJ) -o qwen36_qpack_metal_test -framework Metal -framework Foundation -lc++ $(LDFLAGS)
 
 # fmt=6 (E8/IQ3) encoder for tools/convert_fp8_to_int4.py. OPTIONAL: iq3_pack.py
 # falls back to its numpy path when the library is absent, producing the same
