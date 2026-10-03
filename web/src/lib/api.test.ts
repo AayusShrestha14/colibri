@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import {
-  askBrio, askSystemOne, decidesOnly, extractSSE, extractSSEEvents, generateImage, generatesImages, getHealth, getProfile,
+  askSystemOne, extractSSE, extractSSEEvents, generateImage, generatesImages, getHealth, getProfile,
   listModelInfo, serverEndpoint, streamChat, type GenerateImageOptions, type ImageProgress,
 } from "./api"
 
@@ -119,62 +119,38 @@ describe("reasoning stream", () => {
   })
 })
 
-describe("askBrio", () => {
-  /* The options must travel as a field, never folded into the prompt: keeping
-     them out of the text is half of what the mode saves, and a refactor that
-     "helpfully" appended them would be invisible in the answer. */
-  it("sends the options as data and posts to the brio endpoint", async () => {
-    const seen: { url?: string; body?: unknown } = {}
-    vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
-      seen.url = url
-      seen.body = JSON.parse(String(init.body))
-      return new Response(JSON.stringify({
-        answer: "b", entropy: 0.5, normalize: "mean",
-        choices: [{ option: "b", p: 0.7, logprob: -1, mean_logprob: -1, tokens: 1 }],
-        usage: { prompt_tokens: 9, completion_tokens: 0, read_tokens: 2, total_tokens: 11 },
-      }), { status: 200, headers: { "Content-Type": "application/json" } })
-    }))
-    const out = await askBrio("http://x/v1", "", "m", "state", "q?", ["a", "b"])
-    expect(seen.url).toBe("http://x/v1/brio")
-    expect(seen.body).toMatchObject({ model: "m", state: "state", question: "q?", options: ["a", "b"] })
-    expect(out.answer).toBe("b")
-    expect(out.usage.completion_tokens).toBe(0)
-  })
-
-  it("surfaces the server's own message instead of a bare status", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => new Response(
-      JSON.stringify({ error: { message: "options must be a non-empty array" } }),
-      { status: 400, headers: { "Content-Type": "application/json" } })))
-    await expect(askBrio("http://x/v1", "", "m", "s", "q", ["a"]))
-      .rejects.toThrow("options must be a non-empty array")
-  })
-})
-
 describe("askSystemOne", () => {
-  it("asks a decision model one choice question and draws it like a brio answer", async () => {
-    const seen: { url?: string; body?: { questions: { q: { type: string; criteria: object } } } } = {}
+  /* The options must travel as the labels of a `choice`, never folded into the
+     state: the gateway reads each one as the answer's continuation, and a
+     refactor that "helpfully" appended them to the text would be invisible in
+     the answer. */
+  it("asks one choice question on /v1/systemone and draws its probabilities", async () => {
+    const seen: { url?: string; body?: { state: string; questions: { q: { type: string; criteria: object } } } } = {}
     vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
       seen.url = url
       seen.body = JSON.parse(String(init.body))
       return new Response(JSON.stringify({
         id: "req_1", model: "laya", provider: "colibri",
         answers: { q: { type: "choice", choice: "b", probabilities: { a: 0.25, b: 0.75 }, confidence: 0.5 } },
-        usage: { input_tokens: 40, output_tokens: 0, cost: 0 },
+        usage: { input_tokens: 40, output_tokens: 3, cost: 0 },
       }), { status: 200, headers: { "Content-Type": "application/json" } })
     }))
     const out = await askSystemOne("http://x/v1", "", "laya", "state", "q?", ["a", "b"])
     expect(seen.url).toBe("http://x/v1/systemone")
+    expect(seen.body?.state).toBe("state")
     expect(seen.body?.questions.q).toEqual({ type: "choice", instructions: "q?", criteria: { a: null, b: null } })
     expect(out.answer).toBe("b")
     expect(out.choices.map((c) => c.option)).toEqual(["b", "a"])
     expect(out.entropy).toBeCloseTo(-(0.25 * Math.log(0.25) + 0.75 * Math.log(0.75)) / Math.log(2), 6)
-    expect(out.usage).toEqual({ prompt_tokens: 40, completion_tokens: 0, read_tokens: 40, total_tokens: 40 })
+    expect(out.usage).toEqual({ input_tokens: 40, output_tokens: 3 })
   })
 
-  it("knows a decision model from its capabilities", () => {
-    expect(decidesOnly({ id: "laya", capabilities: ["systemone", "decision"] })).toBe(true)
-    expect(decidesOnly({ id: "qwen36", capabilities: ["chat", "systemone"] })).toBe(false)
-    expect(decidesOnly(undefined)).toBe(false)
+  it("surfaces the server's own message instead of a bare status", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(
+      JSON.stringify({ error: { message: "`questions.q.criteria` must be a non-empty object" } }),
+      { status: 422, headers: { "Content-Type": "application/json" } })))
+    await expect(askSystemOne("http://x/v1", "", "m", "s", "q", []))
+      .rejects.toThrow("must be a non-empty object")
   })
 })
 

@@ -610,11 +610,11 @@ COLI_MODEL=/nvme/glm52_i4 ./coli tune     # misura e salva il profilo di esecuzi
 Gran parte di ciò che si chiede a un modello è una scelta, non un paragrafo:
 quale coda, quale verdetto, quale dei quattro valori può prendere un campo. La
 modalità System One passa al motore le opzioni e legge la probabilità di ciascuna
-invece di generare: `completion_tokens` è 0, nessuna risposta può uscire dalla
-tua lista, e ogni risposta arriva con un'entropia, così "il modello non è
-sicuro" è un numero su cui mettere una soglia. Funziona su tutte e dieci le
-famiglie, sullo stesso server, ed è opzionale per richiesta: la chat resta
-identica byte per byte per chi non la chiede.
+invece di generare: non si genera nulla, nessuna risposta può uscire dalla tua
+lista, e ogni risposta arriva con una confidenza, così "il modello non è sicuro"
+è un numero su cui mettere una soglia. Funziona su tutte e dieci le famiglie,
+sullo stesso server, ed è opzionale per richiesta: la chat resta identica byte
+per byte per chi non la chiede.
 
 ```bash
 # nella TUI: lo stesso modello, a cui si dice di non scrivere
@@ -623,20 +623,19 @@ identica byte per byte per chi non la chiede.
 > 340 lines, 8 files, no tests. CI is green but nothing covers that path.
 
 # da qualunque programma: una richiesta JSON al server in esecuzione
-curl -s http://127.0.0.1:8000/v1/brio -H 'Content-Type: application/json' -d '{
-  "model": "qwen36",
+curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -d '{
   "state": "340 lines, 8 files, no tests. CI is green but nothing covers that path.",
-  "question": "What should the reviewer do?",
-  "options": ["merge", "request changes", "close"]}'
+  "questions": {"review": {"type": "choice", "instructions": "What should the reviewer do?",
+                           "criteria": {"merge": null, "request changes": null, "close": null}}}}'
 ```
 
-`questions` fa molte domande su un documento letto una volta sola, e `schema`
-riempie un oggetto JSON un campo alla volta, valido per costruzione. Misurato
-su Qwen3.6 contro la generazione della stessa risposta sulla stessa macchina
-CPU: 2,4x su uno schema a quattro campi, 5,7x su quattro domande sullo stesso
-documento. Tutta la modalità, la forma di richiesta e risposta, e dove non
-serve: [docs/systemone.md](docs/systemone.md). Anche la dashboard ha una pagina System One, e le stesse risposte arrivano da
-`POST /v1/systemone`, l'API di Jev di TypeSafe: un client Jev passa a colibri cambiando solo il base URL.
+`POST /v1/systemone` parla la richiesta e la risposta dell'API Jev di TypeSafe:
+un client Jev passa a colibri cambiando solo il base URL. Più domande sullo
+stesso documento lo leggono una volta sola: misurato su Qwen3.6 contro la
+generazione delle stesse risposte sulla stessa macchina CPU, 5,7x su quattro
+domande sullo stesso documento. Tutta la modalità, la forma di richiesta e
+risposta, e dove non serve: [docs/systemone.md](docs/systemone.md). Anche la
+dashboard ha una pagina System One.
 
 
 Su Windows un archivio di release include `coli.cmd`: fai doppio clic per l'avvio

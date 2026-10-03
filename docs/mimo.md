@@ -96,7 +96,7 @@ on (the web has its own reasoning toggle).
 
 ## System One mode and prompt reuse
 
-[System One mode](systemone.md) works on MiMo as on the other engines. `POST /v1/brio` scores a
+[System One mode](systemone.md) works on MiMo as on the other engines. `POST /v1/systemone` scores a
 closed set of options instead of generating, and `logprobs` on `/v1/chat/completions` and
 `/v1/completions` (with `echo`) is served too. What is particular to MiMo is what a
 snapshot (`SUBMIT pin=1`) has to hold:
@@ -147,7 +147,7 @@ prompt computed cold.
 `make -C c mimo-tiny-serve-check` serves the same fixture and compares against a cold
 engine, frame by frame: prefix reuse across turns, System One options that slide the window
 past the snapshot, nested snapshots and a sibling question, a snapshot made stale by an
-unrelated prompt, prompts with a picture, and `/v1/brio` and chat logprobs through the
+unrelated prompt, prompts with a picture, and `/v1/systemone` and chat logprobs through the
 gateway. Every option must process only its own tokens. The gateway's patches
 match the official Qwen2-VL processor bit for bit on the fixture's picture.
 

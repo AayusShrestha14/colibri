@@ -1334,13 +1334,13 @@ mimo-tiny-generate:
 mimo-tiny-check: mimo-tiny-generate mimo$(EXE)
 	$(PYTHON) tests/mimo_tiny_harness.py --binary ./mimo$(EXE) --fixture ./mimo_tiny
 
-# The same fixture served: KV prefix reuse, Brio photos (the windowed layers' rings,
-# pictures, nested and stale photos), and /v1/brio and chat logprobs through the
-# gateway. Every comparison is against a cold engine, to the last printed digit.
+# The same fixture served: KV prefix reuse, System One photos (the windowed layers'
+# rings, pictures, nested and stale photos), and /v1/systemone and chat logprobs
+# through the gateway. Every comparison is against a cold engine.
 .PHONY: mimo-tiny-serve-check
 mimo-tiny-serve-check: mimo-tiny-generate mimo$(EXE)
 	$(PYTHON) -m unittest -v tests.test_mimo_prefix_serve tests.test_brio_serve.MimoBrioServe \
-		tests.test_brio_api.MimoBrioEndToEnd
+		tests.test_systemone_api.MimoSystemOneEndToEnd
 
 # Qwen3.8-Flash-Next text-only sibling. qwen38.c owns the direct checkpoint
 # loader and SERVE=1 protocol. With CUDA=1 it links the same expert tier as

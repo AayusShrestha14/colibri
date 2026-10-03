@@ -27,7 +27,7 @@ Configuration through environment variables or flags (also valid after the subco
   --topp P           adaptive expert top-p             --topk N   fixed top-k
   --ngen N           maximum response tokens           --cap N    cache slots/layer
 """
-import os, sys, subprocess, argparse, json, time, signal, shutil, threading, re, codecs, tempfile, textwrap, struct, shlex
+import os, sys, subprocess, argparse, json, math, time, signal, shutil, threading, re, codecs, tempfile, textwrap, struct, shlex
 
 # input() only gets line editing and UP/DOWN history once the readline module
 # has been LOADED — without it the terminal's arrow-key escape sequences are
@@ -1793,17 +1793,37 @@ def install_chat_completer(commands=None, arguments=None):
     readline.parse_and_bind("tab: complete")
     readline.set_completer(complete)
 
+def conversation_state(msgs):
+    """The conversation so far as one text state, a "role: content" line per
+    message with text parts joined: what /decide sends as the context."""
+    lines=[]
+    for message in msgs:
+        if not isinstance(message, dict): continue
+        content=message.get("content")
+        if isinstance(content, list):
+            content="".join(part.get("text","") for part in content
+                            if isinstance(part, dict) and isinstance(part.get("text",""), str))
+        if content:
+            lines.append(f"{message.get('role','user')}: {content}")
+    return "\n".join(lines)
+
+def decide_request(model_id, msgs, question, options):
+    """The POST /v1/systemone body of one /decide turn: the conversation as the
+    state, the question as one `choice` whose labels are the options."""
+    return {"model": model_id, "state": conversation_state(msgs),
+            "questions": {"decide": {"type": "choice", "instructions": question,
+                                     "criteria": {option: None for option in options}}}}
+
 def chat_brio(a, base, model_id, msgs, question, options, w):
     """Un giro di modalita System One dalla TUI (/decide): una richiesta, una distribuzione.
 
-    Il ciclo (fotografia del prefisso, una lettura per opzione, normalizzazione
-    per lunghezza) sta nel gateway, non qui: sono tre cose facili da sbagliare e
-    devono stare in un posto solo. Qui si manda la conversazione come contesto
-    e si disegnano le barre."""
+    Il ciclo (fotografia del prefisso, una lettura per opzione, normalizzazione)
+    sta nel gateway, non qui: sono tre cose facili da sbagliare e devono stare
+    in un posto solo. Qui si manda la conversazione come stato a
+    POST /v1/systemone, una domanda `choice`, e si disegnano le barre."""
     import urllib.request, urllib.error
-    body=json.dumps({"model":model_id,"messages":msgs,"question":question,
-                     "options":options}).encode()
-    req=urllib.request.Request(base.rstrip("/")+"/v1/brio", data=body,
+    body=json.dumps(decide_request(model_id, msgs, question, options)).encode()
+    req=urllib.request.Request(base.rstrip("/")+"/v1/systemone", data=body,
                                headers={"Content-Type":"application/json"})
     if a.api_key: req.add_header("Authorization", f"Bearer {a.api_key}")
     print(f"\n  {C.teal}◆ System One{C.r}")
@@ -1815,27 +1835,30 @@ def chat_brio(a, base, model_id, msgs, question, options, w):
         sp.stop()
         try: detail=json.loads(e.read().decode("utf-8","replace")).get("error",{}).get("message","")
         except Exception: detail=""
-        print(f"  {C.yel}[il server ha rifiutato: HTTP {e.code}{' — '+detail if detail else ''}]{C.r}\n")
+        print(f"  {C.yel}[il server ha rifiutato: HTTP {e.code}{': '+detail if detail else ''}]{C.r}\n")
         return
     except OSError as e:
         sp.stop(); print(f"  {C.yel}[server irraggiungibile: {e}]{C.r}\n"); return
     sp.stop()
+    answer=(out.get("answers") or {}).get("decide") or {}
+    probabilities=answer.get("probabilities") or {}
+    ranked=sorted(((option, float(probabilities.get(option, 0.0))) for option in options),
+                  key=lambda item: -item[1])
     bars=max(10, min(30, w-34))
-    for choice in out.get("choices", []):
-        p=choice.get("p",0.0); filled=int(round(p*bars))
-        colour=C.grn if choice["option"]==out.get("answer") else C.dgray
-        print(f"     {colour}{choice['option'][:22]:<22}{C.r} {colour}{'█'*filled}{C.r}"
-              f"{C.dgray}{'░'*(bars-filled)}{C.r} {p*100:5.1f}%"
-              f"  {C.dim}{choice.get('tokens',0)} tok{C.r}")
-    h=out.get("entropy",1.0)
+    for option, p in ranked:
+        filled=int(round(p*bars))
+        colour=C.grn if option==answer.get("choice") else C.dgray
+        print(f"     {colour}{option[:22]:<22}{C.r} {colour}{'█'*filled}{C.r}"
+              f"{C.dgray}{'░'*(bars-filled)}{C.r} {p*100:5.1f}%")
     # L'entropia e la parte che la generazione non sa dare: non "qual e la
-    # risposta" ma "quanto il modello sa di saperlo".
+    # risposta" ma "quanto il modello sa di saperlo". Normalizzata su log(n).
+    h=-sum(p*math.log(p) for _, p in ranked if p>0)/math.log(max(len(ranked),2))
     verdict=(f"{C.grn}sure{C.r}" if h<.4 else
              f"{C.yel}unsure{C.r}" if h<.8 else f"{C.yel}DOES NOT KNOW{C.r}")
     usage=out.get("usage",{})
-    print(f"     {C.b}→ {out.get('answer','?')}{C.r}  {C.dim}entropy {h:.3f}{C.r} ({verdict})")
-    print(f"  {C.dim}{time.time()-t0:.2f}s · {usage.get('read_tokens',0)} tokens read · "
-          f"{usage.get('completion_tokens',0)} generated{C.r}\n")
+    print(f"     {C.b}→ {answer.get('choice','?')}{C.r}  {C.dim}entropy {h:.3f}{C.r} ({verdict})")
+    print(f"  {C.dim}{time.time()-t0:.2f}s · {usage.get('input_tokens',0)} prompt tokens · "
+          f"{usage.get('output_tokens',0)} option tokens read · nothing generated{C.r}\n")
 
 # Families whose template thinks by default but that coli chat starts with thinking
 # OFF. On a model that streams its experts from disk at about 1 tok/s, the default

@@ -560,7 +560,7 @@ COLI_MODEL=/nvme/glm52_i4 ./coli tune     # このマシンで最速かつ安全
 
 人がモデルに求めることの多くは、段落ではなく選択です: どのキューか、どの判定か、あるフィールドが取り得る
 4 つの値のどれか。System One モードはエンジンに選択肢を渡し、生成する代わりにそれぞれの確率を読み取ります:
-`completion_tokens` は 0 で、どの回答もリストの外に出ることはなく、すべての回答にエントロピーが付くため、
+何も生成されず、どの回答もリストの外に出ることはなく、すべての回答に確信度 (confidence) が付くため、
 「モデルに確信がない」ことが閾値を設定できる数値になります。10 のファミリーすべてで、同じサーバー上で
 動作し、リクエストごとのオプトインです: 求めない人にとって、チャットはバイト単位で同一のままです。
 
@@ -571,19 +571,17 @@ COLI_MODEL=/nvme/glm52_i4 ./coli tune     # このマシンで最速かつ安全
 > 340 lines, 8 files, no tests. CI is green but nothing covers that path.
 
 # from anywhere: one JSON request on the running server
-curl -s http://127.0.0.1:8000/v1/brio -H 'Content-Type: application/json' -d '{
-  "model": "qwen36",
+curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -d '{
   "state": "340 lines, 8 files, no tests. CI is green but nothing covers that path.",
-  "question": "What should the reviewer do?",
-  "options": ["merge", "request changes", "close"]}'
+  "questions": {"review": {"type": "choice", "instructions": "What should the reviewer do?",
+                           "criteria": {"merge": null, "request changes": null, "close": null}}}}'
 ```
 
-`questions` は 1 回だけ読んだ 1 つの文書について多くのことを尋ね、`schema` は JSON オブジェクトを
-1 フィールドずつ埋めるため、構造上必ず妥当になります。Qwen3.6 で、同じ CPU マシン上で同じ回答を
-生成する場合と比べて計測したところ、4 フィールドのスキーマで 2.4 倍、1 つの文書に対する 4 つの質問で
-5.7 倍でした。モード全体、リクエストとレスポンスの形、そして役に立たない場面については
-[docs/systemone.md](docs/systemone.md) を参照してください。ダッシュボードにも System One ページがあります。同じ回答は TypeSafe の Jev と同じ API である
-`POST /v1/systemone` からも得られ、Jev のクライアントは base URL を変えるだけで切り替えられます。
+`POST /v1/systemone` は TypeSafe の Jev API と同じリクエストとレスポンスを話します: Jev のクライアントは
+base URL を変えるだけで colibri に切り替えられます。1 つの文書への複数の質問は文書を 1 回だけ読みます:
+Qwen3.6 で、同じ CPU マシン上で同じ回答を生成する場合と比べて計測したところ、1 つの文書に対する
+4 つの質問で 5.7 倍でした。モード全体、リクエストとレスポンスの形、そして役に立たない場面については
+[docs/systemone.md](docs/systemone.md) を参照してください。ダッシュボードにも System One ページがあります。
 
 
 Windows ではリリースアーカイブに `coli.cmd` が同梱されています。ダブルクリックでクイックスタート、

@@ -11,10 +11,11 @@ class H(SimpleHTTPRequestHandler):
     def log_message(self, *a): pass
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0)); self.rfile.read(n)
-        body = json.dumps({"answer":"request changes","entropy":0.121,"normalize":"mean",
-            "choices":[{"option":"request changes","p":0.974,"logprob":-0.25,"mean_logprob":-0.12,"tokens":2},
-                       {"option":"merge","p":0.023,"logprob":-4.0,"mean_logprob":-4.0,"tokens":1}],
-            "usage":{"prompt_tokens":88,"completion_tokens":0,"read_tokens":4,"total_tokens":92}}).encode()
+        assert self.path == "/v1/systemone", self.path
+        body = json.dumps({"id":"req_1","model":"m","provider":"colibri",
+            "answers":{"q":{"type":"choice","choice":"request changes",
+                            "probabilities":{"merge":0.023,"request changes":0.977},"confidence":0.954}},
+            "usage":{"input_tokens":88,"output_tokens":4,"cost":0}}).encode()
         self.send_response(200); self.send_header("Content-Type","application/json")
         self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body)
     def do_GET(self):

@@ -447,7 +447,7 @@ footer{border-top:1px solid var(--line)}
         options it may pick and it reports the probability of each one. Nothing is generated,
         so there is nothing to parse and no answer outside the list. Typed decisions with
         calibrated probabilities, API compatible with Jev (<code>POST /v1/systemone</code>).</p>
-      <div class="chart"><div class="crow"><span class="cl">one question, 10 options<s>System One</s></span><span class="ct"><i style="width:38.8%"></i></span><span class="cv">101.2 s</span></div><div class="crow"><span class="cl"><s>chat</s></span><span class="ct"><i style="width:48.1%"></i></span><span class="cv">125.6 s<s> 1.2x</s></span></div><div class="crow"><span class="cl">JSON, 4-field schema<s>System One</s></span><span class="ct"><i style="width:39.8%"></i></span><span class="cv">103.8 s</span></div><div class="crow"><span class="cl"><s>chat</s></span><span class="ct"><i style="width:94.2%"></i></span><span class="cv">246.0 s<s> 2.4x</s></span></div><div class="crow"><span class="cl">4 items, shared instructions<s>System One</s></span><span class="ct"><i style="width:17.5%"></i></span><span class="cv">45.7 s</span></div><div class="crow"><span class="cl"><s>chat</s></span><span class="ct"><i style="width:100.0%"></i></span><span class="cv">261.1 s<s> 5.7x</s></span></div></div>
+      <div class="chart"><div class="crow"><span class="cl">one question, 10 options<s>System One</s></span><span class="ct"><i style="width:38.8%"></i></span><span class="cv">101.2 s</span></div><div class="crow"><span class="cl"><s>chat</s></span><span class="ct"><i style="width:48.1%"></i></span><span class="cv">125.6 s<s> 1.2x</s></span></div><div class="crow"><span class="cl">4 items, shared instructions<s>System One</s></span><span class="ct"><i style="width:17.5%"></i></span><span class="cv">45.7 s</span></div><div class="crow"><span class="cl"><s>chat</s></span><span class="ct"><i style="width:100.0%"></i></span><span class="cv">261.1 s<s> 5.7x</s></span></div></div>
       <p class="src">Measured on qwen36 (22 GB), same engine, separate processes. Time from the
         prompt to the answer.</p>
 
@@ -457,11 +457,11 @@ footer{border-top:1px solid var(--line)}
              a message to a policy.</p>
           <div class="io"><b>question</b> what should the reviewer do?<br>
             <b>options</b> merge &middot; request changes &middot; close</div></div>
-        <div class="ex"><h3>Filling a schema</h3>
-          <p>Braces, quotes and field names are data. The engine fills one slot at a time, so
-             the JSON is valid by construction.</p>
-          <div class="io"><b>System One</b> every value is one you allowed<br>
-            <b>chat</b> invented no_tests and track</div></div>
+        <div class="ex"><h3>A decision model</h3>
+          <p>Laya answers the same request natively: one forward pass, probabilities its
+             authors calibrated, no prompt and nothing generated.</p>
+          <div class="io"><b>same API</b> POST /v1/systemone<br>
+            <b>Laya</b> 219 ms for one question on a laptop CPU</div></div>
         <div class="ex"><h3>Many questions, one document</h3>
           <p>Read the contract once, then ask it twenty things. The first question pays for the
              reading, the rest cost their own words.</p>
@@ -470,28 +470,31 @@ footer{border-top:1px solid var(--line)}
       </div>
 
       <div class="split2">
-        <div class="code"><span class="lbl">POST /v1/brio</span><pre>{
-  <span class="k">"model"</span>: <span class="s">"qwen36"</span>,
+        <div class="code"><span class="lbl">POST /v1/systemone</span><pre>{
   <span class="k">"state"</span>: <span class="s">"340 lines, 8 files, no tests."</span>,
-  <span class="k">"question"</span>: <span class="s">"What should the reviewer do?"</span>,
-  <span class="k">"options"</span>: [<span class="s">"merge"</span>, <span class="s">"request changes"</span>, <span class="s">"close"</span>]
+  <span class="k">"questions"</span>: {<span class="k">"review"</span>: {
+    <span class="k">"type"</span>: <span class="s">"choice"</span>,
+    <span class="k">"instructions"</span>: <span class="s">"What should the reviewer do?"</span>,
+    <span class="k">"criteria"</span>: {<span class="k">"merge"</span>: <span class="n">null</span>, <span class="k">"request changes"</span>: <span class="n">null</span>, <span class="k">"close"</span>: <span class="n">null</span>}
+  }}
 }</pre></div>
         <div class="code"><span class="lbl">the reply</span><pre>{
-  <span class="k">"answer"</span>: <span class="s">"request changes"</span>,
-  <span class="k">"entropy"</span>: <span class="n">0.121</span>,
-  <span class="k">"choices"</span>: [
-    {<span class="k">"option"</span>: <span class="s">"request changes"</span>, <span class="k">"p"</span>: <span class="n">0.974</span>},
-    {<span class="k">"option"</span>: <span class="s">"merge"</span>,           <span class="k">"p"</span>: <span class="n">0.023</span>},
-    {<span class="k">"option"</span>: <span class="s">"close"</span>,           <span class="k">"p"</span>: <span class="n">0.004</span>}
-  ],
-  <span class="k">"usage"</span>: {<span class="k">"completion_tokens"</span>: <span class="n">0</span>}
+  <span class="k">"answers"</span>: {<span class="k">"review"</span>: {
+    <span class="k">"choice"</span>: <span class="s">"request changes"</span>,
+    <span class="k">"probabilities"</span>: {
+      <span class="k">"merge"</span>: <span class="n">0.023</span>, <span class="k">"request changes"</span>: <span class="n">0.974</span>, <span class="k">"close"</span>: <span class="n">0.004</span>
+    },
+    <span class="k">"confidence"</span>: <span class="n">0.961</span>
+  }},
+  <span class="k">"usage"</span>: {<span class="k">"output_tokens"</span>: <span class="n">4</span>, <span class="k">"cost"</span>: <span class="n">0</span>}
 }</pre></div>
       </div>
 
       <h3 style="font-size:1.3rem;font-weight:500;margin:3rem 0 .6rem;letter-spacing:-.02em">
         And the thing generation cannot give</h3>
-      <p class="sub" style="margin-bottom:1.6rem">Same request, same model, three fields of one
-        JSON schema. On <b>area</b> it is sure and it is right. On the other two the entropy is
+      <p class="sub" style="margin-bottom:1.6rem">Same document, same model, three closed
+        questions about it (measured when they were the fields of one JSON object, filled one
+        at a time). On <b>area</b> it is sure and it is right. On the other two the entropy is
         near the maximum: it does not know, and it says so. The chat arm wrote
         <code style="font:400 14px var(--mono);background:var(--soft);padding:1px 6px;border-radius:4px">"risk": "high"</code>
         with exactly the same face.</p>

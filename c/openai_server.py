@@ -4652,7 +4652,7 @@ def _engine_extension_args(engine_k):
 
     That is this helper's decision for THESE endpoints, not a property of the request
     builder. `gbytes_before_ext` is a per-call-site parameter, and the other caller that
-    sends an extension key -- /v1/brio -- does not pass it and keeps the header it has
+    sends an extension key -- /v1/systemone's scoring -- does not pass it and keeps the header it has
     always sent; changing that endpoint's wire is not this change's to make."""
     if not engine_k:
         return {}
@@ -5058,7 +5058,7 @@ class Engine:
         # whole of its contract: a DATA tail on every generated token, and an ECHO frame
         # for EVERY prompt position (" nan 0" at position 0) unless a pin photo covers the
         # prefix -- which means never resuming a read-out from a live prefix. colibri.c
-        # (glm) and mimo.c do; the engines that score /v1/brio options but resume
+        # (glm) and mimo.c do; the engines that score /v1/systemone options but resume
         # read-outs from a live prefix would answer `echo` with a hole. Token-id intake
         # is glm's alone: serve_codec.h, which mimo reads its frames with, has no `ids=`.
         self.supports_logprobs_echo = arch in ("glm", "mimo")
@@ -5768,11 +5768,10 @@ def is_image_engine(engine):
 
 # The endpoints that only make sense for a chat model, refused with a pointer
 # when the model draws images instead.
-TEXT_ENDPOINTS = ("/v1/chat/completions", "/v1/completions", "/v1/messages", "/v1/brio",
-                  "/v1/systemone")
+TEXT_ENDPOINTS = ("/v1/chat/completions", "/v1/completions", "/v1/messages", "/v1/systemone")
 # The endpoints that generate or score text with a language model, refused with a
 # pointer to /v1/systemone when the model is a decision engine (chat=0).
-GENERATING_ENDPOINTS = ("/v1/chat/completions", "/v1/completions", "/v1/messages", "/v1/brio")
+GENERATING_ENDPOINTS = ("/v1/chat/completions", "/v1/completions", "/v1/messages")
 IMAGE_OPTION_KEYS = ("default_width", "default_height", "default_steps", "min_side",
                      "max_side", "multiple")
 
@@ -6391,8 +6390,6 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.chat_completion(body, request_id)
             elif path == "/v1/completions":
                 self.completion(body, request_id)
-            elif path == "/v1/brio":
-                self.brio(body, request_id)
             elif path == "/v1/systemone":
                 self.systemone(body, request_id)
             elif path == "/v1/messages":
@@ -6414,163 +6411,48 @@ class APIHandler(BaseHTTPRequestHandler):
                 pass
 
 
-    # ---------------------------------------------------------------- modalita brio
+    # ---------------------------------------------------------------- il canale di scoring
     #
-    # Il modello non genera: si legge il logprob di ogni opzione ammessa e si
-    # normalizza sulle sole opzioni. Torna una distribuzione, non una stringa.
+    # Il percorso di POST /v1/systemone su un modello linguistico. Il modello non
+    # genera: si legge il logprob di ogni opzione ammessa e si normalizza sulle
+    # sole opzioni. Torna una distribuzione, non una stringa. (Un motore di
+    # decisione, decide=1, risponde da se' con DECIDE: _systemone_decide.)
     #
     # PERCHE' IL CICLO STA QUI E NON NEL CLIENT. Servono tre cose facili da
     # sbagliare: fotografare il prefisso condiviso (pin) cosi ogni opzione paga
-    # solo i propri token; NON mettere l'elenco delle opzioni nel prompt (su
-    # qwen36 erano 48 token su 123, meta del risparmio); e normalizzare per
-    # lunghezza, perche' sommare i logprob penalizza le opzioni da piu token --
-    # misurato, la somma diceva "merge" dove la generazione greedy dello stesso
-    # modello diceva "request changes". Un client che rifacesse questo ciclo
-    # sbaglierebbe una di queste tre, e il risultato resterebbe plausibile.
+    # solo i propri token; leggere l'opzione come continuazione della risposta e
+    # non come coda di un elenco; e normalizzare, perche' somma e media dei
+    # logprob danno risposte diverse quando le opzioni hanno lunghezze diverse.
+    # Un client che rifacesse questo ciclo sbaglierebbe una di queste tre, e il
+    # risultato resterebbe plausibile.
     #
-    # COSA TORNA. Non solo il vincitore: la probabilita di OGNI opzione e
-    # l'entropia. E' la differenza con la generazione, che una risposta la da
-    # sempre e con la stessa faccia: qui "non lo so" e' un numero.
-    # TRE FORME, UN ENDPOINT. `options` e' la domanda singola. `questions` e'
-    # un elenco di domande sullo stesso stato, ognuna con le sue opzioni: lo
-    # stato viene fotografato una volta e ogni domanda paga solo se stessa,
-    # che e' dove sta il 5,7x misurato. `schema` e' un oggetto campo -> valori
-    # ammessi: il server scrive lo scheletro JSON, casella per casella, e per
-    # ognuna legge il logprob di ciascun valore. Il JSON non puo' uscire
-    # malformato perche' non lo scrive il modello. Prima queste due forme
-    # esistevano solo come script di misura: chi integrava doveva riscriverle.
-    @staticmethod
-    def _brio_options(options, where, limit=64):
-        if not isinstance(options, list) or not options:
-            raise APIError(400, f"`{where}` must be a non-empty array of strings.", where)
-        if len(options) > limit:
-            raise APIError(400, f"`{where}` accepts at most {limit} entries.", where)
-        seen = set()
-        for option in options:
-            if not isinstance(option, str) or not option.strip():
-                raise APIError(400, f"Every entry of `{where}` must be a non-empty string.", where)
-            if option in seen:
-                raise APIError(400, f"Duplicate option in `{where}`: {option!r}.", where)
-            seen.add(option)
-        if len(options) < 2:
-            raise APIError(400, f"`{where}` needs at least two options to choose between.", where)
-        return options
+    # Lo stato viene fotografato una volta e ogni domanda paga solo se stessa:
+    # e' la forma in cui il canale rende (5,7x misurato contro la chat).
+    # (Fino alla 1.12.1 questo ciclo aveva anche un endpoint suo, POST /v1/brio,
+    # con le forme options/questions/schema. /v1/systemone e' ora l'unica API.)
+    def _score_questions(self, state, questions, normalize="sum", pin_state=True,
+                         fixed=None, cache_slot=None):
+        """Score every question's options against `state` through the engine's
+        logprob channel. `questions` is a list of (question text, options).
 
-    def brio(self, body, request_id, send=True):
-        # `send=False` returns the result instead of writing it: /v1/systemone
-        # builds a `questions` request and re-shapes the answer. `_max_options`
-        # is that caller's word too (Jev allows 255 labels); clamped.
-        option_limit = min(int(body.get("_max_options", 64) or 64), 255)
-        forms = [k for k in ("options", "questions", "schema") if body.get(k) is not None]
-        if len(forms) != 1:
-            raise APIError(400, "Provide exactly one of `options`, `questions` or `schema`.",
-                           forms[0] if forms else "options")
-        form = forms[0]
-        question = body.get("question")
-        if question is not None and not isinstance(question, str):
-            raise APIError(400, "`question` must be a string.", "question")
-        options = questions = schema = None
-        if form == "options":
-            options = self._brio_options(body["options"], "options")
-        elif form == "questions":
-            raw = body["questions"]
-            if not isinstance(raw, list) or not raw:
-                raise APIError(400, "`questions` must be a non-empty array.", "questions")
-            if len(raw) > 64:
-                raise APIError(400, "`questions` accepts at most 64 entries.", "questions")
-            questions = []
-            for i, entry in enumerate(raw):
-                if not isinstance(entry, dict):
-                    raise APIError(400, f"`questions[{i}]` must be an object.", "questions")
-                text = entry.get("question")
-                if not isinstance(text, str) or not text.strip():
-                    raise APIError(400, f"`questions[{i}].question` must be a non-empty string.",
-                                   "questions")
-                per = entry.get("normalize", body.get("normalize", "sum"))
-                if per not in ("mean", "sum"):
-                    raise APIError(400, "`normalize` must be \"mean\" or \"sum\".", "normalize")
-                questions.append((text, self._brio_options(entry.get("options"),
-                                                           f"questions[{i}].options",
-                                                           option_limit), per))
-        else:
-            raw = body["schema"]
-            if not isinstance(raw, dict) or not raw:
-                raise APIError(400, "`schema` must be a non-empty object of field: [values].",
-                               "schema")
-            if len(raw) > 64:
-                raise APIError(400, "`schema` accepts at most 64 fields.", "schema")
-            schema = []
-            for field, values in raw.items():
-                if not isinstance(field, str) or not field.strip():
-                    raise APIError(400, "Every `schema` field name must be a non-empty string.",
-                                   "schema")
-                if any(ch in field for ch in '"\\\n'):
-                    raise APIError(400, f"`schema` field {field!r} cannot contain quotes, "
-                                        "backslashes or newlines.", "schema")
-                schema.append((field, self._brio_options(values, f"schema.{field}")))
-            task = body.get("task")
-            if task is not None and not isinstance(task, str):
-                raise APIError(400, "`task` must be a string.", "task")
-        state = body.get("state")
-        messages = body.get("messages")
-        if state is not None and not isinstance(state, str):
-            raise APIError(400, "`state` must be a string.", "state")
-        if state is None and isinstance(messages, list):
-            # La conversazione in corso FA da stato: e' quello che la TUI manda
-            # quando si scrive /brio a meta chat.
-            parts = []
-            for message_index, message in enumerate(messages):
-                if not isinstance(message, dict):
-                    raise APIError(400, "Every message must be an object.", "messages")
-                content = message.get("content")
-                if isinstance(content, list):
-                    text_parts = []
-                    for part_index, piece in enumerate(content):
-                        if not isinstance(piece, dict):
-                            continue
-                        text = piece.get("text", "")
-                        if not isinstance(text, str):
-                            raise APIError(400, "Text content parts require a string `text` field.",
-                                           f"messages.{message_index}.content.{part_index}.text")
-                        text_parts.append(text)
-                    content = "".join(text_parts)
-                if content:
-                    parts.append(f"{message.get('role', 'user')}: {content}")
-            state = "\n".join(parts)
-        if not state and not question and form == "options":
-            raise APIError(400, "Provide `state`, `messages` or `question`.", "state")
-        if not state and form != "options" and not body.get("_empty_state_ok"):
-            raise APIError(400, f"`{form}` needs a `state` (or `messages`) to decide on.", "state")
-        # "sum" (the joint log-probability of the option as a continuation)
-        # is the default: "mean" compares per-token averages, which silently
-        # favors multi-token options whenever the menu mixes token counts —
-        # e.g. DENY (2 tokens) beating ALLOW (1) on every safe change in a
-        # 30-case benchmark. "mean" stays available for menus whose options
-        # tokenize to the same length, and warns when they do not.
-        normalize = body.get("normalize", "sum")
-        if normalize not in ("mean", "sum"):
-            raise APIError(400, "`normalize` must be \"mean\" or \"sum\".", "normalize")
+        Returns (answers, usage, headers): per question the options sorted by
+        probability, each with `p`, `logprob`, `mean_logprob` and `tokens`, and
+        the normalised entropy; `prompt_tokens` (the longest prompt) and
+        `read_tokens` (the option tokens read); the timing headers.
+
+        `fixed` is a text read before the state and photographed once per slot
+        (/v1/systemone's `prefix`); `pin_state` False skips the photo of the
+        state. The slot defaults to the one derived from the part that does not
+        change: the fixed text when there is one, else the state."""
         # Lo slot si sceglie dallo STATO, non dalla domanda: mille domande
         # diverse sullo stesso contesto devono cadere sullo stesso slot, o la
         # fotografia del prefisso condiviso non le serve a niente. E' la stessa
         # regola di conversation_cache_slot per la chat, con la chiave presa
         # dalla parte che non cambia.
-        cache_slot = body.get("cache_slot")
         if cache_slot is None:
             cache_slot = conversation_cache_slot(
-                [{"role": "system", "content": state or ""}], self.server.kv_slots)
-        if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) \
-                or not 0 <= cache_slot < self.server.kv_slots:
-            raise APIError(400, "Invalid cache slot.", "cache_slot")
-
-        # /v1/systemone's two knobs, private keys like _max_options: `_prefix`
-        # is a fixed text the client sends before a changing state (a game's
-        # rules), photographed so only the state and the question are read;
-        # `_pin_state` False skips the photo of the state, which costs a round
-        # trip and a snapshot and pays only if the state comes back.
-        fixed = body.get("_prefix") or ""
+                [{"role": "system", "content": fixed or state or ""}], self.server.kv_slots)
         fixed_prefix = f"{fixed}\n\n" if fixed else ""
-        pin_state = body.get("_pin_state", True)
         state_prefix = fixed_prefix + (f"Context:\n{state}\n\n" if state else "")
         started = time.time()
         read_total = 0
@@ -6650,20 +6532,13 @@ class APIHandler(BaseHTTPRequestHandler):
                 return scored, round(entropy, 6), n_prefix
 
             # Lo stato da solo, fotografato per primo: e' il livello che tutte
-            # le domande (o tutte le caselle) condividono. Con un livello solo
-            # la domanda si rilegge una volta per opzione; con due, 176 token
-            # invece di 496 su quattro item (misurato).
-            #
-            # Vale anche per la forma `options`: dentro una singola richiesta lo
-            # stato si legge comunque una volta (lo snapshot dello stato viene
-            # ripristinato quando `choose` fotografa il prefisso completo), ma
-            # il punto di ritorno sullo stato condiviso serve TRA richieste. La
-            # pagina web manda una domanda per richiesta sullo stesso documento;
-            # senza questa fotografia ogni domanda rifarebbe il prefill di tutto
-            # il documento, buttando via il "read once" che e' il senso della
-            # modalita. Con essa, ogni domanda successiva paga solo i propri
-            # token. Il costo e' uno snapshot in piu' su una richiesta one-shot,
-            # riusato o sfrattato.
+            # le domande condividono. Con un livello solo la domanda si rilegge
+            # una volta per opzione; con due, 176 token invece di 496 su quattro
+            # item (misurato). Il punto di ritorno sullo stato serve anche TRA
+            # richieste: la pagina web manda una domanda per richiesta sullo
+            # stesso documento, e senza la fotografia ognuna rifarebbe il
+            # prefill di tutto il documento. Quando la fotografia non puo'
+            # pagare (uno stato visto una volta sola) systemone la spegne.
             # The fixed prefix is photographed once per slot, not per request:
             # sending it again would read it again (an identical prompt is not a
             # strict prefix of itself, so no photo can resume it), which is the
@@ -6677,66 +6552,25 @@ class APIHandler(BaseHTTPRequestHandler):
                 n_state, _ = score(state_prefix, True)
                 prompt_max = max(prompt_max, n_state)
 
-            if form == "options":
-                prefix = state_prefix
-                if question:
-                    prefix += f"Question: {question}\n"
-                prefix += "Answer:"
-                scored, entropy, _ = choose(prefix, options, normalize)
-                result = {"object": "brio.choice", "answer": scored[0]["option"],
-                          "entropy": entropy, "normalize": normalize, "choices": scored}
-
-            elif form == "questions":
-                answers = []
-                for text, choices, norm in questions:
-                    prefix = state_prefix + f"Question: {text}\nAnswer:"
-                    scored, entropy, _ = choose(prefix, choices, norm)
-                    answers.append({"question": text, "answer": scored[0]["option"],
-                                    "entropy": entropy, "normalize": norm,
-                                    "choices": scored})
-                result = {"object": "brio.answers", "answers": answers}
-
-            else:
-                # Lo scheletro JSON e' DATO: parentesi, virgolette e nomi dei
-                # campi li scriviamo noi, il modello sceglie solo il valore. Ogni
-                # casella si fotografa con dentro le scelte gia fatte, cosi il
-                # campo dopo vede quelli prima, come nella generazione.
-                head = state_prefix + (f"Task: {task}\n" if task else "")
-                filled, fields = {}, []
-                for field, values in schema:
-                    skeleton = "{" + "".join(
-                        f'"{k}": {json.dumps(v)}, ' for k, v in filled.items())
-                    prefix = head + skeleton + f'"{field}": "'
-                    scored, entropy, _ = choose(prefix, values, normalize)
-                    filled[field] = scored[0]["option"]
-                    fields.append({"field": field, "value": scored[0]["option"],
-                                   "p": scored[0]["p"], "entropy": entropy,
-                                   "choices": scored})
-                result = {"object": "brio.schema", "json": filled, "fields": fields,
-                          "normalize": normalize}
-
-        result.update({
-            "id": "brio-" + uuid.uuid4().hex,
-            "created": int(time.time()),
-            "model": self.server.model_id,
-            "usage": {"prompt_tokens": prompt_max, "completion_tokens": 0,
-                      "read_tokens": read_total,
-                      "total_tokens": prompt_max + read_total},
-        })
+            answers = []
+            for text, choices in questions:
+                prefix = state_prefix + f"Question: {text}\nAnswer:"
+                scored, entropy, _ = choose(prefix, choices, normalize)
+                answers.append({"question": text, "answer": scored[0]["option"],
+                                "entropy": entropy, "choices": scored})
         headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000)),
                    "x-colibri-elapsed-ms": str(round((time.time() - started) * 1000))}
-        if not send:
-            result["_headers"] = headers
-            return result
-        self.send_json(200, result, request_id, headers)
+        return answers, {"prompt_tokens": prompt_max, "read_tokens": read_total}, headers
 
     # ------------------------------------------------------------ Jev-compatible
     #
     # POST /v1/systemone speaks the request and the reply of TypeSafe's Jev
     # API (docs.typesafe.ai/api): a client written for it points at colibri
-    # and changes the base URL, nothing else. The three primitives map onto
-    # the `questions` form of /v1/brio, the same channel: the state is
-    # photographed once and every question pays only its own tokens.
+    # and changes the base URL, nothing else. It is colibri's one decision
+    # API. On a language model the three primitives become closed questions
+    # on the scoring channel above (_score_questions): the state is
+    # photographed once and every question pays only its own tokens. A
+    # decision engine gets the request as it is (DECIDE, _systemone_decide).
     #
     #   noul   -> one yes/no question. `noul` is the probability of yes. The
     #             optional criteria (what true and false mean) go into the
@@ -6745,9 +6579,10 @@ class APIHandler(BaseHTTPRequestHandler):
     #             go into the question text, because a label alone ("billing")
     #             does not say what it means. `confidence` follows their
     #             documented formula, (n * peak - 1) / (n - 1).
-    #   score  -> the levels of `criteria` are the options "1".."n"; `score`
-    #             is the expected value under the distribution, `legend` the
-    #             levels by number, `confidence` as for choice.
+    #   score  -> the levels of `criteria` are the options "1".."n" for the
+    #             model; the reply numbers them from 0 as Jev does. `score` is
+    #             the expected level, `legend` the levels as sent,
+    #             `confidence` as for choice.
     #
     # What differs, stated rather than hidden: `model` echoes the served
     # model, not "jev-latest"; `usage.output_tokens` counts the option tokens
@@ -6860,55 +6695,44 @@ class APIHandler(BaseHTTPRequestHandler):
             return
         # A question with one option has its answer already: nothing to score.
         asked = [entry for entry in plan if len(entry[3]) > 1]
-        result = {"answers": [], "usage": {"prompt_tokens": 0, "read_tokens": 0}}
+        scored, usage, headers = [], {"prompt_tokens": 0, "read_tokens": 0}, None
         if asked:
             # Photograph the state when it can pay: within this request (two or
             # more questions read it), or because it came back from an earlier
             # one. A state that changes on every call (a game, a feed) is read
             # straight through instead. `pin_state` says it explicitly.
-            if options["pin_state"] is None:
-                options["pin_state"] = len(asked) > 1 or self.server.state_seen(state or "")
-            else:
-                self.server.state_seen(state or "")
-            inner = {"state": state or "", "_max_options": 255, "_empty_state_ok": True,
-                     "normalize": options["normalize"], "_pin_state": options["pin_state"],
-                     "questions": [{"question": text, "options": choices}
-                                   for _, _, text, choices, _ in asked]}
-            if options["prefix"]:
-                inner["_prefix"] = options["prefix"]
-            if options["cache_slot"] is not None:
-                inner["cache_slot"] = options["cache_slot"]
-            elif options["prefix"]:
-                # The photo of the prefix lives in a slot: route by the part
-                # that does not change, as the state is routed without one.
-                inner["cache_slot"] = conversation_cache_slot(
-                    [{"role": "system", "content": options["prefix"]}], self.server.kv_slots)
-            result = self.brio(inner, request_id, send=False)
-        scored = iter(result["answers"])
+            pin_state = options["pin_state"]
+            seen = self.server.state_seen(state or "")
+            if pin_state is None:
+                pin_state = len(asked) > 1 or seen
+            scored, usage, headers = self._score_questions(
+                state or "", [(text, choices) for _, _, text, choices, _ in asked],
+                normalize=options["normalize"], pin_state=pin_state,
+                fixed=options["prefix"], cache_slot=options["cache_slot"])
+        scored = iter(scored)
         answers = {}
-        for qid, kind, _, options, levels in plan:
-            if len(options) > 1:
+        for qid, kind, _, choices, levels in plan:
+            if len(choices) > 1:
                 got = next(scored)
                 p = {c["option"]: c["p"] for c in got["choices"]}
             else:
-                p = {options[0]: 1.0}
+                p = {choices[0]: 1.0}
             if kind == "noul":
                 answers[qid] = {"type": "noul", "noul": round(float(p.get("yes", 0.0)), 6)}
             elif kind == "choice":
-                answers[qid] = {"type": "choice", "choice": max(options, key=lambda o: p[o]),
-                                "probabilities": {o: round(float(p[o]), 6) for o in options},
+                answers[qid] = {"type": "choice", "choice": max(choices, key=lambda o: p[o]),
+                                "probabilities": {o: round(float(p[o]), 6) for o in choices},
                                 "confidence": self._systemone_confidence(p.values())}
             else:
-                values = [float(p[o]) for o in options]
+                values = [float(p[o]) for o in choices]
                 answers[qid] = {"type": "score",
                                 "score": round(sum(i * v for i, v in enumerate(values)), 6),
                                 "legend": {str(i): legend for i, legend in enumerate(levels)},
                                 "probabilities": {str(i): round(v, 6) for i, v in enumerate(values)},
                                 "confidence": self._systemone_confidence(values)}
-        self.send_json(200, self._systemone_reply(answers, request_id,
-                                                  result["usage"]["prompt_tokens"],
-                                                  result["usage"]["read_tokens"]),
-                       request_id, result.get("_headers"))
+        self.send_json(200, self._systemone_reply(answers, request_id, usage["prompt_tokens"],
+                                                  usage["read_tokens"]),
+                       request_id, headers)
 
     def _systemone_options(self, body):
         """colibri's optional fields on /v1/systemone, none of which a Jev client

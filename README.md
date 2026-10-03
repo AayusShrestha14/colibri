@@ -586,11 +586,11 @@ COLI_MODEL=/nvme/glm52_i4 ./coli tune     # measure and save this machine's fast
 Most of what people ask a model for is a choice, not a paragraph: which queue,
 which verdict, which of the four values a field may take. System One mode hands the
 engine the options and reads the probability of each one instead of
-generating: `completion_tokens` is 0, no answer can fall outside your list,
-and every answer comes with an entropy, so "the model is not sure" is a
-number you can put a threshold on. It runs on all ten families, on the same
-server, and it is opt-in per request: chat is byte-identical for everyone who
-does not ask for it.
+generating: nothing is generated, no answer can fall outside your list, and
+every answer comes with a confidence, so "the model is not sure" is a number
+you can put a threshold on. It runs on all ten families, on the same server,
+and it is opt-in per request: chat is byte-identical for everyone who does not
+ask for it.
 
 ```bash
 # in the TUI: the same model, told to stop writing
@@ -599,20 +599,18 @@ does not ask for it.
 > 340 lines, 8 files, no tests. CI is green but nothing covers that path.
 
 # from anywhere: one JSON request on the running server
-curl -s http://127.0.0.1:8000/v1/brio -H 'Content-Type: application/json' -d '{
-  "model": "qwen36",
+curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -d '{
   "state": "340 lines, 8 files, no tests. CI is green but nothing covers that path.",
-  "question": "What should the reviewer do?",
-  "options": ["merge", "request changes", "close"]}'
+  "questions": {"review": {"type": "choice", "instructions": "What should the reviewer do?",
+                           "criteria": {"merge": null, "request changes": null, "close": null}}}}'
 ```
 
-`questions` asks many things about one document read once, and `schema` fills
-a JSON object one field at a time, valid by construction. Measured on Qwen3.6
-against generating the same answer on the same CPU box: 2.4x on a four-field
-schema, 5.7x on four questions about one document. The whole mode, the
-request and reply shapes, and where it does not help: [docs/systemone.md](docs/systemone.md).
-The dashboard has a System One page as well, and the same answers come over
-`POST /v1/systemone`, the API of TypeSafe's Jev: a Jev client switches by changing its base URL.
+`POST /v1/systemone` speaks the request and the reply of TypeSafe's Jev API: a
+Jev client switches to colibri by changing its base URL. Many questions about
+one document read it once: measured on Qwen3.6 against generating the same
+answers on the same CPU box, 5.7x on four questions about one document. The
+whole mode, the request and reply shapes, and where it does not help:
+[docs/systemone.md](docs/systemone.md). The dashboard has a System One page as well.
 
 
 On Windows a release archive ships `coli.cmd`: double-click it for the quick

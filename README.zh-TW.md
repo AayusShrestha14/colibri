@@ -509,8 +509,8 @@ COLI_MODEL=/nvme/glm52_i4 ./coli tune     # 測量並儲存本機最快且安全
 #### System One 模式：問一個封閉式問題
 
 人們向模型提出的大多數請求是一次選擇，而不是一段文字：哪個佇列、哪個結論、某個欄位應取四個值中的哪一個。
-System One 模式把允許的選項交給引擎，讀出每個選項的機率，而不是生成文字：`completion_tokens` 為 0，
-答案不可能落在你的清單之外，並且每個答案都附帶一個熵，"模型沒有把握"因此成為一個可以設門檻的數字。
+System One 模式把允許的選項交給引擎，讀出每個選項的機率，而不是生成文字：不生成任何內容，
+答案不可能落在你的清單之外，並且每個答案都附帶一個信心值（confidence），"模型沒有把握"因此成為一個可以設門檻的數字。
 它在全部十個模型家族上可用，執行在同一個伺服器上，且按請求可選：不請求它的聊天，輸出逐位元組保持不變。
 
 ```bash
@@ -520,18 +520,16 @@ System One 模式把允許的選項交給引擎，讀出每個選項的機率，
 > 340 lines, 8 files, no tests. CI is green but nothing covers that path.
 
 # 從任何程式：向執行中的伺服器傳送一個 JSON 請求
-curl -s http://127.0.0.1:8000/v1/brio -H 'Content-Type: application/json' -d '{
-  "model": "qwen36",
+curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -d '{
   "state": "340 lines, 8 files, no tests. CI is green but nothing covers that path.",
-  "question": "What should the reviewer do?",
-  "options": ["merge", "request changes", "close"]}'
+  "questions": {"review": {"type": "choice", "instructions": "What should the reviewer do?",
+                           "criteria": {"merge": null, "request changes": null, "close": null}}}}'
 ```
 
-`questions` 可以對只讀一次的文件提出多個問題；`schema` 逐欄位填充一個 JSON 物件，結構上必然合法。
-在 Qwen3.6 上與在同一台 CPU 機器上生成同樣答案相比的實測：四欄位 schema 快 2.4 倍，
+`POST /v1/systemone` 使用與 TypeSafe 的 Jev API 相同的請求與回覆：Jev 用戶端只需更改 base URL 即可切換到 colibri。
+對同一文件的多個問題只讀取文件一次：在 Qwen3.6 上與在同一台 CPU 機器上生成同樣答案相比的實測，
 對同一文件的四個問題快 5.7 倍。完整說明、請求與回覆格式、以及它不適用的情形見 [docs/systemone.md](docs/systemone.md)。
-儀表板中也有 System One 頁面。同樣的回答也可以透過 `POST /v1/systemone` 取得，
-它與 TypeSafe 的 Jev API 相同：Jev 用戶端只需更改 base URL 即可切換。
+儀表板中也有 System One 頁面。
 
 
 在 Windows 上，發布壓縮檔附帶 `coli.cmd`：按兩下即可快速開始，或在 cmd 或 PowerShell 中執行
