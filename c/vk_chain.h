@@ -27,8 +27,8 @@
  *     chain_ew, chain_qsa, chain_ple. Offsets and strides are in floats.
  *   - multi-head latent attention: the MLA ops and the layer op below (chain_mla,
  *     chain_hgemv, chain_dsa, its k-pooled modes included), Kimi Delta Attention
- *     (chain_kda) and manifold-constrained hyper-connections (chain_mhc): loaded beside
- *     the others but optional.
+ *     (chain_kda), manifold-constrained hyper-connections (chain_mhc) and Kimi K3's
+ *     attention residuals and SiTU-GLU (chain_ares): loaded beside the others but optional.
  *
  * Threading: the engine thread only (the main queue is the backend's, used from the
  * same thread by coli_vk_matmul; the expert tier submits on its own queue).
@@ -96,6 +96,15 @@ int  vkc_rope(VkcBuf *x, VkcBuf *cs, const VkcRope *p);
 typedef struct { int S, H, KVH, hd, pos_base, cap, q_off, q_row, q_seg, g_off, g_row, g_seg, has_gate,
                  o_off, o_row, sel_off, sel_row; float scale; int k_off, v_off; } VkcAttn;
 int  vkc_attn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf *sel, const VkcAttn *p);
+/* The same core with what MiMo adds (vkc_attn is this with every field below zero):
+ * win a sliding window of that many positions (row s sees max(0, pos - win + 1)..pos);
+ * ring the cache a ring of that many rows (position t in row t % ring); vd V's head dim
+ * (0 = hd; also the output's per-head stride), at most 256; kv_pm position-major rows
+ * (K[(row*KVH + kvh)*hd + d], V[(row*KVH + kvh)*vd + d]) instead of head-major; sink a
+ * sink logit per head at snk[sink_off + h], which joins the softmax denominator only. */
+typedef struct { VkcAttn a; int win, ring, vd, kv_pm, sink, sink_off; } VkcAttnW;
+int  vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf *sel, VkcBuf *snk,
+                const VkcAttnW *p);
 /* chain_dnconv.comp */
 typedef struct { int S, CD, CK, in_off, in_row, out_off, out_row, snap_row, order, w_off, ring_off, snap_off; } VkcDnConv;
 int  vkc_dnconv(VkcBuf *in, VkcBuf *w, VkcBuf *ring, VkcBuf *out, VkcBuf *snap, const VkcDnConv *p);
@@ -111,6 +120,7 @@ int  vkc_dnrec(int KD, VkcBuf *cv, VkcBuf *ab, VkcBuf *z, VkcBuf *st, VkcBuf *pr
 #define VKC_EW_HC_MIX   4
 #define VKC_EW_HC_INJ   5
 #define VKC_EW_HC_APPLY 6
+#define VKC_EW_SCALE    7
 typedef struct { int op, n, D, C, flags, e_row, y_off, a_off, b_off, c_off, e_off; float fc; } VkcEw;
 int  vkc_ew(VkcBuf *y, VkcBuf *a, VkcBuf *b, VkcBuf *c, VkcBuf *e, const VkcEw *p);
 /* chain_qsa.comp (mode 0: nb block keys from b0; mode 1: S rows' selections) */
@@ -257,13 +267,22 @@ int vkc_mla(const VkcMla *m, VkcMlaScratch *s, VkcBuf *x, size_t x_off, int S, i
  *   the raw decay, beta and output-gate projections; prm at prm_off: A_log[H], dt[P],
  *   norm[VD]; alpha = exp(lb * sigmoid(exp(A_log) * (f + dt))), beta = sigmoid(b), q and k
  *   l2-normalized with neps inside the root; y = RMSNorm(o, eps) * norm * sigmoid(g).
- *   The state [H][KD][VD] at st_off. */
+ *   The state [H][KD][VD] at st_off.
+ * vkc_kda_rec_flags: the same with flags (0 is vkc_kda_rec, GLM-5.3's arithmetic);
+ *   Kimi K3's (kimi_k3.c's kda_forward) sets both:
+ *   VKC_KDA_EXP_A   prm holds exp(A_log) itself, used as it is
+ *   VKC_KDA_K3      the l2 sums take neps after the squares, q is normalized, then
+ *                   scaled, and the update is k * ((v - mem) * beta) */
 int vkc_kda_ready(void);
 typedef struct { int S, C, K, P, in_off, in_row, in_part, out_off, out_row, w_off, win_off; } VkcKdaConv;
 int vkc_kda_conv(VkcBuf *in, VkcBuf *w, VkcBuf *win, VkcBuf *out, const VkcKdaConv *p);
+#define VKC_KDA_EXP_A 1
+#define VKC_KDA_K3    2
 typedef struct { int S, H, VD, P, m_off, m_row, f_off, f_row, b_off, b_row, g_off, g_row, y_off, y_row, st_off, prm_off;
                  float lb, neps, eps; } VkcKdaRec;
 int vkc_kda_rec(int KD, VkcBuf *m, VkcBuf *f, VkcBuf *b, VkcBuf *g, VkcBuf *prm, VkcBuf *st, VkcBuf *y, const VkcKdaRec *p);
+int vkc_kda_rec_flags(int KD, VkcBuf *m, VkcBuf *f, VkcBuf *b, VkcBuf *g, VkcBuf *prm, VkcBuf *st, VkcBuf *y,
+                      const VkcKdaRec *p, int flags);
 
 /* ---- manifold-constrained hyper-connections (chain_mhc.comp) ------------------------
  * hyper_connections.h for S rows of H <= 8 streams of D floats ([S][H*D] at x_off,
@@ -285,6 +304,34 @@ int vkc_mhc_ready(void);
 typedef struct { int S, H, D, iters, x_off, x_row, m_off, m_row, hp_off, hp_row, y_off, y_row, prm_off, n;
                  float eps, hc_eps, lim; } VkcMhc;
 int vkc_mhc(int mode, VkcBuf *x, VkcBuf *m, VkcBuf *hp, VkcBuf *prm, VkcBuf *y, const VkcMhc *p);
+/* Inkling's ops, their pipelines made on first use (an engine checks *_ready at setup:
+ * a build without the shader keeps every other op, and that engine's chain off).
+ * chain_sconv.comp (mode 0: the depthwise causal short convolution, residual inside, in
+ * place, its ring carried; mode 1: x *= fc over n floats; mode 2: x /= fc) */
+typedef struct { int mode, S, C, CK, x_off, x_row, w_off, ring_off, n; float fc; } VkcSconv;
+int  vkc_sconv_ready(void);
+int  vkc_sconv(VkcBuf *x, VkcBuf *w, VkcBuf *ring, const VkcSconv *p);
+/* chain_relattn.comp: attention with a relative-position bias bank, a per-row scale
+ * tau and a sliding window over a ring cache, the step's own rows read from kvs */
+typedef struct { int S, H, KVH, hd, pos_base, cap, window, ext, d_rel;
+                 int q_off, q_row, o_off, o_row, k_off, v_off, ks_off, vs_off, kv_row;
+                 int r_off, r_row, relp_off, tau_off; float scale; } VkcRelAttn;
+int  vkc_relattn_ready(void);
+int  vkc_relattn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *kvs, VkcBuf *r, VkcBuf *relp, VkcBuf *tau,
+                 const VkcRelAttn *p);
+
+/* ---- attention residuals and SiTU-GLU (chain_ares.comp) ----------------------------
+ * Kimi K3's residual stream (AttnRes) and its activation, for S rows:
+ *   vkc_ares_mix  kimi_k3.c's res_mix: row s mixes the nb block snapshots ([nb][D] at
+ *                 b_off + s*b_row) and the running prefix (x_off + s*x_row) by the
+ *                 softmax of (v . w) / sqrt(mean(v^2) + eps), w at w_off in prm, into
+ *                 y_off + s*y_row; nb <= 15, y apart from x and blk
+ *   vkc_situ      y[i] = b1*tanh(g/b1)*sigmoid(g)*b2*tanh(u/b2), i < n, in the CPU's order */
+int vkc_ares_ready(void);
+typedef struct { int S, D, nb, x_off, x_row, b_off, b_row, w_off, y_off, y_row; float eps; } VkcAres;
+int vkc_ares_mix(VkcBuf *x, VkcBuf *blk, VkcBuf *prm, VkcBuf *y, const VkcAres *p);
+typedef struct { int n, g_off, u_off, y_off; float b1, b2; } VkcSitu;
+int vkc_situ(VkcBuf *g, VkcBuf *u, VkcBuf *y, const VkcSitu *p);
 
 /* ---- DeepSeek V4.1 Flash and DeepSeek V4 attention (chain_dsv4.comp) -----------------
  * The model is MQA over one KV row per position (the same row is key and value): a

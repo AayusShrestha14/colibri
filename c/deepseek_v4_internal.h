@@ -1044,7 +1044,7 @@ struct ColiV4Session {
     /* Prompt-end capture for SUBMIT pin=1: the ids fed and the head scores
      * that predict the token after them. A later prompt that starts with
      * exactly these ids gets its first fresh token's predictor from here; that
-     * token is the one a closed-set caller asks about (docs/brio.md). The
+     * token is the one a closed-set caller asks about (docs/systemone.md). The
      * attention state itself goes to a v4_ckpt slot; this is the part the
      * snapshot does not hold. */
     int *pin_ids;

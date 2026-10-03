@@ -79,6 +79,7 @@ static int g_metal = 0;
 #include "vk_tier.h"
 static int g_vk_ready = 0;
 static int g_vk_tier_try = 0;   /* the device opened with the expert tier to be tried */
+static int g_vk_chain = 0;      /* COLI_VK_CHAIN decided on, and the chain's pipelines are up (inkling_chain.h) */
 #endif
 #if defined(__APPLE__)
 #include <mach/mach.h>
@@ -188,6 +189,9 @@ typedef struct {
     /* KV prefix reuse: what the current K/V and conv states were built from.
      * See kv_prefix.h — recorded where the tokens are fed, never derived. */
     kv_prefix kvp;
+#ifdef COLI_VULKAN
+    void *vkchain;                        /* the dense chain's device state (inkling_chain.h), NULL until it runs */
+#endif
 } Model;
 
 /* ---------- utility ---------- */
@@ -1847,13 +1851,14 @@ static void ink_vk_cpu_pairs(Model *m, int layer, const float *x, int n, const i
     }
     free(use); free(fill); free(pi);
 }
-/* moe() with the tier on, after its routing pass: idx/keff/wgt as moe() made them. */
+/* moe() with the tier on, after its routing pass: idx/keff/wgt as moe() made them;
+ * routed_only leaves the shared experts out (the dense chain runs them). */
 static void ink_vk_moe(Model *m, Layer *l, int layer, const float *x, int S, float *out,
-                       const int *idx, const int *keff, const float *wgt) {
+                       const int *idx, const int *keff, const float *wgt, int routed_only) {
     Cfg *c = &m->c;
     int D = c->hidden, K = c->topk, I = c->moe_inter, ns = c->n_shared;
     int B = S < INK_VK_ROWS ? S : INK_VK_ROWS;
-    float *ctb = falloc((int64_t)B * K * D), *shb = ns > 0 ? falloc((int64_t)B * D) : NULL;
+    float *ctb = falloc((int64_t)B * K * D), *shb = ns > 0 && !routed_only ? falloc((int64_t)B * D) : NULL;
     float *g = falloc(2*I), *u = g + I, *hh = falloc(D);
     int *ib = malloc((size_t)B * K * sizeof(int));
     uint8_t *taken = malloc((size_t)B * K), *want = malloc((size_t)B * K);
@@ -1900,12 +1905,17 @@ static void ink_vk_moe(Model *m, Layer *l, int layer, const float *x, int S, flo
 }
 #endif
 
-static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
+/* moe() with two doors for the dense chain (inkling_chain.h): lg_in, the router's
+ * logits [S][E+ns] the device computed (NULL: computed here); shw, when not NULL, asks
+ * for the routed experts only, and receives the shared experts' combine weights,
+ * shw[j*S + s] (the device runs the shared experts and adds them in moe()'s order).
+ * Under Metal the shared experts' GPU block ignores shw: the chain does not run there. */
+static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out, const float *lg_in, float *shw) {
     Cfg *c = &m->c;
     int D = c->hidden, E = c->n_experts, K = c->topk, I = c->moe_inter, ns = c->n_shared;
     int ET = E + ns;
-    float *logits = falloc((int64_t)S*ET);
-    matmul(logits, x, l->router, S, D, ET);
+    float *logits = lg_in ? (float *)lg_in : falloc((int64_t)S*ET);
+    if (!lg_in) matmul(logits, x, l->router, S, D, ET);
     memset(out, 0, (int64_t)S*D*sizeof(float));
     int   *idx  = malloc((size_t)S*K*sizeof(int));
     int   *keff = malloc((size_t)S*sizeof(int));      /* routed effettivi per token (TOPP) */
@@ -1959,10 +1969,12 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         }
         m->euse += keff[s];
     }
+    if (shw) for (int s = 0; s < S; s++) for (int j = 0; j < ns; j++) shw[(int64_t)j*S + s] = wgt[(int64_t)s*(K+ns) + K + j];
 #ifdef COLI_VULKAN
     if (vkt_ready()) {   /* the Vulkan expert tier takes the layer from here (ink_vk_moe) */
-        ink_vk_moe(m, l, layer, x, S, out, idx, keff, wgt);
-        free(logits); free(idx); free(keff); free(wgt); free(use); free(fill); free(fl);
+        ink_vk_moe(m, l, layer, x, S, out, idx, keff, wgt, shw != NULL);
+        if (!lg_in) free(logits);
+        free(idx); free(keff); free(wgt); free(use); free(fill); free(fl);
         return;
     }
 #endif
@@ -2179,12 +2191,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
      * Under Metal these run on the GPU as an fmt=5 block overlapped with the
      * routed rounds (or on the CPU during the last GPU round); either path
      * sets shared_done. */
-    if (!shared_done) {
+    if (!shared_done && !shw) {
         double ts = now_s();
         shared_experts_cpu(m, l, x, S, out, wgt, g, u, hh);
         m->t_shared += now_s() - ts;
     }
-    free(logits); free(idx); free(keff); free(wgt); free(use); free(fill); free(fl);
+    if (!lg_in) free(logits);
+    free(idx); free(keff); free(wgt); free(use); free(fill); free(fl);
     free(g); free(hh);              /* u aliases g+I */
 #ifdef COLI_METAL
     if (mxg) {
@@ -2194,6 +2207,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     }
     free(sxg); free(srw);
 #endif
+}
+static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
+    moe_ex(m, l, layer, x, S, out, NULL, NULL);
 }
 
 /* ---------- DMel audio embedding ----------
@@ -2245,6 +2261,10 @@ static void inkling_layers_forward_range(Model *m, float *x, int S, int pos0,
     }
     free(nrm); free(tmp);
 }
+
+#ifdef COLI_VULKAN
+#include "inkling_chain.h"   /* COLI_VK_CHAIN: every layer's dense chain on the device */
+#endif
 
 /* ---------- one forward pass over S new tokens ----------
  * Returns malloc'd logits of the last token (unpadded vocab). If tf_out is
@@ -2331,6 +2351,9 @@ static void ink_pin_state_restore(Model *m, const InkPinState *st){
         for (int i = 0; i < c->n_layers; i++)
             memcpy(m->cs[j][i], st->cs[j][i],
                    (size_t)ink_cs_cells(c,j,i) * sizeof(float));
+#ifdef COLI_VULKAN
+    inkc_host_wrote(m, 0);   /* the dense chain's copy goes up again before its next step */
+#endif
 }
 
 static float *step_mm(Model *m, const int *ids, int S, int pos0, int *tf_out,
@@ -2349,6 +2372,19 @@ static float *step_mm(Model *m, const int *ids, int S, int pos0, int *tf_out,
         if (m->embed_norm) rmsnorm_row(x + (int64_t)s*D, x + (int64_t)s*D, m->embed_norm, D, c->eps);
     }
     free(arow);
+#ifdef COLI_VULKAN
+    /* COLI_VK_CHAIN: the layers, the final norm and lm_head on the device; x comes
+     * back only when the per-position heads below read every row */
+    float *chain_logit = NULL;
+    if (g_vk_chain) {
+        chain_logit = falloc(c->unpad_vocab);
+        if (!inkc_forward(m, x, S, pos0, (g_echo_k > 0 && g_echo_id && S > 1) || tf_out != NULL, chain_logit)) {
+            free(chain_logit); chain_logit = NULL;
+            inkc_cpu_step(m, pos0, S);
+        }
+    }
+    if (!chain_logit)
+#endif
     inkling_layers_forward_range(m, x, S, pos0, 0, c->n_layers);
     m->kv_len = pos0 + S;
     /* record what was just fed, at the positions it went to (kv_prefix.h).
@@ -2405,6 +2441,9 @@ static float *step_mm(Model *m, const int *ids, int S, int pos0, int *tf_out,
         }
         free(normed); free(logits);
     }
+#ifdef COLI_VULKAN
+    if (chain_logit) { free(x); free(last); return chain_logit; }   /* the chain's last frame ran the head */
+#endif
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
     for (int d = 0; d < D; d++) last[d] /= c->mup;
     matmul_w(logit, last, m->lm_head, 1, D, c->unpad_vocab);
@@ -2425,6 +2464,9 @@ static void state_reset(Model *m) {
         for (int j = 0; j < 4; j++)
             memset(m->cs[j][i], 0, (int64_t)((j < 2) ? kvdim : c->hidden) * (c->conv_k-1) * sizeof(float));
     }
+#ifdef COLI_VULKAN
+    inkc_host_wrote(m, 1);   /* zeros: the dense chain fills its copy with zeros */
+#endif
 }
 
 static void kv_alloc(Model *m, int max_t) {
@@ -2497,10 +2539,15 @@ static void kv_alloc(Model *m, int max_t) {
 static void generate(Model *m, const int *prompt, int np, int n_new, int *out,
                      const uint8_t *dmel, int naud) {
     for (int i = 0; i < np; i++) out[i] = prompt[i];
+    /* DUMP=<path>: every forward's logits (unpadded vocab raw float32 each, in order),
+     * for a comparison of two runs (tests/vulkan_engines.sh compares the dense chain's) */
+    const char *dp = getenv("DUMP");
+    FILE *df = dp && *dp ? fopen(dp, "wb") : NULL;
     float *logit = step_mm(m, prompt, np, 0, NULL, dmel, naud);
     int len = np;
     Cfg *c = &m->c;
     for (int s = 0; s < n_new; s++) {
+        if (df) fwrite(logit, sizeof(float), (size_t)c->unpad_vocab, df);
         int best = 0; float bv = logit[0];
         for (int i = 1; i < c->unpad_vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
         free(logit);
@@ -2509,6 +2556,7 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out,
         int one = best;
         logit = step(m, &one, 1, len - 1, NULL);
     }
+    if (df) fclose(df);
 }
 
 /* ---------- interactive prompt mode: greedy, streaming, stop on eos ---------- */
@@ -2571,7 +2619,7 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new,
            m->t_fill, m->t_expert, m->t_shared, m->t_attn,
            wall - m->t_fill - m->t_expert - m->t_shared - m->t_attn);
 #ifdef COLI_VULKAN
-    fflush(stdout); ink_vk_report(); ink_vk_tier_report(m, "run");
+    fflush(stdout); ink_vk_report(); ink_vk_tier_report(m, "run"); inkc_report(m);
 #endif
     free(ids);
 }
@@ -2904,7 +2952,7 @@ static int serve_one(Model *m, Tok *T, SReq *q) {
            m->t_fill - f0, m->t_shared - s0, m->t_expert - e0, m->t_attn - a0, 0.0, forwards);
     fflush(stdout);
 #ifdef COLI_VULKAN
-    ink_vk_report(); ink_vk_tier_report(m, "turn");
+    ink_vk_report(); ink_vk_tier_report(m, "turn"); inkc_report(m);
 #endif
     serve_hits(m);
     free(ids);
@@ -3139,6 +3187,7 @@ int main(int argc, char **argv) {
         pins_load(&m, snap);
 #ifdef COLI_VULKAN
         ink_vk_tier_start(&m);   /* after the history: the warm start reads it */
+        inkc_start(&m);          /* COLI_VK_CHAIN, after the tier */
 #endif
         char tkp[2048]; snprintf(tkp, sizeof(tkp), "%s/tokenizer.json", snap);
         Tok T; tok_load(&T, tkp);
@@ -3155,6 +3204,7 @@ int main(int argc, char **argv) {
         pins_load(&m, snap);
 #ifdef COLI_VULKAN
         ink_vk_tier_start(&m);
+        inkc_start(&m);          /* COLI_VK_CHAIN, after the tier */
 #endif
         char tkp[2048]; snprintf(tkp, sizeof(tkp), "%s/tokenizer.json", snap);
         Tok T; tok_load(&T, tkp);
@@ -3208,6 +3258,7 @@ int main(int argc, char **argv) {
     Model m; model_init(&m, snap, cap, bits);
 #ifdef COLI_VULKAN
     ink_vk_tier_start(&m);   /* the oracle reads no history: the tier fills as experts pass by */
+    inkc_start(&m);          /* COLI_VK_CHAIN, after the tier */
 #endif
     printf("== Inkling C engine (Stage A), cache = %d experts/layer, experts @ %s ==\n",
            cap, m.xq ? "container (int4/int8 + .qs)" : bits ? "int (runtime quant)" : "f32");
@@ -3259,7 +3310,7 @@ int main(int argc, char **argv) {
     printf("PEAK RSS: %.2f GB | expert cache hit %.1f%% | %.2f tok/s\n",
            rss_gb(), tot?100.0*m.hits/tot:0.0, ngen/dt);
 #ifdef COLI_VULKAN
-    fflush(stdout); ink_vk_report(); ink_vk_tier_report(&m, "run");
+    fflush(stdout); ink_vk_report(); ink_vk_tier_report(&m, "run"); inkc_report(&m);
 #endif
     free(buf); free(arena);
     return (match == ngen) ? 0 : 1;

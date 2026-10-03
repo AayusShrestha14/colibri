@@ -179,6 +179,12 @@ jobs:
           # the routed-expert tier of inkling and olmoe under ASan and UBSan
           - family: inkling-olmoe-sanitize
             req: c/tools/oracle-requirements.txt
+          # the dense chain (COLI_VK_CHAIN=1) of inkling and olmoe, and the same under
+          # ASan and UBSan
+          - family: inkling-olmoe-chain
+            req: c/tools/oracle-requirements.txt
+          - family: inkling-olmoe-chain-sanitize
+            req: c/tools/oracle-requirements.txt
           - family: mimo-qwenimage
             req: c/tools/requirements-qwenimage-tiny.txt
           - family: deepseek
@@ -193,6 +199,11 @@ jobs:
           - family: kimi
             req: c/tools/requirements-kimi-k3-tiny.txt
           - family: kimi-mimo-sanitize
+            req: c/tools/requirements-mimo-tiny.txt
+          # MiMo-V2.6's dense chain (COLI_VK_CHAIN=1), and the same under ASan and UBSan
+          - family: mimo-chain
+            req: c/tools/requirements-mimo-tiny.txt
+          - family: mimo-chain-sanitize
             req: c/tools/requirements-mimo-tiny.txt
           # GLM-5.2 (colibri) and GLM-5.3 Flash (glm53) on the routed-expert tier, and
           # the same under ASan and UBSan
@@ -214,6 +225,12 @@ jobs:
           - family: deepseek-chain-sanitize
             req: c/tools/requirements-deepseek-v4-tiny.txt
             extra: sympy pillow
+          # the dense chain (COLI_VK_CHAIN=1) of Kimi K3: its attention residuals, KDA
+          # and gated MLA layers on the device, and the same under ASan and UBSan
+          - family: kimi-chain
+            req: c/tools/requirements-kimi-k3-tiny.txt
+          - family: kimi-chain-sanitize
+            req: c/tools/requirements-kimi-k3-tiny.txt
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -317,7 +334,7 @@ jobs:
         run: |
           cd c
           rc=0
-          ENGINES="colibri glm53 inkling kimi_k3 olmoe qwen36 qwen38 deepseek_v41 mimo qwenimage"
+          ENGINES="colibri glm53 inkling kimi_k3 olmoe qwen36 qwen38 deepseek_v41 mimo qwenimage laya"
           if [ "${{ matrix.v4 }}" = "1" ]; then ENGINES="$ENGINES deepseek-v4"; fi
           for t in $ENGINES; do
             echo "::group::$t"
@@ -1126,6 +1143,37 @@ jobs:
           QWEN38_TINY=qwen38_tiny python3 -m unittest -v tests.test_qwen38_dashboard tests.test_qwen38_brio
           python3 tools/make_edge_tiny_tokenizer.py --vocab-size 64 qwen38_tiny_fp8
           QWEN38_TINY=qwen38_tiny_fp8 python3 -m unittest -v tests.test_qwen38_brio
+
+  laya-tiny-check:
+    name: Laya tiny oracle (vs the laya package) and POST /v1/systemone end to end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install the fixture generator's one dependency
+        run: pip install numpy
+      - name: Generate the fixture, build laya, compare with the committed reference
+        run: make -C c laya-tiny-check
+
+  jev-sdk-check:
+    name: TypeSafe's SDKs (Python, TypeScript) against coli serve, base URL changed only
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install the pinned SDKs
+        run: |
+          pip install -r c/tools/requirements-jev-sdk.txt
+          cd c/tools/jev-sdk && npm ci
+      - name: Both SDKs against a language model (tiny MiMo) and a decision engine (tiny Laya)
+        run: make -C c jev-sdk-check
 
   qwenimage-tiny-check:
     name: Qwen-Image tiny oracle (text encoder, DiT, scheduler, VAE vs diffusers)

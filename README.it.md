@@ -61,13 +61,13 @@ $ ./coli chat
   <img src="docs/media/colibri-dashboard.png" width="900" alt="dashboard web di colibrì — metriche live, pannello hardware, livelli degli expert">
 </p>
 <p align="center"><em>La dashboard web (<code>./coli web</code>), ridisegnata nella 1.12.0: uno spazio di lavoro con un dock per la chat,
-la modalità Brio, la pagina Brain e il Profiling, in tema chiaro o scuro. Qui Qwen3.6 che risponde su una macchina
+la modalità System One, la pagina Brain e il Profiling, in tema chiaro o scuro. Qui Qwen3.6 che risponde su una macchina
 solo CPU, con gli expert letti dal disco.</em></p>
 
 <p align="center">
-  <img src="docs/media/colibri-brio.png" width="900" alt="la pagina Brio: un documento letto una volta, una probabilità per ogni risposta ammessa, e un'entropia">
+  <img src="docs/media/colibri-brio.png" width="900" alt="la pagina System One: un documento letto una volta, una probabilità per ogni risposta ammessa, e un'entropia">
 </p>
-<p align="center"><em><strong>Modalità Brio</strong>: lo stesso modello, a cui si dice di non scrivere. Gli dai un documento e le sole risposte
+<p align="center"><em><strong>Modalità System One</strong>: lo stesso modello, a cui si dice di non scrivere. Gli dai un documento e le sole risposte
 che può scegliere; legge la probabilità di ciascuna, non genera niente, e riporta un'entropia che dice quando non è
 sicuro. Qui: <strong>request changes al 99.9%</strong>, entropia 0.005, 4 token letti, 0 generati.</em></p>
 
@@ -550,6 +550,7 @@ altre nove famiglie di modelli linguistici, e un motore genera immagini. Ognuna 
 | **Qwen3-Coder-30B-A3B** (Alibaba) | 30B / 3B | [`Justvugg/Qwen3-Coder-30B-A3B-colibri-int4`](https://huggingface.co/Justvugg/Qwen3-Coder-30B-A3B-colibri-int4) (19 GB, int4-gs64), convertito da [`Qwen/Qwen3-Coder-30B-A3B-Instruct`](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct). MoE Qwen3 di sola attenzione sul motore Qwen3.6, 128 expert top-8, una sua forma XML per le chiamate ai tool e nessun thinking; in teacher forcing il container int4 sceglie il token top-1 della release bf16 nel 96,9% delle posizioni | `make -C c qwen36` | [qwen36.md](docs/qwen36.md#qwen3-coder-30b-a3b) |
 | **OLMoE** (AI2) | 7B / 1B | convertito con `c/tools/convert_olmoe_merged.py`: container **int8**, ~7 GB | `make -C c olmoe` | - |
 | **Qwen-Image-2.1** (Alibaba) | modello di immagini | [`Qwen/Qwen-Image-2.1`](https://huggingface.co/Qwen/Qwen-Image-2.1) (~33 GB), checkpoint diffusers ufficiale, **nessuna conversione**: il text encoder e il diffusion transformer vengono quantizzati a int8 durante il caricamento. Immagini dentro `coli chat`, `POST /v1/images/generations` su `coli serve`. Qwen Research License: solo uso non commerciale | `make -C c qwenimage` | [qwen-image.md](docs/qwen-image.md) |
+| **Laya** (Convai Innovations) | modello di decisione, 421M | [`convaiinnovations/laya`](https://huggingface.co/convaiinnovations/laya) (842 MB), checkpoint ufficiale, **nessuna conversione**: un encoder ModernBERT con una testa di decisione che risponde a domande tipizzate (choice, score, noul) con probabilità calibrate invece di generare. Servito su `POST /v1/systemone` da `coli serve`. Apache-2.0 | `make -C c laya` | [laya.md](docs/laya.md) |
 
 Qwen3.6 offre tre container pre-convertiti: **int4-gs64** (consigliato: coseno
 misurato rispetto all'ancora int8 da 0,98777 a 0,99313 e KL da 0,109 a 0,080
@@ -604,37 +605,37 @@ COLI_MODEL=/nvme/glm52_i4 ./coli tune     # misura e salva il profilo di esecuzi
 ./coli serve --model /nvme/glm52_i4       # API + dashboard, senza browser (headless)
 ```
 
-#### Modalità Brio: una domanda a risposta chiusa
+#### Modalità System One: una domanda a risposta chiusa
 
 Gran parte di ciò che si chiede a un modello è una scelta, non un paragrafo:
 quale coda, quale verdetto, quale dei quattro valori può prendere un campo. La
-modalità Brio passa al motore le opzioni e legge la probabilità di ciascuna
-invece di generare: `completion_tokens` è 0, nessuna risposta può uscire dalla
-tua lista, e ogni risposta arriva con un'entropia, così "il modello non è
-sicuro" è un numero su cui mettere una soglia. Funziona su tutte e dieci le
-famiglie, sullo stesso server, ed è opzionale per richiesta: la chat resta
-identica byte per byte per chi non la chiede.
+modalità System One passa al motore le opzioni e legge la probabilità di ciascuna
+invece di generare: non si genera nulla, nessuna risposta può uscire dalla tua
+lista, e ogni risposta arriva con una confidenza, così "il modello non è sicuro"
+è un numero su cui mettere una soglia. Funziona su tutte e dieci le famiglie,
+sullo stesso server, ed è opzionale per richiesta: la chat resta identica byte
+per byte per chi non la chiede.
 
 ```bash
 # nella TUI: lo stesso modello, a cui si dice di non scrivere
 ./coli chat --model /nvme/qwen36_i4_gs64
-> /brio merge | request changes | close
+> /decide merge | request changes | close
 > 340 lines, 8 files, no tests. CI is green but nothing covers that path.
 
 # da qualunque programma: una richiesta JSON al server in esecuzione
-curl -s http://127.0.0.1:8000/v1/brio -H 'Content-Type: application/json' -d '{
-  "model": "qwen36",
+curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -d '{
   "state": "340 lines, 8 files, no tests. CI is green but nothing covers that path.",
-  "question": "What should the reviewer do?",
-  "options": ["merge", "request changes", "close"]}'
+  "questions": {"review": {"type": "choice", "instructions": "What should the reviewer do?",
+                           "criteria": {"merge": null, "request changes": null, "close": null}}}}'
 ```
 
-`questions` fa molte domande su un documento letto una volta sola, e `schema`
-riempie un oggetto JSON un campo alla volta, valido per costruzione. Misurato
-su Qwen3.6 contro la generazione della stessa risposta sulla stessa macchina
-CPU: 2,4x su uno schema a quattro campi, 5,7x su quattro domande sullo stesso
-documento. Tutta la modalità, la forma di richiesta e risposta, e dove non
-serve: [docs/brio.md](docs/brio.md). Anche la dashboard ha una pagina Brio.
+`POST /v1/systemone` parla la richiesta e la risposta dell'API Jev di TypeSafe:
+un client Jev passa a colibri cambiando solo il base URL. Più domande sullo
+stesso documento lo leggono una volta sola: misurato su Qwen3.6 contro la
+generazione delle stesse risposte sulla stessa macchina CPU, 5,7x su quattro
+domande sullo stesso documento. Tutta la modalità, la forma di richiesta e
+risposta, e dove non serve: [docs/systemone.md](docs/systemone.md). Anche la
+dashboard ha una pagina System One.
 
 
 Su Windows un archivio di release include `coli.cmd`: fai doppio clic per l'avvio
@@ -693,7 +694,7 @@ modello:
 | Backend Vulkan (qualsiasi GPU: AMD tramite RADV, comprese le schede non più supportate da ROCm) | [docs/vulkan.md](docs/vulkan.md) |
 | Backend Metal per Apple Silicon | [docs/metal.md](docs/metal.md) |
 | API compatibile OpenAI, KV slot, dashboard web | [docs/api.md](docs/api.md) |
-| Modalità Brio: punteggiare un insieme chiuso di opzioni invece di generare | [docs/brio.md](docs/brio.md) |
+| Modalità System One: punteggiare un insieme chiuso di opzioni invece di generare | [docs/systemone.md](docs/systemone.md) |
 | ABI sperimentale di embedding per segmenti di layer | [docs/segment-runtime.md](docs/segment-runtime.md) |
 | ABI Edge sperimentale per tokenizer/embedding/head | [docs/edge-runtime.md](docs/edge-runtime.md) |
 | Draft forzati da grammatica (output strutturato) | [docs/grammar-draft.md](docs/grammar-draft.md) |
