@@ -10,6 +10,9 @@
 #   bash tests/vulkan_engines.sh mimo-chain | mimo-chain-sanitize   # MiMo-V2.6's dense chain
 #   bash tests/vulkan_engines.sh inkling-olmoe-chain | inkling-olmoe-chain-sanitize
 #   bash tests/vulkan_engines.sh glm-chain | glm-chain-sanitize     # the same for colibri and glm53
+#   bash tests/vulkan_engines.sh staged    # staged uploads: the same bits as mapped memory, the decision
+#   bash tests/vulkan_engines.sh <family>-staged   # a family with COLI_VK_STAGED=1 (qwen-staged: and
+#                                                  # an engine under an emulated small window)
 #
 # Needs libvulkan-dev, glslc and mesa-vulkan-drivers, plus the Python packages of
 # the family's tiny fixtures (see the vulkan-engines job in .github/workflows/ci.yml).
@@ -62,6 +65,62 @@ shader_formats() {
   tail -1 vk_test.log | grep -qx PASS || fail "qmatmul format cases"
   ./tests/test_vk_tier shaders/qmatmul.spv | tee vk_tier.log
   tail -1 vk_tier.log | grep -qx PASS || fail "routed-expert tier"
+}
+
+# Staged uploads (docs/vulkan.md, "Memory placement without Resizable BAR"): resident
+# data copied from a host staging buffer into device-local memory the host does not map,
+# as a discrete card without Resizable BAR needs, against the mapped path on this device:
+#   - the harness's results (every format, the tiled GEMMs, the expert batch) bit for bit
+#     the same mapped (COLI_VK_STAGED=0), staged (=1, twice: no run-to-run difference) and
+#     under an emulated 246 MB host-visible window (COLI_VK_HOST_VISIBLE_CAP_MB=246 and
+#     nothing else), which must choose staging on its own;
+#   - the routed-expert tier (test_vk_tier) and the chain's ops (test_vk_chain) staged;
+#   - each staged run ends with no resident data in host memory ("[VK] memory at exit").
+staged_check() {  # <err log> <tag>: staged, and nothing resident left in host memory
+  grep -q '^\[VK\] memory: staged uploads' "$1" || { cat "$1"; fail "$2: not staged"; }
+  grep -q 'resident data in host memory: 0.0 MiB' "$1" || { grep '\[VK\] memory' "$1"; fail "$2: resident data in host memory"; }
+}
+family_staged() {
+  make tests/test_vk_tier tests/test_vk_chain VK=1   # the shaders too
+  cc -O2 -pthread -DVK_TEST backend_vulkan.c -o vk_test -lvulkan -lm
+  local m e d d0=""
+  for m in mapped staged staged-again window; do
+    case $m in
+      mapped) e=COLI_VK_STAGED=0 ;;
+      staged|staged-again) e=COLI_VK_STAGED=1 ;;
+      window) e=COLI_VK_HOST_VISIBLE_CAP_MB=246 ;;
+    esac
+    env -u COLI_VK_STAGED -u COLI_VK_HOST_VISIBLE_CAP_MB $e COLI_VK_TEST_MATMUL_ONLY=1 ./vk_test shaders/qmatmul.spv > vk_test.log 2> vk_test.err
+    tail -1 vk_test.log | grep -qx PASS || { cat vk_test.log vk_test.err; fail "staged harness, $m"; }
+    if [ $m = mapped ]; then grep -qx 'memory: mapped' vk_test.log || { cat vk_test.err; fail "staged harness: COLI_VK_STAGED=0 staged"; }
+    else staged_check vk_test.err "staged harness, $m"; fi
+    d=$(sed -n 's/^outputs digest //p' vk_test.log)
+    [ -n "$d" ] || fail "staged harness, $m: no digest"
+    [ -n "$d0" ] || d0=$d
+    [ "$d" = "$d0" ] || fail "staged harness, $m: the results differ from the mapped run's ($d against $d0)"
+    echo "OK staged harness $m: $(grep '^memory:' vk_test.log), results digest $d"
+  done
+  COLI_VK_STAGED=1 ./tests/test_vk_tier shaders/qmatmul.spv > vk_tier.log 2> vk_tier.err
+  tail -1 vk_tier.log | grep -qx PASS || { cat vk_tier.log vk_tier.err; fail "staged routed-expert tier"; }
+  staged_check vk_tier.err "staged routed-expert tier"
+  echo "OK staged routed-expert tier: $(grep -o 'resident data in host memory: .*' vk_tier.err)"
+  COLI_VK_STAGED=1 ./tests/test_vk_chain shaders/qmatmul.spv > vk_chain.log 2> vk_chain.err
+  tail -1 vk_chain.log | grep -qx PASS || { cat vk_chain.log vk_chain.err; fail "staged chain ops"; }
+  staged_check vk_chain.err "staged chain ops"
+  echo "OK staged chain ops: $(grep -o 'resident data in host memory: .*' vk_chain.err)"
+}
+# An engine under the emulated window, COLI_VK_STAGED unset: it stages on its own, the
+# tier with the trunk on the device and the chain give the CPU's tokens (and logits),
+# and nothing resident ends in host memory.
+staged_window() {
+  make qwen36 VK=1
+  $PY tools/make_qwen36_tiny.py --out qwen36_tiny --ref-mode full --emit-ref qwen36_tiny/ref_full.json
+  $PY tools/convert_qwen36.py --model qwen36_tiny --out qwen36_tiny_c --ebits 8
+  tier_gate qwen36 "window qwen36 tier and trunk" COLI_VK_HOST_VISIBLE_CAP_MB=246 COLI_VK_DENSE=1 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
+  staged_check vk.log "window qwen36 tier and trunk"
+  chain_gate qwen36 "window qwen36 chain" 1 COLI_VK_HOST_VISIBLE_CAP_MB=246 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
+  staged_check vk.log "window qwen36 chain"
+  echo "OK window qwen36: staged on its own, $(grep -o 'resident data in host memory: .*' vk.log)"
 }
 
 # tier_count <engine> <log>: N from the last "[VK] tier <engine> run: device N of M" line;
@@ -1904,5 +1963,10 @@ case "${1:-}" in
   inkling-olmoe-chain-sanitize) family_inkling_olmoe_chain_sanitize ;;
   glm-chain)      family_glm_chain ;;
   glm-chain-sanitize) family_glm_chain_sanitize ;;
-  *) echo "usage: $0 shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize|mimo-chain|mimo-chain-sanitize|inkling-olmoe-chain|inkling-olmoe-chain-sanitize|glm-chain|glm-chain-sanitize" >&2; exit 2 ;;
+  staged)         family_staged ;;
+  *-staged)       # COLI_VK_STAGED unset for the window's run, then the whole family staged
+                  if [ "$1" = qwen-staged ]; then env -u COLI_VK_STAGED bash tests/vulkan_engines.sh staged-window; fi
+                  COLI_VK_STAGED=1 bash tests/vulkan_engines.sh "${1%-staged}" ;;
+  staged-window)  staged_window ;;
+  *) echo "usage: $0 staged|<family>-staged|shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize|mimo-chain|mimo-chain-sanitize|inkling-olmoe-chain|inkling-olmoe-chain-sanitize|glm-chain|glm-chain-sanitize" >&2; exit 2 ;;
 esac
