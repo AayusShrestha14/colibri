@@ -946,7 +946,7 @@ int qt_dnproj_matmul_batch(int layer, float *y, const float *x, int S, int I, in
 }
 
 /* ---- the DeltaNet layer on the device (see qwen36_tier.h) ---------------- */
-static struct { ColiCudaDn *d; int dev, on, dnout; } G_dn[QT_DN_MAX_LAYERS];
+static struct { ColiCudaDn *d; int dev, on; ColiCudaTensor *proj, *projz, *outp; } G_dn[QT_DN_MAX_LAYERS];
 int qt_dn_gpu_ready(int layer){ return layer >= 0 && layer < QT_DN_MAX_LAYERS && G_dn[layer].on; }
 int qt_dn_gpu_init(int layer, int vh, int vk, int kdim, int vdim, int conv_dim, int convk, int hidden,
                    const float *conv_w, const float *norm_w, float eps, int dnout_handle_plus1){
@@ -955,9 +955,28 @@ int qt_dn_gpu_init(int layer, int vh, int vk, int kdim, int vdim, int conv_dim, 
     int h = dnout_handle_plus1 - 1;
     if(h < 0 || h >= G_dense_n || !G_dense[h].on) return 0;             /* and the out_proj */
     if(G_dense[h].dev != G_dnp[layer].dev) return 0;                    /* on the same card */
-    ColiCudaDn *d = coli_cuda_dn_create(G_dnp[layer].dev, vh, vk, kdim, vdim, conv_dim, convk, hidden, conv_w, norm_w, eps);
+    ColiCudaDn *d = coli_cuda_dn_create(G_dnp[layer].dev, vh, vk, kdim, vdim, conv_dim, convk, hidden, conv_w, norm_w, eps, 0);
     if(!d) return 0;                                                    /* older backend or no memory: CPU path stands */
-    G_dn[layer].d = d; G_dn[layer].dev = G_dnp[layer].dev; G_dn[layer].dnout = h; G_dn[layer].on = 1;
+    G_dn[layer].d = d; G_dn[layer].dev = G_dnp[layer].dev; G_dn[layer].on = 1;
+    G_dn[layer].proj = G_dnp[layer].t; G_dn[layer].projz = NULL; G_dn[layer].outp = G_dense[h].t;
+    return 1;
+}
+/* The same layer from three dense handles (qwen38: dnqkv, dnz, dnout as the
+ * engine's own trunk items), all on one device; gate_sigmoid selects the
+ * gated norm's gate (sigmoid(z) for Qwen3.8, silu(z) for Qwen3.6). */
+int qt_dn_gpu_init_dense(int layer, int vh, int vk, int kdim, int vdim, int conv_dim, int convk, int hidden,
+                         const float *conv_w, const float *norm_w, float eps, int gate_sigmoid,
+                         int proj_handle_plus1, int projz_handle_plus1, int dnout_handle_plus1){
+    if(layer < 0 || layer >= QT_DN_MAX_LAYERS) return 0;
+    int hp = proj_handle_plus1 - 1, hz = projz_handle_plus1 - 1, ho = dnout_handle_plus1 - 1;
+    if(hp < 0 || hp >= G_dense_n || !G_dense[hp].on) return 0;
+    if(hz < 0 || hz >= G_dense_n || !G_dense[hz].on) return 0;
+    if(ho < 0 || ho >= G_dense_n || !G_dense[ho].on) return 0;
+    if(G_dense[hp].dev != G_dense[hz].dev || G_dense[hp].dev != G_dense[ho].dev) return 0;   /* one card */
+    ColiCudaDn *d = coli_cuda_dn_create(G_dense[hp].dev, vh, vk, kdim, vdim, conv_dim, convk, hidden, conv_w, norm_w, eps, gate_sigmoid);
+    if(!d) return 0;
+    G_dn[layer].d = d; G_dn[layer].dev = G_dense[hp].dev; G_dn[layer].on = 1;
+    G_dn[layer].proj = G_dense[hp].t; G_dn[layer].projz = G_dense[hz].t; G_dn[layer].outp = G_dense[ho].t;
     return 1;
 }
 int qt_dn_gpu_set_state(int layer, const float *ring, const float *rec){
@@ -969,7 +988,7 @@ int qt_dn_gpu_get_state(int layer, float *ring, float *rec){
 }
 int qt_dn_gpu_step(int layer, const float *x, float *out, const float *egh, const float *beta){
     if(!qt_dn_gpu_ready(layer)) return 0;
-    if(coli_cuda_dn_step(G_dn[layer].d, G_dnp[layer].t, G_dense[G_dn[layer].dnout].t, x, out, egh, beta)) return 1;
+    if(coli_cuda_dn_step(G_dn[layer].d, G_dn[layer].proj, G_dn[layer].projz, G_dn[layer].outp, x, out, egh, beta)) return 1;
     fprintf(stderr,"[dn] layer %d GPU step failed; CPU from here on\n", layer);
     G_dn[layer].on = 0;
     return 0;
