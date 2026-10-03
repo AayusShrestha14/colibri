@@ -8,6 +8,7 @@
 #   bash tests/vulkan_engines.sh shader    # the qmatmul formats, the expert batch and the tier, no engine
 #   bash tests/vulkan_engines.sh qwen-chain | qwen-chain-sanitize   # the dense chain (COLI_VK_CHAIN=1)
 #   bash tests/vulkan_engines.sh glm-chain | glm-chain-sanitize     # the same for colibri and glm53
+#   bash tests/vulkan_engines.sh deepseek-chain | deepseek-chain-sanitize   # deepseek_v41 and deepseek_v4
 #
 # Needs libvulkan-dev, glslc and mesa-vulkan-drivers, plus the Python packages of
 # the family's tiny fixtures (see the vulkan-engines job in .github/workflows/ci.yml).
@@ -1529,6 +1530,127 @@ family_glm_chain_sanitize() {
   make clean >/dev/null 2>&1 || true
 }
 
+# DeepSeek V4.1 Flash (deepseek_v41) and DeepSeek V4 (deepseek_v4) on the dense chain
+# (COLI_VK_CHAIN=1). v41_gate runs the CPU and then the chain with the same settings:
+# the same exit code (the engine fails on a token off its reference), the same printed
+# token stream, every logits row (DUMP) within 1e-4 of the largest, the chain ran (or,
+# with FAULT_BACK=k, the device was lost k frames before the end of a fault-free run and
+# the CPU took over).
+v41_gate() {  # <tag> <env...> -- <argv...>
+  local tag=$1; shift
+  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  local rc_cpu=0 rc_vk=0
+  rm -f chain.usage cpu.f32 vk.f32
+  env "${envs[@]}" DUMP=cpu.f32 ./deepseek_v41 "$@" > cpu.txt 2> cpu.log || rc_cpu=$?
+  if [ -n "${FAULT_BACK:-}" ]; then
+    env "${envs[@]}" COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 \
+      ./deepseek_v41 "$@" > /dev/null 2> vk.log || true
+    local frames; frames=$(sed -n 's/^\[VK\] deepseek_v41 chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p' vk.log | tail -1)
+    [ -n "$frames" ] && [ "$frames" -gt "$FAULT_BACK" ] || { cat vk.log; fail "$tag: no fault-free run to count frames from"; }
+    envs+=("COLI_VK_CHAIN_FAULT=$((frames - FAULT_BACK + 1))")
+    rm -f chain.usage
+  fi
+  env "${envs[@]}" DUMP=vk.f32 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 \
+    COLI_VK_CHAIN=${CHAINMODE:-1} ./deepseek_v41 "$@" > vk.txt 2> vk.log || rc_vk=$?
+  [ "$rc_cpu" = "$rc_vk" ] || { tail -20 vk.log; fail "$tag: exit $rc_vk, the CPU's $rc_cpu"; }
+  { [ -s cpu.txt ] && cmp -s cpu.txt vk.txt; } || { cat cpu.txt vk.txt; tail -20 vk.log; fail "$tag: the chain's tokens differ from the CPU"; }
+  if [ -n "${FAULT_BACK:-}" ]; then
+    grep -q "deepseek_v41 chain: the device was lost" vk.log || { cat vk.log; fail "$tag: no loss was handled"; }
+  else
+    [ "$(chain_count deepseek_v41 vk.log)" -gt 0 ] || { cat vk.log; fail "$tag: the chain never ran"; }
+  fi
+  local lg; lg=$(logits_close cpu.f32 vk.f32) || { echo "$lg"; fail "$tag: logits"; }
+  echo "OK $tag: tokens = CPU (exit $rc_cpu), $lg, $(chain_count deepseek_v41 vk.log) chain forwards$(grep -q 'the device was lost' vk.log && echo ', the device lost and the CPU on')"
+}
+v41_chain_fixtures() {
+  $PY tools/make_dsv41_tiny.py --out dsv41_tiny --emit-ref dsv41_tiny/ref.json > /dev/null
+  $PY tools/make_dsv41_tiny.py --out dsv41_long --emit-ref dsv41_long/ref.json --prompt-len 40 --max-new 6 > /dev/null
+}
+
+# deepseek_v41 in every configuration the chain takes: the expert cache from one slot
+# to all (cap 1, 2, 8), the 8-token and the 40-token prompt (the window ring of 8 and
+# the ratio-2 groups roll over many times; the candidate blocks and the published index
+# keys of the ratio-1 group), DSpark drafts accepted (1, 3) and rejected (2, 4, 5:
+# undo rows on the device's copies), prompts in chunks of 3 and 7 (the device's ring
+# wraps), prompts only (decode on the CPU between them), the tier off, the per-matrix
+# trunk beside, the tiled GEMM from two rows, the per-row GEMV, V41_INDEX_OWNER, a
+# device lost mid-decode, in a prompt and between drafts; serve sessions frame for
+# frame (pins, the prompt cache, the prefill read-out, DSpark, prompts only), images
+# on the wire, and the engine's own serve tests with the chain on.
+family_deepseek_chain() {
+  make deepseek_v41 tests/test_vk_chain VK=1
+  ./tests/test_vk_chain shaders/qmatmul.spv | tee vk_chain.log
+  tail -1 vk_chain.log | grep -qx PASS || fail "the chain's ops"
+  v41_chain_fixtures
+  export OMP_NUM_THREADS=2
+  local cap f
+  for cap in 1 2 8; do v41_gate "chain deepseek_v41 cap=$cap" SNAP=dsv41_tiny -- $cap dsv41_tiny/ref.json; done
+  for cap in 2 8; do v41_gate "chain deepseek_v41 40-token prompt cap=$cap" SNAP=dsv41_long -- $cap dsv41_long/ref.json; done
+  for f in 1 2 3 4 5; do v41_gate "chain deepseek_v41 DSpark spec=$f" SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=$f -- 8 dsv41_tiny/ref.json; done
+  v41_gate "chain deepseek_v41 DSpark spec=5, one cache slot" SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=5 -- 1 dsv41_tiny/ref.json
+  v41_gate "chain deepseek_v41 prompt in chunks of 3" SNAP=dsv41_long COLI_VK_CHAIN_ROWS=3 -- 8 dsv41_long/ref.json
+  v41_gate "chain deepseek_v41 prompt in chunks of 7" SNAP=dsv41_long COLI_VK_CHAIN_ROWS=7 -- 2 dsv41_long/ref.json
+  CHAINMODE=2 v41_gate "chain deepseek_v41 prompts only" SNAP=dsv41_long -- 8 dsv41_long/ref.json
+  CHAINMODE=2 v41_gate "chain deepseek_v41 prompts only, DSpark spec=2" SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=2 -- 8 dsv41_tiny/ref.json
+  v41_gate "chain deepseek_v41 tier off" SNAP=dsv41_long COLI_VK_TIER=0 -- 8 dsv41_long/ref.json
+  v41_gate "chain deepseek_v41 beside the per-matrix trunk" SNAP=dsv41_long COLI_VK_DENSE=1 -- 8 dsv41_long/ref.json
+  v41_gate "chain deepseek_v41 tiled GEMM from 2 rows" SNAP=dsv41_long COLI_VK_GEMM_MIN_S=2 -- 8 dsv41_long/ref.json
+  v41_gate "chain deepseek_v41 the per-row GEMV" SNAP=dsv41_tiny COLI_VK_CHAIN_GEMV=0 -- 8 dsv41_tiny/ref.json
+  v41_gate "chain deepseek_v41 V41_INDEX_OWNER=1" SNAP=dsv41_long V41_INDEX_OWNER=1 -- 8 dsv41_long/ref.json
+  FAULT_BACK=5 v41_gate "chain deepseek_v41 device lost mid-decode" SNAP=dsv41_long -- 8 dsv41_long/ref.json
+  FAULT_BACK=100 v41_gate "chain deepseek_v41 device lost in the prompt" SNAP=dsv41_long COLI_VK_CHAIN_ROWS=7 -- 8 dsv41_long/ref.json
+  FAULT_BACK=8 v41_gate "chain deepseek_v41 device lost between drafts" SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=5 -- 8 dsv41_tiny/ref.json
+  $PY tests/vulkan_chain_serve.py ./deepseek_v41 dsv41_tiny V41_DSPARK=0
+  $PY tests/vulkan_chain_serve.py ./deepseek_v41 dsv41_tiny V41_DSPARK=1
+  COLI_VK_CHAIN=2 $PY tests/vulkan_chain_serve.py ./deepseek_v41 dsv41_tiny V41_DSPARK=1 COLI_VK_CHAIN_ROWS=3
+  $PY tests/vulkan_chain_v41_image.py ./deepseek_v41 dsv41_tiny V41_DSPARK=0
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_USAGE=$PWD/chain.usage \
+    $PY -m unittest tests.test_dsv41_prefix_serve tests.test_dsv41_dspark_serve
+  rm -f chain.usage chain-serve.usage chain-image.usage
+  unset OMP_NUM_THREADS
+}
+
+# The same chain under ASan and UBSan: memory safety is the gate; each run must have run
+# the chain (or handled the loss), with the ASAN_OPTIONS of every sanitized family.
+family_deepseek_chain_sanitize() {
+  local SAN="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  make clean >/dev/null 2>&1 || true
+  make deepseek_v41 tests/test_vk_chain VK=1 EXTRA_CFLAGS="$SAN"
+  export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
+  ./tests/test_vk_chain shaders/qmatmul.spv > san.log 2>&1 || true
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log || ! tail -1 san.log | grep -qx PASS; then cat san.log; fail "asan: the chain's ops"; fi
+  echo "OK asan: the chain's ops"
+  v41_chain_fixtures
+  export OMP_NUM_THREADS=2
+  dsan() {  # <tag> <env and argv...>   (FAULT_BACK=k: the loss k frames before the end of a fault-free run)
+    local tag=$1; shift
+    local fault=()
+    if [ -n "${FAULT_BACK:-}" ]; then
+      rm -f chain.usage
+      env COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 "$@" > san.log 2>&1 || true
+      local frames; frames=$(sed -n 's/^\[VK\] deepseek_v41 chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p' san.log | tail -1)
+      [ -n "$frames" ] && [ "$frames" -gt "$FAULT_BACK" ] || { cat san.log; fail "$tag: no fault-free run to count frames from"; }
+      fault=("COLI_VK_CHAIN_FAULT=$((frames - FAULT_BACK + 1))")
+    fi
+    rm -f chain.usage
+    env COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 "${fault[@]}" "$@" > san.log 2>&1 || true
+    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    grep -q "deepseek_v41 chain: \([1-9][0-9]* forwards\|the device was lost\)" san.log || { cat san.log; fail "$tag: the chain never ran"; }
+    echo "OK $tag: sanitizers clean, $(chain_count deepseek_v41 san.log) chain forwards"
+  }
+  dsan "asan chain deepseek_v41 40-token prompt" SNAP=dsv41_long ./deepseek_v41 8 dsv41_long/ref.json
+  dsan "asan chain deepseek_v41 DSpark spec=5, one cache slot" SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=5 ./deepseek_v41 1 dsv41_tiny/ref.json
+  dsan "asan chain deepseek_v41 prompt in chunks of 3" SNAP=dsv41_long COLI_VK_CHAIN_ROWS=3 ./deepseek_v41 2 dsv41_long/ref.json
+  FAULT_BACK=20 dsan "asan chain deepseek_v41 device lost" SNAP=dsv41_long ./deepseek_v41 8 dsv41_long/ref.json
+  $PY tests/vulkan_chain_serve.py ./deepseek_v41 dsv41_tiny V41_DSPARK=1 > san.log 2>&1 || { cat san.log; fail "asan chain deepseek_v41 serve"; }
+  echo "OK asan chain serve deepseek_v41: $(tail -1 san.log)"
+  $PY tests/vulkan_chain_v41_image.py ./deepseek_v41 dsv41_tiny V41_DSPARK=0 > san.log 2>&1 || { cat san.log; fail "asan chain deepseek_v41 images"; }
+  echo "OK asan chain images deepseek_v41: $(tail -1 san.log)"
+  rm -f chain.usage chain-serve.usage chain-image.usage
+  unset OMP_NUM_THREADS
+  make clean >/dev/null 2>&1 || true
+}
+
 case "${1:-}" in
   shader)         shader_formats ;;
   qwen)           family_qwen ;;
@@ -1546,5 +1668,7 @@ case "${1:-}" in
   qwen-chain-sanitize) family_qwen_chain_sanitize ;;
   glm-chain)      family_glm_chain ;;
   glm-chain-sanitize) family_glm_chain_sanitize ;;
-  *) echo "usage: $0 shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize|glm-chain|glm-chain-sanitize" >&2; exit 2 ;;
+  deepseek-chain) family_deepseek_chain ;;
+  deepseek-chain-sanitize) family_deepseek_chain_sanitize ;;
+  *) echo "usage: $0 shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize|glm-chain|glm-chain-sanitize|deepseek-chain|deepseek-chain-sanitize" >&2; exit 2 ;;
 esac
