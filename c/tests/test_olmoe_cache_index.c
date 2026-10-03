@@ -184,6 +184,31 @@ static void check_demand_joins_demand(void) {
     free_loader(&m);
 }
 
+/* The forward pass is multiplying with the only slot (cap 1) when the prefetcher
+ * comes up with another expert for the layer: the prefetch must leave the slot
+ * alone until expert_put, then may take it. Before the busy count it read the
+ * other expert into the slot under the forward pass's matmul. */
+static void check_prefetch_spares_busy(void) {
+    Model m; init_cache(&m, 8, 1);
+    m.c.inter = 4; m.c.hidden = 4;
+    m.is_queued = calloc(8, 1); m.is_pinned = calloc(8, 1);
+    g_io_loads = g_io_open = 0; g_io_release = 1;   /* no read is held */
+    g_test_expert_load = held_load;
+    Slot *e = NULL;
+    expert_get(&m, 0, 2, &e);
+    m.is_queued[6] = 1;
+    pilot_realload(&m, 0, 6);
+    CHECK(io_get(&g_io_loads) == 1 && e && e->eid == 2 && slot_indexed(&m, 0, 2) == e,
+          "the prefetch took the slot the forward pass was reading (%d reads)", io_get(&g_io_loads));
+    CHECK(m.is_queued[6] == 0, "the skipped prefetch stayed queued");
+    expert_put(e);
+    m.is_queued[6] = 1;
+    pilot_realload(&m, 0, 6);
+    CHECK(io_get(&g_io_loads) == 2 && slot_indexed(&m, 0, 6) == e,
+          "after expert_put the prefetch did not take the slot");
+    free_loader(&m);
+}
+
 int main(void) {
     Model m; init_cache(&m, 6, 2); LCache *lc = &m.cache[0]; lc->n = 2;
     cache_publish(&m, 0, &lc->slots[0], 1);
@@ -209,6 +234,7 @@ int main(void) {
     check_demand_joins_prefetch();
     check_prefetch_skips_demand();
     check_demand_joins_demand();
+    check_prefetch_spares_busy();
     if (failures) { fprintf(stderr,"olmoe cache index: %d failure(s)\n", failures); return 1; }
     puts("olmoe cache index: ok");
     return 0;
