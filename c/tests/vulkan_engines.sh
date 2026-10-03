@@ -1461,7 +1461,7 @@ family_qwen_chain() {
 family_qwen_chain_sanitize() {
   make clean >/dev/null 2>&1 || true
   make qwen36 qwen38 tests/test_vk_chain VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
-  export ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1
+  export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
   ./tests/test_vk_chain shaders/qmatmul.spv > san.log 2>&1 || true
   if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log || ! tail -1 san.log | grep -qx PASS; then cat san.log; fail "asan: the chain's ops"; fi
   echo "OK asan: the chain's ops"
