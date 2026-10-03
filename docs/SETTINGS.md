@@ -72,7 +72,7 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 | `--port` | `8000` | Port. |
 | `--model-id` | `$COLI_MODEL_ID` or `glm-5.2-colibri` | Model id reported by the API. |
 | `--api-key` | `$COLI_API_KEY` | Require this bearer token. |
-| `--cors-origin` | none (repeatable) | Allowed CORS origin(s). |
+| `--cors-origin` | none (repeatable) | Allowed CORS origin(s). A plain value replaces the default list; `+ORIGIN` adds to it. |
 | `--allowed-host` | `$COLI_ALLOWED_HOSTS` or none (repeatable) | Additional Host header accepted by the DNS-rebinding guard. |
 | `--max-queue` | `$COLI_MAX_QUEUE` or `8` | Max queued requests. |
 | `--queue-timeout` | `$COLI_QUEUE_TIMEOUT` or `300` | Seconds a request may wait. |
@@ -142,7 +142,7 @@ Run directly (or via `coli serve`). OpenAI-compatible `/v1/chat/completions`.
 | `--port` | `8000` | Port. |
 | `--model-id` | `$COLI_MODEL_ID` or `glm-5.2-colibri` | Model id in API responses. |
 | `--api-key` | `$COLI_API_KEY` | Required bearer token. |
-| `--cors-origin` | none (repeatable) | Allowed CORS origin(s). |
+| `--cors-origin` | none (repeatable) | Allowed CORS origin(s). A plain value replaces the default list; `+ORIGIN` adds to it. |
 | `--allowed-host` | `$COLI_ALLOWED_HOSTS` or none (repeatable) | Additional Host header accepted by the DNS-rebinding guard. |
 | `--cap` | `0` (auto) | Expert-cache cap; `0` = engine default (`8`, or `1` on Metal + macOS + fast model volume — #379). |
 | `--max-tokens` | `1024` | Default max completion tokens. |

@@ -49,13 +49,13 @@ $ ./coli chat
 <p align="center">
   <img src="docs/media/colibri-dashboard.png" width="900" alt="colibrì 网页仪表盘——实时指标、硬件面板与专家存储层级">
 </p>
-<p align="center"><em>网页仪表盘（<code>./coli web</code>），1.12.0 重新设计：一个工作区，底部停靠栏切换聊天、Brio 模式、
+<p align="center"><em>网页仪表盘（<code>./coli web</code>），1.12.0 重新设计：一个工作区，底部停靠栏切换聊天、System One 模式、
 Brain 页面和性能分析，支持浅色与深色主题。图中是 Qwen3.6 在纯 CPU 机器上作答，专家从磁盘流式读取。</em></p>
 
 <p align="center">
-  <img src="docs/media/colibri-brio.png" width="900" alt="Brio 页面：文档只读一次，每个允许的答案各有一个概率，并给出熵">
+  <img src="docs/media/colibri-brio.png" width="900" alt="System One 页面：文档只读一次，每个允许的答案各有一个概率，并给出熵">
 </p>
-<p align="center"><em><strong>Brio 模式</strong>：同一个模型，只是不再让它写。给它一段文档和唯一允许的几个答案，
+<p align="center"><em><strong>System One 模式</strong>：同一个模型，只是不再让它写。给它一段文档和唯一允许的几个答案，
 它读出每个答案的概率，不生成任何 token，并给出一个熵，说明它何时没有把握。图中：<strong>request changes，99.9%</strong>，
 熵 0.005，读取 4 个 token，生成 0 个。</em></p>
 
@@ -463,6 +463,7 @@ GLM-5.2 是参考模型，但同样的流式方法还能运行另外九个语言
 | **Qwen3-Coder-30B-A3B**（Alibaba） | 30B / 3B | [`Justvugg/Qwen3-Coder-30B-A3B-colibri-int4`](https://huggingface.co/Justvugg/Qwen3-Coder-30B-A3B-colibri-int4)（19 GB，int4-gs64），由 [`Qwen/Qwen3-Coder-30B-A3B-Instruct`](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct) 转换而来。运行在 Qwen3.6 引擎上的全注意力 Qwen3 MoE，128 个专家 top-8，有自己的 XML 工具调用格式，不带思考；在 teacher forcing 下，int4 容器在 96.9% 的位置上选出与 bf16 发布版相同的 top-1 token | `make -C c qwen36` | [qwen36.md](docs/qwen36.md#qwen3-coder-30b-a3b) |
 | **OLMoE**（AI2） | 7B / 1B | 用 `c/tools/convert_olmoe_merged.py` 转换，**int8** 容器，约 7 GB | `make -C c olmoe` | 无 |
 | **Qwen-Image-2.1**（Alibaba） | 图像模型 | [`Qwen/Qwen-Image-2.1`](https://huggingface.co/Qwen/Qwen-Image-2.1)（约 33 GB），官方 diffusers checkpoint，**无需转换**：文本编码器与扩散 transformer 在加载时量化为 int8。`coli chat` 中直接显示图片，`coli serve` 提供 `POST /v1/images/generations`。Qwen Research License：仅限非商业用途 | `make -C c qwenimage` | [qwen-image.md](docs/qwen-image.md) |
+| **Laya**（Convai Innovations） | 决策模型，421M | [`convaiinnovations/laya`](https://huggingface.co/convaiinnovations/laya)（842 MB），官方 checkpoint，**无需转换**：ModernBERT 编码器加决策头，对类型化问题（choice、score、noul）给出校准后的概率，而不是生成文本。由 `coli serve` 在 `POST /v1/systemone` 上提供。Apache-2.0 | `make -C c laya` | [laya.md](docs/laya.md) |
 
 Qwen3.6 提供三个预转换容器：**int4-gs64**（推荐：与 per-row 相比，对 int8 基准的余弦相似度
 实测从 0.98777 提升到 0.99313，KL 从 0.109 降到 0.080，即量化误差减少约 44%）、作为 A/B 基线的
@@ -504,31 +505,30 @@ COLI_MODEL=/nvme/glm52_i4 ./coli tune     # 测量并保存本机最快且安全
 ./coli serve --model /nvme/glm52_i4       # API + 仪表盘，不打开浏览器（headless）
 ```
 
-#### Brio 模式：问一个封闭式问题
+#### System One 模式：问一个封闭式问题
 
 人们向模型提出的大多数请求是一次选择，而不是一段文字：哪个队列、哪个结论、某个字段应取四个值中的哪一个。
-Brio 模式把允许的选项交给引擎，读出每个选项的概率，而不是生成文本：`completion_tokens` 为 0，
-答案不可能落在你的列表之外，并且每个答案都附带一个熵，"模型没有把握"因此成为一个可以设阈值的数字。
+System One 模式把允许的选项交给引擎，读出每个选项的概率，而不是生成文本：不生成任何内容，
+答案不可能落在你的列表之外，并且每个答案都附带一个置信度（confidence），"模型没有把握"因此成为一个可以设阈值的数字。
 它在全部十个模型家族上可用，运行在同一个服务器上，且按请求可选：不请求它的聊天，输出逐字节保持不变。
 
 ```bash
 # 在 TUI 中：同一个模型，只是不再让它写
 ./coli chat --model /nvme/qwen36_i4_gs64
-> /brio merge | request changes | close
+> /decide merge | request changes | close
 > 340 lines, 8 files, no tests. CI is green but nothing covers that path.
 
 # 从任何程序：向运行中的服务器发送一个 JSON 请求
-curl -s http://127.0.0.1:8000/v1/brio -H 'Content-Type: application/json' -d '{
-  "model": "qwen36",
+curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -d '{
   "state": "340 lines, 8 files, no tests. CI is green but nothing covers that path.",
-  "question": "What should the reviewer do?",
-  "options": ["merge", "request changes", "close"]}'
+  "questions": {"review": {"type": "choice", "instructions": "What should the reviewer do?",
+                           "criteria": {"merge": null, "request changes": null, "close": null}}}}'
 ```
 
-`questions` 可以对只读一次的文档提出多个问题；`schema` 逐字段填充一个 JSON 对象，结构上必然合法。
-在 Qwen3.6 上与在同一台 CPU 机器上生成同样答案相比的实测：四字段 schema 快 2.4 倍，
-对同一文档的四个问题快 5.7 倍。完整说明、请求与回复格式、以及它不适用的情形见 [docs/brio.md](docs/brio.md)。
-仪表盘中也有 Brio 页面。
+`POST /v1/systemone` 使用与 TypeSafe 的 Jev API 相同的请求和回复：Jev 客户端只需更改 base URL 即可切换到 colibri。
+对同一文档的多个问题只读取文档一次：在 Qwen3.6 上与在同一台 CPU 机器上生成同样答案相比的实测，
+对同一文档的四个问题快 5.7 倍。完整说明、请求与回复格式、以及它不适用的情形见 [docs/systemone.md](docs/systemone.md)。
+仪表盘中也有 System One 页面。
 
 
 在 Windows 上，发布包附带 `coli.cmd`：双击即可快速开始，或在 cmd 或 PowerShell 中运行
@@ -578,7 +578,7 @@ COLI_MODEL=/nvme/kimi_k3       ./coli chat
 | Vulkan 后端（任意 GPU：通过 RADV 支持 AMD，包括 ROCm 已放弃的显卡） | [docs/vulkan.md](docs/vulkan.md) |
 | Apple Silicon Metal 后端 | [docs/metal.md](docs/metal.md) |
 | OpenAI 兼容 API、KV slots、网页仪表盘 | [docs/api.md](docs/api.md) |
-| Brio 模式：对封闭的选项集打分而不是生成 | [docs/brio.md](docs/brio.md) |
+| System One 模式：对封闭的选项集打分而不是生成 | [docs/systemone.md](docs/systemone.md) |
 | 实验性的层分段嵌入 ABI | [docs/segment-runtime.md](docs/segment-runtime.md) |
 | 实验性的 tokenizer／嵌入／head Edge ABI | [docs/edge-runtime.md](docs/edge-runtime.md) |
 | 语法强制草稿（结构化输出） | [docs/grammar-draft.md](docs/grammar-draft.md) |

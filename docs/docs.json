@@ -19,11 +19,11 @@
           },
           {
             "group": "Serve models",
-            "pages": ["api-reference/overview", "api", "brio", "serve_protocol"]
+            "pages": ["api-reference/overview", "api", "systemone", "serve_protocol"]
           },
           {
             "group": "Model engines",
-            "pages": ["deepseek-v4", "kimi_k3", "qwen38", "qwen36", "inkling", "mimo", "qwen-image"]
+            "pages": ["deepseek-v4", "kimi_k3", "qwen38", "qwen36", "inkling", "mimo", "qwen-image", "laya"]
           },
           {
             "group": "Configure and tune",

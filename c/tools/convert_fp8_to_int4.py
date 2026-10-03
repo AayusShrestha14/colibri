@@ -74,6 +74,8 @@ OTHER_FAMILY_PATHS = {
                        "see docs/mimo.md",
     "qwenimage21pipeline": "Qwen-Image-2.1 is NOT converted: the image engine reads the "
                            "diffusers checkpoint as downloaded; see docs/qwen-image.md",
+    "laya_modernbert": "Laya is NOT converted: the decision engine reads the release "
+                       "as downloaded; see docs/laya.md",
 }
 
 

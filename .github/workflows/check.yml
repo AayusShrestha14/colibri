@@ -108,7 +108,7 @@ jobs:
             python c/tests/mimo_tiny_harness.py --binary c/mimo --fixture c/mimo_tiny
           cd c && ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
             python -m unittest tests.test_mimo_prefix_serve tests.test_brio_serve.MimoBrioServe \
-            tests.test_brio_api.MimoBrioEndToEnd
+            tests.test_systemone_api.MimoSystemOneEndToEnd
 
   v4-tiny:
     name: Linux (generated tiny V4 target oracle)
@@ -158,6 +158,7 @@ jobs:
           cd c && COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_dashboard
           COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_context_exceeded
           COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_hostile_weights
+          COLI_GLM53_FIXTURE=/tmp/glm53_mm python -m unittest -v tests.test_glm53_hostile_weights.Glm53MatrixShapeTest
       # The two stdlib-only oracles used to be argparse scripts that `make
       # test-python` collected as zero tests (#1700). They run here, on the
       # fixtures generated above, token-exact against transformers in f32.
