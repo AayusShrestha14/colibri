@@ -87,7 +87,10 @@ python3 c/coli setup --yes --model qwen36-35b --no-start
 What it does, in order: detects the hardware, picks the engine build (CUDA
 for an NVIDIA card when the CUDA toolkit is installed and the engine has a
 CUDA path, else Vulkan when a Vulkan GPU answered and the Vulkan headers and
-`glslc` are installed, else the CPU), builds or fetches the engine, downloads
+`glslc` are installed, else the CPU; on an integrated GPU, which shares the
+CPU's RAM, Vulkan only for the engines measured faster there, today Qwen3.6,
+Qwen3-Coder and Qwen3.8, unless `--backend vulkan` asks for it), builds or
+fetches the engine, downloads
 the model with resume, runs the planner on the files, and writes the run
 configuration. It prints each step.
 

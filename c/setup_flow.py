@@ -281,6 +281,16 @@ def package_hint(kinds, os_info=None, platform_name=None):
 
 # ---------------------------------------------------------------- backend
 
+#: The engines whose Vulkan path was measured faster than their CPU run on an
+#: integrated GPU (a Radeon 780M, docs/vulkan.md "Measured on a Radeon 780M" and
+#: "The chain on a Radeon 780M"): Qwen3.6 writes at 6.0 tok/s on the CPU and 9.9
+#: with the GPU, Qwen3.8 Flash Next at 3.5 and 3.8. An integrated GPU has no memory
+#: of its own: it reads the same RAM as the CPU, through the same bandwidth, and on
+#: OLMoE that made it slower to write than the CPU alone (23 against 17 tok/s). So
+#: on an integrated GPU the other engines stay on the CPU unless asked
+#: (--backend vulkan). A discrete GPU, with its own VRAM, runs Vulkan for every one.
+VULKAN_IGPU_MEASURED = frozenset({"qwen36", "qwen38"})
+
 
 def choose_backend(hw, family, tc, requested="auto"):
     """Which build to run the model with, and why.
@@ -288,8 +298,10 @@ def choose_backend(hw, family, tc, requested="auto"):
     CUDA first for an NVIDIA card when this engine has a CUDA path and the
     toolkit is here (its VRAM expert tier is the measured fast path); else
     Vulkan when a Vulkan GPU answered and the build has its headers and glslc;
-    else the CPU. Every GPU path the machine has but cannot build yet comes
-    back in `missing` with the command that would enable it."""
+    else the CPU. On an integrated GPU, Vulkan only for the engines measured
+    faster there (VULKAN_IGPU_MEASURED) unless Vulkan was asked for by name.
+    Every GPU path the machine has but cannot build yet comes back in `missing`
+    with the command that would enable it."""
     gpu = hw.get("gpu") or {}
     vk, nvidia = gpu.get("vulkan"), gpu.get("nvidia") or []
     decision = {"backend": "cpu", "reason": "", "missing": [], "gpu": None}
@@ -308,6 +320,12 @@ def choose_backend(hw, family, tc, requested="auto"):
         elif requested == "cuda" and not cuda_engine:
             decision["missing"].append(("cuda", f"{family.display_name} has no CUDA path here; "
                                                 "Vulkan or the CPU run it"))
+    if (vk and vk.get("type") == "integrated" and requested in ("auto", "cuda")
+            and family.id not in VULKAN_IGPU_MEASURED):
+        decision["reason"] = (f"{vk['name']} is an integrated GPU, which shares the CPU's RAM, "
+                              f"and {family.display_name} was not measured faster on one: "
+                              "the engine runs on the CPU (--backend vulkan uses the GPU anyway)")
+        return decision
     if vk and requested in ("auto", "vulkan", "cuda"):
         if tc.get("can_build_vulkan"):
             kind = vk.get("type")
