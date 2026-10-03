@@ -514,6 +514,7 @@ int main(int argc, char **argv) {
     printf("DeepSeek V4:\n"); v4_act();
     ColiVkPoolStats ps; coli_vk_pool_stats(1, &ps);
     CHECK(ps.live == 0, "%d tier ranges still live after every shutdown", ps.live);
+    coli_vk_shutdown();   /* with staged uploads: where the experts were ("[VK] memory at exit") */
     printf(fails ? "FAIL (%d)\n" : "PASS\n", fails);
     return fails != 0;
 }
