@@ -675,7 +675,7 @@ Next) run it: by default on a discrete GPU, and for qwen36 on an integrated one 
 the expert tier (see [the default](#the-chain-on-a-radeon-780m)); `COLI_VK_CHAIN=1`
 anywhere. colibri (GLM-5.2) and glm53 (GLM-5.3 Flash) run it too, with the MLA,
 KDA and hyper-connection ops ([below](#glm-52-and-glm-53-flash-on-the-chain)), and
-deepseek_v41 with DeepSeek's own ([below](#deepseek-v41-flash-and-deepseek-v4-on-the-chain)).
+deepseek_v41 and deepseek_v4 with DeepSeek's own ([below](#deepseek-v41-flash-and-deepseek-v4-on-the-chain)).
 
 **What runs where, per layer** (S rows: one at decode, a prompt chunk at prefill):
 
@@ -742,7 +742,7 @@ f32 throughout, as the CPU's f32 path.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `COLI_VK_CHAIN` | on for a discrete GPU; on an integrated GPU with the expert tier, what the engine measured (qwen36 on, qwen38 off; colibri, glm53 and deepseek_v41 off: not measured); off on a CPU device | `1`: every layer's dense chain on the device; `2`: prompts only (forwards of more than two rows; decode and MTP verifies on the per-matrix path, the state moving between the two); `0`: the per-matrix path. The `[VK] <engine>: dense chain ...` line says which and why. |
+| `COLI_VK_CHAIN` | on for a discrete GPU; on an integrated GPU with the expert tier, what the engine measured (qwen36 on, qwen38 off; colibri, glm53, deepseek_v41 and deepseek_v4 off: not measured); off on a CPU device | `1`: every layer's dense chain on the device; `2`: prompts only (forwards of more than two rows; decode and MTP verifies on the per-matrix path, the state moving between the two); `0`: the per-matrix path. The `[VK] <engine>: dense chain ...` line says which and why. |
 | `COLI_VK_CHAIN_ROWS` | `512` | Prompt rows per chunk: a longer prompt runs every layer chunk by chunk (the device's scratch is sized for one chunk). |
 | `COLI_VK_CHAIN_GEMV` | on | `0`: the decode matrices take `qmatmul.comp`'s GEMV instead of `chain_gemv.comp`'s. |
 | `COLI_VK_CHAIN_SPIN_US` | `2000` | How long a wait on a chain frame polls the fence before blocking. |
@@ -945,6 +945,91 @@ fixtures, on Lavapipe, the 780M and the Iris Xe:
 [VK] deepseek_v41: dense chain off (an integrated GPU with the expert tier: not measured; COLI_VK_CHAIN=0 off, 1 on, 2 prompts only)
 ```
 
+### DeepSeek V4 on the chain
+
+`deepseek_v4_chain.h` runs DeepSeek V4's layers on the dense chain (`make deepseek-v4
+VK=1`, `COLI_VK_CHAIN=1`), every forward the engine makes: prompts, decode steps, the
+verify of a draft, the teacher-forced pass of `--record-oracle`, serve turns. What runs
+where, per layer:
+
+| | deepseek_v4 |
+|---|---|
+| device, frame A1 | the previous layer's FFN branch (the routed sum from the host plus the shared expert, to bf16) written back into the hc_mult streams; the attention site (hc_attn_fn, the split with Sinkhorn, the collapse with the site's own pre, bf16, the norm, bf16); the attention: the input to E4M3, wq_a, q_norm; on a compressed layer the compressor (wkv and wgate in bf16 on the f32 input, the ring with its position bias, the pooled rows' norm, RoPE at the group's first position with YaRN's table, the no-position part to E4M3 per 64); on a ratio-4 layer the indexer (its own compressor into the keys with the Hadamard transform and E2M1 per 32; the queries from the q latent, RoPE, Hadamard, E2M1; weights_proj; the scores and the top-k in score order); wq_b and the per-head RMS without weight, wkv and kv_norm, RoPE, the key's no-position part to E4M3 per 64, the new rows into the window ring; the sparse attention with the sink over the window and the compressed rows (V4's bf16 weights and output), the inverse RoPE, wo_a per group, wo_b; mHC's exit; the FFN site; every bf16 and E4M3 rounding where the CPU makes it |
+| host | the router (bf16, or the hash router on the token ids) and the routed experts: the expert tier's batch and the CPU's share, summed in the CPU block's order (ascending expert, then rank) |
+| device, frame A2 (not waited for) | the shared expert: the input to E4M3, w1 and w3, V4's SwiGLU between bf16 roundings, the input to E4M3, w2, bf16 |
+| after the last layer | the streams back to the host, which runs the final collapse, the norm and the head as before (and DSpark's taps of the last three layers) |
+
+The matrices are the per-matrix path's device copies, found in the same map (fp8 as
+fmt 12, bf16 as fmt 11), and the mHC mixes in f32 (fmt 10), which only the chain
+multiplies. Every matrix takes the per-row GEMV, never the tiled GEMM: a row's bits then
+do not depend on how a forward is cut into chunks, nor on whether the row is a prompt
+row, a decode step or a verify row, which is what the CPU gives (its batched and
+per-token kernels agree bit for bit), and what makes a reused prefix give the bits of a
+cold prefill. A prompt's matrices are slower for it than they could be.
+
+Four roundings are ops of their own, `vkc_dsv4_round` (bf16 over segments; E4M3 per
+block, the scale the smallest power of two that brings the block's maximum under 448;
+E2M1 per block, the scale the smallest that brings it under 6; the Hadamard transform
+with its bf16), each the engine's C bit for bit, and `vkc_dsv4_swiglu`. The indexer's
+scores past 4096 query floats (V4's 64 heads of 128) read the queries from memory instead
+of staging them, the same sums.
+
+**The state.** The host's stays canonical. What a forward changes there (the window ring,
+the compressed rows and their count, each compressor's ring, the indexer's keys and count
+and its compressor's ring) is written back once the forward's last frame is through, as
+the CPU would have left it. The device mirrors it: the window ring (window + chunk rows)
+behind a watermark, with the position each row holds, so a row a rejected draft longer
+than a chunk overwrote goes up again; the compressed rows and the index keys of each layer
+behind watermarks of their own; each compressor's ring behind a flag. Every host write
+lowers them: a CPU forward, a restored snapshot (a rejected draft), a reset, a prefix
+checkpoint or a pin restored, another attention state, a forward that does not start
+where the last one ended.
+
+**Drafts.** n-gram drafts (`V4_DRAFT`) verify through the chain and replay the accepted
+rows through it after a rejection. The full DSpark drafter (three MTP stages) stays on the
+CPU, reading the taps of the target's last three layers that the chain copies back; the
+tiny fixture has one MTP layer, so that path ran target-only in every test here.
+
+**A lost device.** The forward that failed runs again on the CPU from its input (the chain
+leaves the host's state and the caller's rows untouched until the last frame), and the CPU
+runs from there: nothing to rebuild.
+
+**Declined** (the CPU path runs, the device's copies follow): no resident dense layers (a
+low-memory plan reloads them per forward, and the `--oracle` path's own copies), the CUDA
+tier, prompts only (`COLI_VK_CHAIN=2`) for forwards of two rows or fewer, a forward whose
+attention list (the window plus every compressed row of a layer without an indexer) would
+pass 3072 entries (from there on in that session), and geometries past the shaders (head
+dim above 1024, an indexer head that is not a power of two or above 4096, a top-k above
+4096, more than 8 streams).
+
+**Arithmetic.** The device sums in other orders than the CPU (the GEMV, the norms' and
+mHC's reductions) and its exp and sqrt are not glibc's, so an intermediate value now and
+then lands on the other side of a bf16 rounding. V4 then amplifies it: the next E4M3
+rounding of a block that holds that value can move a whole step (one part in 8 to 16),
+and the indexer's top-k can pick another compressed row. Measured on Lavapipe: given the
+same input, a layer on the chain gives the CPU's output bit for bit apart from such
+single-value flips (checked by feeding the CPU the chain's layer output); on the fixtures
+51 to 100% of the logits rows are bit-identical to the CPU's, and the worst row moves by
+up to 0.32 of its largest logit (the 2-output-group fixture's 72-token case, after one
+flipped norm value at layer 0 moved a key row by an E4M3 step); in one of 1,500
+teacher-forced positions the argmax moved, never in a generated stream. So the gates
+are: the CPU's generated tokens exactly (and the reference's), every logits row within
+0.5 of its largest |logit|, and two checks no driver can blur: the chain against itself
+(chunks of 1, 2, 3 or the default, prefill chunks of 3, the tier off, drafts rejected and
+accepted give the same bits) and each decode row equal to the teacher-forced row at its
+position. A stale row in the device's ring after a rejected draft (a bug found while
+writing this) moved the logits by 0.39 to 0.53 of the largest, inside what a
+rounding flip can do, and failed the self-consistency check at once.
+
+**The default.** `COLI_VK_CHAIN_UNMEASURED`: off on an integrated GPU (`COLI_VK_CHAIN=1`
+turns it on, `2` for prompts only), on a discrete GPU the rule above. No DeepSeek V4
+checkpoint was run (the 780M box has none; the model is far past its disk), so speed is
+not measured; the tests prove the tokens on the tiny fixtures.
+
+```
+[VK] deepseek_v4: dense chain off (an integrated GPU with the expert tier: not measured; COLI_VK_CHAIN=0 off, 1 on, 2 prompts only)
+```
+
 ### Adding an engine to the chain
 
 The recipe qwen36_chain.h and qwen38_chain.h follow, for the engines still on the
@@ -975,7 +1060,7 @@ What each remaining architecture needs on top of today's shaders:
 |---|---|---|
 | kimi_k3 (MLA layers) | MLA: q_a/kv_a, the latent norms, q_b, RoPE on the rope dims, a latent + rope cache | the [MLA ops](#multi-head-latent-attention-on-the-chain-vkc_mla) take any geometry (q_lora or none, NoPE, the scale and cos/sin table from the engine, a gate on the values for Kimi K3); colibri and glm53 run them ([above](#glm-52-and-glm-53-flash-on-the-chain)) |
 | deepseek_v41 | MQA over a window ring and compressed rows, a sink, an indexer with candidate blocks | on the chain ([above](#deepseek-v41-flash-and-deepseek-v4-on-the-chain)), with the [DeepSeek ops](#deepseek-v41-flash-and-deepseek-v4s-attention-vkc_dsv4) |
-| deepseek_v4 | MLA with compressed (CSA) and hierarchical (HCA) KV, mHC | the manifold hyper-connections are `vkc_mhc` (GLM-5.3's, the same arithmetic) and the clamped SwiGLU too; the compressors' rolling windows are rings like the conv's, snapshotted the same way; the CPU rounds activations to E4M3 before its fp8 matmuls, so the chain needs that rounding as an element-wise op to keep the same arithmetic |
+| deepseek_v4 | MQA over a window ring and compressed (CSA, HCA) rows, mHC, bf16 and E4M3 roundings | on the chain ([above](#deepseek-v4-on-the-chain)), with the DeepSeek ops and their rounding modes |
 | kimi_k3 (KDA layers) | Kimi Delta Attention: a gated delta rule whose decay is a vector over the key channels | `vkc_kda_conv` and `vkc_kda_rec` (GLM-5.3's KDA, `delta_attention.h`'s step); Kimi K3 builds its decay and output gate its own way (a full g_proj, not a low-rank one), which the recurrence's prologue and epilogue would take as options |
 | mimo | sliding-window attention (and full layers) | `chain_attn.comp` with a window (positions from `max(0, pos - W + 1)`: one more push constant), the cache optionally a ring of W rows (the host mirror then indexes `t % W`) |
 | inkling | grouped attention, MoE with a shared expert | qwen36's attention and combine as they are; its per-position heads are matmuls of the residual rows |
