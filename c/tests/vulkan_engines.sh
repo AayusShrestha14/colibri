@@ -1567,6 +1567,323 @@ v41_chain_fixtures() {
   $PY tools/make_dsv41_tiny.py --out dsv41_long --emit-ref dsv41_long/ref.json --prompt-len 40 --max-new 6 > /dev/null
 }
 
+# DeepSeek V4 (deepseek_v4) on the dense chain: the deepseek-chain family's V4 half. The
+# functions use $PY, fail and chain_count from tests/vulkan_engines.sh and run from c/.
+#
+# v4_chain_gate <tag> <fixture> <case> <env...>: the CPU run (no COLI_VULKAN) and the
+# chain run of one oracle case of the fixture (or ids:a,b,...:n, those ids and n new
+# tokens), with the same settings and --record-oracle: the generated ids equal to the
+# CPU's (and to the reference's greedy stream), every logits row (DUMP) within
+# V4_CHAIN_TOL (5e-1) of its largest |logit|, the same draft attempts and acceptances as
+# the CPU (V4_DRAFT), the chain ran, and, on the chain throughout, each decode row equal
+# bit for bit to the teacher-forced row at its position. The teacher-forced argmaxes that
+# moved are counted, not gated (the logits bound already covers them). FAULT_BACK=k: the
+# device is lost k frames before the end of a fault-free run (counted without
+# --record-oracle) and the CPU takes over; CHAINMODE=2: prompts only. Each run starts
+# from no expert history (the fixture's .coli_usage removed), the tier's uploads awaited.
+# Why 0.5: DeepSeek V4 rounds to bf16 after nearly every step and the input of every fp8
+# matrix to E4M3 per block; a value the device's sums put on the other side of a bf16
+# boundary can move a whole E4M3 block by a step and the indexer's top-k to another row.
+# Measured worst on Lavapipe and a Radeon 780M: 0.32 (deepseek_v4_tiny_g2, long). The
+# check that no driver blurs is v4_chain_same (and the decode-row check above).
+v4_chain_prompt() {  # <fixture> <case>: the case's prompt as the tiny vocabulary's text (ids:a,b,...: those ids)
+  $PY -c 'import json,sys; c=sys.argv[2]; ids=[int(t) for t in c[4:].split(":")[0].split(",")] if c.startswith("ids:") else json.load(open(sys.argv[1]+"/ref.json"))["cases"][c]["prompt_ids"]; print("".join("<t%03d>" % t for t in ids))' "$1" "$2"
+}
+v4_chain_logits() {  # <cpu.f32> <vk.f32> <vocab>: the worst row's |diff| over its largest |logit|
+  $PY - "$1" "$2" "$3" "${V4_CHAIN_TOL:-5e-1}" <<'PY'
+import array, sys
+a = array.array("f", open(sys.argv[1], "rb").read()); b = array.array("f", open(sys.argv[2], "rb").read())
+V, tol = int(sys.argv[3]), float(sys.argv[4])
+if not a or len(a) != len(b): print(f"logits: {len(a)} and {len(b)} values"); sys.exit(1)
+worst, same = 0.0, 0
+for r in range(len(a) // V):
+    ra, rb = a[r * V:(r + 1) * V], b[r * V:(r + 1) * V]
+    d = max(abs(x - y) for x, y in zip(ra, rb)); m = max(abs(x) for x in ra)
+    same += d == 0
+    worst = max(worst, d / m if m else d)
+print(f"logits: {same} of {len(a) // V} rows identical, worst row {worst:.2e} of its largest")
+sys.exit(0 if worst <= tol else 1)
+PY
+}
+# v4_chain_same <tag> <fixture> <case> <A> <B> <env...>: the chain twice, with the settings
+# A and then B (space-separated KEY=VALUE lists) on top of env: the same ids and every
+# logits row the same bits. The chain's arithmetic does not depend on how the rows are
+# cut (every matrix takes the per-row GEMV, every other op is per row or in the CPU's
+# row order) nor on which side of the tier computed an expert, so chunks of 1 or 3, the
+# tier off or a draft's rows cut differently give the default run's bits; a state the
+# device kept stale across forwards (a rejected draft longer than a chunk) shows here
+# even where its logits stay within the CPU's tolerance.
+v4_chain_same() {
+  local tag=$1 fx=$2 c=$3 A=$4 B=$5; shift 5
+  local p mt side
+  p=$(v4_chain_prompt "$fx" "$c")
+  mt=$($PY -c 'import json,sys; c=sys.argv[2]; print(c.split(":")[2] if c.startswith("ids:") else json.load(open(sys.argv[1]+"/ref.json"))["cases"][c]["max_new_tokens"])' "$fx" "$c")
+  for side in a b; do
+    rm -f "$fx/.coli_usage" "v4-$side.f32"
+    # shellcheck disable=SC2046
+    env "$@" $([ $side = a ] && echo "$A" || echo "$B") DUMP=v4-$side.f32 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 \
+      ./deepseek_v4 "./$fx" "$p" --raw-prompt --max-tokens "$mt" --record-oracle v4-$side.json > /dev/null 2> v4-$side.err ||
+      { tail -20 v4-$side.err; fail "$tag: run $side"; }
+    [ "$(chain_count deepseek_v4 v4-$side.err)" -gt 0 ] || { cat v4-$side.err; fail "$tag: the chain never ran ($side)"; }
+  done
+  rm -f "$fx/.coli_usage"
+  cmp -s v4-a.f32 v4-b.f32 && $PY -c 'import json,sys; sys.exit(json.load(open("v4-a.json"))["full_ids"] != json.load(open("v4-b.json"))["full_ids"])' ||
+    { v4_chain_logits v4-a.f32 v4-b.f32 "$($PY -c 'import json,sys; print(json.load(open(sys.argv[1]+"/config.json"))["vocab_size"])' "$fx")"; fail "$tag: $A and $B give different bits"; }
+  echo "OK $tag (${c%%:*}): $A and $B: the same ids and the same logits bit for bit ($(($(wc -c < v4-a.f32) / 4)) values), $(chain_count deepseek_v4 v4-b.err) chain forwards"
+}
+v4_chain_gate() {
+  local tag=$1 fx=$2 c=$3; shift 3
+  local p mt lg frames fault=()
+  p=$(v4_chain_prompt "$fx" "$c")
+  mt=$($PY -c 'import json,sys; c=sys.argv[2]; print(c.split(":")[2] if c.startswith("ids:") else json.load(open(sys.argv[1]+"/ref.json"))["cases"][c]["max_new_tokens"])' "$fx" "$c")
+  rm -f "$fx/.coli_usage" cpu.f32 vk.f32 v4-cpu.json v4-vk.json
+  env "$@" DUMP=cpu.f32 ./deepseek_v4 "./$fx" "$p" --raw-prompt --max-tokens "$mt" --record-oracle v4-cpu.json > /dev/null 2> v4-cpu.err ||
+    { cat v4-cpu.err; fail "$tag: CPU run"; }
+  if [ -n "${FAULT_BACK:-}" ]; then
+    rm -f "$fx/.coli_usage"
+    env "$@" COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 ./deepseek_v4 "./$fx" "$p" --raw-prompt --max-tokens "$mt" > /dev/null 2> v4-vk.err || true
+    frames=$(sed -n 's/^\[VK\] deepseek_v4 chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p' v4-vk.err | tail -1)
+    [ -n "$frames" ] && [ "$frames" -gt "$FAULT_BACK" ] || { cat v4-vk.err; fail "$tag: no fault-free run to count frames from"; }
+    fault=("COLI_VK_CHAIN_FAULT=$((frames - FAULT_BACK + 1))")
+  fi
+  rm -f "$fx/.coli_usage"
+  env "$@" "${fault[@]}" DUMP=vk.f32 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=${CHAINMODE:-1} \
+    ./deepseek_v4 "./$fx" "$p" --raw-prompt --max-tokens "$mt" --record-oracle v4-vk.json > /dev/null 2> v4-vk.err ||
+    { tail -20 v4-vk.err; fail "$tag: chain run"; }
+  rm -f "$fx/.coli_usage"
+  $PY - "$fx" "$c" <<'PY' || { tail -20 v4-vk.err; fail "$tag: the chain's session differs from the CPU's"; }
+import json, sys
+a, b = json.load(open("v4-cpu.json")), json.load(open("v4-vk.json"))
+ref = a["full_ids"] if sys.argv[2].startswith("ids:") else json.load(open(sys.argv[1] + "/ref.json"))["cases"][sys.argv[2]]["greedy_full_ids"]
+ok = a["full_ids"] == b["full_ids"] == ref and len(a["tf_pred"]) == len(b["tf_pred"])
+if not ok: print("CPU", a["full_ids"], "chain", b["full_ids"], "ref", ref)
+open("v4-tf.txt", "w").write(str(sum(x != y for x, y in zip(a["tf_pred"], b["tf_pred"]))))
+sys.exit(0 if ok else 1)
+PY
+  if [ "${EVICT:-0}" = 1 ]; then   # the budget forced evictions
+    [ "$(tier_evictions deepseek_v4 v4-vk.err)" -gt 0 ] || { grep '\[VK\] tier' v4-vk.err; fail "$tag: the budget forced no eviction"; }
+  fi
+  # drafts (V4_DRAFT): the same attempts, drafted and accepted tokens as the CPU's
+  [ "$(grep -ao 'v4_dspark attempts=[0-9]* drafted=[0-9]* accepted=[0-9]*' v4-cpu.err)" = \
+    "$(grep -ao 'v4_dspark attempts=[0-9]* drafted=[0-9]* accepted=[0-9]*' v4-vk.err)" ] || { grep -a v4_dspark v4-cpu.err v4-vk.err; fail "$tag: the drafts went otherwise"; }
+  if [ -n "${FAULT_BACK:-}" ]; then
+    grep -q "deepseek_v4 chain: the device was lost" v4-vk.err || { cat v4-vk.err; fail "$tag: no loss was handled"; }
+  else
+    [ "$(chain_count deepseek_v4 v4-vk.err)" -gt 0 ] || { cat v4-vk.err; fail "$tag: the chain never ran"; }
+  fi
+  lg=$(v4_chain_logits cpu.f32 vk.f32 "$($PY -c 'import json,sys; print(json.load(open(sys.argv[1]+"/config.json"))["vocab_size"])' "$fx")") ||
+    { echo "$lg"; fail "$tag: logits"; }
+  # an oracle case on the chain throughout: its decode rows are the teacher-forced
+  # forward's rows at the same positions, bit for bit (as on the CPU)
+  if [ "${c#ids:}" = "$c" ] && [ "${CHAINMODE:-1}" = 1 ] && [ -z "${FAULT_BACK:-}" ] && [ "${*#*V4_DRAFT}" = "$*" ]; then
+    $PY - vk.f32 "$fx" "$c" <<'PY' || fail "$tag: a decode row differs from the teacher-forced row at its position"
+import array, json, sys
+v = array.array("f", open(sys.argv[1], "rb").read())
+V = json.load(open(sys.argv[2] + "/config.json"))["vocab_size"]
+case = json.load(open(sys.argv[2] + "/ref.json"))["cases"][sys.argv[3]]
+P, mt = len(case["prompt_ids"]), case["max_new_tokens"]
+row = lambda r: v[r * V:(r + 1) * V]
+for j in range(mt):            # session rows: the prompt's last position, then each decode step
+    if row(j) != row(mt + P - 1 + j): sys.exit(1)
+PY
+    lg="$lg, decode rows = teacher-forced rows"
+  fi
+  echo "OK $tag (${c%%:*}): ids = CPU$(case $c in ids:*) ;; *) echo ' = reference';; esac), $(cat v4-tf.txt) teacher-forced argmaxes moved, $lg, $(chain_count deepseek_v4 v4-vk.err) chain forwards$(grep -q 'the device was lost' v4-vk.err && echo ', the device lost and the CPU on')$(grep -ao 'v4_dspark attempts=[0-9]* drafted=[0-9]* accepted=[0-9]*' v4-vk.err | tail -1 | sed 's/^/, /')$([ "${EVICT:-0}" = 1 ] && grep -ao 'evictions [0-9]*' v4-vk.err | tail -1 | sed 's/^/, /')"
+}
+# v4_chain_fixtures: the 4-expert fixture (a copy), the 8-expert one (pinned rows16
+# experts), and three more geometries: 8 heads in 2 output groups (wo_a per group), a
+# window of 4 with ratios 4 and 2 (the window and the rings roll over more often), and
+# DeepSeek V4's indexer of 64 heads of 128 (the scores past the shared staging).
+v4_chain_fixtures() {
+  $PY tools/make_deepseek_v4_tiny.py --output deepseek_v4_tiny_t --force > /dev/null
+  local spec
+  for spec in "deepseek_v4_tiny_e8 EXPERTS=8" "deepseek_v4_tiny_g2 HEADS=8 O_GROUPS=2" \
+              "deepseek_v4_tiny_w4 SLIDING=4 COMPRESS_RATIOS=[0,4,2] HCA=2" "deepseek_v4_tiny_ix INDEX_HEADS=64 INDEX_DIM=128"; do
+    # shellcheck disable=SC2086
+    $PY - tools/make_deepseek_v4_tiny.py $spec <<'PY' > /dev/null
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("gen", sys.argv[1])
+gen = importlib.util.module_from_spec(spec); spec.loader.exec_module(gen)
+for kv in sys.argv[3:]:
+    k, v = kv.split("=", 1)
+    if k != "HCA": setattr(gen, k, eval(v)); continue
+    hf = gen.make_hf_config                      # the heavily compressed layers' ratio
+    def patched(C, hf=hf, r=int(v)):
+        cfg = hf(C); cfg.compress_rates["heavily_compressed_attention"] = r; return cfg
+    gen.make_hf_config = patched
+sys.argv = ["make_deepseek_v4_tiny.py", "--output", sys.argv[2], "--force"]
+gen.main()
+PY
+  done
+}
+# v4_chain_serve: the brio served prompt's per-position logprob echoes with the chain
+# against the CPU's (pinned, then a prompt that extends the pin, then max_tokens 0),
+# and the prefix-reuse contract (tests/test_deepseek_v4_prefix.py) with the chain on.
+v4_chain_serve() {  # <fixture>
+  $PY - "$1" <<'PY' || fail "deepseek_v4 chain served: the chain's echoes differ from the CPU's"
+import json, os, sys
+from pathlib import Path
+sys.path.insert(0, "tests")
+import test_deepseek_v4_brio as b
+fx = Path(sys.argv[1])
+case = json.load(open(fx / "ref.json"))["cases"]["long"]
+ids = case["prompt_ids"]
+def turns(chain):
+    for k in ("COLI_VULKAN", "COLI_VK_CHAIN", "COLI_VK_TIER_SYNC"): os.environ.pop(k, None)
+    try: os.remove(fx / ".coli_usage")
+    except FileNotFoundError: pass
+    if chain: os.environ.update(COLI_VULKAN="1", COLI_VK_CHAIN=os.environ.get("V4_CHAIN_MODE", "1"), COLI_VK_TIER_SYNC="1")
+    s = b.Serve(Path("deepseek_v4").resolve(), fx)
+    out = []
+    try:
+        out.append(s.submit(b.token_prompt(ids[:40]), 3, logprobs=4, pin=True))
+        out.append(s.submit(b.token_prompt(ids[:40] + ids[40:60]), 4, logprobs=4))
+        out.append(s.submit(b.token_prompt(ids), 0, logprobs=5))
+        out.append(s.submit(b.token_prompt(ids[:30]), 4))
+    finally:
+        s.close()
+        err = s.process.stderr.read().decode(errors="replace")
+    return out, err
+cpu, err_cpu = turns(False)
+dev, err = turns(True)
+for text in (err_cpu, err):   # a sanitized build reports into the engine's stderr
+    if "ERROR: AddressSanitizer" in text or "runtime error:" in text: print(text[-4000:]); sys.exit("sanitizer diagnostic")
+if "deepseek_v4 chain:" not in err or " forwards" not in err:
+    print(err[-3000:]); sys.exit("the chain never ran")
+worst, n, same = 0.0, 0, 0
+for x, y in zip(cpu, dev):
+    if [d[0] for d in x.data] != [d[0] for d in y.data] or sorted(x.echoes) != sorted(y.echoes) or x.reuse != y.reuse:
+        print("CPU", x.data, x.echoes.keys(), x.reuse, "chain", y.data, y.echoes.keys(), y.reuse); sys.exit(1)
+    for p in x.echoes:
+        n += 1; same += x.echoes[p] == y.echoes[p]
+        if x.echoes[p]["token"] != y.echoes[p]["token"]: sys.exit(1)
+        worst = max(worst, abs(x.echoes[p]["lp"] - y.echoes[p]["lp"]))
+fw = [l for l in err.splitlines() if "deepseek_v4 chain:" in l and "forwards" in l][-1]
+print(f"OK deepseek_v4 chain served: the pin, its extension, a read-only prompt and a shorter one: texts and reuse = CPU, "
+      f"{same} of {n} logprob echoes identical, worst |delta| {worst:.2e}; {fw.split('] ', 1)[1][:48]}")
+sys.exit(0 if worst <= 0.5 else 1)
+PY
+}
+# v4_chain_san <tag> <env and argv...>: a sanitized build's chain run (FAULT_BACK=k: the
+# loss k frames before the end of a fault-free run): no sanitizer diagnostic, and the
+# chain ran (or handled the loss).
+v4_chain_san() {
+  local tag=$1; shift
+  local fault=() frames
+  if [ -n "${FAULT_BACK:-}" ]; then
+    rm -f deepseek_v4_tiny_*/.coli_usage
+    env COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 "$@" > san.log 2>&1 || true
+    frames=$(sed -n 's/^\[VK\] deepseek_v4 chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p' san.log | tail -1)
+    [ -n "$frames" ] && [ "$frames" -gt "$FAULT_BACK" ] || { cat san.log; fail "$tag: no fault-free run to count frames from"; }
+    fault=("COLI_VK_CHAIN_FAULT=$((frames - FAULT_BACK + 1))")
+  fi
+  rm -f deepseek_v4_tiny_*/.coli_usage
+  env COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 "${fault[@]}" "$@" > san.log 2>&1 || true
+  rm -f deepseek_v4_tiny_*/.coli_usage
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+  grep -q "deepseek_v4 chain: \([1-9][0-9]* forwards\|the device was lost\)" san.log || { cat san.log; fail "$tag: the chain never ran"; }
+  echo "OK $tag: sanitizers clean, $(chain_count deepseek_v4 san.log) chain forwards$(grep -q 'the device was lost' san.log && echo ', the device lost')"
+}
+
+# The V4 half of the family: the engine, its fixtures, then every configuration: 4 and 8
+# experts (pinned rows16), the three oracle cases (the long one rolls the window of 8 and
+# both compressors over many times), 2 output groups, a window of 4 with ratios 4 and 2,
+# V4's indexer of 64 heads of 128, eviction, the tier off, the per-matrix trunk beside,
+# prefill and chain chunks, the per-row GEMV, V4_IDX_IDENTITY, prompts only, n-gram
+# drafts accepted and rejected (V4_MTP on a one-layer MTP checkpoint runs target-only),
+# the chain against itself, a device lost mid-decode, in the prompt and between drafts,
+# served turns (a pin, its extension, a read-only prompt), and the engine's own serve
+# tests with the chain on.
+v4_chain_family() {
+  make deepseek-v4 VK=1
+  v4_chain_fixtures
+  local c fx
+  for c in short compressed long; do
+    v4_chain_gate "chain deepseek_v4 4 experts" deepseek_v4_tiny_t $c
+    v4_chain_gate "chain deepseek_v4 8 experts, pinned rows16" deepseek_v4_tiny_e8 $c
+  done
+  for c in short long; do
+    v4_chain_gate "chain deepseek_v4 2 output groups" deepseek_v4_tiny_g2 $c
+    v4_chain_gate "chain deepseek_v4 a window of 4, ratios 4 and 2" deepseek_v4_tiny_w4 $c
+    v4_chain_gate "chain deepseek_v4 an indexer of 64 heads of 128" deepseek_v4_tiny_ix $c
+  done
+  EVICT=1 v4_chain_gate "chain deepseek_v4 a budget of three experts" deepseek_v4_tiny_e8 long COLI_VK_TIER_GB=0.00009
+  v4_chain_gate "chain deepseek_v4 tier off" deepseek_v4_tiny_t long COLI_VK_TIER=0 COLI_VK_DENSE=0
+  v4_chain_gate "chain deepseek_v4 beside the per-matrix trunk" deepseek_v4_tiny_t long COLI_VK_DENSE=1
+  v4_chain_gate "chain deepseek_v4 prefill chunks of 7" deepseek_v4_tiny_t long V4_PREFILL_CHUNK=7
+  v4_chain_gate "chain deepseek_v4 chain chunks of 3" deepseek_v4_tiny_e8 long COLI_VK_CHAIN_ROWS=3
+  v4_chain_gate "chain deepseek_v4 chunks of 5, a window of 4" deepseek_v4_tiny_w4 long COLI_VK_CHAIN_ROWS=5
+  v4_chain_gate "chain deepseek_v4 the per-row GEMV" deepseek_v4_tiny_t long COLI_VK_CHAIN_GEMV=0
+  v4_chain_gate "chain deepseek_v4 V4_IDX_IDENTITY=1" deepseek_v4_tiny_t long V4_IDX_IDENTITY=1
+  CHAINMODE=2 v4_chain_gate "chain deepseek_v4 prompts only" deepseek_v4_tiny_t long
+  # n-gram drafts on prompts whose tails repeat: accepted and rejected (A), every one
+  # rejected (R), a mix over three attempts (M)
+  local A=ids:20,21,22,23,24,25,26,27,28,29,20,21,22:12 R=ids:20,21,22,23,50,51,52,20,21,22:12
+  local M=ids:30,31,32,33,34,35,60,61,30,31,32,33,34,35,36,37,38,39,40,41,30,31,32:12
+  v4_chain_gate "chain deepseek_v4 n-gram drafts accepted and rejected" deepseek_v4_tiny_t $A V4_DRAFT=4 V4_NGRAM_PARTIAL_KEEP=1
+  v4_chain_gate "chain deepseek_v4 an n-gram draft rejected" deepseek_v4_tiny_t $R V4_DRAFT=4 V4_NGRAM_PARTIAL_KEEP=1
+  v4_chain_gate "chain deepseek_v4 n-gram drafts, a window of 4" deepseek_v4_tiny_w4 $M V4_DRAFT=4 V4_NGRAM_PARTIAL_KEEP=1
+  v4_chain_gate "chain deepseek_v4 n-gram drafts, 8 experts" deepseek_v4_tiny_e8 $M V4_DRAFT=4 V4_NGRAM_PARTIAL_KEEP=1
+  CHAINMODE=2 v4_chain_gate "chain deepseek_v4 prompts only, drafts" deepseek_v4_tiny_w4 $M V4_DRAFT=4 V4_NGRAM_PARTIAL_KEEP=1
+  v4_chain_gate "chain deepseek_v4 V4_MTP=1 (one MTP layer: target only)" deepseek_v4_tiny_t long V4_MTP=1 V4_DRAFT=3
+  # the chain against itself
+  for fx in deepseek_v4_tiny_t deepseek_v4_tiny_w4 deepseek_v4_tiny_g2; do
+    v4_chain_same "chain deepseek_v4 chunks, $fx" $fx long "X=1" "COLI_VK_CHAIN_ROWS=1"
+    v4_chain_same "chain deepseek_v4 prefill chunks, $fx" $fx long "X=1" "V4_PREFILL_CHUNK=3"
+  done
+  v4_chain_same "chain deepseek_v4 the tier off" deepseek_v4_tiny_e8 long "X=1" "COLI_VK_TIER=0 COLI_VK_DENSE=0"
+  v4_chain_same "chain deepseek_v4 a draft rejected, chunks of 2" deepseek_v4_tiny_w4 $R "X=1" "COLI_VK_CHAIN_ROWS=2" V4_DRAFT=4 V4_NGRAM_PARTIAL_KEEP=1
+  v4_chain_same "chain deepseek_v4 drafts, chunks of 1" deepseek_v4_tiny_w4 $M "X=1" "COLI_VK_CHAIN_ROWS=1" V4_DRAFT=4 V4_NGRAM_PARTIAL_KEEP=1
+  v4_chain_same "chain deepseek_v4 drafts, chunks of 3, 8 experts" deepseek_v4_tiny_e8 $A "X=1" "COLI_VK_CHAIN_ROWS=3" V4_DRAFT=4 V4_NGRAM_PARTIAL_KEEP=1
+  FAULT_BACK=3 v4_chain_gate "chain deepseek_v4 device lost mid-decode" deepseek_v4_tiny_t long
+  FAULT_BACK=40 v4_chain_gate "chain deepseek_v4 device lost in the prompt" deepseek_v4_tiny_t long COLI_VK_CHAIN_ROWS=7
+  FAULT_BACK=10 v4_chain_gate "chain deepseek_v4 device lost between drafts" deepseek_v4_tiny_w4 $M V4_DRAFT=4 V4_NGRAM_PARTIAL_KEEP=1
+  v4_chain_serve deepseek_v4_tiny_t
+  V4_CHAIN_MODE=2 v4_chain_serve deepseek_v4_tiny_t
+  local t
+  for t in test_deepseek_v4_prefix test_deepseek_v4_brio test_deepseek_v4_tiny; do
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_USAGE=$PWD/chain.usage \
+    $PY tests/$t.py --binary "$PWD/deepseek_v4" --fixture "$PWD/deepseek_v4_tiny_t" > v4-test.log 2>&1 ||
+    { cat v4-test.log; fail "deepseek_v4 $t with the chain"; }
+  echo "OK deepseek_v4 $t with the chain: $(tail -1 v4-test.log)"
+  done
+  rm -rf deepseek_v4_tiny_t deepseek_v4_tiny_e8 deepseek_v4_tiny_g2 deepseek_v4_tiny_w4 deepseek_v4_tiny_ix chain.usage
+  rm -f cpu.f32 vk.f32 v4-*.f32 v4-*.json v4-*.err v4-tf.txt v4-test.log
+}
+
+# The same under ASan and UBSan (LTO off, as family_deepseek_sanitize builds it): no
+# diagnostic, and each run ran the chain (or handled the loss); the serve tests with
+# UBSan halting on its first report.
+v4_chain_sanitize_runs() {
+  local p t
+  p=$(v4_chain_prompt deepseek_v4_tiny_t long)
+  mk() { v4_chain_prompt x "ids:$1"; }
+  v4_chain_san "asan chain deepseek_v4 long, 4 experts" ./deepseek_v4 ./deepseek_v4_tiny_t "$p" --raw-prompt --max-tokens 4 --record-oracle san.json
+  v4_chain_san "asan chain deepseek_v4 8 experts, pinned rows16, eviction" COLI_VK_TIER_GB=0.00009 ./deepseek_v4 ./deepseek_v4_tiny_e8 "$p" --raw-prompt --max-tokens 4 --record-oracle san.json
+  v4_chain_san "asan chain deepseek_v4 chunks of 3, a window of 4" COLI_VK_CHAIN_ROWS=3 ./deepseek_v4 ./deepseek_v4_tiny_w4 "$(v4_chain_prompt deepseek_v4_tiny_w4 long)" --raw-prompt --max-tokens 4 --record-oracle san.json
+  v4_chain_san "asan chain deepseek_v4 2 output groups" ./deepseek_v4 ./deepseek_v4_tiny_g2 "$(v4_chain_prompt deepseek_v4_tiny_g2 long)" --raw-prompt --max-tokens 4
+  v4_chain_san "asan chain deepseek_v4 an indexer of 64 heads of 128" ./deepseek_v4 ./deepseek_v4_tiny_ix "$(v4_chain_prompt deepseek_v4_tiny_ix long)" --raw-prompt --max-tokens 4
+  v4_chain_san "asan chain deepseek_v4 drafts rejected, chunks of 2" V4_DRAFT=4 V4_NGRAM_PARTIAL_KEEP=1 COLI_VK_CHAIN_ROWS=2 ./deepseek_v4 ./deepseek_v4_tiny_w4 "$(mk 20,21,22,23,50,51,52,20,21,22)" --raw-prompt --max-tokens 12
+  v4_chain_san "asan chain deepseek_v4 drafts" V4_DRAFT=4 V4_NGRAM_PARTIAL_KEEP=1 ./deepseek_v4 ./deepseek_v4_tiny_w4 "$(mk 30,31,32,33,34,35,60,61,30,31,32,33,34,35,36,37,38,39,40,41,30,31,32)" --raw-prompt --max-tokens 12
+  FAULT_BACK=10 v4_chain_san "asan chain deepseek_v4 device lost" ./deepseek_v4 ./deepseek_v4_tiny_t "$p" --raw-prompt --max-tokens 4
+  v4_chain_serve deepseek_v4_tiny_t > san.log 2>&1 || { cat san.log; fail "asan chain deepseek_v4 served"; }
+  echo "OK asan chain deepseek_v4 served: $(tail -1 san.log | cut -c1-120)"
+  for t in test_deepseek_v4_prefix test_deepseek_v4_brio; do
+    UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 $PY tests/$t.py --binary $PWD/deepseek_v4 --fixture $PWD/deepseek_v4_tiny_t > san.log 2>&1 || { cat san.log; fail "asan $t with the chain"; }
+    echo "OK asan $t with the chain: $(tail -1 san.log)"
+  done
+}
+v4_chain_family_sanitize() {
+  local SAN="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  make deepseek-v4-clean >/dev/null 2>&1 || true
+  make deepseek-v4 VK=1 LTO=0 EXTRA_CFLAGS="$SAN" EXTRA_LDFLAGS="$SAN"
+  v4_chain_fixtures
+  export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
+  v4_chain_sanitize_runs
+  rm -rf deepseek_v4_tiny_t deepseek_v4_tiny_e8 deepseek_v4_tiny_g2 deepseek_v4_tiny_w4 deepseek_v4_tiny_ix san.json san.log
+  make deepseek-v4-clean >/dev/null 2>&1 || true
+}
+
 # deepseek_v41 in every configuration the chain takes: the expert cache from one slot
 # to all (cap 1, 2, 8), the 8-token and the 40-token prompt (the window ring of 8 and
 # the ratio-2 groups roll over many times; the candidate blocks and the published index
@@ -1576,7 +1893,8 @@ v41_chain_fixtures() {
 # trunk beside, the tiled GEMM from two rows, the per-row GEMV, V41_INDEX_OWNER, a
 # device lost mid-decode, in a prompt and between drafts; serve sessions frame for
 # frame (pins, the prompt cache, the prefill read-out, DSpark, prompts only), images
-# on the wire, and the engine's own serve tests with the chain on.
+# on the wire, and the engine's own serve tests with the chain on. Then deepseek_v4
+# (v4_chain_family above).
 family_deepseek_chain() {
   make deepseek_v41 tests/test_vk_chain VK=1
   ./tests/test_vk_chain shaders/qmatmul.spv | tee vk_chain.log
@@ -1607,6 +1925,7 @@ family_deepseek_chain() {
   COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_USAGE=$PWD/chain.usage \
     $PY -m unittest tests.test_dsv41_prefix_serve tests.test_dsv41_dspark_serve
   rm -f chain.usage chain-serve.usage chain-image.usage
+  v4_chain_family
   unset OMP_NUM_THREADS
 }
 
@@ -1647,6 +1966,7 @@ family_deepseek_chain_sanitize() {
   $PY tests/vulkan_chain_v41_image.py ./deepseek_v41 dsv41_tiny V41_DSPARK=0 > san.log 2>&1 || { cat san.log; fail "asan chain deepseek_v41 images"; }
   echo "OK asan chain images deepseek_v41: $(tail -1 san.log)"
   rm -f chain.usage chain-serve.usage chain-image.usage
+  v4_chain_family_sanitize
   unset OMP_NUM_THREADS
   make clean >/dev/null 2>&1 || true
 }
