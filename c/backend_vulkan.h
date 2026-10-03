@@ -249,9 +249,7 @@ unsigned long long coli_vk_matmul_calls(void);
 #define COLI_VK_CHAIN_OFF     0
 #define COLI_VK_CHAIN_ON      1
 #define COLI_VK_CHAIN_PREFILL 2   /* forwards of more than two rows only */
-/* `igpu` only: the engine was not measured on an integrated GPU; off there, and the
- * [VK] line says so */
-#define COLI_VK_CHAIN_UNMEASURED 3
+#define COLI_VK_CHAIN_UNMEASURED 3 /* as `igpu`: not measured on an integrated GPU, so off there */
 int coli_vk_chain_decide(const char *engine, int tier_on, int igpu);
 /* The device as the chain sees it: Vulkan handles as void * (VkInstance,
  * VkPhysicalDevice, VkDevice, VkQueue), the memory types the backend picked, the
