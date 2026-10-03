@@ -7,6 +7,7 @@
 #   bash tests/vulkan_engines.sh glm | glm-sanitize   # GLM-5.2 (colibri) and GLM-5.3 Flash (glm53)
 #   bash tests/vulkan_engines.sh shader    # the qmatmul formats, the expert batch and the tier, no engine
 #   bash tests/vulkan_engines.sh qwen-chain | qwen-chain-sanitize   # the dense chain (COLI_VK_CHAIN=1)
+#   bash tests/vulkan_engines.sh glm-chain | glm-chain-sanitize     # the same for colibri and glm53
 #
 # Needs libvulkan-dev, glslc and mesa-vulkan-drivers, plus the Python packages of
 # the family's tiny fixtures (see the vulkan-engines job in .github/workflows/ci.yml).
@@ -1340,6 +1341,183 @@ family_qwen_chain_sanitize() {
   make clean >/dev/null 2>&1 || true
 }
 
+# The dense chain of the MLA engines: GLM-5.2 (colibri) and GLM-5.3 Flash (glm53).
+# mla_gate <engine> <tag> <tol 0|1> <env...> -- <argv...>: the CPU run's token lines
+# (colibri: the generated tokens, the teacher-forced predictions and the oracle's
+# mismatches; glm53: teacher_forcing and greedy), every logits row within 1e-4 of the
+# largest |logit| (tol 1; DUMP= writes them), and a "[VK] <engine> chain: N forwards"
+# line with N > 0. LOST=1: COLI_VK_CHAIN_FAULT is set, and the run must say the device
+# was lost (and, for glm53 with REBUILD=1, rebuild the KDA state of some positions).
+mla_toks() {  # <engine> <log>
+  if [ "$1" = colibri ]; then grep -aE '^GLM C engine|^PREFILL|^\[ORACLE\] mismatch' "$2" | sed 's/ | [0-9.]* pos\/s//'
+  else grep -aE '^teacher_forcing|^greedy' "$2"; fi
+}
+mla_gate() {
+  local eng=$1 tag=$2 tol=$3; shift 3
+  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  rm -f chain.usage cpu.f32 vk.f32
+  env "${envs[@]}" COLI_USAGE=chain.usage USAGE_SAVE=0 DUMP=cpu.f32 ./"$eng" "$@" > cpu.log 2>&1 || true
+  rm -f chain.usage
+  env "${envs[@]}" COLI_USAGE=chain.usage USAGE_SAVE=0 DUMP=vk.f32 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 \
+    COLI_VK_CHAIN=${CHAINMODE:-1} ./"$eng" "$@" > vk.log 2>&1 || true
+  mla_toks "$eng" cpu.log > cpu.tok; mla_toks "$eng" vk.log > vk.tok
+  { [ -s cpu.tok ] && cmp -s cpu.tok vk.tok; } || { cat cpu.tok vk.tok; tail -20 vk.log; fail "$tag: the chain's tokens differ from the CPU"; }
+  if [ "${LOST:-0}" = 1 ]; then
+    grep -q "$eng chain: the device was lost" vk.log || { cat vk.log; fail "$tag: no loss was handled"; }
+    if [ "${REBUILD:-0}" = 1 ]; then grep -q "rebuilding the state of [1-9]" vk.log || { cat vk.log; fail "$tag: no state was rebuilt"; }; fi
+  else
+    [ "$(chain_count "$eng" vk.log)" -gt 0 ] || { cat vk.log; fail "$tag: the chain never ran"; }
+  fi
+  local lg=""
+  if [ "$tol" = 1 ]; then lg=$(logits_close cpu.f32 vk.f32) || { echo "$lg"; fail "$tag: logits"; }; lg=", $lg"; fi
+  echo "OK $tag: tokens = CPU$lg, $(chain_count "$eng" vk.log) chain forwards$(grep -o 'rebuilding the state of [0-9]* positions' vk.log | sed 's/^/, /')"
+}
+glm_chain_fixtures() {
+  glm_fixtures
+  $PY tools/make_glm_mtp_tiny.py --src glm_tiny --out glm_tiny_mtp > /dev/null && cp ref_glm.json glm_tiny_mtp/
+  rm -rf glm_tiny_serve && cp -r glm_tiny glm_tiny_serve
+  $PY tools/make_edge_tiny_tokenizer.py --vocab-size 256 ./glm_tiny_serve > /dev/null   # serve speaks text
+  rm -rf glm53_serve && cp -r glm53_stream-i4 glm53_serve
+  $PY tools/make_edge_tiny_tokenizer.py --vocab-size 128 ./glm53_serve > /dev/null
+  $PY tools/make_glm53_multimodal_tiny.py --output glm53_mm_tiny > /dev/null
+  rm -rf glm53_lim0 && cp -r glm53_stream-i4 glm53_lim0   # swiglu_limit 0: the tier declines, the chain does not
+  $PY - <<'PY'
+import json
+p = "glm53_lim0/config.json"; c = json.load(open(p))
+(c["text_config"] if "text_config" in c else c)["swiglu_limit"] = 0.0
+json.dump(c, open(p, "w"))
+PY
+}
+
+# Every configuration the chain takes: colibri in every expert format (IDOT=0 where the
+# CPU would round activations to int8: the device matches IDOT=0, as for the tier),
+# decode and teacher-forced prefill in chunks, the DSA indexer's selection active
+# (DSA_TOPK=4 on the 12-token prompt, and DSA_FORCE), n-gram and MTP drafts accepted and
+# rejected (the MTP fixture's head is the last layer's copy), the tier off, the per-matrix
+# trunk and attention core beside it, prompts only, a device lost mid-decode and in a
+# prompt, serve sessions (pins, the prompt cache, two KV slots, the prefill read-out);
+# glm53 with f32, int8 and int4 trunks, streamed and resident experts, an image, prefill
+# chunks and chain chunks, swiglu_limit 0, a lost device whose KDA state is rebuilt on
+# the CPU, serve sessions, and its pin-branch harness with the chain on.
+family_glm_chain() {
+  make colibri glm53 tests/test_vk_chain VK=1
+  ./tests/test_vk_chain shaders/qmatmul.spv | tee vk_chain.log
+  tail -1 vk_chain.log | grep -qx PASS || fail "the chain's ops"
+  glm_chain_fixtures
+  export OMP_NUM_THREADS=2 CAP_RAISE=0
+  local cap b fx d
+  for cap in 1 64; do mla_gate colibri "chain colibri f32 cap=$cap" 1 SNAP=glm_tiny REF=ref_glm.json -- $cap 16 16; done
+  mla_gate colibri "chain colibri f32 prefill" 1 SNAP=glm_tiny REF=ref_glm.json TF=1 -- 64 16 16
+  mla_gate colibri "chain colibri prefill in chunks of 3" 1 SNAP=glm_tiny REF=ref_glm.json TF=1 COLI_VK_CHAIN_ROWS=3 -- 64 16 16
+  for b in 8 4 3; do
+    mla_gate colibri "chain colibri ${b}-bit trunk and experts" 1 SNAP=glm_tiny REF=ref_glm.json IDOT=0 -- 2 $b $b
+  done
+  mla_gate colibri "chain colibri int4-g64 experts" 1 SNAP=glm_tiny_fmt4 REF=glm_tiny_fmt4/ref_glm.json -- 2 16 16
+  mla_gate colibri "chain colibri E8/IQ3 experts on the CPU" 1 SNAP=glm_tiny_fmt6 REF=glm_tiny_fmt6/ref_glm.json -- 2 16 16
+  for fx in i4 i4r i3 d3; do
+    mla_gate colibri "chain colibri $fx container" 1 SNAP=glm_tiny_$fx REF=glm_tiny_$fx/ref_glm.json IDOT=0 -- 1 4 4
+  done
+  mla_gate colibri "chain colibri i4 container, prefill" 1 SNAP=glm_tiny_i4 REF=glm_tiny_i4/ref_glm.json IDOT=0 TF=1 -- 2 4 4
+  # the DSA indexer's selection on the device: index_topk 4 against a 32-token context
+  mla_gate colibri "chain colibri DSA top-4" 1 SNAP=glm_tiny REF=ref_glm.json DSA_TOPK=4 -- 64 16 16
+  mla_gate colibri "chain colibri DSA top-4, prefill in chunks of 5" 1 SNAP=glm_tiny REF=ref_glm.json DSA_TOPK=4 TF=1 COLI_VK_CHAIN_ROWS=5 -- 64 16 16
+  mla_gate colibri "chain colibri DSA_FORCE" 1 SNAP=glm_tiny REF=ref_glm.json DSA_FORCE=1 -- 64 16 16
+  # drafts: n-gram, and the MTP head at depths 1 to 3 (accepted and rejected)
+  mla_gate colibri "chain colibri n-gram drafts" 1 SNAP=glm_tiny REF=ref_glm.json DRAFT=3 -- 64 16 16
+  for d in 1 2 3; do mla_gate colibri "chain colibri MTP depth $d" 1 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=$d -- 64 16 16; done
+  mla_gate colibri "chain colibri MTP with DSA top-4" 1 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DSA_TOPK=4 -- 64 16 16
+  mla_gate colibri "chain colibri MTP, 4-bit" 1 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json IDOT=0 DRAFT=2 -- 2 4 4
+  # around the chain: the tier off, the per-matrix trunk and core, the GEMM and GEMV choices
+  mla_gate colibri "chain colibri tier off" 1 SNAP=glm_tiny REF=ref_glm.json COLI_VK_TIER=0 -- 64 16 16
+  mla_gate colibri "chain colibri beside COLI_VK_DENSE=1 COLI_VK_ATTN=1" 1 SNAP=glm_tiny_i4 REF=glm_tiny_i4/ref_glm.json IDOT=0 COLI_VK_DENSE=1 COLI_VK_ATTN=1 -- 2 4 4
+  # COLI_VK_DEV2 beside the chain: a second logical device holds what the capped tier does not
+  SNAP=glm_tiny_i4r REF=glm_tiny_i4r/ref_glm.json IDOT=0 STATS=glm_tiny_i4r/.coli_usage ./colibri 64 4 4 > /dev/null 2>&1 || true
+  mla_gate colibri "chain colibri beside COLI_VK_DEV2" 1 SNAP=glm_tiny_i4r REF=glm_tiny_i4r/ref_glm.json IDOT=0 COLI_VK_EXPERTS=4 COLI_VK_DEV2=0 -- 64 4 4
+  grep -qaE 'lru \+ [1-9][0-9]* vk /' vk.log || { cat vk.log; fail "chain colibri beside COLI_VK_DEV2: no expert on the devices"; }
+  rm -f glm_tiny_i4r/.coli_usage
+  mla_gate colibri "chain colibri tiled GEMM from 2 rows" 1 SNAP=glm_tiny REF=ref_glm.json TF=1 COLI_VK_GEMM_MIN_S=2 -- 64 16 16
+  mla_gate colibri "chain colibri the per-row GEMV" 1 SNAP=glm_tiny REF=ref_glm.json COLI_VK_CHAIN_GEMV=0 -- 64 16 16
+  CHAINMODE=2 mla_gate colibri "chain colibri prompts only, drafts" 1 SNAP=glm_tiny REF=ref_glm.json DRAFT=3 -- 64 16 16
+  # the device lost: mid-decode, in the prompt, between MTP drafts
+  LOST=1 mla_gate colibri "chain colibri device lost mid-decode" 1 SNAP=glm_tiny REF=ref_glm.json COLI_VK_CHAIN_FAULT=30 -- 64 16 16
+  LOST=1 mla_gate colibri "chain colibri device lost in the prompt" 1 SNAP=glm_tiny REF=ref_glm.json COLI_VK_CHAIN_FAULT=3 -- 64 16 16
+  LOST=1 mla_gate colibri "chain colibri device lost with MTP" 1 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json COLI_VK_CHAIN_FAULT=40 -- 64 16 16
+  # serve sessions frame for frame: pins, the prompt cache, the prefill read-out, two KV slots
+  CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0
+  CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 DSA_TOPK=4 DRAFT=3
+  CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 KV_SLOTS=2
+  COLI_VK_CHAIN=2 CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 DSA_TOPK=4
+
+  # glm53
+  local ids bits
+  ids=$($PY -c "print(','.join(str((i*37+5)%120+2) for i in range(100)))")
+  mla_gate glm53 "chain glm53 decode" 1 GLM53_BITS=32 -- --model glm53_stream-i4 --ids 5,7,9,11,13,17,19,23 --greedy 8
+  for bits in 32 8 4; do
+    mla_gate glm53 "chain glm53 100-token prompt, ${bits}-bit trunk" 1 GLM53_BITS=$bits -- --model glm53_stream-i4 --ids $ids --greedy 4
+  done
+  mla_gate glm53 "chain glm53 prefill chunks of 7, one cache slot" 1 GLM53_BITS=4 GLM53_PREFILL_CHUNK=7 GLM53_EXPERT_GB=0.000001 -- --model glm53_stream-i4 --ids $ids --greedy 4
+  mla_gate glm53 "chain glm53 chain chunks of 3" 1 GLM53_BITS=32 COLI_VK_CHAIN_ROWS=3 -- --model glm53_stream-i4 --ids $ids --greedy 4
+  mla_gate glm53 "chain glm53 resident experts" 1 GLM53_BITS=32 -- --model glm53_tiny --ids $ids --greedy 6
+  mla_gate glm53 "chain glm53 tier off" 1 GLM53_BITS=32 COLI_VK_TIER=0 -- --model glm53_stream-i4 --ids $ids --greedy 6
+  mla_gate glm53 "chain glm53 an image" 1 GLM53_BITS=32 -- --model glm53_mm_tiny --ids 103,117,268,268,268,268,120,121 --patches glm53_mm_tiny/patches.f32 --grid 4x4 --greedy 4
+  mla_gate glm53 "chain glm53 swiglu_limit 0" 1 GLM53_BITS=32 -- --model glm53_lim0 --ids $ids --greedy 4
+  grep -qa 'tier glm53: swiglu_limit is 0' vk.log || { cat vk.log; fail "chain glm53 swiglu_limit 0: the tier did not decline"; }
+  CHAINMODE=2 mla_gate glm53 "chain glm53 prompts only" 1 GLM53_BITS=32 GLM53_PREFILL_CHUNK=16 -- --model glm53_stream-i4 --ids $ids --greedy 6
+  LOST=1 REBUILD=1 mla_gate glm53 "chain glm53 device lost, the KDA state rebuilt" 1 GLM53_BITS=32 GLM53_PREFILL_CHUNK=16 COLI_VK_CHAIN_FAULT=20 -- --model glm53_stream-i4 --ids $ids --greedy 6
+  LOST=1 REBUILD=1 mla_gate glm53 "chain glm53 device lost after an image" 1 GLM53_BITS=32 COLI_VK_CHAIN_FAULT=6 -- --model glm53_mm_tiny --ids 103,117,268,268,268,268,120,121 --patches glm53_mm_tiny/patches.f32 --grid 4x4 --greedy 4
+  CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=32
+  CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=4 COLI_VK_CHAIN_ROWS=3
+  CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=32 KV_SLOTS=2
+  COLI_VK_CHAIN=2 CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=32
+  # a pin restored over rows another branch rewrote: the KDA state goes up from the pin,
+  # the MLA rows' watermark comes down
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_USAGE=$PWD/chain.usage $PY tests/glm53_pin_branch_harness.py --binary ./glm53 --fixture glm53_mm_tiny
+  unset OMP_NUM_THREADS CAP_RAISE
+}
+
+# The same chains under ASan and UBSan: memory safety is the gate; each run must have run
+# the chain (or handled the loss). detect_stack_use_after_return=0 as in every sanitized
+# family (ASan's fake stack breaks 64-byte aligned AVX-512 locals).
+family_glm_chain_sanitize() {
+  make clean >/dev/null 2>&1 || true
+  make colibri glm53 tests/test_vk_chain VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
+  ./tests/test_vk_chain shaders/qmatmul.spv > san.log 2>&1 || true
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log || ! tail -1 san.log | grep -qx PASS; then cat san.log; fail "asan: the chain's ops"; fi
+  echo "OK asan: the chain's ops"
+  glm_chain_fixtures
+  export OMP_NUM_THREADS=2 CAP_RAISE=0
+  msan() {  # <engine> <tag> <env and argv...>
+    local eng=$1 tag=$2; shift 2
+    rm -f chain.usage
+    env COLI_USAGE=chain.usage USAGE_SAVE=0 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 "$@" > san.log 2>&1 || true
+    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    grep -q "$eng chain: \([1-9][0-9]* forwards\|the device was lost\)" san.log || { cat san.log; fail "$tag: the chain never ran"; }
+    echo "OK $tag: sanitizers clean, $(chain_count "$eng" san.log) chain forwards"
+  }
+  local ids
+  ids=$($PY -c "print(','.join(str((i*37+5)%120+2) for i in range(100)))")
+  msan colibri "asan chain colibri f32 decode" SNAP=glm_tiny REF=ref_glm.json ./colibri 1 16 16
+  msan colibri "asan chain colibri DSA top-4 prefill, chunks of 3" SNAP=glm_tiny REF=ref_glm.json TF=1 DSA_TOPK=4 COLI_VK_CHAIN_ROWS=3 ./colibri 64 16 16
+  msan colibri "asan chain colibri i4 container" SNAP=glm_tiny_i4 REF=glm_tiny_i4/ref_glm.json IDOT=0 ./colibri 2 4 4
+  msan colibri "asan chain colibri MTP depth 2" SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 ./colibri 64 16 16
+  msan colibri "asan chain colibri device lost" SNAP=glm_tiny REF=ref_glm.json COLI_VK_CHAIN_FAULT=30 ./colibri 64 16 16
+  msan glm53 "asan chain glm53 decode" GLM53_BITS=32 ./glm53 --model glm53_stream-i4 --ids 5,7,9,11,13,17,19,23 --greedy 8
+  msan glm53 "asan chain glm53 int4 trunk, chain chunks of 3" GLM53_BITS=4 COLI_VK_CHAIN_ROWS=3 ./glm53 --model glm53_stream-i4 --ids $ids --greedy 4
+  msan glm53 "asan chain glm53 an image" GLM53_BITS=32 ./glm53 --model glm53_mm_tiny --ids 103,117,268,268,268,268,120,121 --patches glm53_mm_tiny/patches.f32 --grid 4x4 --greedy 4
+  msan glm53 "asan chain glm53 device lost, rebuilt" GLM53_BITS=32 GLM53_PREFILL_CHUNK=16 COLI_VK_CHAIN_FAULT=20 ./glm53 --model glm53_stream-i4 --ids $ids --greedy 6
+  local args
+  for args in "./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 KV_SLOTS=2" "./glm53 glm53_serve GLM53_BITS=32 KV_SLOTS=2"; do
+    # shellcheck disable=SC2086
+    CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=$([ "${args%% *}" = ./colibri ] && echo colibri || echo numeric) \
+      $PY tests/vulkan_chain_serve.py $args > san.log 2>&1 || { cat san.log; fail "asan chain serve $args"; }
+    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan chain serve $args: sanitizer diagnostic"; fi
+    echo "OK asan chain serve ${args%% *}: $(tail -1 san.log)"
+  done
+  unset OMP_NUM_THREADS CAP_RAISE
+  make clean >/dev/null 2>&1 || true
+}
+
 case "${1:-}" in
   shader)         shader_formats ;;
   qwen)           family_qwen ;;
@@ -1355,5 +1533,7 @@ case "${1:-}" in
   glm-sanitize)   family_glm_sanitize ;;
   qwen-chain)     family_qwen_chain ;;
   qwen-chain-sanitize) family_qwen_chain_sanitize ;;
-  *) echo "usage: $0 shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize" >&2; exit 2 ;;
+  glm-chain)      family_glm_chain ;;
+  glm-chain-sanitize) family_glm_chain_sanitize ;;
+  *) echo "usage: $0 shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize|glm-chain|glm-chain-sanitize" >&2; exit 2 ;;
 esac
