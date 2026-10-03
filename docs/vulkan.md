@@ -673,7 +673,7 @@ command buffer instead, and keeps the residual stream on the device from one lay
 to the next. qwen36 (Qwen3.6, Qwen3-Coder, Qwen3.8-27B) and qwen38 (Qwen3.8 Flash
 Next) run it: by default on a discrete GPU, and for qwen36 on an integrated one with
 the expert tier (see [the default](#the-chain-on-a-radeon-780m)); `COLI_VK_CHAIN=1`
-anywhere.
+anywhere. olmoe and inkling run it as well ([OLMoE and Inkling](#olmoe-and-inkling)).
 
 **What runs where, per layer** (S rows: one at decode, a prompt chunk at prefill):
 
@@ -740,7 +740,7 @@ f32 throughout, as the CPU's f32 path.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `COLI_VK_CHAIN` | on for a discrete GPU; on an integrated GPU with the expert tier, what the engine measured (qwen36 on, qwen38 off); off on a CPU device | `1`: every layer's dense chain on the device; `2`: prompts only (forwards of more than two rows; decode and MTP verifies on the per-matrix path, the state moving between the two); `0`: the per-matrix path. The `[VK] <engine>: dense chain ...` line says which and why. |
+| `COLI_VK_CHAIN` | on for a discrete GPU; on an integrated GPU with the expert tier, what the engine measured (qwen36 on, qwen38 off, olmoe on; inkling off, not measured); off on a CPU device | `1`: every layer's dense chain on the device; `2`: prompts only (forwards of more than two rows; decode and MTP verifies on the per-matrix path, the state moving between the two); `0`: the per-matrix path. The `[VK] <engine>: dense chain ...` line says which and why. |
 | `COLI_VK_CHAIN_ROWS` | `512` | Prompt rows per chunk: a longer prompt runs every layer chunk by chunk (the device's scratch is sized for one chunk). |
 | `COLI_VK_CHAIN_GEMV` | on | `0`: the decode matrices take `qmatmul.comp`'s GEMV instead of `chain_gemv.comp`'s. |
 | `COLI_VK_CHAIN_SPIN_US` | `2000` | How long a wait on a chain frame polls the fence before blocking. |
@@ -824,6 +824,128 @@ prediction of it. Not timed either: contexts past 2048 tokens (where Qwen3.8's Q
 selects blocks instead of attending to all of them), serve sessions, Qwen3-Coder and
 Qwen3.8-27B (no checkpoints on the box); their correctness is the Lavapipe gates'.
 
+### OLMoE and Inkling
+
+olmoe (`olmoe_chain.h`) and inkling (`inkling_chain.h`) run the chain too, with the same
+knobs, default rule and `[VK] <engine> chain: ...` line as qwen36.
+
+| | olmoe | inkling |
+|---|---|---|
+| device, frame A1 | the layer before's routed sum joining the residual; the input norm; q/k/v; OLMoE's q and k norms over the whole projection; RoPE from the CPU's table; the K/V rows into the device mirror; attention; o_proj; the residual add; the post-attention norm; the router logits | the layer before's MoE output joining the residual (the routed sum, then each shared expert times its combine weight, `moe()`'s order, then the MLP's short convolution and the add); the input norm; q/k/v and the bias projection r; the short convolutions on K and V with their rings; the per-head q/k norms; the attention (`chain_relattn.comp`); the K/V rows into the device ring; o_proj; the attention's short convolution; the residual add; the post-attention norm; the router logits (routed and shared). A dense-MLP layer runs its MLP, global scale, short convolution and add in the same frame |
+| host | softmax, top-k, the routed experts (the tier's batch and the CPU's share in rank order: the code `moe()` runs); the K/V rows into the host's cache; `PILOT`'s prefetch (below) | the sigmoid router with its bias, top-k, the joint combine weights, `TOPP`; the routed experts (`moe_ex`: `moe()`'s code, the device's logits handed in, the shared experts left out); the K/V rows into the host's cache |
+| device, frame A2 (not waited for) | none: OLMoE has no shared expert | the shared experts, unweighted |
+| last frame | the final norm and lm_head on the last row | the final norm, the division by the width multiplier, lm_head; the per-position heads (logprobs, teacher forcing) read the final rows on the host |
+
+Inkling's attention is not qwen36's: a learned relative-position bias (an r projection
+per row mixed through a per-layer bank, one bias per backward distance), the log-length
+scale tau, a sliding window on five layers of six over a ring of K/V rows, and short
+depthwise convolutions (residual inside) on K, V, the attention output and the MLP
+output. Two shaders do it, made on first use so that the qwen chains never depend on
+them: `chain_relattn.comp` (grouped attention with the bias bank mixed in the CPU's
+order, tau from a host table computed as the CPU computes it, the window, the ring, and
+the step's own rows read from its K/V scratch as `attention()` reads them, so a step
+that wraps the ring never loses a row an earlier query of it reads) and
+`chain_sconv.comp` (the convolution with its ring, in `sconv_apply`'s order, plus the
+scalar multiply and divide of the dense MLP's global scale and the logits' width
+multiplier). The shared experts join through `chain_ew.comp`'s `HC_APPLY` over one stream
+(y += w[row] * x), the CPU's `os[d] += w * hh[d]`. Nothing in the chain stages a row
+in shared memory past what the device allows: Inkling's hidden size (6144) and its
+24576-wide dense MLP run through `chain_gemv.comp` or, past its staging, `qmatmul.comp`'s
+GEMV reading from the buffer; `tools/make_tiny_inkling.py --wide` makes a two-layer
+model at D = 6144 for the tests.
+
+**State.** Both keep the host's K/V cache canonical and copy each step's rows back.
+olmoe mirrors it behind qwen36's watermark. Inkling's mirror has the host's layout, a
+ring on sliding layers, and a range of positions per layer that the host wrote alone
+(a CPU step): the next chain step uploads the rows of its last `cap` positions first,
+whatever positions they now hold, so a rewind to a pinned snapshot over a wrapped ring
+reads on the device what the CPU reads. Inkling's four convolution states per layer run
+on the device and come back at the end of every chain step (a few KB a layer), so the
+host's copy is always current; a reset, a restored snapshot or a CPU step sends them
+up again before the next chain step.
+
+**Where they decline** (the per-matrix path, the state marked as the host's): inkling
+under CUDA or Metal; inkling's bf16 matrices on a CPU whose bf16 dot rounds the
+activations (AVX512-BF16), which the per-matrix path keeps on the CPU for the same
+reason (`[VK] inkling chain: ... bf16 stays on the CPU`); a geometry outside the shaders
+(head dim above 256, a bias bank wider than 64, more than 9 taps). olmoe runs `PILOT`:
+the rows after attention come down with the frame and the prefetch reads them, the
+rows after the MoE are those plus the routed sum (the float add the device makes).
+Running PILOT under the chain showed a race of the CPU path's own: the prefetcher could
+take the slot the forward pass was multiplying with as its LRU victim (at cap 1 the only
+slot) and read another expert into it mid-matmul. A slot now counts its readers, and
+neither eviction takes one being read. A device lost mid-step: olmoe redoes the step on
+the CPU (attention only, nothing to rebuild); inkling rebuilds its K/V and convolution
+states on the CPU from the prefix record, as qwen36 does.
+
+**OLMoE-1B-7B on the Radeon 780M** (`allenai/OLMoE-1B-7B-0924`, converted with
+`tools/convert_olmoe_merged.py`: int8 experts, f32 trunk; cap 64, `OMP_NUM_THREADS=8`,
+1-min load under 2, no other engine running, the same binary for every arm, every tier
+arm from the same history of an unrelated prompt). Cold: the model files dropped from
+the page cache first (`posix_fadvise`, as the qwen bench does); warm: the run after.
+Decode is 100 steps after a 25-token prompt: the engine's time for 101 new tokens minus
+its time for 1 (the prefill alone), both from `TUNE decode`; prefill is a 512-token
+prompt with one new token. Where a warm cell lists two numbers, they are separate
+rounds.
+
+| Decode, 100 tokens | cold | warm |
+|---|---|---|
+| CPU | 22.2 tok/s | 23.1, 23.2 tok/s |
+| tier, trunk on the CPU | 12.6 tok/s | 12.8, 12.8 tok/s |
+| tier and chain (`COLI_VK_CHAIN=1`) | 16.8 tok/s | 17.3, 17.2 tok/s |
+| chain without the tier (`COLI_VK_TIER=0`) | 12.0 tok/s | 12.8 tok/s |
+
+| Prefill, 512 tokens | cold | warm |
+|---|---|---|
+| CPU | 11.7 s | 10.5, 10.6 s |
+| tier, trunk on the CPU | 6.3 s | 6.4, 6.4 s |
+| tier and chain | 5.5 s | 5.5, 5.5 s |
+| chain without the tier | 12.7 s | 11.4 s |
+
+What the numbers say:
+- **Against the tier alone the chain wins both**: decode 35% faster, the 512-token
+  prompt 14% sooner. That is the comparison `coli_vk_chain_decide` makes on an
+  integrated GPU with the tier on, so olmoe passes ON there.
+- **Against the CPU, decode loses**: 17.3 against 23.1 tok/s. OLMoE's trunk is f32
+  (1.49 GB read every token, more than its eight routed experts' 0.8 GB of int8); the CPU
+  reads it faster than the GPU does at the clock it mostly holds. Prefill wins: 5.5
+  against 10.5 s. `COLI_VULKAN=1` is opt-in, and on this box the CPU alone is the faster
+  way to decode OLMoE; with the device on, the chain is the better of its two modes.
+  `COLI_VK_CHAIN_PROF=1` put 95% of the chain's device time in the trunk's f32 GEMVs,
+  34.8 ms a token (about 43 GB/s for its 1.49 GB); the GPU sat at its 800 MHz floor in
+  78% of the clock samples with the chain, 95% with the tier alone.
+- **Without the tier** the chain only moves the f32 trunk to the device and leaves every
+  expert on the CPU: slower than the CPU in both. The default keeps it off there.
+- **The text.** Every arm, cold and warm, printed the same 100 decode tokens, and the
+  same first token after the 512-token prompt.
+
+**Not measured**: a discrete GPU; OLMoE in serve sessions, past a 537-token context, with
+`PILOT` (its experts fit in RAM here) or with the dense trunk on the device beside the
+chain (`COLI_VK_DENSE=1`).
+
+**Inkling: not measured.** No Inkling checkpoint runs on the box (the model is 975B),
+so its integrated-GPU default is off (`COLI_VK_CHAIN_UNMEASURED`: the `[VK]` line says
+"not measured"); `COLI_VK_CHAIN=1` turns it on. Its correctness is the tiny fixtures',
+on Lavapipe and on the 780M (below), including the two-layer model at D = 6144.
+
+**Tests.** `tests/vulkan_engines.sh inkling-olmoe-chain` gates every configuration on the
+CPU run's tokens and every forward's logits within 1e-4 of the largest (`DUMP=<path>` in
+both engines' ref mode writes them; measured 2e-7 relative on the fixtures, 6e-7 at
+D = 6144): inkling's f32, dense-int4g64 and bf16 snapshots (on an AVX512-BF16 host the
+bf16 one checks the clean decline instead), its int4 and int8 expert containers and
+runtime quantizations, `TOPP`, the tier off, the trunk's device copies shared with the
+per-matrix path, prefill in chunks of 3, the tiled GEMM, the per-row GEMV, prompts only,
+D = 6144 (and the tier's expert batch at that width); olmoe's caps, 4-bit experts,
+`PILOT` at caps 1 and 2 and `PILOT=3`, the tier off, the shared trunk, an eviction
+budget, chunks, the GEMM, the per-row GEMV, prompts only; the device lost mid-decode in
+both (inkling in a shared-expert frame and at a router); `tests/vulkan_chain_serve.py`
+sessions (pins, prompt-cache extensions, a divergent prompt, logprobs) frame for frame
+against the CPU, with the chain and with prompts only; and both engines' prefix-reuse,
+dashboard and Brio tests with the chain on. `inkling-olmoe-chain-sanitize` runs the
+chain's ops, a set of those configurations and a serve session of each engine under
+ASan and UBSan. On the 780M (RADV) every one of those configurations and serve sessions
+gave the CPU's tokens.
+
 ### Adding an engine to the chain
 
 The recipe qwen36_chain.h and qwen38_chain.h follow, for the engines still on the
@@ -856,8 +978,8 @@ What each remaining architecture needs on top of today's shaders:
 | deepseek_v4 | MLA with compressed (CSA) and hierarchical (HCA) KV, mHC | the manifold hyper-connections are qwen38's stream read/apply with a Sinkhorn normalization (an element-wise op that iterates); the compressors' rolling windows are rings like the conv's, snapshotted the same way; the CPU rounds activations to E4M3 before its fp8 matmuls, so the chain needs that rounding as an element-wise op to keep the same arithmetic |
 | kimi_k3 (KDA layers) | Kimi Delta Attention: a gated delta rule whose decay is a vector over the key channels | `chain_dnrec.comp` with the decay per key row (one `exp(g_k)` per row of the column, loaded beside q and k in shared memory) instead of one per head; the short convolution is `chain_dnconv.comp`; its output gate and norm as the gated norm |
 | mimo | sliding-window attention (and full layers) | `chain_attn.comp` with a window (positions from `max(0, pos - W + 1)`: one more push constant), the cache optionally a ring of W rows (the host mirror then indexes `t % W`) |
-| inkling | grouped attention, MoE with a shared expert | qwen36's attention and combine as they are; its per-position heads are matmuls of the residual rows |
-| olmoe | attention with q/k norm, MoE without a shared expert | qwen36's Qwen3-Coder geometry (all attention, no gate, no shared expert) is the same chain |
+| inkling | grouped attention with a relative-position bias, a sliding window and short convolutions; MoE with shared experts | in the chain ([OLMoE and Inkling](#olmoe-and-inkling)): two shaders of its own, `chain_relattn.comp` and `chain_sconv.comp`; the shared experts join through `HC_APPLY` |
+| olmoe | attention with q/k norm, MoE without a shared expert | in the chain ([OLMoE and Inkling](#olmoe-and-inkling)) with qwen36's ops as they are |
 
 ## Adding an engine to the tier
 
@@ -940,7 +1062,10 @@ in short:
   (measured 2e-7 and below on the fixtures), prefill in chunks, an image, MTP drafts
   rejected, accepted and alternating, a device lost mid-run, the qwen38 oracle targets,
   the prefix-reuse contract and serve sessions frame for frame; `qwen-chain-sanitize`
-  runs the chain under ASan and UBSan.
+  runs the chain under ASan and UBSan. `inkling-olmoe-chain` and
+  `inkling-olmoe-chain-sanitize` do the same for inkling and olmoe
+  ([OLMoE and Inkling](#olmoe-and-inkling)); `vk-chain-check` covers their ops
+  (`chain_sconv.comp`, `chain_relattn.comp`, the GEMV and the norm at D = 6144).
 - int4 weights decode as offset-binary (nibble−8), byte-identical layout to
   the CPU path — no repacking.
 - Khronos validation layers: the backend never enables them, so the loader
