@@ -95,7 +95,7 @@ const en: Record<string, string> = {
   "brio.needTwo": "a second option is needed, on its own line",
   "brio.scoreAll": "Answer {{n}}",
   "brio.stop": "Stop",
-  "nav.brio": "Brio",
+  "nav.brio": "System One",
   "brio.sure": "confident",
   "brio.unsure": "unsure",
   "brio.unknown": "does not know",

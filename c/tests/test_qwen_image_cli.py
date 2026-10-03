@@ -133,7 +133,7 @@ class LauncherTest(unittest.TestCase):
         # a picture's path at the start of a line is a message, not a command
         self.assertEqual(self.cli.chat_command("/home/me/foto.png cosa vedi?"), (None, None))
         self.assertEqual(self.cli.chat_command("~/Desktop/a.JPG"), (None, None))
-        self.assertEqual(self.cli.chat_command("/brio a | b"), ("brio", "a | b"))
+        self.assertEqual(self.cli.chat_command("/decide a | b"), ("decide", "a | b"))
         self.assertEqual(self.cli.chat_command("/save /tmp/x/nome.png"), ("save", "/tmp/x/nome.png"))
 
 

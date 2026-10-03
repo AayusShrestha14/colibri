@@ -95,7 +95,7 @@ const id: Record<string, string> = {
   "brio.needTwo": "diperlukan opsi kedua, pada baris tersendiri",
   "brio.scoreAll": "Jawab {{n}}",
   "brio.stop": "Hentikan",
-  "nav.brio": "Brio",
+  "nav.brio": "System One",
   "brio.sure": "yakin",
   "brio.unsure": "tidak yakin",
   "brio.unknown": "tidak tahu",

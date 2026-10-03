@@ -94,7 +94,7 @@ const it: Record<string, string> = {
   "brio.needTwo": "serve almeno una seconda opzione, separata da virgola o a capo",
   "brio.scoreAll": "Rispondi a {{n}}",
   "brio.stop": "Ferma",
-  "nav.brio": "Brio",
+  "nav.brio": "System One",
   "brio.sure": "certo",
   "brio.unsure": "incerto",
   "brio.unknown": "non sa",

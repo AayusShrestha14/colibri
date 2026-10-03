@@ -36,6 +36,10 @@ class FamilyCapabilities:
     # handshake line, openai_server.Engine.vision), never this bit's: a glm53
     # export can carry vision_config and no model.visual.* tensors.
     image: bool = False
+    # A decision engine: it answers POST /v1/systemone natively (the DECIDE
+    # command) and generates nothing. The engine confirms it at start-up with
+    # `CAPS decide=1 chat=0`, which is what the gateway routes on.
+    decision: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,11 +159,13 @@ class FamilyDescriptor:
     # la geometria lo rende visibile. 0 = nessun riferimento dichiarato, il
     # banner stampa display_scale come sempre.
     reference_experts: int = 0
-    # "text" for the chat engines, "image" for a text-to-image pipeline. An
-    # image family has no KV cache, no experts and no chat template: coli
-    # routes it to the image REPL, the image planner and POST
-    # /v1/images/generations, and every text-only invariant (context variable,
-    # segment conformance, tuning) is scoped to modality "text".
+    # "text" for the chat engines, "image" for a text-to-image pipeline,
+    # "decision" for a decision model. An image family has no KV cache, no
+    # experts and no chat template: coli routes it to the image REPL, the image
+    # planner and POST /v1/images/generations, and every text-only invariant
+    # (context variable, segment conformance, tuning) is scoped to modality
+    # "text". A decision family has none of them either: it is served by
+    # `coli serve` / `coli web` and answers POST /v1/systemone only.
     modality: str = "text"
     # Where the tokenizer lives, relative to the model directory. A diffusers
     # pipeline keeps it in processor/, not at the root.
@@ -1630,6 +1636,52 @@ FAMILIES = (
         modality="image",
         tokenizer_file="processor/tokenizer.json",
     ),
+    FamilyDescriptor(
+        id="laya",
+        # A Laya checkpoint has no config.json at its root: resolve_model reads
+        # rl_agent_config.json and the encoder's own config.json, and names it
+        # laya_<encoder model_type>. The English and typed-decisions checkpoints
+        # are ModernBERT-large; laya-multilingual is mmBERT-base, also model_type
+        # modernbert, and is told apart by its geometry.
+        model_types=("laya_modernbert",),
+        display_name="Laya",
+        display_scale="421M",
+        display_variants=(
+            DisplayVariant((("hidden_size", 1024), ("num_hidden_layers", 28)), "Laya", "421M"),
+            DisplayVariant((("hidden_size", 768), ("num_hidden_layers", 22)),
+                           "Laya multilingual", "322M", model_id="laya-multilingual"),
+        ),
+        engine_artifact="laya",
+        engine_aliases=(),
+        engine_group="laya",
+        internal_arch="laya",
+        build_target="laya",
+        process_names=("laya",),
+        default_model_id="laya",
+        cli_adapter="laya",
+        gateway_adapter="laya",
+        planner_id="laya",
+        planner_geometry=None,
+        planner_unsupported_reason=(
+            "a decision model has no KV cache and no experts: it keeps its weights "
+            "resident (about 1.7 GB in f32 for the 421M checkpoint) and reads at "
+            "most max_len tokens per question"),
+        expert_inventory=lambda _name, _size, _config, _dtype=None: (),
+        config_section="root",
+        # max_len 512 (the English checkpoint) by default; the multilingual
+        # encoder reads up to 8192. No generation, so the output budgets are the
+        # placeholders every descriptor carries, and no context variable: the
+        # engine's own COLI_LAYA_MAX_LEN overrides the checkpoint's max_len.
+        limits=FamilyLimits(512, 8192, 1, 1, 1, 0, ""),
+        capabilities=FamilyCapabilities(False, False, False, False, decision=True),
+        has_gateway_adapter=True,
+        # one-shot `coli run` has nothing to run: a decision needs questions,
+        # which come over POST /v1/systemone from `coli serve` / `coli web`
+        has_cli_adapter=False,
+        supports_accelerator=False,
+        modality="decision",
+        tokenizer_file="tokenizer/tokenizer.json",
+    ),
 )
 
 
@@ -1653,7 +1705,8 @@ def _build_registry(families):
                 not isinstance(family.has_cli_adapter, bool) or
                 not isinstance(family.tune_prompt_template, str) or
                 "{prompt}" not in family.tune_prompt_template or
-                family.modality not in ("text", "image") or
+                family.modality not in ("text", "image", "decision") or
+                family.capabilities.decision != (family.modality == "decision") or
                 not isinstance(family.tokenizer_file, str) or not family.tokenizer_file):
             raise RegistryError(f"incomplete family descriptor: {family.id}")
         try:
@@ -1752,11 +1805,44 @@ def tuning_replay_prompt(family, prompt):
 
 
 MODEL_INDEX = "model_index.json"
+# A Laya checkpoint (and anything trained with its code) carries this instead of
+# a root config.json; its encoder's config.json sits in encoder/.
+DECISION_CONFIG = "rl_agent_config.json"
+
+
+def _resolve_decision_checkpoint(model):
+    """A Laya-style decision checkpoint: rl_agent_config.json at the root, the
+    encoder's config.json under encoder/. The family is keyed on the encoder,
+    laya_<model_type>, and the encoder config is the family config (its geometry
+    names the variant)."""
+    def load(path, what):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except OSError as error:
+            raise FamilyConfigError(f"cannot read {what}: {model}") from error
+        except json.JSONDecodeError as error:
+            raise FamilyConfigError(f"invalid {what}: {error}") from error
+        if not isinstance(value, dict):
+            raise FamilyConfigError(f"{what} is not a JSON object")
+        return value
+    config = load(model / DECISION_CONFIG, DECISION_CONFIG)
+    encoder = load(model / "encoder" / "config.json", "encoder/config.json")
+    model_type = "laya_" + _normalize_model_type(encoder.get("model_type"))
+    try:
+        family = _BY_TYPE[model_type]
+    except KeyError as error:
+        raise UnknownFamilyError(f"unsupported decision checkpoint: an "
+                                 f"{encoder.get('model_type')} encoder") from error
+    if family.modality != "decision":
+        raise UnknownFamilyError(f"unsupported decision checkpoint: {model_type}")
+    return ResolvedFamily(family, model_type, config, encoder, str(model))
 
 
 def resolve_model(model_dir):
     model = Path(model_dir).expanduser().resolve()
     path = model / "config.json"
+    if not path.is_file() and (model / DECISION_CONFIG).is_file():
+        return _resolve_decision_checkpoint(model)
     if not path.is_file() and (model / MODEL_INDEX).is_file():
         # A diffusers pipeline (Qwen-Image): the root carries model_index.json
         # and each component keeps its own config.json in its own directory.
@@ -1942,5 +2028,6 @@ def public_metadata(family):
             "audio_payload": family.capabilities.audio_payload,
             "thinking": family.capabilities.thinking,
             "image": family.capabilities.image,
+            "decision": family.capabilities.decision,
         },
     }
