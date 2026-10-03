@@ -7,9 +7,10 @@ The turns exercise what moves the chain's device state around: a pinned snapshot
 a prompt that diverges and one that starts over, a cache that grows between turns,
 and the prefill read-out (logprobs=k, ECHO frames). Token ids and texts must be the
 CPU's exactly; the logprobs printed with them may differ in their last digits (the
-device sums in another order), so numbers compare within 1e-4 (CHAIN_SERVE_TOL sets
-another bound, for an engine whose fixture amplifies rounding more; the OK line gives
-the largest difference seen). CHAIN_SERVE_EXPECT, a regular expression the chain
+device sums in another order), so numbers compare within 1e-4 (CHAIN_SERVE_TOL in the
+environment sets another bound: a fixture whose logits run to the hundreds, as MiMo's
+does, prints logprobs whose rounding is larger in absolute terms; the OK line gives the
+largest difference seen). CHAIN_SERVE_EXPECT, a regular expression the chain
 session's stderr must match (a lost device's rebuild, say, with COLI_VK_CHAIN_FAULT).
 
 usage: vulkan_chain_serve.py <engine> <snapshot> [KEY=VALUE ...]   (extra environment)
@@ -126,8 +127,8 @@ def main():
                 print(f"  cpu: {a[:200]!r}\n  vk : {b[:200]!r}")
                 break
         sys.exit(f"FAIL: the chain's frames differ from the CPU's ({len(cpu)} vs {len(dev)})")
-    print(f"OK serve {os.path.basename(snap)} {' '.join(sys.argv[3:])}: {len(cpu)} frames = CPU, "
-          f"{pins} pin lines, {len(reuse)} turns reusing state, numbers within {WORST[0]:.1e}, "
+    print(f"OK serve {os.path.basename(snap)} {' '.join(sys.argv[3:])}: {len(cpu)} frames = CPU "
+          f"(numbers within {WORST[0]:.1e}), {pins} pin lines, {len(reuse)} turns reusing state, "
           f"{forwards[-1].split('] ', 1)[1][:60]}")
 
 

@@ -11,10 +11,12 @@
  *            weight slice per stream, in place
  *   rope     rotate-half from a host table, heads at a stride
  *   attn     causal GQA with the output gate over a cache at an offset, prefill rows
- *            after earlier ones, and a selection list
+ *            after earlier ones, and a selection list; MiMo's form (vkc_attn_w): a
+ *            sliding window, a ring of rows, position-major rows, V's own head dim and
+ *            a sink logit per head
  *   dnconv   both orders of the sum, the ring carried across calls, the snapshot row
  *   dnrec    KD 8 and 128, silu and sigmoid gates, the state carried, the snapshot
- *   ew       every element-wise op
+ *   ew       every element-wise op (SCALE: MiMo's value scale)
  *   qsa      block keys, and the selection with ties broken as the CPU sorts
  *   ple      the gate and the dilated convolution with its ring and snapshot
  *   frames   vkc_write, vkc_read, a frame left in flight and one ordered after it
@@ -36,6 +38,12 @@
  *            keeps it, its order of the l2 norms and the update, over two submissions
  *   ares     Kimi K3's attention residuals (res_mix) over 0 to 15 block snapshots, and
  *            SiTU-GLU on values both sides of its two constants
+ *   sconv    inkling's short convolution (residual inside, the ring carried across
+ *            calls) and its scalar multiply and divide
+ *   relattn  inkling's attention: the relative-position bias, tau, a sliding window
+ *            over a ring the step wraps, the step's rows read from its own K/V, and a
+ *            global layer; the shared experts' weighted add (HC_APPLY over one stream)
+ *   inkling's hidden size: the GEMV and the norm at D = 6144, the GEMV at I = 24576
  *
  *   make vk-chain-check VK=1   (VK_ICD_FILENAMES=.../lvp_icd.json for Lavapipe) */
 #include <stdio.h>
@@ -224,6 +232,51 @@ static void test_attn(int S, int pos_base, int hd, int use_list) {
     free(q); free(kc); free(vc); free(sel); free(ref);
 }
 
+/* MiMo's attention (vkc_attn_w): row s at pos = pos_base + s sees the positions
+ * max(0, pos - win + 1)..pos (win 0: from 0); position t sits in row t % ring of the
+ * cache (ring 0: row t), rows position-major (kv_pm) or head-major; V has its own head
+ * dim vd; with a sink, one more logit per head joins the softmax denominator. */
+static void test_attn_win(int S, int pos_base, int H, int KVH, int hd, int vd, int win, int ring, int sink, int kv_pm) {
+    int rows = ring ? ring : pos_base + S + 3, koff = 32, voff = 16, qrow = H * hd + 40;
+    size_t kn = (size_t)koff + (size_t)rows * KVH * hd, vn = (size_t)voff + (size_t)rows * KVH * vd;
+    float *q = fvec((size_t)S * qrow, 1.f), *kc = fvec(kn, 1.f), *vc = fvec(vn, 1.f), *snk = fvec(H + 5, 2.f);
+    float scale = 1.f / sqrtf((float)hd);
+    float *ref = malloc((size_t)S * H * vd * sizeof *ref);
+    for (int s = 0; s < S; s++) for (int h = 0; h < H; h++) {
+        int kvh = h / (H / KVH), pos = pos_base + s, first = win ? (pos - win + 1 > 0 ? pos - win + 1 : 0) : 0, n = pos - first + 1;
+        double *sc = malloc(n * sizeof *sc), mx = sink ? snk[5 + h] : -1e300, sum = 0;
+        for (int j = 0; j < n; j++) {
+            int r = ring ? (first + j) % ring : first + j;
+            size_t kb = koff + (kv_pm ? ((size_t)r * KVH + kvh) : ((size_t)kvh * rows + r)) * hd;
+            double a = 0; for (int d = 0; d < hd; d++) a += (double)q[(size_t)s * qrow + h * hd + d] * kc[kb + d];
+            sc[j] = a * scale; if (sc[j] > mx) mx = sc[j];
+        }
+        if (sink) sum = exp(snk[5 + h] - mx);
+        for (int j = 0; j < n; j++) { sc[j] = exp(sc[j] - mx); sum += sc[j]; }
+        for (int d = 0; d < vd; d++) {
+            double a = 0;
+            for (int j = 0; j < n; j++) {
+                int r = ring ? (first + j) % ring : first + j;
+                size_t vb = voff + (kv_pm ? ((size_t)r * KVH + kvh) : ((size_t)kvh * rows + r)) * vd;
+                a += sc[j] / sum * vc[vb + d];
+            }
+            ref[((size_t)s * H + h) * vd + d] = (float)a;
+        }
+        free(sc);
+    }
+    VkcBuf *qb = up(q, (size_t)S * qrow), *kb = up(kc, kn), *vb = up(vc, vn), *sb = up(snk, H + 5);
+    VkcBuf *ob = vkc_buf((size_t)S * H * vd * 4, VKC_DOWN);
+    VkcAttnW p = {{S, H, KVH, hd, pos_base, rows, 0, qrow, hd, 0, 0, 0, 0, 0, H * vd, 0, 0, scale, koff, voff},
+                  win, ring, vd, kv_pm, sink, 5};
+    vkc_begin(); int ok = vkc_attn_w(qb, kb, vb, ob, NULL, NULL, sink ? sb : NULL, &p); vkc_submit(1);
+    float *o = vkc_ptr(ob);
+    double e = relerr(o, ref, (size_t)S * H * vd, 1e-3);
+    CHECK(ok && e < 2e-5, "attn window S %d pos %d hd %d vd %d win %d ring %d sink %d pm %d: err %.2e",
+          S, pos_base, hd, vd, win, ring, sink, kv_pm, e);
+    vkc_free(qb); vkc_free(kb); vkc_free(vb); vkc_free(sb); vkc_free(ob);
+    free(q); free(kc); free(vc); free(snk); free(ref);
+}
+
 /* ---- DeltaNet: convolution and recurrence ------------------------------------------ */
 static void conv_ref(int S, int CD, int CK, const float *in, const float *w, float *ring, float *out, int order, int snap_row, float *snap) {
     for (int s = 0; s < S; s++) for (int c = 0; c < CD; c++) {
@@ -325,7 +378,8 @@ static void test_ew(void) {
     struct { int op, flags, n; const char *name; } ops[] = {
         {VKC_EW_ADD, 0, R * D, "add"}, {VKC_EW_COMBINE, 1 | 2 | 4, R * D, "combine"}, {VKC_EW_COMBINE, 2 | 8, R * D, "combine-noresid"},
         {VKC_EW_COMBINE, 1, R * D, "combine-routed"}, {VKC_EW_SWIGLU, 0, R * D, "swiglu"}, {VKC_EW_HC_LOW, 0, R * D, "hc-low"},
-        {VKC_EW_HC_MIX, 0, R * D, "hc-mix"}, {VKC_EW_HC_INJ, 0, R * C, "hc-inj"}, {VKC_EW_HC_APPLY, 0, R * W, "hc-apply"}};
+        {VKC_EW_HC_MIX, 0, R * D, "hc-mix"}, {VKC_EW_HC_INJ, 0, R * C, "hc-inj"}, {VKC_EW_HC_APPLY, 0, R * W, "hc-apply"},
+        {VKC_EW_SCALE, 0, R * D, "scale"}};
     for (size_t k = 0; k < sizeof ops / sizeof *ops; k++) {
         int n = ops[k].n, op = ops[k].op, f = ops[k].flags;
         for (int i = 0; i < n; i++) {
@@ -341,6 +395,7 @@ static void test_ew(void) {
             case VKC_EW_HC_INJ: ref[i] = 2.f * sigm(a[i] / C); break;
             case VKC_EW_HC_APPLY: { int rr = i / W, rem = i % W, s = rem / D, dd = rem % D;
                 ref[i] = c[i] + a[rr * C + s] * b[rr * D + dd]; break; }
+            case VKC_EW_SCALE: ref[i] = a[i] * (float)C; break;
             }
         }
         if (op == VKC_EW_HC_APPLY) { vkc_begin(); vkc_write(yb, 0, c, nw * 4); vkc_submit(1); }
@@ -353,6 +408,145 @@ static void test_ew(void) {
     }
     vkc_free(ab); vkc_free(bb); vkc_free(cb); vkc_free(eb); vkc_free(yb);
     free(a); free(b); free(c); free(e); free(ref);
+}
+
+/* ---- inkling: the short convolution, the scale, the attention ----------------------- */
+/* inkling.c's sconv_apply for S rows of C channels, in place, the ring (CK-1 raw inputs) carried */
+static void sconv_ref(int S, int C, int CK, float *x, const float *w, float *ring) {
+    int P = CK - 1;
+    float *col = malloc((size_t)(P + S) * sizeof *col);
+    for (int c = 0; c < C; c++) {
+        for (int j = 0; j < P; j++) col[j] = ring[c * P + j];
+        for (int t = 0; t < S; t++) col[P + t] = x[(size_t)t * C + c];
+        for (int t = 0; t < S; t++) {
+            float acc = 0.f;
+            for (int j = 0; j < CK; j++) acc += w[c * CK + j] * col[t + j];
+            x[(size_t)t * C + c] = acc + col[P + t];
+        }
+        for (int j = 0; j < P; j++) ring[c * P + j] = col[S + j];
+    }
+    free(col);
+}
+static void test_sconv(int C, int CK) {
+    int S1 = 6, S2 = 1, P = CK - 1, xo = 8, ro = 4;
+    size_t nx = (size_t)(S1 + S2) * C;
+    float *w = fvec((size_t)C * CK, 0.5f), *x = fvec(nx, 1.f), *ring = fvec((size_t)C * P, 1.f);
+    float *xr = malloc(nx * sizeof *xr), *rr = malloc((size_t)C * P * sizeof *rr);
+    memcpy(xr, x, nx * sizeof *xr); memcpy(rr, ring, (size_t)C * P * sizeof *rr);
+    sconv_ref(S1, C, CK, xr, w, rr);
+    sconv_ref(S2, C, CK, xr + (size_t)S1 * C, w, rr);
+    VkcBuf *wb = up(w, (size_t)C * CK), *xb = vkc_buf((xo + nx) * 4, VKC_DEV), *rb = vkc_buf((ro + (size_t)C * P) * 4, VKC_DEV);
+    vkc_begin(); vkc_write(xb, xo, x, nx * 4); vkc_write(rb, ro, ring, (size_t)C * P * 4); vkc_submit(1);
+    VkcSconv p1 = {0, S1, C, CK, xo, C, 0, ro, 0, 1.f}, p2 = {0, S2, C, CK, xo + S1 * C, C, 0, ro, 0, 1.f};
+    vkc_begin(); int ok = vkc_sconv(xb, wb, rb, &p1); vkc_submit(0);     /* left in flight */
+    vkc_begin(); ok &= vkc_sconv(xb, wb, rb, &p2); vkc_submit(1);
+    float *o = down(xb, xo, nx), *r = down(rb, ro, (size_t)C * P);
+    double e1 = relerr(o, xr, nx, 1e-3), e2 = relerr(r, rr, (size_t)C * P, 1e-3);
+    CHECK(ok && e1 < 1e-6 && e2 == 0, "sconv C %d CK %d: out %.2e ring %.2e", C, CK, e1, e2);
+    /* the scalar multiply and divide over n floats at an offset */
+    int n = 3 * C + 5; float fc = 24.f;
+    for (int mode = 1; mode <= 2; mode++) {
+        vkc_begin(); vkc_write(xb, xo, x, (size_t)n * 4); vkc_submit(1);
+        VkcSconv ps = {mode, 0, 0, 0, xo, 0, 0, 0, n, fc};
+        vkc_begin(); ok = vkc_sconv(xb, NULL, NULL, &ps); vkc_submit(1);
+        float *y = down(xb, xo, n), *ref = malloc((size_t)n * sizeof *ref);
+        for (int i = 0; i < n; i++) ref[i] = mode == 1 ? x[i] * fc : x[i] / fc;
+        double e = relerr(y, ref, n, 1e-6);
+        CHECK(ok && e < 1e-6, "sconv mode %d: err %.2e", mode, e);
+        free(y); free(ref);
+    }
+    vkc_free(wb); vkc_free(xb); vkc_free(rb);
+    free(w); free(x); free(ring); free(xr); free(rr); free(o); free(r);
+}
+/* inkling.c's attention() for S rows from pos_base: the K/V of every position in kt/vt
+ * ([T][KVH*hd]), r [S][H*dr], relp [dr][ext], tau [S]; the device sees the positions
+ * before pos_base through a ring of cap rows (t % cap, the latest such t < pos_base)
+ * and the step's own rows in a scratch, k at ks, v at vs, kvd floats a row. */
+static void test_relattn(int S, int pos_base, int window, int cap, int hd, int dr, int ext) {
+    int H = 4, KVH = 2, kvd = KVH * hd, T = pos_base + S, koff = 32, roff = 16, poff = 24, toff = 8;
+    float *q = fvec((size_t)S * H * hd, 1.f), *kt = fvec((size_t)T * kvd, 1.f), *vt = fvec((size_t)T * kvd, 1.f);
+    float *r = fvec((size_t)S * H * dr, 0.5f), *relp = fvec((size_t)dr * ext, 0.5f), *tau = malloc(S * sizeof *tau);
+    for (int s = 0; s < S; s++) tau[s] = 1.f + (rnd() % 1000) / 2000.f;
+    float scale = 1.f / (float)hd;
+    float *ref = malloc((size_t)S * H * hd * sizeof *ref);
+    for (int s = 0; s < S; s++) for (int h = 0; h < H; h++) {
+        int kvh = h / (H / KVH), qpos = pos_base + s, t0 = window > 0 && qpos - window + 1 > 0 ? qpos - window + 1 : 0;
+        int n = qpos - t0 + 1;
+        double *sc = malloc(n * sizeof *sc), mx = -1e300, sum = 0;
+        for (int j = 0; j < n; j++) {
+            int t = t0 + j, dist = qpos - t;
+            double a = 0; for (int d = 0; d < hd; d++) a += (double)q[((size_t)s * H + h) * hd + d] * kt[(size_t)t * kvd + kvh * hd + d];
+            double b = 0; if (dist < ext) for (int k = 0; k < dr; k++) b += (double)r[((size_t)s * H + h) * dr + k] * relp[k * ext + dist];
+            sc[j] = tau[s] * (a * scale + b); if (sc[j] > mx) mx = sc[j];
+        }
+        for (int j = 0; j < n; j++) { sc[j] = exp(sc[j] - mx); sum += sc[j]; }
+        for (int d = 0; d < hd; d++) {
+            double a = 0; for (int j = 0; j < n; j++) a += sc[j] / sum * vt[(size_t)(t0 + j) * kvd + kvh * hd + d];
+            ref[((size_t)s * H + h) * hd + d] = (float)a;
+        }
+        free(sc);
+    }
+    /* the ring as the host keeps it after the positions before pos_base, and the scratch */
+    size_t nr = (size_t)koff + (size_t)KVH * cap * hd;
+    float *kr = calloc(nr, sizeof *kr), *vr = calloc(nr, sizeof *vr);
+    for (int t = 0; t < pos_base; t++) for (int h = 0; h < KVH; h++) {
+        memcpy(kr + koff + ((size_t)h * cap + t % cap) * hd, kt + (size_t)t * kvd + h * hd, hd * sizeof(float));
+        memcpy(vr + koff + ((size_t)h * cap + t % cap) * hd, vt + (size_t)t * kvd + h * hd, hd * sizeof(float));
+    }
+    size_t ks = 4, vs = ks + (size_t)S * kvd, nsc = vs + (size_t)S * kvd;
+    float *scr = calloc(nsc, sizeof *scr);
+    memcpy(scr + ks, kt + (size_t)pos_base * kvd, (size_t)S * kvd * sizeof(float));
+    memcpy(scr + vs, vt + (size_t)pos_base * kvd, (size_t)S * kvd * sizeof(float));
+    float *rbuf = calloc(roff + (size_t)S * H * dr, sizeof *rbuf), *pbuf = calloc(poff + (size_t)dr * ext, sizeof *pbuf), *tbuf = calloc(toff + S, sizeof *tbuf);
+    memcpy(rbuf + roff, r, (size_t)S * H * dr * sizeof(float)); memcpy(pbuf + poff, relp, (size_t)dr * ext * sizeof(float));
+    memcpy(tbuf + toff, tau, S * sizeof(float));
+    VkcBuf *qb = up(q, (size_t)S * H * hd), *kb = up(kr, nr), *vb = up(vr, nr), *sb = up(scr, nsc), *rb = up(rbuf, roff + (size_t)S * H * dr);
+    VkcBuf *pb = up(pbuf, poff + (size_t)dr * ext), *tb = up(tbuf, toff + S), *ob = vkc_buf((size_t)S * H * hd * 4, VKC_DOWN);
+    VkcRelAttn p = {S, H, KVH, hd, pos_base, cap, window, ext, dr, 0, H * hd, 0, H * hd, koff, koff, (int)ks, (int)vs, kvd,
+                    roff, H * dr, poff, toff, scale};
+    vkc_begin(); int ok = vkc_relattn(qb, kb, vb, ob, sb, rb, pb, tb, &p); vkc_submit(1);
+    double e = relerr((float *)vkc_ptr(ob), ref, (size_t)S * H * hd, 1e-3);
+    CHECK(ok && e < 2e-5, "relattn S %d pos %d window %d cap %d hd %d d_rel %d ext %d: err %.2e", S, pos_base, window, cap, hd, dr, ext, e);
+    vkc_free(qb); vkc_free(kb); vkc_free(vb); vkc_free(sb); vkc_free(rb); vkc_free(pb); vkc_free(tb); vkc_free(ob);
+    free(q); free(kt); free(vt); free(r); free(relp); free(tau); free(ref); free(kr); free(vr); free(scr); free(rbuf); free(pbuf); free(tbuf);
+}
+/* the shared experts joining the routed sum: y = routed; y += w_j[r] * sh_j[r] in order */
+static void test_weighted_add(void) {
+    int R = 3, D = 70, NS = 2;
+    float *routed = fvec((size_t)R * D, 2.f), *sh = fvec((size_t)NS * R * D, 2.f), *w = fvec((size_t)NS * R, 1.f), *ref = malloc((size_t)R * D * sizeof *ref);
+    memcpy(ref, routed, (size_t)R * D * sizeof *ref);
+    for (int j = 0; j < NS; j++) for (int r = 0; r < R; r++) for (int d = 0; d < D; d++) ref[r * D + d] += w[j * R + r] * sh[((size_t)j * R + r) * D + d];
+    VkcBuf *yb = up(routed, (size_t)R * D), *sb = up(sh, (size_t)NS * R * D), *wb = up(w, (size_t)NS * R);
+    vkc_begin(); int ok = 1;
+    for (int j = 0; j < NS; j++) { VkcEw p = {VKC_EW_HC_APPLY, R * D, D, 1, 0, 1, 0, j * R, j * R * D, 0, 0, 1.f}; ok &= vkc_ew(yb, wb, sb, NULL, NULL, &p); }
+    vkc_submit(1);
+    float *y = down(yb, 0, (size_t)R * D);
+    double e = relerr(y, ref, (size_t)R * D, 1e-3);
+    CHECK(ok && e < 1e-6, "weighted add: err %.2e", e);
+    vkc_free(yb); vkc_free(sb); vkc_free(wb); free(routed); free(sh); free(w); free(ref); free(y);
+}
+static void test_inkling(void) {
+    test_sconv(37, 4); test_sconv(6144, 4); test_sconv(9, 1); test_sconv(5, 9);
+    test_relattn(1, 0, 0, 64, 16, 4, 32);              /* the first position, global */
+    test_relattn(5, 200, 0, 300, 32, 16, 64);          /* global, distances past ext (bias 0) */
+    test_relattn(1, 40, 16, 16, 32, 4, 16);            /* decode, a sliding window over a wrapped ring */
+    test_relattn(20, 30, 16, 16, 16, 4, 16);           /* a step that wraps the ring more than once */
+    test_relattn(130, 3, 0, 200, 24, 4, 200);          /* two tiles of positions */
+    test_relattn(3, 513, 512, 512, 128, 16, 512);      /* the real window and ring, hd 128 */
+    test_relattn(2, 9, 0, 64, 256, 64, 8);             /* the largest head and bank */
+    test_weighted_add();
+    for (int k = 0; k < 4; k++) { int f[4] = {1, 4, 10, 11}; test_matmul(f[k], 1, 6144, 48, 0, 0); }
+    test_matmul(10, 1, 24576, 16, 0, 0);               /* past chain_gemv's staging: qmatmul.comp */
+    test_matmul(4, 1, 24576, 16, 0, 0);
+    VkcNorm np = {2, 6144, 1, 0, 6144, 6144, 0, 6144, 6144, 0, 0, 0, 1e-6f, 1.f};
+    float *x = fvec(2 * 6144, 1.f), *w = fvec(6144, 1.f), *ref = malloc(2 * 6144 * sizeof *ref);
+    for (int r = 0; r < 2; r++) { double ms = 0; for (int i = 0; i < 6144; i++) ms += (double)x[r * 6144 + i] * x[r * 6144 + i];
+        float rr = 1.f / sqrtf((float)(ms / 6144) + 1e-6f); for (int i = 0; i < 6144; i++) ref[r * 6144 + i] = x[r * 6144 + i] * rr * w[i]; }
+    VkcBuf *xb = up(x, 2 * 6144), *wb = up(w, 6144), *yb = vkc_buf(2 * 6144 * 4, VKC_DOWN);
+    vkc_begin(); int ok = vkc_norm(xb, wb, yb, &np); vkc_submit(1);
+    double e = relerr((float *)vkc_ptr(yb), ref, 2 * 6144, 1e-3);
+    CHECK(ok && e < 1e-5, "norm D 6144: err %.2e", e);
+    vkc_free(xb); vkc_free(wb); vkc_free(yb); free(x); free(w); free(ref);
 }
 
 /* ---- QSA: block keys and selection ----------------------------------------------------- */
@@ -1170,6 +1364,15 @@ int main(int argc, char **argv) {
     printf("norm done\n");
     test_rope();
     test_attn(1, 0, 16, 0); test_attn(1, 140, 32, 0); test_attn(5, 200, 64, 0); test_attn(6, 9, 256, 1); test_attn(130, 3, 24, 0);
+    /* MiMo: a prompt's rows through a window (from position 0, and past it), a decode row
+     * over a ring as large as the window, prefill rows over a larger ring, full attention
+     * with V's own head dim, a window wider than a tile, the head-major layout with a
+     * window, the release's head dims (192 / 128) over a ring of 128 */
+    test_attn_win(5, 0, 4, 2, 48, 32, 8, 0, 1, 1);  test_attn_win(5, 20, 4, 2, 48, 32, 8, 0, 1, 1);
+    test_attn_win(1, 30, 4, 4, 48, 32, 8, 8, 1, 1); test_attn_win(1, 3, 4, 4, 48, 32, 8, 8, 1, 1);
+    test_attn_win(3, 40, 4, 2, 48, 32, 8, 10, 0, 1); test_attn_win(4, 6, 4, 2, 64, 48, 0, 0, 1, 1);
+    test_attn_win(2, 300, 4, 2, 16, 16, 150, 0, 1, 1); test_attn_win(130, 3, 4, 2, 24, 40, 16, 0, 0, 0);
+    test_attn_win(1, 500, 8, 4, 192, 128, 128, 128, 1, 1);
     printf("attn done\n");
     test_dnconv(0); test_dnconv(1);
     test_dnrec(8, 8, 8, 4, 0); test_dnrec(4, 4, 4, 2, 1); test_dnrec(128, 128, 4, 2, 0); test_dnrec(32, 100, 6, 3, 1);
@@ -1222,6 +1425,8 @@ int main(int argc, char **argv) {
         test_situ(1.f, 1.f); test_situ(4.f, 25.f);
         printf("ares done\n");
     }
+    if (vkc_sconv_ready() && vkc_relattn_ready()) { test_inkling(); printf("inkling done\n"); }
+    else CHECK(0, "inkling's ops: chain_sconv.spv or chain_relattn.spv did not load");
     VkcStats st; vkc_stats(&st);
     printf("chain: %llu frames, %llu ops, %llu matmuls (%llu GEMM), %llu barriers\n", st.frames, st.ops, st.matmuls, st.gemms, st.barriers);
     vkc_shutdown();

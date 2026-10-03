@@ -82,6 +82,8 @@ def hw_report(vulkan=None, nvidia=(), icd=None, os_id="ubuntu"):
 
 IGPU = {"name": "Iris Xe", "type": "integrated", "api_version": "1.2.318",
         "api_version_raw": (1 << 22) | (2 << 12) | 318}
+DGPU = {"name": "AMD Radeon RX 7800 XT", "type": "discrete", "api_version": "1.3.296",
+        "api_version_raw": (1 << 22) | (3 << 12) | 296}
 RTX = {"index": 0, "name": "NVIDIA GeForce RTX 4070", "total_bytes": 12 * 2**30,
        "free_bytes": 11 * 2**30, "driver": "560"}
 TC_ALL = {"source_checkout": True, "make": "/usr/bin/make", "cc": "/usr/bin/gcc",
@@ -140,8 +142,32 @@ class BackendChoice(unittest.TestCase):
         self.assertIn("nvidia-cuda-toolkit", decision["missing"][0][1])
 
     def test_engine_without_cuda_path_uses_vulkan(self):
-        decision = self.choose(hw_report(vulkan=IGPU, nvidia=[RTX]), family="mimo")
+        rtx_vk = {"name": RTX["name"], "type": "discrete", "api_version": "1.3.289",
+                  "api_version_raw": (1 << 22) | (3 << 12) | 289}
+        decision = self.choose(hw_report(vulkan=rtx_vk, nvidia=[RTX]), family="mimo")
         self.assertEqual(decision["backend"], "vulkan")
+
+    def test_integrated_gpu_only_for_engines_measured_faster_there(self):
+        for family in sorted(setup_flow.VULKAN_IGPU_MEASURED):
+            with self.subTest(family=family):
+                self.assertEqual(self.choose(hw_report(vulkan=IGPU), family=family)["backend"], "vulkan")
+        for family in ("mimo", "glm", "inkling", "kimi", "deepseek_v4"):
+            with self.subTest(family=family):
+                decision = self.choose(hw_report(vulkan=IGPU), family=family)
+                self.assertEqual(decision["backend"], "cpu")
+                self.assertIn("integrated GPU", decision["reason"])
+                self.assertIn("--backend vulkan", decision["reason"])
+                self.assertEqual(decision["missing"], [])   # nothing to install: a choice, not a lack
+
+    def test_integrated_gpu_when_vulkan_is_asked_for(self):
+        decision = self.choose(hw_report(vulkan=IGPU), family="mimo", requested="vulkan")
+        self.assertEqual(decision["backend"], "vulkan")
+        self.assertEqual(decision["gpu"], "Iris Xe")
+
+    def test_discrete_gpu_runs_vulkan_for_every_engine(self):
+        for family in ("qwen36", "qwen38", "mimo", "glm", "inkling", "kimi", "deepseek_v4"):
+            with self.subTest(family=family):
+                self.assertEqual(self.choose(hw_report(vulkan=DGPU), family=family)["backend"], "vulkan")
 
     def test_vulkan_gpu_without_headers_prints_the_package_command(self):
         tc = dict(TC_ALL, vulkan_headers=False, glslc=None, can_build_vulkan=False)
