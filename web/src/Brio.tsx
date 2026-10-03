@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react"
 import { FileUp, ListChecks, LoaderCircle, Plus, X } from "lucide-react"
 
-import { askBrio, askSystemOne, type BrioResponse } from "@/lib/api"
+import { askSystemOne, type DecisionResponse } from "@/lib/api"
 import { useLocale } from "./i18n"
 
 /* System One mode (the page is still Brio in the code).
@@ -29,7 +29,7 @@ interface Row {
   id: number
   text: string
   options: string          /* vuoto = usa le opzioni comuni */
-  result?: BrioResponse
+  result?: DecisionResponse
   seconds?: number
   error?: string
 }
@@ -38,10 +38,8 @@ let nextId = 1
 const blank = (): Row => ({ id: nextId++, text: "", options: "" })
 const first = (): Row => ({ id: nextId++, text: "", options: "yes\nno" })
 
-export default function Brio({ baseUrl, apiKey, model, connected, decision = false }: {
+export default function Brio({ baseUrl, apiKey, model, connected }: {
   baseUrl: string; apiKey: string; model: string; connected: boolean
-  /* a decision model (Laya): it answers only POST /v1/systemone */
-  decision?: boolean
 }) {
   const { t } = useLocale()
   const [state, setState] = useState("")
@@ -86,8 +84,7 @@ export default function Brio({ baseUrl, apiKey, model, connected, decision = fal
       setRunning(row.id)
       const started = performance.now()
       try {
-        const ask = decision ? askSystemOne : askBrio
-        const result = await ask(baseUrl, apiKey, model, state, row.text, lines(row.options), controller.signal)
+        const result = await askSystemOne(baseUrl, apiKey, model, state, row.text, lines(row.options), controller.signal)
         patch(row.id, { result, seconds: (performance.now() - started) / 1000 })
       } catch (cause) {
         if (controller.signal.aborted) break   /* fermato apposta: le domande dopo restano intatte */
@@ -168,8 +165,8 @@ export default function Brio({ baseUrl, apiKey, model, connected, decision = fal
                   <div className="brio-foot" data-level={level}>
                     <strong>{row.result.answer}</strong>
                     <span>{t("brio.entropy")} {row.result.entropy.toFixed(3)} · {t(`brio.${level}`)}</span>
-                    <em>{row.seconds?.toFixed(1)}s · {row.result.usage.read_tokens} {t("brio.readTokens")} ·{" "}
-                      <b>{row.result.usage.completion_tokens} {t("brio.generatedTokens")}</b></em>
+                    <em>{row.seconds?.toFixed(1)}s · {row.result.usage.input_tokens + row.result.usage.output_tokens} {t("brio.readTokens")} ·{" "}
+                      <b>0 {t("brio.generatedTokens")}</b></em>
                   </div>
                 </div>
               ) : null}

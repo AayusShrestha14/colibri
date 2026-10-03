@@ -22,10 +22,11 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 ```
 
 Implemented endpoints are `GET /v1/models`, `GET /v1/models/{model}`,
-`POST /v1/chat/completions`, legacy `POST /v1/completions`, `POST /v1/brio`
-(closed-set scoring, [systemone.md](systemone.md)) and `POST /v1/systemone`, the
-request and reply of TypeSafe's Jev API served by the same channel, or answered
-natively by a decision model such as [Laya](laya.md) or
+`POST /v1/chat/completions`, legacy `POST /v1/completions` and
+`POST /v1/systemone`, colibri's one decision API ([systemone.md](systemone.md)):
+the request and reply of TypeSafe's Jev API, scored by a language model through
+its logprob channel or answered natively by a decision model such as
+[Laya](laya.md) or
 [GLiNER2.5-Decide](gliner_decide.md). Chat and
 completion requests support JSON responses, SSE streaming, usage counts,
 `max_tokens`/`max_completion_tokens`, `temperature`, `top_p`, and up to four
@@ -568,8 +569,7 @@ What you get is one workspace with a dock to switch page:
 - **System One**: closed-set answers. A document, a question and the only answers
   allowed; the engine reads the probability of each answer, generates nothing,
   and reports an entropy that says when it is not sure. Same thing as
-  `POST /v1/brio`, or `POST /v1/systemone` on a decision model (see
-  [systemone.md](systemone.md));
+  `POST /v1/systemone` (see [systemone.md](systemone.md));
 - **Brain**, two views. *Explore* draws the
   [measured expert atlas](https://github.com/JustVugg/colibri/issues/175) of GLM-5.2 as a cortex with ten regions to
   enter (publish `experts.json` from `tools/expert_atlas/analyze.py --web`).

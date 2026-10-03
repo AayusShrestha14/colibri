@@ -400,6 +400,31 @@ Ti servono due cose: **il programma** (poche centinaia di KB) e **il modello**
 (372 GB). Guida passo passo per tutte le piattaforme nella
 [Quick Start](docs/quickstart.md).
 
+### In un solo passo
+
+**Windows:** scarica il repository (**Code**, poi **Download ZIP**, oppure
+`git clone`), scompattalo e fai doppio clic su **`START-HERE.bat`**.
+**Linux e macOS:**
+
+```bash
+git clone https://github.com/JustVugg/colibri && cd colibri
+./start-here.sh
+```
+
+Rileva RAM, disco e GPU, consiglia un modello adatto a questa macchina (Invio
+lo accetta), compila il motore con Vulkan o CUDA quando la tua GPU può usarli
+(oppure scarica quello già compilato), scarica il modello con ripresa
+(interrompilo quando vuoi, rilancialo per continuare) e apre la dashboard nel
+browser. Stampa anche gli URL base OpenAI e Anthropic per le altre app.
+Rilancialo più tardi e colibri parte subito; `c/coli stop` lo ferma. Cosa fa
+ogni passo: [quickstart.md](docs/quickstart.md#the-one-step-way).
+
+Usi un assistente di programmazione AI? Chiedigli di installare colibri seguendo [docs/AI_SETUP.md](docs/AI_SETUP.md).
+Gli assistenti che parlano il Model Context Protocol possono usare `coli mcp`
+([MCP_SERVER.md](docs/MCP_SERVER.md)).
+
+Segue il percorso manuale.
+
 ### 1. Procurati colibri
 
 **Scarica una release già compilata** — Linux, macOS e Windows, nessun
@@ -499,8 +524,8 @@ altre nove famiglie di modelli linguistici, e un motore genera immagini. Ognuna 
 >
 > **Vulkan opzionale** significa una build `VK=1`. Avviato con `COLI_VULKAN=1`, il
 > motore mette le sue matrici residenti su qualsiasi GPU con un driver Vulkan 1.2
-> (GLM-5.2 ha lì un percorso di decode completo, Kimi K3 un suo livello di expert,
-> `K3_VK`), e la CI verifica quei motori contro i token della CPU su un driver
+> (GLM-5.2 ha lì un percorso di decode completo), e la CI verifica quei motori
+> contro i token della CPU su un driver
 > software ([vulkan.md](docs/vulkan.md#the-other-engines)). Corretto non vuol dire
 > ancora più veloce. Sulla prima GPU reale misurata per questi motori, una Radeon
 > 780M integrata (Ryzen 7 PRO 8700GE, stessi binari, page cache fredda), oggi è più
@@ -559,8 +584,9 @@ possono attivare i checkpoint dello stato ricorrente (`COLI_K3_CKPT=N` slot in R
 o parcheggiati su disco con `COLI_K3_CKPT_DIR`): un prompt modificato o di
 follow-up ripristina il checkpoint più profondo ancora disponibile e rifà il
 prefill solo della coda, invece di ripercorrere l'intera conversazione attraverso i
-layer SSM. Sugli host Vulkan `K3_VK_UP=auto` dimensiona il caricamento del livello
-degli expert in base alla banda misurata. I percorsi KDA e MLA del motore sono
+layer SSM. Sugli host Vulkan (`COLI_VULKAN=1`) i suoi expert instradati entrano nel
+livello di expert condiviso, riempito dalla storia degli expert e aggiornato man mano
+che il routing cambia. I percorsi KDA e MLA del motore sono
 validati token-esatti in CI contro l'implementazione del vendor.
 
 Inkling distribuisce expert int4 ma **pesi densi bf16** (49,4 GB residenti); su un
@@ -585,11 +611,11 @@ COLI_MODEL=/nvme/glm52_i4 ./coli tune     # misura e salva il profilo di esecuzi
 Gran parte di ciò che si chiede a un modello è una scelta, non un paragrafo:
 quale coda, quale verdetto, quale dei quattro valori può prendere un campo. La
 modalità System One passa al motore le opzioni e legge la probabilità di ciascuna
-invece di generare: `completion_tokens` è 0, nessuna risposta può uscire dalla
-tua lista, e ogni risposta arriva con un'entropia, così "il modello non è
-sicuro" è un numero su cui mettere una soglia. Funziona su tutte e dieci le
-famiglie, sullo stesso server, ed è opzionale per richiesta: la chat resta
-identica byte per byte per chi non la chiede.
+invece di generare: non si genera nulla, nessuna risposta può uscire dalla tua
+lista, e ogni risposta arriva con una confidenza, così "il modello non è sicuro"
+è un numero su cui mettere una soglia. Funziona su tutte e dieci le famiglie,
+sullo stesso server, ed è opzionale per richiesta: la chat resta identica byte
+per byte per chi non la chiede.
 
 ```bash
 # nella TUI: lo stesso modello, a cui si dice di non scrivere
@@ -598,20 +624,19 @@ identica byte per byte per chi non la chiede.
 > 340 lines, 8 files, no tests. CI is green but nothing covers that path.
 
 # da qualunque programma: una richiesta JSON al server in esecuzione
-curl -s http://127.0.0.1:8000/v1/brio -H 'Content-Type: application/json' -d '{
-  "model": "qwen36",
+curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -d '{
   "state": "340 lines, 8 files, no tests. CI is green but nothing covers that path.",
-  "question": "What should the reviewer do?",
-  "options": ["merge", "request changes", "close"]}'
+  "questions": {"review": {"type": "choice", "instructions": "What should the reviewer do?",
+                           "criteria": {"merge": null, "request changes": null, "close": null}}}}'
 ```
 
-`questions` fa molte domande su un documento letto una volta sola, e `schema`
-riempie un oggetto JSON un campo alla volta, valido per costruzione. Misurato
-su Qwen3.6 contro la generazione della stessa risposta sulla stessa macchina
-CPU: 2,4x su uno schema a quattro campi, 5,7x su quattro domande sullo stesso
-documento. Tutta la modalità, la forma di richiesta e risposta, e dove non
-serve: [docs/systemone.md](docs/systemone.md). Anche la dashboard ha una pagina System One, e le stesse risposte arrivano da
-`POST /v1/systemone`, l'API di Jev di TypeSafe: un client Jev passa a colibri cambiando solo il base URL.
+`POST /v1/systemone` parla la richiesta e la risposta dell'API Jev di TypeSafe:
+un client Jev passa a colibri cambiando solo il base URL. Più domande sullo
+stesso documento lo leggono una volta sola: misurato su Qwen3.6 contro la
+generazione delle stesse risposte sulla stessa macchina CPU, 5,7x su quattro
+domande sullo stesso documento. Tutta la modalità, la forma di richiesta e
+risposta, e dove non serve: [docs/systemone.md](docs/systemone.md). Anche la
+dashboard ha una pagina System One.
 
 
 Su Windows un archivio di release include `coli.cmd`: fai doppio clic per l'avvio

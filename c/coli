@@ -3,6 +3,9 @@
 colibri — tiny engine, immense model.
 Run GLM-5.2 (744B) locally on CPU with roughly 15-26 GB of RAM.
 
+  coli setup                one step: find the hardware, pick a model, build or fetch
+                            the engine, download, then start the dashboard
+  coli start / status / logs  start, inspect, or read the log of what setup configured
   coli chat                 interactive chat (loads the model once)
   coli serve                OpenAI-compatible HTTP API (persistent engine)
   coli run "prompt"         one-shot generation
@@ -24,7 +27,7 @@ Configuration through environment variables or flags (also valid after the subco
   --topp P           adaptive expert top-p             --topk N   fixed top-k
   --ngen N           maximum response tokens           --cap N    cache slots/layer
 """
-import os, sys, subprocess, argparse, json, time, signal, shutil, threading, re, codecs, tempfile, textwrap, struct, shlex
+import os, sys, subprocess, argparse, json, math, time, signal, shutil, threading, re, codecs, tempfile, textwrap, struct, shlex
 
 # input() only gets line editing and UP/DOWN history once the readline module
 # has been LOADED — without it the terminal's arrow-key escape sequences are
@@ -1817,17 +1820,37 @@ def install_chat_completer(commands=None, arguments=None):
     readline.parse_and_bind("tab: complete")
     readline.set_completer(complete)
 
+def conversation_state(msgs):
+    """The conversation so far as one text state, a "role: content" line per
+    message with text parts joined: what /decide sends as the context."""
+    lines=[]
+    for message in msgs:
+        if not isinstance(message, dict): continue
+        content=message.get("content")
+        if isinstance(content, list):
+            content="".join(part.get("text","") for part in content
+                            if isinstance(part, dict) and isinstance(part.get("text",""), str))
+        if content:
+            lines.append(f"{message.get('role','user')}: {content}")
+    return "\n".join(lines)
+
+def decide_request(model_id, msgs, question, options):
+    """The POST /v1/systemone body of one /decide turn: the conversation as the
+    state, the question as one `choice` whose labels are the options."""
+    return {"model": model_id, "state": conversation_state(msgs),
+            "questions": {"decide": {"type": "choice", "instructions": question,
+                                     "criteria": {option: None for option in options}}}}
+
 def chat_brio(a, base, model_id, msgs, question, options, w):
     """Un giro di modalita System One dalla TUI (/decide): una richiesta, una distribuzione.
 
-    Il ciclo (fotografia del prefisso, una lettura per opzione, normalizzazione
-    per lunghezza) sta nel gateway, non qui: sono tre cose facili da sbagliare e
-    devono stare in un posto solo. Qui si manda la conversazione come contesto
-    e si disegnano le barre."""
+    Il ciclo (fotografia del prefisso, una lettura per opzione, normalizzazione)
+    sta nel gateway, non qui: sono tre cose facili da sbagliare e devono stare
+    in un posto solo. Qui si manda la conversazione come stato a
+    POST /v1/systemone, una domanda `choice`, e si disegnano le barre."""
     import urllib.request, urllib.error
-    body=json.dumps({"model":model_id,"messages":msgs,"question":question,
-                     "options":options}).encode()
-    req=urllib.request.Request(base.rstrip("/")+"/v1/brio", data=body,
+    body=json.dumps(decide_request(model_id, msgs, question, options)).encode()
+    req=urllib.request.Request(base.rstrip("/")+"/v1/systemone", data=body,
                                headers={"Content-Type":"application/json"})
     if a.api_key: req.add_header("Authorization", f"Bearer {a.api_key}")
     print(f"\n  {C.teal}◆ System One{C.r}")
@@ -1839,27 +1862,30 @@ def chat_brio(a, base, model_id, msgs, question, options, w):
         sp.stop()
         try: detail=json.loads(e.read().decode("utf-8","replace")).get("error",{}).get("message","")
         except Exception: detail=""
-        print(f"  {C.yel}[il server ha rifiutato: HTTP {e.code}{' — '+detail if detail else ''}]{C.r}\n")
+        print(f"  {C.yel}[il server ha rifiutato: HTTP {e.code}{': '+detail if detail else ''}]{C.r}\n")
         return
     except OSError as e:
         sp.stop(); print(f"  {C.yel}[server irraggiungibile: {e}]{C.r}\n"); return
     sp.stop()
+    answer=(out.get("answers") or {}).get("decide") or {}
+    probabilities=answer.get("probabilities") or {}
+    ranked=sorted(((option, float(probabilities.get(option, 0.0))) for option in options),
+                  key=lambda item: -item[1])
     bars=max(10, min(30, w-34))
-    for choice in out.get("choices", []):
-        p=choice.get("p",0.0); filled=int(round(p*bars))
-        colour=C.grn if choice["option"]==out.get("answer") else C.dgray
-        print(f"     {colour}{choice['option'][:22]:<22}{C.r} {colour}{'█'*filled}{C.r}"
-              f"{C.dgray}{'░'*(bars-filled)}{C.r} {p*100:5.1f}%"
-              f"  {C.dim}{choice.get('tokens',0)} tok{C.r}")
-    h=out.get("entropy",1.0)
+    for option, p in ranked:
+        filled=int(round(p*bars))
+        colour=C.grn if option==answer.get("choice") else C.dgray
+        print(f"     {colour}{option[:22]:<22}{C.r} {colour}{'█'*filled}{C.r}"
+              f"{C.dgray}{'░'*(bars-filled)}{C.r} {p*100:5.1f}%")
     # L'entropia e la parte che la generazione non sa dare: non "qual e la
-    # risposta" ma "quanto il modello sa di saperlo".
+    # risposta" ma "quanto il modello sa di saperlo". Normalizzata su log(n).
+    h=-sum(p*math.log(p) for _, p in ranked if p>0)/math.log(max(len(ranked),2))
     verdict=(f"{C.grn}sure{C.r}" if h<.4 else
              f"{C.yel}unsure{C.r}" if h<.8 else f"{C.yel}DOES NOT KNOW{C.r}")
     usage=out.get("usage",{})
-    print(f"     {C.b}→ {out.get('answer','?')}{C.r}  {C.dim}entropy {h:.3f}{C.r} ({verdict})")
-    print(f"  {C.dim}{time.time()-t0:.2f}s · {usage.get('read_tokens',0)} tokens read · "
-          f"{usage.get('completion_tokens',0)} generated{C.r}\n")
+    print(f"     {C.b}→ {answer.get('choice','?')}{C.r}  {C.dim}entropy {h:.3f}{C.r} ({verdict})")
+    print(f"  {C.dim}{time.time()-t0:.2f}s · {usage.get('input_tokens',0)} prompt tokens · "
+          f"{usage.get('output_tokens',0)} option tokens read · nothing generated{C.r}\n")
 
 # Families whose template thinks by default but that coli chat starts with thinking
 # OFF. On a model that streams its experts from disk at about 1 tok/s, the default
@@ -3108,6 +3134,14 @@ def cmd_stop(a):
     real processes: the pidfile first, then /proc by cmdline/environ — only
     the requested port's tagged engine and matching `coli serve` wrapper."""
     banner("stop")
+    if a.port is None:
+        # Default 8000, or the port `coli setup` configured: the same server
+        # `coli start` launched is the one `coli stop` stops.
+        try:
+            from setup_flow import configured_port
+            a.port=configured_port(8000)
+        except Exception:
+            a.port=8000
     targets={}  # pid -> descrizione
     pf=serve_pidfile(a.port)
     try:
@@ -3534,7 +3568,9 @@ def main():
     pworker.add_argument("--layers",default="all",help="topology label, e.g. 0-37")
     pworker.add_argument("--ebits",type=int,default=8); pworker.add_argument("--dbits",type=int,default=8)
     pst=sub.add_parser("stop", parents=[common], help="shut down a running coli serve and its engine")
-    pst.add_argument("--port",type=int,default=8000); pst.add_argument("--dry-run",action="store_true")
+    pst.add_argument("--port",type=int,default=None,
+                     help="port of the server to stop (default 8000, or the one `coli setup` configured)")
+    pst.add_argument("--dry-run",action="store_true")
     pw=sub.add_parser("web", parents=[common], help="serve + open the dashboard in a browser")
     for arg,kw in (("--host",dict(default="127.0.0.1")),("--port",dict(type=int,default=8000)),
                    ("--model-id",dict(default=os.environ.get("COLI_MODEL_ID"))),
@@ -3549,6 +3585,46 @@ def main():
                        help="additional Host header accepted by the DNS-rebinding guard; repeat as needed"))):
         pw.add_argument(arg,**kw)
     pw.add_argument("--no-browser",action="store_true",help="don't auto-open the browser")
+    # One-step setup (setup_flow.py). No `common` parent: --model here names a
+    # catalog entry, not a model directory, and nothing below loads an engine.
+    pset=sub.add_parser("setup",help="one step: detect hardware, pick a model, build or fetch "
+                        "the engine, download with resume, then start the dashboard")
+    pset.add_argument("--yes","-y",action="store_true",
+                      help="non-interactive: take the recommendation and every default")
+    pset.add_argument("--model",dest="pick",default=None,metavar="ID",
+                      help="catalog model to install (see --list); default: the recommendation")
+    pset.add_argument("--model-dir",default=None,metavar="DIR",
+                      help="use a model already on disk instead of downloading one")
+    pset.add_argument("--dir",default=None,metavar="DIR",
+                      help="folder for downloaded models (default ~/colibri-models)")
+    pset.add_argument("--backend",choices=("auto","cpu","vulkan","cuda"),default=None,
+                      help="engine build: auto (default) picks CUDA, then Vulkan, then the CPU")
+    pset.add_argument("--no-gpu",action="store_true",help="same as --backend cpu")
+    pset.add_argument("--host",default=None,help="address to serve on (default 127.0.0.1)")
+    pset.add_argument("--port",type=int,default=None,help="port to serve on (default 8000)")
+    pset.add_argument("--no-start",action="store_true",help="set up, but do not start the server")
+    pset.add_argument("--background",action="store_true",
+                      help="start the server in the background (log in the setup folder)")
+    pset.add_argument("--no-browser",action="store_true",help="do not open the browser")
+    pset.add_argument("--reconfigure",action="store_true",
+                      help="choose again even if a setup is already complete")
+    pset.add_argument("--list",action="store_true",help="list the catalog against this machine and exit")
+    pset.add_argument("--all",action="store_true",help="also show the models that do not fit")
+    pset.add_argument("--via-windows",choices=("auto","yes","no"),default="auto",
+                      help="WSL only: download through Windows' curl.exe (auto: when it measures faster)")
+    pset.add_argument("--no-verify",action="store_true",help="skip the checksum of downloaded files")
+    pset.add_argument("--json",action="store_true",
+                      help="machine-readable result; implies --yes and a background start")
+    pstart=sub.add_parser("start",help="start what `coli setup` configured")
+    pstart.add_argument("--background",action="store_true",help="run in the background")
+    pstart.add_argument("--no-browser",action="store_true",help="do not open the browser")
+    pstart.add_argument("--json",action="store_true",help="background start, JSON status out")
+    pstatus=sub.add_parser("status",help="what is set up, whether it runs, its URLs and speed")
+    pstatus.add_argument("--json",action="store_true")
+    plogs=sub.add_parser("logs",help="the last lines of the background server (or install) log")
+    plogs.add_argument("-n","--lines",type=int,default=100)
+    plogs.add_argument("--install",action="store_true",help="the install log instead of the server's")
+    sub.add_parser("mcp",help="Model Context Protocol server on stdio, for AI coding assistants")
     pb=sub.add_parser("bench", parents=[common]); pb.add_argument("tasks", nargs="*")
     pb.add_argument("--limit",type=int,default=40)
     if sys.platform == "win32":
@@ -3576,6 +3652,14 @@ def main():
              "doctor":cmd_doctor,"tune":cmd_tune,
              "run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"stop":cmd_stop,"bench":cmd_bench,
              "convert":cmd_convert,"web":cmd_web}.get(a.cmd)
+    if a.cmd in ("setup","start","status","logs"):
+        import setup_flow
+        flow={"setup":setup_flow.cmd_setup,"start":setup_flow.cmd_start,
+              "status":setup_flow.cmd_status,"logs":setup_flow.cmd_logs}[a.cmd]
+        sys.exit(setup_flow.run(flow,a))
+    if a.cmd=="mcp":
+        import mcp_server
+        sys.exit(mcp_server.main())
     if a.cmd=="cluster":
         if a.cluster_cmd=="coordinator": handler=cmd_cluster_coordinator
         elif a.cluster_cmd=="worker": handler=cmd_cluster_worker

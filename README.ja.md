@@ -368,6 +368,31 @@ n=64 の GLM-5.2 ではまだ捕捉されていません。
 必要なものは 2 つです: **プログラム**（数百 KB）と **モデル**（372 GB）。
 全プラットフォーム向けの手順は [クイックスタートガイド](docs/quickstart.md) にあります。
 
+### ワンステップで始める
+
+**Windows:** リポジトリをダウンロードし（**Code** から **Download ZIP**、または
+`git clone`）、展開して **`START-HERE.bat`** をダブルクリックします。
+**Linux と macOS:**
+
+```bash
+git clone https://github.com/JustVugg/colibri && cd colibri
+./start-here.sh
+```
+
+RAM・ディスク・GPU を検出し、このマシンに収まるモデルを推奨し（Enter でそのまま
+選択）、GPU が使える場合は Vulkan または CUDA でエンジンをビルドし（またはビルド済み
+のものを取得し）、モデルを再開可能な形でダウンロードし（いつ中断しても、もう一度
+実行すれば続きから再開します）、ブラウザでダッシュボードを開きます。他のアプリ向けに
+OpenAI と Anthropic のベース URL も表示します。次回からは実行するだけで colibri が
+すぐに起動し、`c/coli stop` で停止します。各ステップの内容:
+[quickstart.md](docs/quickstart.md#the-one-step-way)。
+
+AI コーディングアシスタントを使っていますか？ [docs/AI_SETUP.md](docs/AI_SETUP.md) に従って colibri をセットアップするよう頼んでください。
+Model Context Protocol に対応したアシスタントは `coli mcp` を使えます
+（[MCP_SERVER.md](docs/MCP_SERVER.md)）。
+
+以下は手動での手順です。
+
 ### 1. colibri を入手する
 
 **ビルド済みリリースをダウンロード** — Linux、macOS、Windows に対応し、コンパイラは不要です。
@@ -460,8 +485,8 @@ GLM-5.2 がリファレンスモデルですが、同じストリーミング手
 > 高速なドライブでキャッシュが温まっていれば 1 秒あたり数トークンを想定してください。
 >
 > **Vulkan はオプトイン** とは `VK=1` ビルドのことです。`COLI_VULKAN=1` で実行すると、エンジンは常駐行列を
-> Vulkan 1.2 ドライバを持つ任意の GPU に置きます（GLM-5.2 はそこに完全なデコード経路を持ち、Kimi K3 は
-> 独自のエキスパートティア `K3_VK` を持ちます）。CI はそれらのエンジンをソフトウェアドライバ上で CPU の
+> Vulkan 1.2 ドライバを持つ任意の GPU に置きます（GLM-5.2 はそこに完全なデコード経路を持ちます）。
+> CI はそれらのエンジンをソフトウェアドライバ上で CPU の
 > トークンと照合しています（[vulkan.md](docs/vulkan.md#the-other-engines)）。正しいことと速いことはまだ
 > 別です。これらのエンジンで最初に計測した実 GPU である内蔵 Radeon 780M（Ryzen 7 PRO 8700GE、同じ
 > バイナリ、コールドなページキャッシュ）では、現時点では CPU より遅くなっています: Qwen3.6-35B-A3B の
@@ -511,8 +536,9 @@ Kimi K3 は変換不要です。QAT で学習された MXFP4 エキスパート�
 リカレント状態のチェックポイントをオプトインできます（RAM 上に `COLI_K3_CKPT=N` スロット、または
 `COLI_K3_CKPT_DIR` でディスクに退避）。編集されたプロンプトやフォローアッププロンプトは、残っている
 最も深いチェックポイントを復元して末尾だけを再プリフィルするため、会話全体を SSM レイヤーで
-再生し直す必要がありません。Vulkan ホストでは `K3_VK_UP=auto` が、計測された帯域幅から
-エキスパートティアのアップロード量を決めます。エンジンの KDA と MLA の経路は、CI でベンダー実装に
+再生し直す必要がありません。Vulkan ホスト（`COLI_VULKAN=1`）では、ルーティングされたエキスパートが
+共有のエキスパートティアに載り、エキスパート履歴から埋められ、ルーティングの変化に合わせて
+入れ替わります。エンジンの KDA と MLA の経路は、CI でベンダー実装に
 対してトークン単位で完全一致することが検証されています。
 
 Inkling は int4 のエキスパートと **bf16 の密な重み**（常駐 49.4 GB）で提供されています。それを
@@ -535,7 +561,7 @@ COLI_MODEL=/nvme/glm52_i4 ./coli tune     # このマシンで最速かつ安全
 
 人がモデルに求めることの多くは、段落ではなく選択です: どのキューか、どの判定か、あるフィールドが取り得る
 4 つの値のどれか。System One モードはエンジンに選択肢を渡し、生成する代わりにそれぞれの確率を読み取ります:
-`completion_tokens` は 0 で、どの回答もリストの外に出ることはなく、すべての回答にエントロピーが付くため、
+何も生成されず、どの回答もリストの外に出ることはなく、すべての回答に確信度 (confidence) が付くため、
 「モデルに確信がない」ことが閾値を設定できる数値になります。10 のファミリーすべてで、同じサーバー上で
 動作し、リクエストごとのオプトインです: 求めない人にとって、チャットはバイト単位で同一のままです。
 
@@ -546,19 +572,17 @@ COLI_MODEL=/nvme/glm52_i4 ./coli tune     # このマシンで最速かつ安全
 > 340 lines, 8 files, no tests. CI is green but nothing covers that path.
 
 # from anywhere: one JSON request on the running server
-curl -s http://127.0.0.1:8000/v1/brio -H 'Content-Type: application/json' -d '{
-  "model": "qwen36",
+curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -d '{
   "state": "340 lines, 8 files, no tests. CI is green but nothing covers that path.",
-  "question": "What should the reviewer do?",
-  "options": ["merge", "request changes", "close"]}'
+  "questions": {"review": {"type": "choice", "instructions": "What should the reviewer do?",
+                           "criteria": {"merge": null, "request changes": null, "close": null}}}}'
 ```
 
-`questions` は 1 回だけ読んだ 1 つの文書について多くのことを尋ね、`schema` は JSON オブジェクトを
-1 フィールドずつ埋めるため、構造上必ず妥当になります。Qwen3.6 で、同じ CPU マシン上で同じ回答を
-生成する場合と比べて計測したところ、4 フィールドのスキーマで 2.4 倍、1 つの文書に対する 4 つの質問で
-5.7 倍でした。モード全体、リクエストとレスポンスの形、そして役に立たない場面については
-[docs/systemone.md](docs/systemone.md) を参照してください。ダッシュボードにも System One ページがあります。同じ回答は TypeSafe の Jev と同じ API である
-`POST /v1/systemone` からも得られ、Jev のクライアントは base URL を変えるだけで切り替えられます。
+`POST /v1/systemone` は TypeSafe の Jev API と同じリクエストとレスポンスを話します: Jev のクライアントは
+base URL を変えるだけで colibri に切り替えられます。1 つの文書への複数の質問は文書を 1 回だけ読みます:
+Qwen3.6 で、同じ CPU マシン上で同じ回答を生成する場合と比べて計測したところ、1 つの文書に対する
+4 つの質問で 5.7 倍でした。モード全体、リクエストとレスポンスの形、そして役に立たない場面については
+[docs/systemone.md](docs/systemone.md) を参照してください。ダッシュボードにも System One ページがあります。
 
 
 Windows ではリリースアーカイブに `coli.cmd` が同梱されています。ダブルクリックでクイックスタート、

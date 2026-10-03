@@ -31,7 +31,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import {
-  decidesOnly, generateImage, generatesImages, getHealth, listModelInfo, streamChat,
+  generateImage, generatesImages, getHealth, listModelInfo, streamChat,
   type ChatMessage, type GeneratedImage, type HealthResponse, type StreamChatResult,
 } from "@/lib/api"
 import {
@@ -73,7 +73,6 @@ export default function App() {
   /* Models the server marks with the image_generation capability. With one of
      them selected the conversation generates pictures instead of text. */
   const [imageModels, setImageModels] = useState<string[]>([])
-  const [decisionModels, setDecisionModels] = useState<string[]>([])
   const [model, setModel] = useState(() => stored(localStorage, "colibri.model", "glm-5.2-colibri"))
   const [temperature, setTemperature] = useState(0.7)
   const [maxTokens, setMaxTokens] = useState(4096)
@@ -192,7 +191,6 @@ export default function App() {
       const found = info.map((item) => item.id)
       setModels(found)
       setImageModels(info.filter(generatesImages).map((item) => item.id))
-      setDecisionModels(info.filter(decidesOnly).map((item) => item.id))
       if (found.length && !found.includes(model)) setModel(found[0])
       setConnected(true)
       try {
@@ -607,8 +605,7 @@ export default function App() {
       </section>}
       <section className="brio-workspace" hidden={view !== "brio"}>
         <header className="page-heading"><span>COLIBRI / SYSTEM ONE</span><h1>{t("nav.brio")}</h1></header>
-        <Brio baseUrl={baseUrl} apiKey={apiKey} model={model} connected={connected}
-              decision={decisionModels.includes(model)} />
+        <Brio baseUrl={baseUrl} apiKey={apiKey} model={model} connected={connected} />
       </section>
     </main>
     <NavigationDock view={view} onNavigate={setView} loading={loading} />

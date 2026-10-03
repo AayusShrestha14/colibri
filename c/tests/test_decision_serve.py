@@ -259,14 +259,18 @@ class DecisionGateway(unittest.TestCase):
         self.serve(FakeDecisionEngine({}))
         for path, body in (("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]}),
                            ("/v1/completions", {"prompt": "hi"}),
-                           ("/v1/messages", {"max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}),
-                           ("/v1/brio", {"state": "x", "options": ["a", "b"]})):
+                           ("/v1/messages", {"max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]})):
             with self.subTest(path=path):
                 status, error = self.post_error(path, dict(body, model="laya"))
                 self.assertEqual(status, 400)
                 if path != "/v1/messages":              # Anthropic's envelope has no code
                     self.assertEqual(error["error"]["code"], "unsupported_endpoint")
                 self.assertIn("POST /v1/systemone", error["error"]["message"])
+
+    def test_v1_brio_is_gone_here_too(self):
+        self.serve(FakeDecisionEngine({}))
+        status, error = self.post_error("/v1/brio", {"model": "laya", "state": "x", "options": ["a", "b"]})
+        self.assertEqual((status, error["error"]["code"]), (404, "not_found"))
 
     def test_models_card_and_health_say_decision(self):
         self.serve(FakeDecisionEngine({}))

@@ -1,11 +1,12 @@
 # System One mode: typed decisions with calibrated probabilities
 
-System One mode answers closed questions with a probability per allowed option,
-through an API compatible with TypeSafe's Jev (`POST /v1/systemone`). In System
-One mode a language model stops writing and starts **scoring**. You give it a prompt
-and a set of allowed options; it answers with how likely each option is, and with
-an entropy that says how sure it is. Same binary, same model, same chat path: the
-mode is a key on the request, not a build flag or a separate server.
+System One mode answers closed questions with a probability per allowed
+option. There is one API for it, `POST /v1/systemone`, with the request and
+the reply of TypeSafe's Jev: a state, typed questions (`noul`, `choice`,
+`score`), and for every question a probability per option. A language model
+answers by **scoring** instead of writing; a decision model such as
+[Laya](laya.md) answers natively. Same server and same model as the chat: the
+mode is the endpoint, not a build flag or a separate process.
 
 ## Why you would want it
 
@@ -19,7 +20,7 @@ System One mode answers the three questions a closed-set decision actually has:
 |---|---|---|
 | which option | a string to parse | the option, by construction |
 | how likely each one | not available | a probability per option, including ones the model would never write |
-| does it know | not available | an entropy: 0 means one plausible option, 1 means all of them |
+| does it know | not available | a `confidence` per answer, 1 when one option holds the mass and 0 when it is flat (the terminal and the page also show the entropy) |
 
 The third row is the one you cannot get any other way, and it is usually the one
 that decides whether a decision can be automated.
@@ -47,7 +48,7 @@ and then reach it however you prefer:
 
 | from | how |
 |---|---|
-| your own code | `POST /v1/systemone` or `POST /v1/brio`, below |
+| your own code | `POST /v1/systemone`, below |
 | the terminal | `coli chat --attach http://127.0.0.1:8000`, then `/decide` |
 | the browser | open the server's address, System One in the navigation dock |
 
@@ -57,164 +58,24 @@ already warm for the others.
 ## The HTTP endpoint
 
 ```
-POST /v1/brio
-```
-
-```json
-{
-  "model": "qwen36",
-  "state": "The pull request changes the logprob maths in the engine. 340 lines, 8 files, no tests. CI is green but the project has no coverage on that path.",
-  "question": "What should the reviewer do?",
-  "options": ["merge", "request changes", "close"]
-}
+POST /v1/systemone
 ```
 
 | field | required | meaning |
 |---|---|---|
-| `model` | yes | as in every other endpoint |
-| `options` | one of | 2 to 64 distinct non-empty strings: one closed question |
-| `questions` | one of | an array of `{question, options}`: many questions on one state, see below |
-| `schema` | one of | an object `field: [values]`: a JSON object filled one field at a time, see below |
-| `task` | optional | with `schema`, what the object is for |
-| `state` | one of | the text to decide on |
-| `messages` | one of | a chat history used as the context instead of `state` |
-| `question` | optional | what to ask about the state |
-| `normalize` | optional | `sum` (default) or `mean`, see below |
-| `cache_slot` | optional | forced KV slot; by default derived from `state` |
+| `state` | yes | what the questions are about: text, an object or an array (JSON is read as text) |
+| `questions` | yes | an object of 1 to 64 questions, `id: question`; the reply uses the same ids |
+| `model` | no | any name: the served model answers (a Jev client sends `jev-latest`) |
+| `normalize`, `pin_state`, `prefix`, `cache_slot` | no | colibri's options, below |
 
-The reply:
+Every question has a `type`, optional `instructions` (text, object or array)
+and its `criteria`:
 
-```json
-{
-  "object": "brio.choice",
-  "answer": "request changes",
-  "entropy": 0.121,
-  "normalize": "sum",
-  "choices": [
-    {"option": "request changes", "p": 0.974, "logprob": -0.252, "mean_logprob": -0.126, "tokens": 2},
-    {"option": "merge",           "p": 0.023, "logprob": -4.007, "mean_logprob": -4.007, "tokens": 1},
-    {"option": "close",           "p": 0.004, "logprob": -5.841, "mean_logprob": -5.841, "tokens": 1}
-  ],
-  "usage": {"prompt_tokens": 88, "completion_tokens": 0, "read_tokens": 4, "total_tokens": 92}
-}
-```
-
-`completion_tokens` is always **0**: nothing is generated. `read_tokens` counts the
-option tokens the engine read to score them.
-
-### Many questions on one text: `questions`
-
-The document is photographed once and every question pays only for its own
-words. This is the case where System One mode saves the most (5.7x against the chat,
-measured below), and the server keeps the order of the snapshots itself.
-
-```json
-{
-  "model": "qwen36",
-  "state": "340 lines, 8 files, no tests. CI is green but no coverage on that path.",
-  "questions": [
-    {"question": "What should the reviewer do?", "options": ["merge", "request changes", "close"]},
-    {"question": "Does it need tests?",          "options": ["yes", "no"]},
-    {"question": "How risky is it?",             "options": ["high", "medium", "low"], "normalize": "sum"}
-  ]
-}
-```
-
-The reply is `brio.answers`: an `answers` array in the same order, each entry
-shaped like a single `brio.choice` (`question`, `answer`, `entropy`, `choices`),
-and one `usage` for the whole request. Up to 64 questions, each with 2 to 64
-options; `normalize` can be set per question or once for all of them.
-
-### Fill a JSON object: `schema`
-
-The braces, the quotes and the field names are data the server writes. For
-each field, in the order you give them, the model only picks one of the values
-you allow, with the fields already filled visible to it. The JSON cannot come
-out malformed and no value can be outside your list, because nothing is
-generated.
-
-```json
-{
-  "model": "qwen36",
-  "state": "340 lines, 8 files, no tests. CI is green but no coverage on that path.",
-  "task": "Review this pull request.",
-  "schema": {
-    "decision":    ["merge", "request changes", "close"],
-    "needs_tests": ["yes", "no"],
-    "risk":        ["high", "medium", "low"],
-    "area":        ["engine", "gateway", "docs"]
-  }
-}
-```
-
-The reply is `brio.schema`: `json` is the filled object, ready to use, and
-`fields` carries, per field, the chosen `value`, its `p`, the `entropy` of that
-cell and the full `choices`. The entropy per field is the point: the measured
-run below was sure about `area` (0.17) and not about `needs_tests` and `risk`
-(0.95 and 0.99), and said so, where the chat wrote `"risk": "high"` with the
-same face. `task` is optional. Field names cannot contain quotes, backslashes
-or newlines; values can, they are escaped.
-
-### From your own code
-
-No SDK is needed: it is one JSON request on the same server, with the same
-API key header as the rest.
-
-```python
-import requests
-r = requests.post("http://127.0.0.1:8000/v1/brio", json={
-    "model": "qwen36",
-    "state": open("ticket.txt").read(),
-    "questions": [
-        {"question": "Which queue?", "options": ["billing", "bugs", "sales"]},
-        {"question": "Urgent?",      "options": ["yes", "no"]},
-    ]})
-for a in r.json()["answers"]:
-    print(a["question"], "->", a["answer"], f"(entropy {a['entropy']:.2f})")
-```
-
-```js
-const r = await fetch("http://127.0.0.1:8000/v1/brio", {
-  method: "POST", headers: {"Content-Type": "application/json"},
-  body: JSON.stringify({ model: "qwen36", state: ticket,
-    schema: { queue: ["billing", "bugs", "sales"], urgent: ["yes", "no"] } })
-});
-const { json, fields } = await r.json();
-// json.queue, json.urgent are guaranteed to be values from your lists
-```
-
-### Switching from Jev: change the base URL, keep your code
-
-colibri answers `POST /v1/systemone` with the request and the reply of
-TypeSafe's Jev API. Code written against Jev keeps working: point it at
-colibri and change nothing else. The two official SDKs, unmodified, are
-tested against `coli serve` on a language model and on a decision engine
-(`tests/test_jev_sdk.py`, `make -C c jev-sdk-check`).
-
-Python, `typesafe_sdk`:
-
-```python
-from typesafe_sdk import TypeSafeClient
-
-client = TypeSafeClient(api_key="your-colibri-key", base_url="http://127.0.0.1:8000")
-result = client.system_one(model="jev-latest", state=ticket, questions=questions)
-print(result.choices["department"].choice, result.nouls["urgency"].noul)
-```
-
-TypeScript, `@typesafe-ai/sdk`:
-
-```ts
-import { TypeSafeClient } from "@typesafe-ai/sdk";
-
-const client = new TypeSafeClient({ apiKey: "your-colibri-key", baseURL: "http://127.0.0.1:8000" });
-const { answers } = await client.systemOne({ state: ticket, questions });
-```
-
-Or leave the code as it is and set `TYPESAFE_BASE_URL=http://127.0.0.1:8000`
-and `TYPESAFE_API_KEY` (the server's `COLI_API_KEY`; the SDKs want a
-non-empty key, and a server started without one accepts any). The SDKs
-POST to `<base_url>/v1/systemone` and list models at `<base_url>/v1/models`;
-both routes accept any `model` name (a Jev client sends `jev-latest`).
+| type | criteria | the answer |
+|---|---|---|
+| `noul` | optional `{"true": ..., "false": ...}` descriptions | `noul`: the probability of yes |
+| `choice` | `{label: description or null}`, 1 to 255 labels | `choice`, `probabilities` by label, `confidence` |
+| `score` | `[level 0, level 1, ...]`, 1 to 255 levels | `score` (the expected level), `legend` and `probabilities` keyed `"0".."n-1"`, `confidence` |
 
 ```bash
 curl -s http://127.0.0.1:8000/v1/systemone \
@@ -252,6 +113,91 @@ from disk, the state read once for the three questions):
  "usage": {"input_tokens": 86, "output_tokens": 15, "cost": 0}}
 ```
 
+`usage.output_tokens` counts the option tokens a language model **read**:
+nothing is generated. The probabilities of a question always sum to 1 over
+its options.
+
+### Many questions on one text
+
+The document is photographed once and every question pays only for its own
+words. This is the case where System One mode saves the most (5.7x against the
+chat, measured below), and the server keeps the order of the snapshots itself:
+the state alone first, then each question on top of it.
+
+A closed question with a list of answers is one `choice` whose labels are the
+answers (`{"merge": null, "request changes": null, "close": null}`); a JSON
+object whose fields each take one of a few values is one `choice` per field.
+
+Up to 1.12.1 the same channel also had its own route, `POST /v1/brio`, with an
+`options`, a `questions` and a `schema` form. It is gone: `/v1/systemone` is
+the one decision API. A `schema` filled its fields in order, each seeing the
+values chosen before it; questions on `/v1/systemone` are answered each on
+its own, from the state.
+
+### From your own code
+
+No SDK is needed: it is one JSON request on the same server, with the same
+API key header as the rest.
+
+```python
+import requests
+r = requests.post("http://127.0.0.1:8000/v1/systemone", json={
+    "state": open("ticket.txt").read(),
+    "questions": {
+        "queue":  {"type": "choice", "instructions": "Which queue?",
+                   "criteria": {"billing": None, "bugs": None, "sales": None}},
+        "urgent": {"type": "noul", "instructions": "Is it urgent?"},
+    }})
+answers = r.json()["answers"]
+print(answers["queue"]["choice"], answers["queue"]["confidence"], answers["urgent"]["noul"])
+```
+
+```js
+const r = await fetch("http://127.0.0.1:8000/v1/systemone", {
+  method: "POST", headers: {"Content-Type": "application/json"},
+  body: JSON.stringify({ state: ticket, questions: {
+    queue: { type: "choice", instructions: "Which queue?", criteria: { billing: null, bugs: null, sales: null } },
+    urgent: { type: "noul", instructions: "Is it urgent?" } } })
+});
+const { answers } = await r.json();
+// answers.queue.choice is one of your labels; answers.urgent.noul is P(yes)
+```
+
+### Switching from Jev: change the base URL, keep your code
+
+colibri answers `POST /v1/systemone` with the request and the reply of
+TypeSafe's Jev API. Code written against Jev keeps working: point it at
+colibri and change nothing else. The two official SDKs, unmodified, are
+tested against `coli serve` on a language model and on a decision engine
+(`tests/test_jev_sdk.py`, `make -C c jev-sdk-check`).
+
+Python, `typesafe_sdk`:
+
+```python
+from typesafe_sdk import TypeSafeClient
+
+client = TypeSafeClient(api_key="your-colibri-key", base_url="http://127.0.0.1:8000")
+result = client.system_one(model="jev-latest", state=ticket, questions=questions)
+print(result.choices["department"].choice, result.nouls["urgency"].noul)
+```
+
+TypeScript, `@typesafe-ai/sdk`:
+
+```ts
+import { TypeSafeClient } from "@typesafe-ai/sdk";
+
+const client = new TypeSafeClient({ apiKey: "your-colibri-key", baseURL: "http://127.0.0.1:8000" });
+const { answers } = await client.systemOne({ state: ticket, questions });
+```
+
+Or leave the code as it is and set `TYPESAFE_BASE_URL=http://127.0.0.1:8000`
+and `TYPESAFE_API_KEY` (the server's `COLI_API_KEY`; the SDKs want a
+non-empty key, and a server started without one accepts any). The SDKs
+POST to `<base_url>/v1/systemone` and list models at `<base_url>/v1/models`;
+both routes accept any `model` name (a Jev client sends `jev-latest`).
+
+### What a language model is asked
+
 How the three primitives map onto a language model, so you know what it is
 actually asked:
 
@@ -267,7 +213,7 @@ documentation gives, `(n * peak - 1) / (n - 1)`: 1 when all the mass sits on
 one label, 0 when flat; `noul` carries none, as in theirs. A question with a
 single label or level is answered without asking the model.
 
-What differs, stated rather than hidden:
+What differs from Jev, stated rather than hidden:
 
 - `model` is the served model, `provider` is `"colibri"`, `usage.cost` is 0,
   and `id` is the request id (also the `x-typesafe-request-id` header).
@@ -282,7 +228,7 @@ What differs, stated rather than hidden:
   `sum` rule below. The numbers will not match Jev's on the same input; the
   contract is the same, the model is yours.
 
-#### colibri's options
+### colibri's options
 
 None of these is sent by a Jev client; each is optional.
 
@@ -297,12 +243,13 @@ A decision engine has no log-probabilities and no photos: it ignores
 `normalize` and `pin_state` and refuses `prefix` (put that text in `state` or
 `instructions`); `cache_slot` reaches it as the DECIDE slot.
 
-### Do not put the options in the prompt
+### Do not put the options in the state
 
-Write the state and the question; leave the option list to the `options` field. On a
-real case that list was 48 tokens of 123, and it is about half of what the mode
-saves. Naming the options in the text also biases the scoring towards whichever one
-the sentence happens to mention last.
+Write the state and the instructions; leave the options to `criteria`. The
+server lists a choice's labels once, in the question, and reads each one as
+the answer's continuation. Repeating them in the state or the instructions
+makes the prompt longer for every option read, and naming them in a sentence
+biases the scoring towards whichever one the sentence happens to mention last.
 
 ### `sum` or `mean`
 
@@ -317,9 +264,12 @@ qwen36 one case went the other way (`sum` picked `merge` where the model's
 own greedy answer was `request changes`), so when your options have very
 different lengths, look at both.
 
-## Reading the entropy
+## Reading the answer
 
-Normalised to 0..1 over the number of options.
+`confidence` is `(n * peak - 1) / (n - 1)` over the `n` options: 1 when all
+the mass sits on one, 0 when it is flat. The terminal and the page show the
+entropy of the same probabilities, normalised to 0..1 over the number of
+options:
 
 | entropy | reading |
 |---|---|
@@ -343,11 +293,11 @@ coli chat --attach http://127.0.0.1:8000
 
 › The PR touches the engine and carries no tests. What should we do?
   ◆ System One
-     request changes  ███████████████████████░░░  93.6%  2 tok
-     merge            ██░░░░░░░░░░░░░░░░░░░░░░░░   6.4%  1 tok
-     close            ░░░░░░░░░░░░░░░░░░░░░░░░░░   0.0%  1 tok
-     → request changes  entropy 0.218  (confident)
-  58.71s · 4 tokens read · 0 generated
+     request changes  ███████████████████████░░░  93.6%
+     merge            ██░░░░░░░░░░░░░░░░░░░░░░░░   6.4%
+     close            ░░░░░░░░░░░░░░░░░░░░░░░░░░   0.0%
+     → request changes  entropy 0.218  (sure)
+  58.71s · 131 prompt tokens · 4 option tokens read · nothing generated
 
 › /decide
   ✦ chat
@@ -355,16 +305,17 @@ coli chat --attach http://127.0.0.1:8000
 
 `/decide` with options enters the mode with the conversation so far as the context;
 `/decide` alone returns to chat. `:decide` works too. TAB completes the commands.
+Each question goes to `POST /v1/systemone` as one `choice` whose labels are the
+options, with the conversation as the state.
 
 ## In the browser
 
 The **System One** entry in the navigation dock opens a page built around the same
 shape: the document on top, read once, and questions accumulating below it, each
 with its own set of allowed options and its own answer. The bars show the
-probability of every option, and the entropy sits next to the winner. On a
-decision model (`capabilities` says `decision`) each question goes to
-`POST /v1/systemone` as one `choice`, and the bars are its calibrated
-probabilities.
+probability of every option, and the entropy sits next to the winner. Each
+question goes to `POST /v1/systemone` as one `choice`, on a language model and
+on a decision model alike.
 
 Options are per question, not shared across the page: "how risky is this" wants
 low/medium/high where "do we sign" wants yes/no, and one list for all of them
@@ -413,9 +364,11 @@ first predictor instead.
 3. Sum the `ECHO` log probabilities at positions past the prefix, divide by the
    number of those positions, and take a softmax across the options.
 
-That is exactly what `/v1/brio` does. Doing it in a client is possible and is how
-the endpoint was prototyped, but three things are easy to get wrong: pinning, the
-option list leaking into the prompt, and the length normalisation.
+That is what `/v1/systemone` does on a language model (with `sum` by
+default instead of the per-token mean of step 3). Doing it in a client is
+possible and is how the endpoint was prototyped, but three things are easy to
+get wrong: pinning, the option list leaking into the prompt, and the
+normalisation.
 
 ## Nested snapshots
 
@@ -471,13 +424,11 @@ qwen36 (22 GB, 40 layers) over the gateway, one KV slot:
 | task | System One | generation |
 |---|---|---|
 | one question, 3 options | 65.7 s, 0 tokens generated | 79.6 s, 5 generated |
-| a 4-field JSON schema | 103.8 s, 104 tokens processed | 246.0 s, 226 processed |
 | 4 items sharing one instruction block | 45.7 s per item | 149.2 s per item |
 
-The gap widens with how much the alternative has to **write** and how much scaffolding
-it has to **re-read**. On the JSON case, generation also invented two field names that
-were not in the schema; System One mode cannot, because the field names are yours and only
-the values come from the model.
+The gap widens with how much the alternative has to **write** and how much
+scaffolding it has to **re-read**. (Measured on the route that preceded
+`/v1/systemone`, with the same scoring channel and the same photographs.)
 
 Note that these are on a disk-streaming engine, where the prefill costs about
 0.9 s/token. The ratios are the point, not the absolute numbers.
@@ -512,8 +463,8 @@ cannot tell which kind answered.
 | `c/laya` | Laya (Convai Innovations): ModernBERT encoder + decision head | [laya.md](laya.md) |
 | `c/gliner_decide` | GLiNER2.5-Decide (fastino): DeBERTa-v3 encoder + GLiNER2's classification head | [gliner_decide.md](gliner_decide.md) |
 
-A decision engine serves `POST /v1/systemone` only. Chat, completions,
-messages and `/v1/brio` answer 400 with a pointer to `/v1/systemone`, and
+A decision engine serves `POST /v1/systemone` only. Chat, completions and
+messages answer 400 with a pointer to `/v1/systemone`, and
 `/v1/models` lists the model with `capabilities: ["systemone", "decision"]`
 (a language model says `["chat", "systemone"]`). The path is one round trip:
 the gateway checks the request, sends it to the engine as one record, and

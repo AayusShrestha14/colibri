@@ -329,6 +329,29 @@ context 点积改为累加整数乘积并只舍入一次，因此验证行中的
 你需要两样东西：**程序本体**（几百 KB）和**模型**（372 GB）。各平台的分步
 指引见 [Quick Start 指南](docs/quickstart.md)。
 
+### 一步完成
+
+**Windows：** 下载仓库（**Code** 中的 **Download ZIP**，或 `git clone`），解压后
+双击 **`START-HERE.bat`**。
+**Linux 和 macOS：**
+
+```bash
+git clone https://github.com/JustVugg/colibri && cd colibri
+./start-here.sh
+```
+
+它会检测内存、磁盘和 GPU，推荐一个适合这台机器的模型（按回车即采用推荐），在 GPU
+可用时用 Vulkan 或 CUDA 编译引擎（或获取预编译版本），以可续传的方式下载模型（随时
+可以中断，再次运行即从断点继续），并在浏览器中打开仪表盘。它还会打印供其他应用使用的
+OpenAI 和 Anthropic 基础 URL。之后再次运行，colibri 会直接启动；`c/coli stop` 可以
+停止它。每一步做什么：[quickstart.md](docs/quickstart.md#the-one-step-way)。
+
+在用 AI 编程助手？让它按照 [docs/AI_SETUP.md](docs/AI_SETUP.md) 来安装 colibri。
+支持 Model Context Protocol 的助手可以使用 `coli mcp`
+（[MCP_SERVER.md](docs/MCP_SERVER.md)）。
+
+下面是手动安装的步骤。
+
 ### 1. 获取 colibri
 
 **下载预编译版本**——Linux、macOS 与 Windows 均已提供，无需编译器。从
@@ -416,8 +439,8 @@ GLM-5.2 是参考模型，但同样的流式方法还能运行另外九个语言
 > 流式读取的：慢盘上每秒不到一个 token，快盘在缓存预热后每秒几个 token。
 >
 > **可选 Vulkan** 指的是 `VK=1` 构建。以 `COLI_VULKAN=1` 运行时，引擎会把常驻矩阵放到任何
-> 具有 Vulkan 1.2 驱动的 GPU 上（GLM-5.2 在那里有完整的解码路径，Kimi K3 有自己的专家层级
-> `K3_VK`），CI 在软件驱动上将这些引擎与 CPU 的 token 对照检查
+> 具有 Vulkan 1.2 驱动的 GPU 上（GLM-5.2 在那里有完整的解码路径），CI 在软件驱动上将这些
+> 引擎与 CPU 的 token 对照检查
 > （[vulkan.md](docs/vulkan.md#the-other-engines)）。正确还不等于更快。在这些引擎首次实测的
 > 真实 GPU，即集成显卡 Radeon 780M（Ryzen 7 PRO 8700GE，同样的二进制文件，冷页缓存）上，
 > 目前比 CPU 慢：Qwen3.6-35B-A3B 解码 3.06 tok/s，CPU 为 5.97，输出完全相同；使用 int4 专家的
@@ -463,8 +486,9 @@ cap 170 时从 4.15 到 4.74）。在那台机器上收益不大，因为从磁�
 Kimi K3 无需转换：其 QAT 训练的 MXFP4 专家直接从原始 Hugging Face shard 流式读取，bf16 稠密部分
 在加载时量化。长时间的 agent 会话可以选用循环状态检查点（RAM 中 `COLI_K3_CKPT=N` 个 slot，或用
 `COLI_K3_CKPT_DIR` 存到磁盘）：编辑过的或后续的 prompt 会恢复仍然保留的最深检查点，只对尾部重新
-prefill，而不是让整个对话重新经过 SSM 层回放。在 Vulkan 主机上，`K3_VK_UP=auto` 根据实测带宽
-决定专家层级的上传量。引擎的 KDA 与 MLA 路径在 CI 中与厂商实现逐 token 对照验证。
+prefill，而不是让整个对话重新经过 SSM 层回放。在 Vulkan 主机上（`COLI_VULKAN=1`），路由专家进入
+共享的专家层级：按专家历史预先填充，并随路由变化逐出。引擎的 KDA 与 MLA 路径在 CI 中与厂商实现逐
+token 对照验证。
 
 Inkling 提供 int4 专家，但稠密权重为 **bf16**（常驻 49.4 GB）；对于放不下这些权重的主机，
 [inkling.md](docs/inkling.md) 提供一个单次处理工具，把稠密部分降到 15.3 GB，让 975B 能在
@@ -485,8 +509,8 @@ COLI_MODEL=/nvme/glm52_i4 ./coli tune     # 测量并保存本机最快且安全
 #### System One 模式：问一个封闭式问题
 
 人们向模型提出的大多数请求是一次选择，而不是一段文字：哪个队列、哪个结论、某个字段应取四个值中的哪一个。
-System One 模式把允许的选项交给引擎，读出每个选项的概率，而不是生成文本：`completion_tokens` 为 0，
-答案不可能落在你的列表之外，并且每个答案都附带一个熵，"模型没有把握"因此成为一个可以设阈值的数字。
+System One 模式把允许的选项交给引擎，读出每个选项的概率，而不是生成文本：不生成任何内容，
+答案不可能落在你的列表之外，并且每个答案都附带一个置信度（confidence），"模型没有把握"因此成为一个可以设阈值的数字。
 它在全部十个模型家族上可用，运行在同一个服务器上，且按请求可选：不请求它的聊天，输出逐字节保持不变。
 
 ```bash
@@ -496,18 +520,16 @@ System One 模式把允许的选项交给引擎，读出每个选项的概率，
 > 340 lines, 8 files, no tests. CI is green but nothing covers that path.
 
 # 从任何程序：向运行中的服务器发送一个 JSON 请求
-curl -s http://127.0.0.1:8000/v1/brio -H 'Content-Type: application/json' -d '{
-  "model": "qwen36",
+curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -d '{
   "state": "340 lines, 8 files, no tests. CI is green but nothing covers that path.",
-  "question": "What should the reviewer do?",
-  "options": ["merge", "request changes", "close"]}'
+  "questions": {"review": {"type": "choice", "instructions": "What should the reviewer do?",
+                           "criteria": {"merge": null, "request changes": null, "close": null}}}}'
 ```
 
-`questions` 可以对只读一次的文档提出多个问题；`schema` 逐字段填充一个 JSON 对象，结构上必然合法。
-在 Qwen3.6 上与在同一台 CPU 机器上生成同样答案相比的实测：四字段 schema 快 2.4 倍，
+`POST /v1/systemone` 使用与 TypeSafe 的 Jev API 相同的请求和回复：Jev 客户端只需更改 base URL 即可切换到 colibri。
+对同一文档的多个问题只读取文档一次：在 Qwen3.6 上与在同一台 CPU 机器上生成同样答案相比的实测，
 对同一文档的四个问题快 5.7 倍。完整说明、请求与回复格式、以及它不适用的情形见 [docs/systemone.md](docs/systemone.md)。
-仪表盘中也有 System One 页面。同样的回答也可以通过 `POST /v1/systemone` 获得，
-它与 TypeSafe 的 Jev API 相同：Jev 客户端只需更改 base URL 即可切换。
+仪表盘中也有 System One 页面。
 
 
 在 Windows 上，发布包附带 `coli.cmd`：双击即可快速开始，或在 cmd 或 PowerShell 中运行

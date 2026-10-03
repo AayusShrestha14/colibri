@@ -628,6 +628,44 @@ int coli_deepseek_v4_expert_store_open_base(
  * Alternative registered ExpertStore backends safely ignore the request. */
 void coli_v4_expert_store_prefill_pool(ColiExpertStore *store, int layer);
 
+#ifdef COLI_VULKAN
+/* The Vulkan routed-expert tier (vk_tier.c, Makefile.deepseek-v4 VK=1). The MoE
+ * units reach it through this table, which the engine's own unit fills when
+ * COLI_VULKAN=1 started the tier (GENERATE_STATS, the one unit that links the
+ * backend); it stays NULL in every other link of the units, the parent's tests
+ * among them. The tier serves `store` only, from the engine thread only:
+ *   issue  x[S][hidden] already rounded to E4M3 per 128, idx/w[S*K] the routing
+ *          and its weights; returns how many (s, k) the device took (taken[]);
+ *   join   the taken rows, f32 (the caller rounds each to bf16); 0 = recompute
+ *          them on the CPU;
+ *   note   an expert the CPU computed, as the store lent it (rows16 or not);
+ *   routed a routing the device served: counted as a store lookup counts one. */
+typedef struct {
+    ColiExpertStore *store;
+    int (*issue)(int layer, const float *x, int S, int K, const int *idx, const float *w,
+                 uint8_t *taken);
+    int (*join)(const float **rows);
+    void (*note)(const ColiExpertView *view);
+    void (*routed)(ColiExpertKey key);
+} ColiV4VkTier;
+extern const ColiV4VkTier *coli_v4_vk_tier;
+
+/* The hot store's side of the tier (no-ops on another ExpertStore backend):
+ * count a routing the device served (pin ranking, HITS and EMAP heat, the
+ * .coli_usage history), its history as [layers][experts] counts, whether an
+ * expert sits in the RAM cache now, and one expert read from disk into `buffer`
+ * (record_bytes + 8192 bytes, 4096-aligned), outside the cache and its books,
+ * row-major. device_tier, when set, marks an expert the device holds as tier 2
+ * in EMAP. */
+void coli_v4_expert_store_note_routed(ColiExpertStore *store, ColiExpertKey key);
+uint32_t *const *coli_v4_expert_store_history(ColiExpertStore *store);
+int coli_v4_expert_store_in_ram(ColiExpertStore *store, ColiExpertKey key);
+uint64_t coli_v4_expert_store_record_bytes(ColiExpertStore *store);
+int coli_v4_expert_store_read_private(ColiExpertStore *store, ColiExpertKey key,
+                                      unsigned char *buffer, ColiExpertView *view);
+extern int (*coli_v4_expert_store_device_tier)(int layer, int expert);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

@@ -15,7 +15,7 @@
         "groups": [
           {
             "group": "Get started",
-            "pages": ["index", "quickstart"]
+            "pages": ["index", "quickstart", "AI_SETUP", "MCP_SERVER"]
           },
           {
             "group": "Serve models",
