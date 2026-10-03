@@ -535,6 +535,31 @@ error, only wrong tokens, worse the more experts were resident. The dense
 path has its own buffers now ([qwen36-cuda-tier.md](qwen36-cuda-tier.md));
 qwen36 never called the dense path inside that window.
 
+### The DeltaNet layer on the card (`Q38_DN_GPU=1`)
+
+With the trunk in VRAM a DeltaNet layer still crosses the bus four times per
+decode token: the `dnqkv` and `dnz` results come down, the convolution, the
+recurrence and the gated norm run on the CPU, and the normed rows go back up
+for `dnout`. On qwen36 those round trips were 8 of 39 ms per token
+([qwen36-cuda-tier.md](qwen36-cuda-tier.md#the-deltanet-layer-on-the-card-q36_dn_gpu1));
+Qwen3.8 has 36 such layers of 48 value heads. `Q38_DN_GPU=1` keeps the layer on
+the card: for every DeltaNet layer whose `dnqkv`, `dnz` and `dnout` the placer
+put on one device, the conv ring, the recurrent state (48 x 128 x 128 f32, 3 MB
+per layer) and the conv/norm weights go there too, and a decode token runs the
+layer end to end in one device chain -- x up, the two in_proj GEMVs, causal
+conv + SiLU, per value head the L2 norms, the decay, the delta rule, the gated
+RMSNorm with `sigmoid(z)` (Qwen3.8's gate; Qwen3.6 uses `silu(z)`), the
+out_proj GEMV, out down. The two gates (`a`, `b`) stay on the CPU and travel as
+kernel parameters.
+
+The host arrays remain the state's owner: a prompt (`S > 1`), an MTP verify
+(`snap_after`: the CPU path takes the snapshot after its first row), a
+`--pin` snapshot and the prompt cache pull the state down first; a reset, a pin
+restore and a rejected draft's rollback invalidate the card's copy. A failing
+GPU step turns the layer off and the CPU continues from what the card holds.
+Opt-in; `tests/test_qwen38_dn_gpu.c` (`make qwen38-dn-gpu-check`) runs the tiny
+fixture's oracle with the layers on the fake card.
+
 ### The trunk on the CPU: int8 rows
 
 Without a GPU the same trunk is the decode's floor: 8 GiB of BF16 read on
