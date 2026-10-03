@@ -1233,6 +1233,8 @@ int coli_vk_dense(void) { return g_dense_on; }
  *   38.7 s, and lost decode, 3.2 against 3.8 tok/s: the device's GEMV at the GPU's
  *   800 MHz floor is slower than the CPU's int8 one on a 4.3 GB trunk; prompts only
  *   still lost 5% of decode, the trunk's device copy taking from the tier's budget).
+ *   An engine that has no measurement there passes COLI_VK_CHAIN_UNMEASURED: off, and
+ *   the line says it was not measured.
  *   Unset, a CPU device (Lavapipe): off.
  * Printed as a [VK] line with an engine name (NULL: silent). */
 int coli_vk_chain_decide(const char *engine, int tier_on, int igpu) {
@@ -1244,12 +1246,12 @@ int coli_vk_chain_decide(const char *engine, int tier_on, int igpu) {
         on = v == 0 ? COLI_VK_CHAIN_OFF : v == 2 ? COLI_VK_CHAIN_PREFILL : COLI_VK_CHAIN_ON;
         snprintf(why, sizeof why, "COLI_VK_CHAIN=%s", e);
     } else if (coli_vk_device_integrated()) {
-        on = tier_on ? igpu : COLI_VK_CHAIN_OFF;
+        on = tier_on && igpu != COLI_VK_CHAIN_UNMEASURED ? igpu : COLI_VK_CHAIN_OFF;
         snprintf(why, sizeof why, "an integrated GPU%s: %s; COLI_VK_CHAIN=0 off, 1 on, 2 prompts only",
                  tier_on ? " with the expert tier" : " without the expert tier",
                  on == COLI_VK_CHAIN_ON ? "measured faster on decode and prefill"
                  : on == COLI_VK_CHAIN_PREFILL ? "measured faster on prefill, slower on decode"
-                 : tier_on ? "measured slower on decode" : "not measured");
+                 : tier_on && igpu != COLI_VK_CHAIN_UNMEASURED ? "measured slower on decode" : "not measured");
     } else if (coli_vk_device_shares_ram()) {
         on = COLI_VK_CHAIN_OFF;
         snprintf(why, sizeof why, "a CPU device; COLI_VK_CHAIN=1 turns it on");

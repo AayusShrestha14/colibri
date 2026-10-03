@@ -119,6 +119,22 @@ typedef struct { int mode, S, C, H, CK, NG, keys_off, hyp_off, val_off, snap_row
 int  vkc_ple(VkcBuf *keys, VkcBuf *hyp, VkcBuf *val, VkcBuf *prm, VkcBuf *gated, VkcBuf *normv,
              VkcBuf *conv, VkcBuf *ring, const VkcPle *p);
 
+/* Inkling's ops, their pipelines made on first use (an engine checks *_ready at setup:
+ * a build without the shader keeps every other op, and that engine's chain off).
+ * chain_sconv.comp (mode 0: the depthwise causal short convolution, residual inside, in
+ * place, its ring carried; mode 1: x *= fc over n floats; mode 2: x /= fc) */
+typedef struct { int mode, S, C, CK, x_off, x_row, w_off, ring_off, n; float fc; } VkcSconv;
+int  vkc_sconv_ready(void);
+int  vkc_sconv(VkcBuf *x, VkcBuf *w, VkcBuf *ring, const VkcSconv *p);
+/* chain_relattn.comp: attention with a relative-position bias bank, a per-row scale
+ * tau and a sliding window over a ring cache, the step's own rows read from kvs */
+typedef struct { int S, H, KVH, hd, pos_base, cap, window, ext, d_rel;
+                 int q_off, q_row, o_off, o_row, k_off, v_off, ks_off, vs_off, kv_row;
+                 int r_off, r_row, relp_off, tau_off; float scale; } VkcRelAttn;
+int  vkc_relattn_ready(void);
+int  vkc_relattn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *kvs, VkcBuf *r, VkcBuf *relp, VkcBuf *tau,
+                 const VkcRelAttn *p);
+
 /* counters, for the engines' [VK] lines */
 typedef struct {
     unsigned long long frames, waits, ops, matmuls, gemms, barriers, bytes_up, bytes_down;
