@@ -721,6 +721,8 @@ VK_SPV   += shaders/chain_norm.spv shaders/chain_rope.spv shaders/chain_attn.spv
 VK_SPV   += shaders/chain_mla.spv shaders/chain_hgemv.spv shaders/chain_dsa.spv
 # Kimi Delta Attention and manifold-constrained hyper-connections (vk_chain.h)
 VK_SPV   += shaders/chain_kda.spv shaders/chain_mhc.spv
+# DeepSeek V4.1 Flash and DeepSeek V4 attention (vk_chain.h: vkc_dsv4_*)
+VK_SPV   += shaders/chain_dsv4.spv
 endif
 
 # Optional AMD XDNA2 (Ryzen AI NPU) lane, Windows. Same opt-in shape as VK=1:

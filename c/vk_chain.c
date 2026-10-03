@@ -247,6 +247,8 @@ static VkPipeline make_pipe(VkShaderModule m, const VkSpecializationInfo *si) {
     return p;
 }
 
+static void dsv4_init(void);       /* chain_dsv4.comp (DeepSeek V4.1 / V4), below */
+static void dsv4_shutdown(void);
 int vkc_init(void) {
     if (K.ready) return !K.lost;
     if (!coli_vk_core(&K.core)) return 0;
@@ -299,6 +301,7 @@ int vkc_init(void) {
         if (f && (K.mmod[i] = load_module(K.core.spv_path, mla_file[i]))) K.mpipe[i] = make_pipe(K.mmod[i], NULL);
     }
     K.mla_ok = K.mpipe[PM_MLA] && K.mpipe[PM_HGEMV] && K.mpipe[PM_DSA];
+    dsv4_init();
     /* the fp32 tiled GEMM at the backend's tiles; none = every S on the GEMV */
     K.mod_gemm = K.core.gemm_tiles ? load_module(K.core.spv_path, "qmatmul_gemm.spv") : VK_NULL_HANDLE;
     for (int k = 0; K.mod_gemm && k < K.core.gemm_tiles && k < VKC_GEMM_MAX; k++) {
@@ -1031,6 +1034,84 @@ void vkc_shutdown(void) {
     if (K.mod_dnrec) vkDestroyShaderModule(K.dev, K.mod_dnrec, NULL);
     if (K.pl) vkDestroyPipelineLayout(K.dev, K.pl, NULL);
     if (K.dsl) vkDestroyDescriptorSetLayout(K.dev, K.dsl, NULL);
+    dsv4_shutdown();
     memset(&K, 0, sizeof K);
     K.cur = -1; K.gemm_rows = -1;
+}
+
+/* ---- DeepSeek V4.1 Flash and DeepSeek V4 attention (chain_dsv4.comp) ------------------
+ * Its own optional pipeline: without the shader only these ops decline. */
+static struct { VkShaderModule mod; VkPipeline pipe; } D4;
+static void dsv4_init(void) {
+    char path[1200];
+    const char *sl = strrchr(K.core.spv_path, '/');
+    size_t pre = sl ? (size_t)(sl - K.core.spv_path) + 1 : 0;
+    const char *file = "chain_dsv4.spv";
+    if (pre + strlen(file) + 1 >= sizeof path) return;
+    memcpy(path, K.core.spv_path, pre); strcpy(path + pre, file);
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    fclose(f);
+    if ((D4.mod = load_module(K.core.spv_path, file))) D4.pipe = make_pipe(D4.mod, NULL);
+}
+static void dsv4_shutdown(void) {
+    if (D4.pipe) vkDestroyPipeline(K.dev, D4.pipe, NULL);
+    if (D4.mod) vkDestroyShaderModule(K.dev, D4.mod, NULL);
+    memset(&D4, 0, sizeof D4);
+}
+int vkc_dsv4_ready(void) { return vkc_ready() && D4.pipe; }
+
+/* the shader reads one block of 32 words: the mode, then the op's fields */
+typedef struct { int mode; int w[31]; } Dsv4PC;
+static int dsv4_rec(int kind, int mode, const void *b, size_t bytes, VkcBind *bd, int nb, uint32_t gx, uint32_t gy) {
+    if (!D4.pipe || !open_frame() || K.lost || bytes > sizeof(int) * 31) return 0;
+    Dsv4PC pc; memset(&pc, 0, sizeof pc);
+    pc.mode = mode; memcpy(pc.w, b, bytes);
+    K.kind = kind;
+    return record(D4.pipe, bd, nb, &pc, sizeof pc, gx, gy, 1);
+}
+int vkc_dsv4_attn(VkcBuf *q, VkcBuf *win, VkcBuf *cmp, VkcBuf *list, VkcBuf *prm, VkcBuf *out, const VkcDsAttn *p) {
+    if (p->S < 1 || p->S > 65535 || p->H < 1 || p->H > 65535 || p->hd < 1 || p->hd > 1024 || p->cnt < 0 || p->cnt > 3072)
+        return 0;
+    if (p->cnt == 0) return 0;
+    VkcBind bd[6] = {B(q, 0), B(win, 0), B(cmp ? cmp : win, 0), B(list, 0), B(prm, 0), B(out, 1)};
+    return dsv4_rec(PK_ATTN, 0, p, sizeof *p, bd, 6, (uint32_t)p->H, (uint32_t)p->S);
+}
+int vkc_dsv4_rope(VkcBuf *x, VkcBuf *cs, const VkcDsRope *p) {
+    if (p->nseg < 0 || p->per_row < 1 || p->rd < 2 || (p->rd & 1)) return 0;
+    if (p->nseg == 0) return open_frame() && !K.lost;
+    VkcBind bd[6] = {B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(cs, 0), B(x, 1)};
+    uint32_t gx, gy; grid(((uint64_t)p->nseg * (p->rd / 2) + 255) / 256, &gx, &gy);
+    return dsv4_rec(PK_ROPE, 1, p, sizeof *p, bd, 6, gx, gy);
+}
+int vkc_dsv4_compress(VkcBuf *kv, VkcBuf *sc, VkcBuf *ring, VkcBuf *prm, VkcBuf *out, const VkcDsComp *p) {
+    if (p->S < 0 || p->ratio < 1 || p->P < 1 || p->D < 1 || p->D > p->P || (p->overlap && p->P < 2 * p->D)) return 0;
+    if (p->S == 0) return open_frame() && !K.lost;
+    VkcBind bd[8] = {B(kv, 0), B(sc, 0), B(NULL, 0), B(NULL, 0), B(p->ape_off >= 0 ? prm : NULL, 0), B(out, 1), B(NULL, 0),
+                     B(ring, 1)};
+    return dsv4_rec(PK_DSA, 2, p, sizeof *p, bd, 8, 1, 1);
+}
+int vkc_dsv4_score(VkcBuf *iq, VkcBuf *hw, VkcBuf *keys, VkcBuf *mask, VkcBuf *sc, const VkcDsScore *p) {
+    if (p->S < 1 || p->S > 65535 || p->IH < 1 || p->IH > 64 || p->ID < 1 || p->IH * p->ID > 4096 || p->ratio < 1 ||
+        p->width < 0 || p->sc_row < p->width || (p->mask_row > 0 && !mask)) return 0;
+    if (p->width == 0) return open_frame() && !K.lost;
+    VkcBind bd[6] = {B(iq, 0), B(hw, 0), B(keys, 0), B(p->mask_row > 0 ? mask : NULL, 0), B(NULL, 0), B(sc, 1)};
+    return dsv4_rec(PK_DSA, 3, p, sizeof *p, bd, 6, (uint32_t)p->S, 1);
+}
+int vkc_dsv4_cand(VkcBuf *sc, VkcBuf *mask, const VkcDsCand *p) {
+    if (p->S < 1 || p->S > 65535 || p->block < 1 || p->ratio < 1 || p->width < 0 ||
+        (p->width + p->block - 1) / p->block > 4096 || p->mask_row < p->width) return 0;
+    VkcBind bd[7] = {B(sc, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(mask, 1)};
+    return dsv4_rec(PK_DSA, 4, p, sizeof *p, bd, 7, (uint32_t)p->S, 1);
+}
+int vkc_dsv4_topk(VkcBuf *sc, VkcBuf *list, const VkcDsTopk *p) {
+    if (p->S < 1 || p->S > 65535 || p->topk < 0 || p->width < 0 || (p->order && p->topk > 4096)) return 0;
+    if (p->topk == 0) return open_frame() && !K.lost;
+    VkcBind bd[7] = {B(sc, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(list, 1)};
+    return dsv4_rec(PK_DSA, 5, p, sizeof *p, bd, 7, (uint32_t)p->S, 1);
+}
+int vkc_dsv4_engram(VkcBuf *kv, VkcBuf *prm, VkcBuf *x, const VkcDsEngram *p) {
+    if (p->S < 1 || p->S > 65535 || p->H < 1 || p->D < 1) return 0;
+    VkcBind bd[6] = {B(kv, 0), B(prm, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(x, 1)};
+    return dsv4_rec(PK_EW, 6, p, sizeof *p, bd, 6, (uint32_t)p->H, (uint32_t)p->S);
 }

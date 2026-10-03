@@ -286,6 +286,62 @@ typedef struct { int S, H, D, iters, x_off, x_row, m_off, m_row, hp_off, hp_row,
                  float eps, hc_eps, lim; } VkcMhc;
 int vkc_mhc(int mode, VkcBuf *x, VkcBuf *m, VkcBuf *hp, VkcBuf *prm, VkcBuf *y, const VkcMhc *p);
 
+/* ---- DeepSeek V4.1 Flash and DeepSeek V4 attention (chain_dsv4.comp) -----------------
+ * The model is MQA over one KV row per position (the same row is key and value): a
+ * sliding window of raw rows, plus compressed rows (a compressor pools `ratio`
+ * positions into one) that a DSA indexer picks per query. Optional like the MLA ops:
+ * vkc_dsv4_ready() says whether the shader is there; a missing one turns off these ops.
+ *   vkc_dsv4_attn     sparse attention with a sink over a per-row list (sparse_attn.h):
+ *                     entry e < 0 skipped, e < nwin the window ring's row e, else the
+ *                     compressed row e - nwin; scores (q . k) * scale, the sink in the
+ *                     denominator only, the value sum and the denominator in list order.
+ *                     flags 1: the weights round to bf16 before the value sum and the
+ *                     output to bf16 (DeepSeek V4). Limits: hd <= 1024, cnt <= 3072.
+ *   vkc_dsv4_rope     RoPE on interleaved pairs in place, the first rd floats of each
+ *                     segment, (cos, sin) pairs from a host table; inverse negates the sine
+ *                     (the attention output's un-rotation). flags 1: round to bf16.
+ *   vkc_dsv4_compress the compressor's rolling group for S rows in order: each row's kv
+ *                     and score rows (P floats; score + ape[slot] when ape_off >= 0) into
+ *                     the ring row pos % ratio (ratio + that with overlap), and at each
+ *                     completed group the per-channel softmax pooling of the ring rows
+ *                     (overlap: the first ratio rows read channel d, the next ratio rows
+ *                     channel D + d; the second half then moves to the first) into
+ *                     out[pos / ratio]. ring: (1 + overlap) * ratio kv rows of P at
+ *                     ring_off, then as many score rows.
+ *   vkc_dsv4_score    the indexer's scores: row s (position pos_base + s) scores columns
+ *                     j < lens = (pos + 1) / ratio (and mask[mask_off + s*mask_row + j] != 0
+ *                     when mask_row > 0) as sum_h [dot > 0] dot * hw_h * wscale, dot = q_h .
+ *                     key[j]; every other j < width scores -inf; into sc[sc_off + s*sc_row
+ *                     + j]. IH <= 64, IH*ID <= 4096.
+ *   vkc_dsv4_cand     the candidate blocks: per row, each block's best score, the block of
+ *                     column lens - 1 pinned, then the best min(topb, blocks) blocks (the
+ *                     lower on a tie), mask 1 on their columns. At most 4096 blocks.
+ *   vkc_dsv4_topk     per row the min(topk, finite scores) largest, ties to the lower
+ *                     column, as base + j into the list, ascending (order 0) or by rank
+ *                     (order 1); -1 in the rest of the topk slots. topk <= 4096 for order 1.
+ *   vkc_dsv4_engram   the engram gate: per (stream c, row s) the stream gains
+ *                     sigmoid(signed sqrt(x . (qw * kw * key) * rms(x)^-1 * rms(key)^-1 /
+ *                     sqrt(D))) * value; kv[s] = H keys of D, then the value.
+ * Offsets and strides in floats; lists and masks are int32 buffers. */
+int vkc_dsv4_ready(void);
+typedef struct { int S, H, hd, cnt, l_off, l_row, nwin, w_off, c_off, q_off, q_row, o_off, o_row, sink_off, flags;
+                 float scale; } VkcDsAttn;
+int vkc_dsv4_attn(VkcBuf *q, VkcBuf *win, VkcBuf *cmp, VkcBuf *list, VkcBuf *prm, VkcBuf *out, const VkcDsAttn *p);
+typedef struct { int nseg, per_row, rd, x_off, x_row, x_seg, cs_off, cs_row, inverse, flags; } VkcDsRope;
+int vkc_dsv4_rope(VkcBuf *x, VkcBuf *cs, const VkcDsRope *p);
+typedef struct { int S, pos_base, ratio, P, D, overlap, kv_off, kv_row, sc_off, sc_row, ape_off, out_off, out_row,
+                 ring_off; } VkcDsComp;
+int vkc_dsv4_compress(VkcBuf *kv, VkcBuf *sc, VkcBuf *ring, VkcBuf *prm, VkcBuf *out, const VkcDsComp *p);
+typedef struct { int S, pos_base, ratio, IH, ID, width, q_off, q_row, w_off, w_row, k_off, k_row, mask_row, sc_row;
+                 float wscale; int sc_off, mask_off; } VkcDsScore;
+int vkc_dsv4_score(VkcBuf *iq, VkcBuf *hw, VkcBuf *keys, VkcBuf *mask, VkcBuf *sc, const VkcDsScore *p);
+typedef struct { int S, pos_base, ratio, width, block, topb, sc_row, mask_row; } VkcDsCand;
+int vkc_dsv4_cand(VkcBuf *sc, VkcBuf *mask, const VkcDsCand *p);
+typedef struct { int S, width, topk, sc_row, l_off, l_row, base, order; } VkcDsTopk;
+int vkc_dsv4_topk(VkcBuf *sc, VkcBuf *list, const VkcDsTopk *p);
+typedef struct { int S, H, D, kv_off, kv_row, x_off, x_row, qw_off, kw_off; float eps; } VkcDsEngram;
+int vkc_dsv4_engram(VkcBuf *kv, VkcBuf *prm, VkcBuf *x, const VkcDsEngram *p);
+
 /* counters, for the engines' [VK] lines */
 typedef struct {
     unsigned long long frames, waits, ops, matmuls, gemms, barriers, bytes_up, bytes_down;

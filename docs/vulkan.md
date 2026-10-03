@@ -971,6 +971,32 @@ way, the KDA layer against `delta_attention.h` over two submissions (the state a
 window carried between them, inputs small enough that the l2 eps counts), the mHC ops
 against `hyper_connections.h`; each within 3e-7 on Lavapipe and on the Iris Xe.
 
+### DeepSeek V4.1 Flash and DeepSeek V4's attention (`vkc_dsv4`)
+
+DeepSeek's attention is not the absorbed MLA above: it is MQA over one KV row per
+position, the same row key and value, read from a sliding window of raw rows and from
+compressed rows (a compressor pools `ratio` positions into one) that a DSA indexer picks
+per query, with an attention sink. Its ops are in `vk_chain.h` (`vkc_dsv4_*`), one shader
+of their own (`chain_dsv4.comp`), optional like the MLA ones:
+
+| Op | What it does |
+|---|---|
+| `vkc_dsv4_attn` | the sparse attention of `sparse_attn.h`: per row a list of window rows, compressed rows and skipped entries; the sink in the denominator only, the value sum and the denominator in list order; optionally DeepSeek V4's roundings (the weights and the output to bf16) |
+| `vkc_dsv4_rope` | RoPE on interleaved pairs in place from a host table, forward or inverse (the attention output's un-rotation) |
+| `vkc_dsv4_compress` | the compressor's rolling group: each row's kv and score rows into the ring slot of its position, the per-channel softmax pooling when a group completes; DeepSeek V4's overlapping form (two halves, a position bias per slot) too |
+| `vkc_dsv4_score` | the indexer's scores: the relu-gated, head-weighted dot of each reachable compressed row, a candidate mask, -inf past the row's reach |
+| `vkc_dsv4_cand` | DeepSeek V4.1's candidate blocks: each block's best score, the newest block pinned, the best blocks kept whole |
+| `vkc_dsv4_topk` | the top-k of the CPU's selection (ties to the lower column), in column order (V4.1) or by rank (V4), padded with skipped entries |
+| `vkc_dsv4_engram` | DeepSeek V4.1's engram gate on the residual streams |
+
+`make vk-chain-check VK=1` checks them against references transcribed from
+`deepseek_v41.c` (and V4's rounding variant): the attention over lists of window and
+compressed rows with skipped entries and a row with none (within 1.1e-6 of the largest
+output on Lavapipe), RoPE both ways, the compressor over three calls with its ring
+carried (ratios 1 to 4, the overlapping form with its bias, within 2e-6), the scores,
+the candidate mask and the top-k list slot for slot on scores exact in float on both
+sides, ties included, with and without a mask, and the engram gate (within 2e-6).
+
 ## Adding an engine to the tier
 
 Every MoE engine here is on the tier ([the table above](#the-routed-expert-tier-vk_tierc));

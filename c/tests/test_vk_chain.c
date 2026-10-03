@@ -32,6 +32,10 @@
  *            decay, beta, output norm and gate
  *   mhc      hyper_connections.h's split, collapse and write back, the mean, and the
  *            clamped SwiGLU
+ *   dsv4     DeepSeek V4.1 / V4 (deepseek_v41.c): the sparse attention with a sink over
+ *            window and compressed rows (V4's bf16 roundings too), interleaved RoPE
+ *            both ways, the compressor's ring (V4's overlapping form), the indexer's
+ *            scores, candidate blocks and top-k slot for slot, the engram gate
  *
  *   make vk-chain-check VK=1   (VK_ICD_FILENAMES=.../lvp_icd.json for Lavapipe) */
 #include <stdio.h>
@@ -44,6 +48,7 @@
 #include "../delta_attention.h"      /* the KDA step the KDA ops follow */
 #include "../hyper_connections.h"    /* the mHC arithmetic */
 #include "../sparse_index.h"         /* GLM-5.3's k-pooled indexer */
+#include "../sparse_attn.h"          /* DeepSeek V4.1's attention kernel */
 
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -976,6 +981,270 @@ static void test_kpool(int S, int pos_base, int IH, int ID, int pool, int topk, 
     free(keys); free(gates); free(ape); free(q); free(hw); free(valid); free(ref); free(hwd); free(rk); free(gk);
 }
 
+/* ---- DeepSeek V4.1 / V4 attention (chain_dsv4.comp) ------------------------------------- */
+static float bf16r(float f) { uint32_t u; memcpy(&u, &f, 4); if ((u & 0x7f800000u) != 0x7f800000u) u += 0x7fffu + ((u >> 16) & 1u);
+                              u &= 0xffff0000u; memcpy(&f, &u, 4); return f; }
+/* sparse_attn.h's scalar kernel (and DeepSeek V4's: the weights and the output to bf16)
+ * over lists of window rows (e < nwin), compressed rows (nwin + j) and skipped entries */
+static void test_ds_attn(int S, int H, int hd, int nwin, int ncmp, int cnt, int flags) {
+    int qrow = H * hd + 3, lrow = cnt + 2, orow = H * hd + 3;
+    float *q = fvec((size_t)S * qrow, 1.f), *win = fvec((size_t)(nwin * hd + 5), 1.f), *cmp = fvec((size_t)(ncmp * hd + 7), 1.f);
+    float *sink = fvec((size_t)H + 2, 2.f), *ref = calloc((size_t)S * orow, 4), *sc = malloc((size_t)cnt * 4);
+    int *list = malloc((size_t)S * lrow * 4);
+    float *kvall = malloc((size_t)(nwin + ncmp) * hd * 4);
+    memcpy(kvall, win + 5, (size_t)nwin * hd * 4); memcpy(kvall + (size_t)nwin * hd, cmp + 7, (size_t)ncmp * hd * 4);
+    for (int s = 0; s < S; s++)
+        for (int j = 0; j < lrow; j++) {
+            int r = (int)(rnd() % 5);
+            list[s * lrow + j] = s == S - 1 && S > 1 ? -1                                     /* a row with nothing to read */
+                               : r == 0 ? -1 : r < 3 ? (int)(rnd() % (unsigned)nwin) : nwin + (int)(rnd() % (unsigned)ncmp);
+        }
+    for (int s = 0; s < S; s++)
+        for (int h = 0; h < H; h++) {
+            const float *qq = q + (size_t)s * qrow + 1 + h * hd;
+            float *o = ref + (size_t)s * orow + 2 + h * hd;
+            const int *idx = list + s * lrow + 1;
+            if (!(flags & 1)) { coli_sparse_attend_scalar(o, qq, kvall, idx, cnt, hd, sink[1 + h], 1.f / sqrtf((float)hd), sc); continue; }
+            float best = -1e30f;   /* DeepSeek V4's reference: w to bf16 before the value sum, the output to bf16 */
+            for (int j = 0; j < cnt; j++) {
+                if (idx[j] < 0) { sc[j] = -INFINITY; continue; }
+                float d = 0; for (int i = 0; i < hd; i++) d += qq[i] * kvall[(size_t)idx[j] * hd + i];
+                sc[j] = d * (1.f / sqrtf((float)hd)); if (sc[j] > best) best = sc[j];
+            }
+            float den = expf(sink[1 + h] - best);
+            for (int i = 0; i < hd; i++) o[i] = 0;
+            for (int j = 0; j < cnt; j++) {
+                if (idx[j] < 0) continue;
+                float w = expf(sc[j] - best); den += w; w = bf16r(w);
+                for (int i = 0; i < hd; i++) o[i] += w * kvall[(size_t)idx[j] * hd + i];
+            }
+            for (int i = 0; i < hd; i++) o[i] = bf16r(o[i] / den);
+        }
+    VkcBuf *qb = up(q, (size_t)S * qrow), *wb = up(win, (size_t)nwin * hd + 5), *cb = up(cmp, (size_t)ncmp * hd + 7);
+    VkcBuf *sb = up(sink, (size_t)H + 2), *ob = vkc_buf((size_t)S * orow * 4, VKC_DEV), *lb = vkc_buf((size_t)S * lrow * 4, VKC_DEV);
+    vkc_begin(); vkc_write(lb, 0, list, (size_t)S * lrow * 4); vkc_submit(1);
+    VkcDsAttn p = {S, H, hd, cnt, 1, lrow, nwin, 5, 7, 1, qrow, 2, orow, 1, flags, 1.f / sqrtf((float)hd)};
+    vkc_begin(); int ok = vkc_dsv4_attn(qb, wb, cb, lb, sb, ob, &p); vkc_submit(1);
+    float *got = down(ob, 0, (size_t)S * orow);
+    double e = 0;
+    for (int s = 0; s < S; s++) { double r = relerr(got + (size_t)s * orow + 2, ref + (size_t)s * orow + 2, (size_t)H * hd, 1e-3); if (r > e) e = r; }
+    double tol = (flags & 1) ? 8e-3 : 2e-5;
+    CHECK(ok && e < tol && !bad(got, (size_t)S * orow), "dsv4 attn S %d H %d hd %d cnt %d flags %d: rel err %.2e", S, H, hd, cnt, flags, e);
+    if (!(flags & 1) && S > 1) {   /* the empty row is exactly zero */
+        int z = 1; for (int i = 0; i < H * hd; i++) z &= got[(size_t)(S - 1) * orow + 2 + i] == 0.f;
+        CHECK(z, "dsv4 attn: a row with no entry is not zero");
+    }
+    printf("  dsv4 attn S %d H %d hd %d cnt %d flags %d: rel err %.2e\n", S, H, hd, cnt, flags, e);
+    vkc_free(qb); vkc_free(wb); vkc_free(cb); vkc_free(sb); vkc_free(ob); vkc_free(lb);
+    free(q); free(win); free(cmp); free(sink); free(ref); free(sc); free(list); free(kvall); free(got);
+}
+
+/* deepseek_v41.c's rope_apply: interleaved pairs, forward and inverse, segments at a stride */
+static void test_ds_rope(int flags) {
+    int rows = 3, per = 4, seg = 40, rd = 16, xrow = per * seg + 2, csrow = rd + 1;
+    float *x = fvec((size_t)rows * xrow + 3, 1.f), *ref = malloc(((size_t)rows * xrow + 3) * 4), *cs = malloc(((size_t)rows * csrow + 2) * 4);
+    for (int r = 0; r < rows; r++) for (int i = 0; i < rd / 2; i++) {
+        float a = (r * 7 + 3) * powf(10000.f, -2.f * i / rd);
+        cs[2 + r * csrow + 2 * i] = cosf(a); cs[2 + r * csrow + 2 * i + 1] = sinf(a);
+    }
+    for (int inv = 0; inv < 2; inv++) {
+        memcpy(ref, x, ((size_t)rows * xrow + 3) * 4);
+        for (int r = 0; r < rows; r++) for (int j = 0; j < per; j++) {
+            float *v = ref + 3 + r * xrow + j * seg + (seg - rd);
+            for (int i = 0; i < rd / 2; i++) {
+                float c = cs[2 + r * csrow + 2 * i], sn = cs[2 + r * csrow + 2 * i + 1];
+                if (inv) sn = -sn;
+                float a = v[2 * i], b = v[2 * i + 1];
+                v[2 * i] = a * c - b * sn; v[2 * i + 1] = a * sn + b * c;
+                if (flags & 1) { v[2 * i] = bf16r(v[2 * i]); v[2 * i + 1] = bf16r(v[2 * i + 1]); }
+            }
+        }
+        VkcBuf *xb = up(x, (size_t)rows * xrow + 3), *cb = up(cs, (size_t)rows * csrow + 2);
+        VkcDsRope p = {rows * per, per, rd, 3 + seg - rd, xrow, seg, 2, csrow, inv, flags};
+        vkc_begin(); int ok = vkc_dsv4_rope(xb, cb, &p); vkc_submit(1);
+        float *got = down(xb, 0, (size_t)rows * xrow + 3);
+        double e = relerr(got, ref, (size_t)rows * xrow + 3, 1e-3);
+        CHECK(ok && e < ((flags & 1) ? 8e-3 : 1e-6), "dsv4 rope inverse %d flags %d: rel err %.2e", inv, flags, e);
+        vkc_free(xb); vkc_free(cb); free(got);
+    }
+    free(x); free(ref); free(cs);
+}
+
+/* deepseek_v41.c's compressor_run (its decode form; the prefill form gives the same groups)
+ * and DeepSeek V4's overlapping one (ratio 4: the previous group's rows in the first half,
+ * a channel of its own each, the ape bias), the ring carried over three calls */
+static void test_ds_compress(int ratio, int overlap, int ape) {
+    int D = 24, P = overlap ? 2 * D : D, rows = overlap ? 2 * ratio : ratio, T = 23, pb0 = 3;
+    float *kv = fvec((size_t)T * P, 1.f), *sc = fvec((size_t)T * P, 2.f), *ap = fvec((size_t)ratio * P + 4, 1.f);
+    float *rk = calloc((size_t)rows * P, 4), *rs = malloc((size_t)rows * P * 4);
+    for (int i = 0; i < rows * P; i++) rs[i] = -INFINITY;
+    int G = (pb0 + T) / ratio + 1;
+    float *ref = calloc((size_t)G * D, 4);
+    for (int t = 0; t < T; t++) {
+        int pos = pb0 + t, slot = pos % ratio, sr = overlap ? ratio + slot : slot;
+        for (int c = 0; c < P; c++) { rk[sr * P + c] = kv[t * P + c]; rs[sr * P + c] = sc[t * P + c] + (ape ? ap[4 + slot * P + c] : 0.f); }
+        if ((pos + 1) % ratio) continue;
+        for (int d = 0; d < D; d++) {
+            float best = -INFINITY;
+            for (int k = 0; k < rows; k++) { int col = overlap && k >= ratio ? D + d : d; if (rs[k * P + col] > best) best = rs[k * P + col]; }
+            float tot = 0, mix = 0;
+            for (int k = 0; k < rows; k++) { int col = overlap && k >= ratio ? D + d : d; float w = expf(rs[k * P + col] - best); tot += w; mix += w * rk[k * P + col]; }
+            ref[(size_t)(pos / ratio) * D + d] = mix / tot;
+        }
+        if (overlap) { memcpy(rk, rk + (size_t)ratio * P, (size_t)ratio * P * 4); memcpy(rs, rs + (size_t)ratio * P, (size_t)ratio * P * 4); }
+    }
+    VkcBuf *kb = up(kv, (size_t)T * P), *sb = up(sc, (size_t)T * P), *ab = up(ap, (size_t)ratio * P + 4);
+    VkcBuf *ring = vkc_buf((size_t)(2 * rows * P + 5) * 4, VKC_DEV), *ob = vkc_buf((size_t)G * D * 4, VKC_DEV);
+    float *init = malloc((size_t)(2 * rows * P + 5) * 4);
+    for (int i = 0; i < 2 * rows * P + 5; i++) init[i] = i >= 5 + rows * P ? -INFINITY : 0.f;
+    vkc_begin(); vkc_write(ring, 0, init, (size_t)(2 * rows * P + 5) * 4); vkc_submit(1);
+    int cuts[4] = {0, 5, 6, T}, ok = 1;
+    for (int k = 0; k < 3; k++) {
+        int n = cuts[k + 1] - cuts[k];
+        VkcDsComp p = {n, pb0 + cuts[k], ratio, P, D, overlap, cuts[k] * P, P, cuts[k] * P, P, ape ? 4 : -1, 0, D, 5};
+        vkc_begin(); ok &= vkc_dsv4_compress(kb, sb, ring, ab, ob, &p); vkc_submit(k == 2);
+    }
+    float *got = down(ob, 0, (size_t)G * D);
+    int g0 = (pb0 + 1 + ratio - 1) / ratio;   /* the first group completed by a row here */
+    double e = relerr(got + (size_t)g0 * D, ref + (size_t)g0 * D, (size_t)(G - 1 - g0) * D, 1e-3);
+    CHECK(ok && e < 2e-6, "dsv4 compress ratio %d overlap %d ape %d: rel err %.2e", ratio, overlap, ape, e);
+    vkc_free(kb); vkc_free(sb); vkc_free(ab); vkc_free(ring); vkc_free(ob);
+    free(kv); free(sc); free(ap); free(rk); free(rs); free(ref); free(got); free(init);
+}
+
+/* deepseek_v41.c's indexer_run and candidate_blocks: the scores with the reach and the
+ * mask, the candidate blocks, and the top-k list slot for slot. Inputs on a grid of 0.25
+ * (weights 0.5, a power-of-two scale) so every score is exact in float on both sides,
+ * with equal keys for ties. */
+static void ds_topk_ref(const float *score, int width, int topk, int base, int order, int *row) {
+    int taken = 0;
+    for (int k = 0; k < topk; k++) row[k] = -1;
+    for (int k = 0; k < topk; k++) {
+        int best = -1;
+        for (int j = 0; j < width; j++) {
+            if (score[j] == -INFINITY) continue;
+            int already = 0; for (int u = 0; u < taken; u++) if (row[u] == j) { already = 1; break; }
+            if (already) continue;
+            if (best < 0 || score[j] > score[best]) best = j;
+        }
+        if (best < 0) break;
+        row[taken++] = best;
+    }
+    if (order == 0)
+        for (int a = 0; a < taken; a++) for (int b = a + 1; b < taken; b++) if (row[b] < row[a]) { int t = row[a]; row[a] = row[b]; row[b] = t; }
+    for (int k = 0; k < taken; k++) row[k] += base;
+}
+static void ds_cand_ref(const float *score, int width, int lens, int block, int topb, int *keep) {
+    int blocks = (width + block - 1) / block;
+    float *best = malloc((size_t)(blocks + 1) * 4);
+    for (int b = 0; b < blocks; b++) { float top = -INFINITY; for (int i = b * block; i < (b + 1) * block && i < width; i++) if (score[i] > top) top = score[i]; best[b] = top; }
+    int last = (lens - 1) / block;
+    if (last >= 0 && last < blocks) best[last] = INFINITY;
+    int wanted = topb < blocks ? topb : blocks;
+    for (int i = 0; i < width; i++) keep[i] = 0;
+    for (int pick = 0; pick < wanted; pick++) {
+        int chosen = -1;
+        for (int b = 0; b < blocks; b++) if (best[b] > -INFINITY && (chosen < 0 || best[b] > best[chosen])) chosen = b;
+        if (chosen < 0) break;
+        for (int i = chosen * block; i < (chosen + 1) * block && i < width; i++) keep[i] = 1;
+        best[chosen] = -INFINITY;
+    }
+    free(best);
+}
+static void test_ds_index(int S, int pos_base, int ratio, int IH, int ID, int topk, int block, int topb, int order) {
+    int width = (pos_base + S) / ratio, krow = ID + 3, qrow = IH * ID + 1, wrow = IH + 2, scrow = width + 3, lrow = topk + 5, base = 11;
+    if (width < 1) width = 1;
+    float *q = malloc((size_t)(S * qrow + 1) * 4), *k = malloc((size_t)(width * krow + 3) * 4), *w = malloc((size_t)(S * wrow + 2) * 4);
+    for (int i = 0; i < S * qrow + 1; i++) q[i] = ((int)(rnd() % 17) - 8) * 0.25f;
+    for (int i = 0; i < width * krow + 3; i++) k[i] = ((int)(rnd() % 17) - 8) * 0.25f;
+    for (int i = 0; i < S * wrow + 2; i++) w[i] = ((int)(rnd() % 9) - 3) * 0.5f;
+    for (int t = 0; t < width; t += 4) for (int i = 0; i < ID; i++) k[3 + t * krow + i] = k[3 + (t / 4) * krow + i];   /* ties */
+    float wscale = 0.25f;
+    float *ref = malloc((size_t)S * scrow * 4), *refm = malloc((size_t)S * scrow * 4);
+    int *keep = calloc((size_t)S * scrow, 4), *lst = malloc((size_t)S * lrow * 4), *lstm = malloc((size_t)S * lrow * 4);
+    for (int s = 0; s < S; s++) {
+        int lens = (pos_base + s + 1) / ratio;
+        float wt[64];
+        for (int h = 0; h < IH; h++) { wt[h] = w[2 + s * wrow + h]; wt[h] *= wscale; }
+        for (int j = 0; j < width; j++) {
+            if (j >= lens) { ref[s * scrow + j] = -INFINITY; continue; }
+            float total = 0;
+            for (int h = 0; h < IH; h++) {
+                float dot = 0; for (int i = 0; i < ID; i++) dot += q[1 + s * qrow + h * ID + i] * k[3 + j * krow + i];
+                if (dot > 0.f) total += dot * wt[h];
+            }
+            ref[s * scrow + j] = total;
+        }
+        ds_cand_ref(ref + s * scrow, width, lens, block, topb, keep + s * scrow);
+        for (int j = 0; j < width; j++) refm[s * scrow + j] = keep[s * scrow + j] ? ref[s * scrow + j] : -INFINITY;
+        ds_topk_ref(ref + s * scrow, width, topk, base, order, lst + s * lrow + 2);
+        ds_topk_ref(refm + s * scrow, width, topk, base, order, lstm + s * lrow + 2);
+    }
+    VkcBuf *qb = up(q, (size_t)S * qrow + 1), *kb = up(k, (size_t)width * krow + 3), *wb = up(w, (size_t)S * wrow + 2);
+    VkcBuf *scb = vkc_buf((size_t)S * scrow * 4, VKC_DEV), *mb = vkc_buf((size_t)S * scrow * 4, VKC_DEV);
+    VkcBuf *lb = vkc_buf((size_t)S * lrow * 4, VKC_DEV), *lb2 = vkc_buf((size_t)S * lrow * 4, VKC_DEV), *scb2 = vkc_buf((size_t)S * scrow * 4, VKC_DEV);
+    VkcDsScore sp = {S, pos_base, ratio, IH, ID, width, 1, qrow, 2, wrow, 3, krow, 0, scrow, wscale, 0, 0};
+    VkcDsCand cp = {S, pos_base, ratio, width, block, topb, scrow, scrow};
+    VkcDsTopk tp = {S, width, topk, scrow, 2, lrow, base, order};
+    VkcDsScore sm = sp; sm.mask_row = scrow;
+    vkc_begin();
+    int ok = vkc_dsv4_score(qb, wb, kb, NULL, scb, &sp) && vkc_dsv4_cand(scb, mb, &cp) && vkc_dsv4_topk(scb, lb, &tp);
+    if (S > 1)   /* the masked scores one row at a time, at offsets (a speculative step's rows read different keys) */
+        for (int s = 0; s < S && ok; s++) {
+            VkcDsScore r1 = sm; r1.S = 1; r1.pos_base = pos_base + s; r1.q_off = 1 + s * qrow; r1.w_off = 2 + s * wrow;
+            r1.sc_off = s * scrow; r1.mask_off = s * scrow;
+            ok = vkc_dsv4_score(qb, wb, kb, mb, scb2, &r1);
+        }
+    else ok = ok && vkc_dsv4_score(qb, wb, kb, mb, scb2, &sm);
+    ok = ok && vkc_dsv4_topk(scb2, lb2, &tp);
+    vkc_submit(1);
+    float *gs = down(scb, 0, (size_t)S * scrow);
+    int *gm = (int *)down(mb, 0, (size_t)S * scrow), *gl = (int *)down(lb, 0, (size_t)S * lrow), *gl2 = (int *)down(lb2, 0, (size_t)S * lrow);
+    int same_sc = 1, same_m = 1, same_l = 1, same_l2 = 1;
+    for (int s = 0; s < S; s++) {
+        for (int j = 0; j < width; j++) {
+            same_sc &= gs[s * scrow + j] == ref[s * scrow + j];
+            same_m &= gm[s * scrow + j] == keep[s * scrow + j];
+        }
+        for (int t = 0; t < topk; t++) { same_l &= gl[s * lrow + 2 + t] == lst[s * lrow + 2 + t]; same_l2 &= gl2[s * lrow + 2 + t] == lstm[s * lrow + 2 + t]; }
+    }
+    CHECK(ok && same_sc && same_m && same_l && same_l2, "dsv4 index S %d pos %d ratio %d IH %d ID %d topk %d block %d/%d order %d: "
+          "scores %d mask %d list %d masked list %d", S, pos_base, ratio, IH, ID, topk, block, topb, order, same_sc, same_m, same_l, same_l2);
+    vkc_free(qb); vkc_free(kb); vkc_free(wb); vkc_free(scb); vkc_free(mb); vkc_free(lb); vkc_free(lb2); vkc_free(scb2);
+    free(q); free(k); free(w); free(ref); free(refm); free(keep); free(lst); free(lstm); free(gs); free(gm); free(gl); free(gl2);
+}
+
+/* deepseek_v41.c's engram_run gate, in place on the streams */
+static void test_ds_engram(int S, int H, int D) {
+    int kvrow = (H + 1) * D + 2, xrow = H * D + 3;
+    float *kv = fvec((size_t)S * kvrow + 1, 1.f), *x = fvec((size_t)S * xrow + 4, 1.f), *prm = fvec((size_t)2 * H * D + 6, 1.f);
+    float *ref = malloc(((size_t)S * xrow + 4) * 4), eps = 1e-6f;
+    memcpy(ref, x, ((size_t)S * xrow + 4) * 4);
+    for (int s = 0; s < S; s++) {
+        const float *k0 = kv + 1 + (size_t)s * kvrow, *value = k0 + (size_t)H * D;
+        for (int c = 0; c < H; c++) {
+            const float *key = k0 + (size_t)c * D, *qw = prm + 6 + (size_t)c * D, *kw = prm + 6 + (size_t)H * D + (size_t)c * D;
+            float *st = ref + 4 + (size_t)s * xrow + (size_t)c * D;
+            double ss = 0, ks = 0, dot = 0;
+            for (int i = 0; i < D; i++) { ss += (double)st[i] * st[i]; ks += (double)key[i] * key[i]; dot += (double)st[i] * qw[i] * kw[i] * key[i]; }
+            float rstd = (1.0f / sqrtf((float)(ss / D) + eps)) * (1.0f / sqrtf((float)(ks / D) + eps));
+            float scaled = (float)dot * rstd / sqrtf((float)D);
+            float mag = fabsf(scaled); if (mag < 1e-6f) mag = 1e-6f;
+            float sr = sqrtf(mag); if (scaled < 0) sr = -sr;
+            float g = sigm(sr);
+            for (int i = 0; i < D; i++) st[i] += g * value[i];
+        }
+    }
+    VkcBuf *kb = up(kv, (size_t)S * kvrow + 1), *xb = up(x, (size_t)S * xrow + 4), *pb = up(prm, (size_t)2 * H * D + 6);
+    VkcDsEngram p = {S, H, D, 1, kvrow, 4, xrow, 6, 6 + H * D, eps};
+    vkc_begin(); int ok = vkc_dsv4_engram(kb, pb, xb, &p); vkc_submit(1);
+    float *got = down(xb, 0, (size_t)S * xrow + 4);
+    double e = relerr(got, ref, (size_t)S * xrow + 4, 1e-3);
+    CHECK(ok && e < 2e-6, "dsv4 engram S %d H %d D %d: rel err %.2e", S, H, D, e);
+    vkc_free(kb); vkc_free(xb); vkc_free(pb);
+    free(kv); free(x); free(prm); free(ref); free(got);
+}
+
 /* ---- frames: many ops, frames in flight, ordering ---------------------------------------- */
 static void test_frames(void) {
     int n = 1000;
@@ -1092,6 +1361,18 @@ int main(int argc, char **argv) {
         printf("kda done\n");
         test_mhc(2, 64, 3); test_mhc(4, 96, 20); test_mhc(3, 40, 1);
         printf("mhc done\n");
+    }
+    if (!vkc_dsv4_ready()) { fails++; printf("FAIL: the DeepSeek V4 shader did not load\n"); }
+    else {
+        test_ds_attn(1, 4, 64, 8, 5, 13, 0); test_ds_attn(3, 2, 512, 128, 40, 300, 0); test_ds_attn(2, 3, 100, 6, 9, 20, 0);
+        test_ds_attn(2, 2, 64, 8, 12, 2900, 0); test_ds_attn(3, 4, 64, 8, 5, 13, 1);
+        test_ds_rope(0); test_ds_rope(1);
+        test_ds_compress(2, 0, 0); test_ds_compress(1, 0, 0); test_ds_compress(4, 0, 0); test_ds_compress(4, 1, 1);
+        test_ds_compress(3, 0, 1);
+        test_ds_index(1, 30, 1, 4, 32, 4, 2, 2, 0); test_ds_index(5, 40, 2, 4, 32, 4, 2, 2, 0); test_ds_index(3, 0, 1, 2, 16, 8, 2, 3, 0);
+        test_ds_index(2, 900, 1, 3, 64, 100, 4, 8, 0); test_ds_index(4, 300, 4, 16, 64, 16, 1, 3, 1); test_ds_index(3, 1, 2, 2, 16, 4, 2, 1, 0);
+        test_ds_engram(1, 4, 128); test_ds_engram(3, 2, 300);
+        printf("dsv4 done\n");
     }
     VkcStats st; vkc_stats(&st);
     printf("chain: %llu frames, %llu ops, %llu matmuls (%llu GEMM), %llu barriers\n", st.frames, st.ops, st.matmuls, st.gemms, st.barriers);
