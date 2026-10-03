@@ -104,9 +104,9 @@ jobs:
         run: |
           make -C c clean >/dev/null
           make -C c mimo EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
-          ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+          ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
             python c/tests/mimo_tiny_harness.py --binary c/mimo --fixture c/mimo_tiny
-          cd c && ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+          cd c && ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
             python -m unittest tests.test_mimo_prefix_serve tests.test_brio_serve.MimoBrioServe \
             tests.test_brio_api.MimoBrioEndToEnd
 

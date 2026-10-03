@@ -9,6 +9,99 @@ stuck, `./coli doctor` (below) tells you exactly what's missing.
 > experts from disk instead of needing them all in RAM. The engine is a single
 > C program; Python is only used once, to prepare the model files.
 
+Use an AI coding assistant? Ask it to set up colibri following [docs/AI_SETUP.md](AI_SETUP.md).
+
+---
+
+## The one-step way
+
+**Windows:** download the repository (on GitHub: **Code**, then **Download ZIP**,
+and unzip it; or `git clone`), then double-click **`START-HERE.bat`** in the
+top folder.
+
+**Linux and macOS:**
+
+```bash
+git clone https://github.com/JustVugg/colibri.git
+cd colibri
+./start-here.sh
+```
+
+Both run `coli setup`, which does the rest:
+
+1. **Finds your hardware**: RAM, free disk where the model goes, CPU features,
+   and GPUs (any Vulkan GPU with its memory, NVIDIA cards through nvidia-smi).
+2. **Recommends a model that fits**, in a short numbered menu with download
+   sizes; Enter takes the recommendation. "Fits" means the part of the model
+   that always stays in RAM (the dense part) plus a minimum expert cache fit
+   in your RAM, and the download fits on your disk.
+3. **Gets the engine**: it builds it for your machine when a compiler is
+   there, with Vulkan or CUDA when your GPU can use it, or downloads the
+   prebuilt one (CPU) when there is no compiler. If a package is missing for
+   your GPU it prints the exact command to install it and carries on with the
+   CPU; nothing is installed system-wide without you. Run the setup again once
+   you have installed it, and it rebuilds the engine for the GPU.
+4. **Downloads the model** with progress and resume. Interrupt it whenever you
+   like: running it again continues where it stopped.
+5. **Starts colibri** and opens the dashboard in your browser, and prints the
+   addresses other apps can use.
+
+What you see on Linux (on Windows the same, in the window `START-HERE.bat` opens):
+
+```
+$ ./start-here.sh
+colibri setup
+
+Your machine
+  CPU     13th Gen Intel(R) Core(TM) i7-1355U, 6 cores (12 threads), AVX2, AVX_VNNI
+  RAM     27.3 GB (24.7 GB free now)
+  Disk    787 GB free in /home/me/colibri-models
+  GPU     Intel(R) Iris(R) Xe Graphics via Vulkan 1.3 (integrated, shares RAM)
+  System  Ubuntu 24.04 LTS
+
+Models that fit this machine
+  (fits = the dense part, which always stays in RAM, plus a minimum expert cache fit in RAM, and the download fits on the disk)
+   1) Qwen3.6-35B-A3B                   23 GB   runs from RAM         [recommended]
+      general chat with thinking, tools and images; int4-gs64 container; the whole model fits in RAM (20 GB)
+   2) Qwen3-Coder-30B-A3B               19 GB   runs from RAM
+      coding model with tool calls, no thinking; int4-gs64 container; the whole model fits in RAM (18 GB)
+   3) DeepSeek V4 Flash REAP 150B       85 GB   streams from the SSD
+   ...
+  (2 more fit too: `--all` lists them, `--model ID` picks one)
+  (4 more need more RAM or disk: `coli setup --list` shows why)
+Choose a model [Enter = 1]:
+
+Engine: qwen36 with VULKAN (Intel(R) Iris(R) Xe Graphics, integrated GPU)
+  building: make qwen36 ARCH=native VK=1
+Download: Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64 (23.1 GB); safe to interrupt, rerun to continue
+  [##########..............]  41.0%  9.5 GB/23.1 GB  38.2 MB/s  6 min left
+...
+Starting colibri
+  Browser:             http://127.0.0.1:8000/
+  OpenAI base URL:     http://127.0.0.1:8000/v1
+  Anthropic base URL:  http://127.0.0.1:8000
+  stop: press Ctrl+C here (or close this window)
+```
+
+**Later:** run `START-HERE.bat` or `./start-here.sh` again and colibri starts
+straight away, with no second download or build. To stop it, press Ctrl+C in
+its window, or run `c/coli stop` from another terminal (`c\coli.cmd stop` on
+Windows). `c/coli status` shows what is installed, whether it runs, its
+addresses and the speed of the last answer. To pick another model:
+`./start-here.sh --reconfigure`.
+
+**On WSL** keep the model on the Linux disk (the default, `~/colibri-models`),
+never under `/mnt/c`. If WSL's own network is much slower than Windows' (it can
+be: 63 KB/s against 3.3 MB/s was measured on one machine), the setup offers to
+download through Windows' `curl.exe` into the same folder.
+
+Useful options (`c/coli setup --help` lists them all): `--yes` takes every
+default without asking, `--model ID` picks a model (`--list` shows the ids
+against your machine), `--dir DIR` puts the models elsewhere, `--no-gpu` keeps
+everything on the CPU, `--model-dir DIR` uses a model you already have.
+
+The rest of this page is the same thing done by hand, step by step.
+
 ---
 
 ## 0. What you need first (prerequisites)
