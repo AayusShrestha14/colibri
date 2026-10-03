@@ -2,6 +2,7 @@ const de: Record<string, string> = {
   // navigation
   "nav.chat": "Chat",
   "nav.brain": "Expertenkarte",
+  "nav.brio": "System One",
   "nav.profiling": "Profiling",
 
   // Marke

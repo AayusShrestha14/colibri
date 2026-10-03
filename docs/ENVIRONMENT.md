@@ -245,6 +245,13 @@ With `COLI_VULKAN=1` every MoE engine (qwen36, qwen38, inkling, olmoe, kimi_k3, 
 | `COLI_VK_TIER_GEMM_ROWS` | `16` | Rows from which an expert of a step takes the tiled GEMM (prefill) instead of the per-row GEMV; `0` never. Below it a row's bits do not depend on how many rows share the dispatch. |
 | `COLI_VK_TIER_QUEUE` | a second queue | `0`: the tier's batches share the main queue with the dense matmuls (they then serialize). Unset: a second queue of the main family, else a compute-only family's (RADV), else shared (Lavapipe). |
 | `COLI_VK_DENSE` | on; off on a device sharing the CPU's RAM while the tier is on | Where the dense (non-expert) matrices of qwen36, qwen38, inkling, olmoe, kimi_k3 (its shared experts), mimo, deepseek_v41, deepseek_v4, glm53 and qwenimage run. `0`: on the CPU (with the tier on, the device takes the routed experts only); `1`: on the device whatever the device. Unset: on the device, except on an integrated GPU or a CPU device (Lavapipe) while the engine runs the expert tier (every one of them but qwenimage, which has no routed experts), where they stay on the CPU: there the dense matmuls cost more than the tier gains (measured on a Radeon 780M). The `[VK] <engine>: device ready, dense matrices on the ...` line says which and why. The GLM engine reads it through the same rule with its own default, off (see above). |
+| `COLI_VK_CHAIN` | on for a discrete GPU; qwen36 and olmoe on, qwen38 off, and mimo, inkling, colibri and glm53 off (not measured) on an integrated GPU with the tier; off on a CPU device | qwen36, qwen38, olmoe, inkling, mimo, colibri (GLM-5.2) and glm53 (GLM-5.3 Flash): every layer's dense chain recorded into one submission per layer, the residual stream and the recurrent and KV state on the device (see [vulkan.md](vulkan.md#the-dense-chain-vk_chainc)). `0` off, `1` on, `2` on for prompts only (decode on the CPU). The `[VK] <engine>: dense chain ...` line says which and why. |
+| `COLI_VK_CHAIN_ROWS` | `512` | Prompt rows per chunk of the chain's prefill. |
+| `COLI_VK_CHAIN_GEMV` | on | `0`: the chain's decode matrices take `qmatmul.comp`'s GEMV instead of `chain_gemv.comp`'s. |
+| `COLI_VK_CHAIN_SPIN_US` | `2000` | How long a wait on a chain frame polls before blocking. |
+| `COLI_VK_CHAIN_PROF` | off | `1`: device time per kind of chain op, one line per run. |
+| `COLI_VK_CHAIN_FAULT` | off | Tests: the n-th chain frame fails as a lost device would; the engine rebuilds the state on the CPU and runs there (colibri and mimo have none to rebuild: the CPU continues from its host caches). |
+| `DUMP` | unset | colibri and glm53 in a `VK=1` build: every logits row the forward computes, appended to this file as raw f32 (the Vulkan gates compare the device's with the CPU's). |
 
 ### Second Vulkan device (opt-in)
 
@@ -459,6 +466,9 @@ and the CPU/GPU execution split.
 | `QWEN_SHARED_BATCH` | bounded by 32 MiB scratch | Batch the CPU shared expert across prompt rows. `=0` restores scalar calls; a positive integer caps rows per chunk. The CUDA-tier overlap path is unchanged. |
 | `Q36_MAXT` | conservative engine default | Lower the served/context capacity; it cannot raise the model's compiled safety ceiling. |
 | `COLI_VULKAN` | `0` | `VK=1` build: the dense trunk on the Vulkan device, and the routed experts on the shared expert tier (`COLI_VK_TIER*`, `COLI_VK_DENSE`, see [Vulkan](#vulkan-any-gpu-with-a-vulkan-12-driver)). With the tier on, the engine keeps the expert history `COLI_USAGE` (default `<snap>/.coli_usage`), saved at every run and serve turn end; it keeps none otherwise. |
+| `Q36_DN_GPU` | `0` (off) | CUDA expert tier: a decode token runs every DeltaNet layer whose in_proj and out_proj sit on one card end to end on that card (conv, recurrence, gated norm; state resident in VRAM). Measured on the 35B, 3070, trunk in VRAM: DeltaNet 16.2 -> 10.8 ms/token, the token 39.4 -> 33.3 ms. See [qwen36-cuda-tier.md](qwen36-cuda-tier.md#the-deltanet-layer-on-the-card-q36_dn_gpu1). |
+| `QT_HOME` | `expert` | CUDA expert tier on two or more cards: `layer` homes every expert of a layer on one card (layer ranges weighted by allowance / probed dense-GEMV time per card, `QT_LAYER_SPLIT=<n>` layers on the first card overrides), with the layer's trunk and, for the last layer, lm_head alongside -- a pipeline instead of a per-layer join. See [qwen36-cuda-tier.md](qwen36-cuda-tier.md#two-cards-as-a-pipeline-qt_homelayer). |
+| `Q36_OFFER_SHEXP` | `0` (off) | Offer the shared expert to the VRAM placer. Off by default: on the card it costs 6.3 ms/token (3070) to 11-12.7 ms (with a slower second card) against 3.7-4.0 on the CPU, where it hides behind the expert group. |
 
 ## Qwen3.8 engine (`qwen38`)
 
@@ -565,6 +575,15 @@ Read **only** by `c/olmoe.c`. This is the sister engine used for streaming-cache
 | `CONF_LIMIT` | `0.92` | Confidence ceiling for the router prediction. Clamped to [0.1, 1.0]. |
 | `EXPERT_DROP` | `0` (off) | Drop experts below the confidence threshold instead of loading them (quality/speed experiment). |
 | `COLI_VULKAN` | `0` | `VK=1` build: attention, router and lm_head on the Vulkan device, and the routed experts (int8 rows) on the shared expert tier (`COLI_VK_TIER*`, `COLI_VK_DENSE`, see [Vulkan](#vulkan-any-gpu-with-a-vulkan-12-driver)). The warm start reads the history `COLI_USAGE` names; without it the tier fills as experts pass by. |
+
+## Laya engine (`laya`)
+
+Read **only** by `c/laya.c`, the decision engine ([laya.md](laya.md)).
+
+| Variable | Default | Effect |
+|---|---|---|
+| `COLI_LAYA_MAX_LEN` | the checkpoint's `max_len` | Tokens per question sequence (512 on the English checkpoint, capped at the encoder's 8192 positions). |
+| `COLI_LAYA_HEAD_MAX_LEN` | the checkpoint's `head_max_len` | Tokens shared by a question's instructions and options; raise it for questions with many options. |
 
 ---
 

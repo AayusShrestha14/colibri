@@ -6,6 +6,10 @@
 #   bash tests/vulkan_engines.sh mimo-qwenimage | kimi | kimi-mimo-sanitize | deepseek | deepseek-sanitize
 #   bash tests/vulkan_engines.sh glm | glm-sanitize   # GLM-5.2 (colibri) and GLM-5.3 Flash (glm53)
 #   bash tests/vulkan_engines.sh shader    # the qmatmul formats, the expert batch and the tier, no engine
+#   bash tests/vulkan_engines.sh qwen-chain | qwen-chain-sanitize   # the dense chain (COLI_VK_CHAIN=1)
+#   bash tests/vulkan_engines.sh mimo-chain | mimo-chain-sanitize   # MiMo-V2.6's dense chain
+#   bash tests/vulkan_engines.sh inkling-olmoe-chain | inkling-olmoe-chain-sanitize
+#   bash tests/vulkan_engines.sh glm-chain | glm-chain-sanitize     # the same for colibri and glm53
 #
 # Needs libvulkan-dev, glslc and mesa-vulkan-drivers, plus the Python packages of
 # the family's tiny fixtures (see the vulkan-engines job in .github/workflows/ci.yml).
@@ -962,6 +966,162 @@ family_kimi_mimo_sanitize() {
   make clean >/dev/null 2>&1 || true
 }
 
+# MiMo-V2.6's dense chain (mimo_chain.h, COLI_VK_CHAIN=1): every layer's attention with
+# its sliding window (a ring of 8 rows on the fixture, which every case outgrows), the
+# sink logits, partial RoPE with two thetas and the value scale on the device, the
+# routed experts on the host. Gates, per configuration (mimo_chain_gate): the CPU run's
+# generated tokens; the teacher-forced logits of every position (MIMO_LOGITS) within
+# 1e-4 of the largest one; a "[VK] mimo chain: N forwards" line with N > 0.
+mimo_ids() {  # <case|image> <field>: a field of ref.json's case
+  $PY -c "import json,sys;r=json.load(open('mimo_tiny/ref.json'));c=r['image'] if sys.argv[1]=='image' else r['cases'][sys.argv[1]];print(' '.join(map(str,c[sys.argv[2]])))" "$1" "$2"
+}
+mimo_chain_gate() {  # <tag> <case> <env...>   (CHAINMODE: COLI_VK_CHAIN's value, default 1)
+  local tag=$1 c=$2 extra=() fw lg; shift 2
+  [ "$c" = image ] && extra=(--image mimo_tiny/patches.f32 --grid $MGRID)
+  env "$@" COLI_TEMP=0 ./mimo mimo_tiny --ids "$(mimo_ids $c prompt_ids)" --ngen 6 "${extra[@]}" > mimo-cpu.txt 2>/dev/null
+  env "$@" COLI_TEMP=0 COLI_VULKAN=1 COLI_VK_CHAIN=${CHAINMODE:-1} COLI_VK_TIER_SYNC=1 \
+    ./mimo mimo_tiny --ids "$(mimo_ids $c prompt_ids)" --ngen 6 "${extra[@]}" > mimo-vk.txt 2> mimo-vk.err
+  [ -s mimo-cpu.txt ] && cmp -s mimo-cpu.txt mimo-vk.txt || { cat mimo-cpu.txt mimo-vk.txt mimo-vk.err; fail "$tag $c: the chain's tokens differ from the CPU"; }
+  fw=$(chain_count mimo mimo-vk.err)
+  [ "$fw" -gt 0 ] || { cat mimo-vk.err; fail "$tag $c: the chain never ran"; }
+  rm -f cpu.f32 vk.f32
+  env "$@" MIMO_LOGITS=cpu.f32 ./mimo mimo_tiny --ids "$(mimo_ids $c greedy_full_ids)" --ngen 0 "${extra[@]}" > /dev/null 2>&1
+  env "$@" MIMO_LOGITS=vk.f32 COLI_VULKAN=1 COLI_VK_CHAIN=${CHAINMODE:-1} COLI_VK_TIER_SYNC=1 \
+    ./mimo mimo_tiny --ids "$(mimo_ids $c greedy_full_ids)" --ngen 0 "${extra[@]}" > /dev/null 2> mimo-vk.err
+  lg=$(logits_close cpu.f32 vk.f32) || { echo "$lg"; fail "$tag $c: logits"; }
+  echo "OK $tag $c: tokens = CPU, $lg, $fw chain forwards"
+}
+# mimo_lost_gate <tag> <case> <back> <env...>: the device "lost" (COLI_VK_CHAIN_FAULT) at
+# the chain frame <back> frames before the end of the same run without a fault (the
+# frames a device spends setting up differ: on Lavapipe its memory needs no zeroing
+# frames). The host's caches hold whole steps only, so the CPU runs the rest of the
+# step from where they end, with nothing to rebuild (a picture included): the CPU
+# run's tokens all the same.
+mimo_lost_gate() {
+  local tag=$1 c=$2 back=$3 extra=() frames; shift 3
+  [ "$c" = image ] && extra=(--image mimo_tiny/patches.f32 --grid $MGRID)
+  env "$@" COLI_TEMP=0 ./mimo mimo_tiny --ids "$(mimo_ids $c prompt_ids)" --ngen 6 "${extra[@]}" > mimo-cpu.txt 2>/dev/null
+  env "$@" COLI_TEMP=0 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 \
+    ./mimo mimo_tiny --ids "$(mimo_ids $c prompt_ids)" --ngen 6 "${extra[@]}" > /dev/null 2> mimo-vk.err
+  frames=$(sed -n 's/^\[VK\] mimo chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p' mimo-vk.err | tail -1)
+  [ "${frames:-0}" -gt "$back" ] || { cat mimo-vk.err; fail "$tag: the run had no frame $back before its end"; }
+  env "$@" COLI_TEMP=0 COLI_VK_CHAIN_FAULT=$((frames - back)) COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 \
+    ./mimo mimo_tiny --ids "$(mimo_ids $c prompt_ids)" --ngen 6 "${extra[@]}" > mimo-vk.txt 2> mimo-vk.err
+  [ -s mimo-cpu.txt ] && cmp -s mimo-cpu.txt mimo-vk.txt || { cat mimo-cpu.txt mimo-vk.txt mimo-vk.err; fail "$tag: tokens differ from the CPU"; }
+  grep -q "the device was lost at position [0-9]" mimo-vk.err || { cat mimo-vk.err; fail "$tag: the device was never lost"; }
+  echo "OK $tag: tokens = CPU, $(grep -o 'the device was lost at position [0-9]*' mimo-vk.err)"
+}
+mimo_served_fixture() {  # the fixture plus a byte tokenizer, for the serve tests
+  rm -rf mimo_tiny_served
+  $PY -c "import sys, shutil; sys.path.insert(0, 'tests'); import mimo_serve_fixture as f; shutil.copytree(f.served_fixture(), 'mimo_tiny_served')"
+}
+
+family_mimo_chain() {
+  make mimo tests/test_vk_chain VK=1
+  ./tests/test_vk_chain shaders/qmatmul.spv | tee vk_chain.log
+  tail -1 vk_chain.log | grep -qx PASS || fail "the chain's ops"
+  $PY tools/make_mimo_tiny.py --output ./mimo_tiny --force --vision
+  MGRID=$($PY -c "import json;i=json.load(open('mimo_tiny/ref.json'))['image'];print(i['grid_h'],i['grid_w'])")
+  # Xiaomi's vendor oracle with the chain on: greedy and teacher-forced in every case,
+  # the native FP8/BF16 trunk, prefill in blocks of 3 and of 1, the picture
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 $PY tests/mimo_tiny_harness.py --binary ./mimo --fixture ./mimo_tiny
+  # every dense form (MIMO_DENSE_BITS 32: f32, fmt 10; 0: the release's FP8 and BF16, fmt
+  # 12 and 11; 8: int8 rows, fmt 1), the prompt in one block (the tiled GEMM, the window
+  # gathered beside the block) and one token at a time (the ring read in place), text
+  # and picture, the routed experts on the tier
+  local bits ch c k
+  for bits in 32 0 8; do for ch in 64 1; do for c in short window long image; do
+    mimo_chain_gate "chain mimo bits=$bits MIMO_CHUNK=$ch" $c MIMO_DENSE_BITS=$bits MIMO_CHUNK=$ch
+  done; done; done
+  for c in short long; do
+    mimo_chain_gate "chain mimo blocks of 3" $c MIMO_DENSE_BITS=32 MIMO_CHUNK=3
+    mimo_chain_gate "chain mimo tier off" $c MIMO_DENSE_BITS=0 COLI_VK_TIER=0
+    mimo_chain_gate "chain mimo experts on the CPU (MIMO_VK_EXPERTS=0)" $c MIMO_DENSE_BITS=32 MIMO_VK_EXPERTS=0
+    mimo_chain_gate "chain mimo a block in chunks of 3 rows" $c MIMO_DENSE_BITS=32 COLI_VK_CHAIN_ROWS=3
+    mimo_chain_gate "chain mimo tiled GEMM from S=2" $c MIMO_DENSE_BITS=0 COLI_VK_GEMM_MIN_S=2
+    mimo_chain_gate "chain mimo the per-row GEMV" $c MIMO_DENSE_BITS=32 COLI_VK_CHAIN_GEMV=0
+    mimo_chain_gate "chain mimo eviction (MIMO_VK_EXPERTS=2)" $c MIMO_DENSE_BITS=32 MIMO_VK_EXPERTS=2
+  done
+  # the picture's tower on the device too (COLI_VK_DENSE=1: the per-matrix path for the
+  # tower, the chain for the layers)
+  mimo_chain_gate "chain mimo tower on the device" image MIMO_DENSE_BITS=0 COLI_VK_DENSE=1
+  # The window boundary, bit for bit: with every matrix on the per-row GEMV and the tier
+  # off the chain's logits are the same bytes whatever the blocks -- one row reading the
+  # ring in place, blocks of 3, of the window's 8 and of 9 rows gathering it, the whole
+  # prompt -- so a row's window is the same rows in the same order on every path.
+  for c in window long image; do
+    local x=(); [ $c = image ] && x=(--image mimo_tiny/patches.f32 --grid $MGRID)
+    for ch in 64 1 3 8 9; do
+      COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER=0 COLI_VK_GEMM_MIN_S=0 MIMO_DENSE_BITS=32 MIMO_CHUNK=$ch MIMO_LOGITS=blk$ch.f32 \
+        ./mimo mimo_tiny --ids "$(mimo_ids $c greedy_full_ids)" --ngen 0 "${x[@]}" > /dev/null 2> mimo-vk.err
+      [ "$(chain_count mimo mimo-vk.err)" -gt 0 ] || { cat mimo-vk.err; fail "chain mimo blocks $ch $c: the chain never ran"; }
+      [ $ch = 64 ] || cmp -s blk64.f32 blk$ch.f32 || fail "chain mimo $c: blocks of $ch are not the bytes of one block"
+    done
+    echo "OK chain mimo window boundary $c: blocks of 64, 1, 3, 8, 9 give the same logits bytes"
+  done
+  # COLI_VK_CHAIN=2: prompts on the device, decode on the CPU, the caches moving between them
+  for c in short long image; do CHAINMODE=2 mimo_chain_gate "chain mimo prompts only" $c MIMO_DENSE_BITS=32; done
+  # the device lost (frames counted back from the end of the run: 5 decode steps of 6
+  # frames follow the prompt): inside the last decode step; inside the first block of
+  # a prompt split in chunks of 3 rows (the CPU takes the step's remaining rows); inside
+  # a picture's prompt; inside a prompt fed one token at a time
+  mimo_lost_gate "chain mimo device lost mid-decode" long 3 MIMO_DENSE_BITS=32
+  mimo_lost_gate "chain mimo device lost inside a chunked prompt" long 100 MIMO_DENSE_BITS=32 COLI_VK_CHAIN_ROWS=3
+  mimo_lost_gate "chain mimo device lost inside a picture's prompt" image 33 MIMO_DENSE_BITS=0
+  mimo_lost_gate "chain mimo device lost, one token at a time" short 50 MIMO_DENSE_BITS=32 MIMO_CHUNK=1
+  # the prefix-reuse contract and Brio photos (the rings restored into the device's
+  # mirrors), compared bit for bit with a cold engine: the per-row GEMV and no tier, so
+  # a resumed prompt's rows get the bits of the same rows computed cold
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER=0 COLI_VK_GEMM_MIN_S=0 $PY -m unittest tests.test_mimo_prefix_serve
+  # a serve session against the CPU's, frame for frame, in both modes and with the
+  # device lost mid-session. The fixture's logits run to 300 (its head is scaled for wide
+  # greedy margins), so its logprobs compare within 1e-3: about 3e-6 of the largest logit
+  mimo_served_fixture
+  for k in 1 2; do CHAIN_SERVE_TOL=1e-3 COLI_VK_CHAIN=$k $PY tests/vulkan_chain_serve.py ./mimo mimo_tiny_served OMP_NUM_THREADS=2; done
+  CHAIN_SERVE_TOL=1e-3 $PY tests/vulkan_chain_serve.py ./mimo mimo_tiny_served OMP_NUM_THREADS=2 COLI_VK_CHAIN_FAULT=60
+}
+
+# MiMo's chain under ASan and UBSan: memory safety is the gate (a sanitized build
+# vectorizes differently, so tokens are not compared); each run must have run the chain.
+family_mimo_chain_sanitize() {
+  make clean >/dev/null 2>&1 || true
+  make mimo tests/test_vk_chain VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
+  ./tests/test_vk_chain shaders/qmatmul.spv > san.log 2>&1 || true
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log || ! tail -1 san.log | grep -qx PASS; then cat san.log; fail "asan: the chain's ops"; fi
+  echo "OK asan: the chain's ops"
+  $PY tools/make_mimo_tiny.py --output ./mimo_tiny --force --vision
+  MGRID=$($PY -c "import json;i=json.load(open('mimo_tiny/ref.json'))['image'];print(i['grid_h'],i['grid_w'])")
+  msan() {  # <tag> <case> <env...>
+    local tag=$1 c=$2 x=(); shift 2
+    [ "$c" = image ] && x=(--image mimo_tiny/patches.f32 --grid $MGRID)
+    env OMP_NUM_THREADS=2 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_TEMP=0 "$@" \
+      ./mimo mimo_tiny --ids "$(mimo_ids $c prompt_ids)" --ngen 6 "${x[@]}" > san.log 2>&1 || true
+    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    [ "$(chain_count mimo san.log)" -gt 0 ] || { cat san.log; fail "$tag: the chain never ran"; }
+    echo "OK $tag: sanitizers clean, $(chain_count mimo san.log) chain forwards"
+  }
+  msan "asan chain mimo f32, the tier" long MIMO_DENSE_BITS=32
+  msan "asan chain mimo native FP8/BF16, picture, tower on the device" image MIMO_DENSE_BITS=0 COLI_VK_DENSE=1
+  msan "asan chain mimo blocks of 3 in chunks of 2 rows" long MIMO_DENSE_BITS=32 MIMO_CHUNK=3 COLI_VK_CHAIN_ROWS=2
+  msan "asan chain mimo one token at a time, int8" window MIMO_DENSE_BITS=8 MIMO_CHUNK=1
+  msan "asan chain mimo experts on the CPU" short MIMO_DENSE_BITS=32 MIMO_VK_EXPERTS=0
+  # the device lost inside a prompt split in chunks of 3 rows: the frame 100 before the
+  # end of the same run without a fault (a device's setup frames differ)
+  msan "asan chain mimo frames to the end" long MIMO_DENSE_BITS=32 COLI_VK_CHAIN_ROWS=3
+  local frames
+  frames=$(sed -n 's/^\[VK\] mimo chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p' san.log | tail -1)
+  env OMP_NUM_THREADS=2 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_TEMP=0 MIMO_DENSE_BITS=32 COLI_VK_CHAIN_ROWS=3 \
+    COLI_VK_CHAIN_FAULT=$((frames - 100)) ./mimo mimo_tiny --ids "$(mimo_ids long prompt_ids)" --ngen 6 > san.log 2>&1 || true
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan chain mimo device lost: sanitizer diagnostic"; fi
+  grep -q "the device was lost at position [1-9]" san.log || { cat san.log; fail "asan chain mimo device lost: not lost inside the prompt"; }
+  echo "OK asan chain mimo device lost: sanitizers clean, $(grep -o 'the device was lost at position [0-9]*' san.log)"
+  mimo_served_fixture
+  CHAIN_SERVE_TOL=1e-3 $PY tests/vulkan_chain_serve.py ./mimo mimo_tiny_served OMP_NUM_THREADS=2 > san.log 2>&1 || { cat san.log; fail "asan chain mimo serve"; }
+  echo "OK asan chain mimo serve: $(tail -1 san.log)"
+  make clean >/dev/null 2>&1 || true
+}
+
 # GLM-5.2 (colibri) and GLM-5.3 Flash (glm53) on the routed-expert tier: the fixtures.
 # colibri: the bf16 oracle, whose experts the loader quantizes to the bits asked for
 # (16: f32, fmt 10 on the device; 8: int8, fmt 1; 4: int4 per row, fmt 2; 3: int3-g64,
@@ -1152,6 +1312,577 @@ family_glm_sanitize() {
   make clean >/dev/null 2>&1 || true
 }
 
+# The dense chain (vk_chain.c, COLI_VK_CHAIN=1): every layer recorded into one
+# submission, the residual stream, the KV mirrors and the recurrent state on the device.
+# Gates, per configuration: the CPU run's tokens (and its oracle, where the CPU passes
+# it); the last logits within 1e-4 of the largest one where both runs multiply f32
+# activations (tol 1); a "[VK] <engine> chain: N forwards" line with N > 0. Beside them:
+# the chain's ops against CPU references (tests/test_vk_chain), qwen38's oracle targets
+# with the chain on, the prefix-reuse contract, and serve sessions (pins, the prompt
+# cache, the prefill read-out, MTP drafts) frame for frame against the CPU.
+chain_count() {
+  local n
+  n=$(sed -n "s/^\[VK\] $1 chain: \([0-9][0-9]*\) forwards.*/\1/p" "$2" | tail -1)
+  echo "${n:-0}"
+}
+logits_close() {  # <cpu.f32> <vk.f32>: max |diff| within 1e-4 of the largest |logit|
+  $PY - "$1" "$2" <<'PY'
+import array, sys
+a = array.array("f", open(sys.argv[1], "rb").read()); b = array.array("f", open(sys.argv[2], "rb").read())
+d = max(abs(x - y) for x, y in zip(a, b)) if a and len(a) == len(b) else float("inf")
+m = max(abs(x) for x in a) if a else 0.0
+print(f"max |logit diff| {d:.2e} of {m:.2e}")
+sys.exit(0 if d <= 1e-4 * m else 1)
+PY
+}
+chain_gate() {  # <engine> <tag> <tol 0|1> <env...> -- <argv...>   (CPUENV: the CPU arm's own settings)
+  local eng=$1 tag=$2 tol=$3; shift 3
+  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  rm -f chain.usage cpu.f32 vk.f32
+  local rc_cpu=0
+  env "${envs[@]}" ${CPUENV:-} DUMP=cpu.f32 ./"$eng" "$@" > cpu.log 2>&1 || rc_cpu=$?
+  env "${envs[@]}" DUMP=vk.f32 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=${CHAINMODE:-1} \
+    ./"$eng" "$@" > vk.log 2>&1 || { [ $rc_cpu != 0 ] || { cat vk.log; fail "$tag: the chain misses the oracle the CPU passes"; }; }
+  same_tokens cpu.log vk.log "$tag"
+  [ "$(chain_count "$eng" vk.log)" -gt 0 ] || { cat vk.log; fail "$tag: the chain never ran"; }
+  local lg=""
+  if [ "$tol" = 1 ]; then lg=$(logits_close cpu.f32 vk.f32) || { echo "$lg"; fail "$tag: logits"; }; lg=", $lg"; fi
+  echo "OK $tag: tokens = CPU$lg, $(chain_count "$eng" vk.log) chain forwards"
+}
+
+# lost_gate <engine> <tag> <frame> <env...> -- <argv...>: the device "lost" at the given
+# chain frame (COLI_VK_CHAIN_FAULT); the engine rebuilds the recurrent state on the CPU
+# from the prefix record and continues there: the CPU run's tokens all the same.
+lost_gate() {
+  local eng=$1 tag=$2 k=$3; shift 3
+  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  rm -f chain.usage
+  env "${envs[@]}" ./"$eng" "$@" > cpu.log 2>&1 || true
+  env "${envs[@]}" COLI_VK_CHAIN_FAULT=$k COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 \
+    ./"$eng" "$@" > vk.log 2>&1 || true
+  same_tokens cpu.log vk.log "$tag"
+  grep -q "rebuilding the state of [1-9]" vk.log || { cat vk.log; fail "$tag: no state was rebuilt"; }
+  echo "OK $tag: tokens = CPU, $(grep -o 'rebuilding the state of [0-9]* positions' vk.log)"
+}
+
+family_qwen_chain() {
+  make qwen36 qwen38 tests/test_vk_chain VK=1
+  ./tests/test_vk_chain shaders/qmatmul.spv | tee vk_chain.log
+  tail -1 vk_chain.log | grep -qx PASS || fail "the chain's ops"
+  $PY tools/make_qwen36_tiny.py --out qwen36_tiny --ref-mode full --emit-ref qwen36_tiny/ref_full.json
+  $PY tools/make_qwen36_tiny.py --geometry qwen3-coder-30b --out qwen3_coder_tiny --ref-mode full --emit-ref qwen3_coder_tiny/ref_full.json
+  $PY tools/make_qwen36_tiny.py --geometry qwen38-27b-dense --out qwen38_27b_tiny --ref-mode full --emit-ref qwen38_27b_tiny/ref_full.json
+  $PY tools/make_qwen36_tiny.py --geometry qwen38-2p4t --seed 3 --out qwen38_2p4t_tiny --ref-mode full --emit-ref qwen38_2p4t_tiny/ref_full.json
+  local fx cap caps
+  # qwen36: the hybrid, Qwen3-Coder (attention only, no gate, no shared expert), the
+  # 27B dense geometry (no routed experts: no host step at all) and the 2.4T one
+  for fx in qwen36_tiny qwen3_coder_tiny qwen38_27b_tiny qwen38_2p4t_tiny; do
+    $PY tools/convert_qwen36.py --model $fx --out ${fx}_c --ebits 8
+    caps="1 8"; [ $fx = qwen38_2p4t_tiny ] && caps=8
+    for cap in $caps; do
+      chain_gate qwen36 "chain qwen36 $fx f32 cap=$cap" 1 COLI_DENSE_I8=0 SNAP=${fx}_c -- $cap 8 $fx/ref_full.json
+    done
+    # int8 dense rows (fmt 1): the CPU arm with f32 activations (COLI_DENSE_IDOT=0), as the device
+    CPUENV=COLI_DENSE_IDOT=0 chain_gate qwen36 "chain qwen36 $fx int8" 1 SNAP=${fx}_c -- 8 8 $fx/ref_full.json
+  done
+  # the expert containers the tier reads, the tier off, prefill in chunks of 3 rows,
+  # the tiled GEMM inside the chain from S = 2
+  $PY tools/make_qwen36_tiny.py --out qwen36_tiny64 --ref-mode full --inter 64 --emit-ref qwen36_tiny64/ref_full.json
+  $PY tools/convert_qwen36.py --model qwen36_tiny64 --out qwen36_tiny64_c --ebits 4 --gs 64
+  $PY tools/convert_qwen36.py --model qwen36_tiny64 --out qwen36_tiny64_d8 --ebits 4 --gs 64 --down-bits 8
+  $PY tools/convert_qwen36.py --model qwen36_tiny --out qwen36_tiny_i4r --ebits 4
+  chain_gate qwen36 "chain qwen36 int4-g64 planar" 1 QWEN_EXPERT_ACT=f32 COLI_DENSE_I8=0 SNAP=qwen36_tiny64_c -- 8 4 qwen36_tiny64/ref_full.json
+  chain_gate qwen36 "chain qwen36 int4-g64 int8 activations" 0 COLI_DENSE_I8=0 SNAP=qwen36_tiny64_c -- 1 4 qwen36_tiny64/ref_full.json
+  chain_gate qwen36 "chain qwen36 mixed int4/int8" 1 COLI_DENSE_I8=0 SNAP=qwen36_tiny64_d8 -- 8 4 qwen36_tiny64/ref_full.json
+  chain_gate qwen36 "chain qwen36 int4 per row" 1 COLI_DENSE_I8=0 SNAP=qwen36_tiny_i4r -- 8 4 qwen36_tiny/ref_full.json
+  chain_gate qwen36 "chain qwen36 tier off" 1 COLI_VK_TIER=0 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
+  chain_gate qwen36 "chain qwen36 prefill in chunks of 3" 1 COLI_VK_CHAIN_ROWS=3 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
+  chain_gate qwen36 "chain qwen36 tiled GEMM" 1 COLI_VK_GEMM_MIN_S=2 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
+  chain_gate qwen36 "chain qwen36 the per-row GEMV" 1 COLI_VK_CHAIN_GEMV=0 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
+  # an image: the M-RoPE positions reach the chain as the host's cos/sin table,
+  # token-exact against transformers, on the CLI and through the IMAGE frame
+  $PY tools/make_qwen36_vl_tiny.py --out qwen38_27b_vl_tiny
+  $PY tools/convert_qwen36.py --model qwen38_27b_vl_tiny --out qwen38_27b_vl_tiny_c --ebits 8
+  chain_gate qwen36 "chain qwen36 vision" 1 COLI_DENSE_I8=0 SNAP=qwen38_27b_vl_tiny_c -- 8 8 qwen38_27b_vl_tiny/ref.json
+  QWEN36_VL_TINY=qwen38_27b_vl_tiny_c QWEN36_VL_REF=qwen38_27b_vl_tiny/ref.json COLI_VULKAN=1 COLI_VK_CHAIN=1 \
+    COLI_USAGE=$PWD/chain.usage $PY -m unittest tests.test_qwen36_vision_serve
+  # the device lost mid-decode: the state rebuilt on the CPU, the run finishes there
+  lost_gate qwen36 "chain qwen36 device lost" 40 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
+  # the prefix-reuse contract with the state on the device, and a serve session
+  QWEN36_TINY=$PWD/qwen36_tiny_c COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_USAGE=$PWD/chain.usage $PY tests/test_qwen36_prefix_serve.py
+  $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0
+  # COLI_VK_CHAIN=2, prompts on the device and decode on the CPU: the state crosses
+  # between them at every turn's first decode step and next prompt
+  CHAINMODE=2 chain_gate qwen36 "chain qwen36 prompts only" 1 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
+  COLI_VK_CHAIN=2 $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0
+
+  # qwen38: every resident format, prefill batching, every expert form, MTP
+  $PY tools/make_qwen38_tiny.py --out qwen38_tiny
+  $PY tools/make_qwen38_tiny.py --out qwen38_tiny_fp8 --fp8-experts
+  $PY tools/make_qwen38_tiny.py --out qwen38_tiny_int4 --fp8-experts --int4-experts --expert-gain 3
+  local trunk batch bf16 fx ref f
+  for batch in 0 1; do for bf16 in 0 1; do
+    chain_gate qwen38 "chain qwen38 bf16=$bf16 batch=$batch" 1 OMP_NUM_THREADS=2 Q38_PREFILL_BATCH=$batch Q38_NATIVE_BF16=$bf16 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
+  done; done
+  # the int8 trunk (fmt 1): the CPU's integer kernel rounds activations, so tokens only
+  chain_gate qwen38 "chain qwen38 int8 trunk" 0 OMP_NUM_THREADS=2 Q38_TRUNK_MIN_KB=0 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
+  for fx in qwen38_tiny_fp8 qwen38_tiny_int4; do
+    ref=$fx/ref.json; [ $fx = qwen38_tiny_int4 ] && ref=$fx/ref_int4.json
+    for batch in 0 1; do chain_gate qwen38 "chain qwen38 $fx batch=$batch" 1 OMP_NUM_THREADS=2 Q38_PREFILL_BATCH=$batch SNAP=$fx -- 2 8 $ref; done
+  done
+  chain_gate qwen38 "chain qwen38 tier off" 1 OMP_NUM_THREADS=2 COLI_VK_TIER=0 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
+  chain_gate qwen38 "chain qwen38 prefill in chunks of 3" 1 OMP_NUM_THREADS=2 COLI_VK_CHAIN_ROWS=3 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
+  $PY tools/make_qwen38_tiny.py --out qwen38_tiny_mtp --mtp
+  $PY tools/make_edge_tiny_tokenizer.py --vocab-size 64 ./qwen38_tiny_mtp   # serve speaks text
+  $PY tools/make_qwen38_tiny.py --out qwen38_tiny_fp8_mtp --fp8-experts --mtp
+  $PY tools/make_qwen38_tiny.py --out qwen38_tiny_int4_mtp --fp8-experts --int4-experts --expert-gain 3 --mtp
+  # MTP verify (S = 2) with the device's snapshot and rollback: drafts as they come,
+  # every draft rejected (a rollback per token), every one accepted, alternating
+  for fx in qwen38_tiny_mtp qwen38_tiny_fp8_mtp qwen38_tiny_int4_mtp; do for f in "" reject accept mixed; do
+    chain_gate qwen38 "chain qwen38 MTP $fx ${f:-drafting}" 1 OMP_NUM_THREADS=2 Q38_MTP=1 Q38_MTP_FORCE=$f SNAP=$fx -- 2 8 $fx/ref.json
+  done; done
+  # the device lost mid-decode, once between steps and once inside an MTP verify
+  lost_gate qwen38 "chain qwen38 device lost" 20 OMP_NUM_THREADS=2 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
+  lost_gate qwen38 "chain qwen38 device lost in a verify" 45 OMP_NUM_THREADS=2 Q38_MTP=1 Q38_MTP_FORCE=mixed SNAP=qwen38_tiny_mtp -- 2 8 qwen38_tiny_mtp/ref.json
+  # the oracle targets with the chain on (COLI_VK_TIER_BALANCE=0: the int4 target wants
+  # the same last logits from every expert path, and the balancer moves experts between
+  # the device and the CPU by measured times); the MTP harness, whose prompt-cache and pin
+  # checks compare a warm session's draft logits bit for bit with a fresh one's, with the
+  # tier off: the tier's residency differs between two sessions, with or without the chain
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 \
+    make qwen38-tiny-check qwen38-tiny-fp8-check qwen38-tiny-int4-check VK=1
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER=0 make qwen38-tiny-mtp-check VK=1
+  $PY tests/vulkan_chain_serve.py ./qwen38 qwen38_tiny_mtp OMP_NUM_THREADS=2 Q38_MTP=1
+  $PY tests/vulkan_chain_serve.py ./qwen38 qwen38_tiny_mtp OMP_NUM_THREADS=2
+  CHAINMODE=2 chain_gate qwen38 "chain qwen38 prompts only, MTP" 1 OMP_NUM_THREADS=2 Q38_MTP=1 Q38_MTP_FORCE=mixed SNAP=qwen38_tiny_mtp -- 2 8 qwen38_tiny_mtp/ref.json
+  COLI_VK_CHAIN=2 $PY tests/vulkan_chain_serve.py ./qwen38 qwen38_tiny_mtp OMP_NUM_THREADS=2 Q38_MTP=1
+}
+
+# The chain under ASan and UBSan: memory safety is the gate (a sanitized build
+# vectorizes differently, so tokens are not compared); each run must have run the chain.
+family_qwen_chain_sanitize() {
+  make clean >/dev/null 2>&1 || true
+  make qwen36 qwen38 tests/test_vk_chain VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
+  ./tests/test_vk_chain shaders/qmatmul.spv > san.log 2>&1 || true
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log || ! tail -1 san.log | grep -qx PASS; then cat san.log; fail "asan: the chain's ops"; fi
+  echo "OK asan: the chain's ops"
+  $PY tools/make_qwen36_tiny.py --out qwen36_tiny --ref-mode full --emit-ref qwen36_tiny/ref_full.json
+  $PY tools/convert_qwen36.py --model qwen36_tiny --out qwen36_tiny_c --ebits 8
+  $PY tools/make_qwen36_tiny.py --geometry qwen38-27b-dense --out qwen38_27b_tiny --ref-mode full --emit-ref qwen38_27b_tiny/ref_full.json
+  $PY tools/convert_qwen36.py --model qwen38_27b_tiny --out qwen38_27b_tiny_c --ebits 8
+  $PY tools/make_qwen36_tiny.py --out qwen36_tiny64 --ref-mode full --inter 64 --emit-ref qwen36_tiny64/ref_full.json
+  $PY tools/convert_qwen36.py --model qwen36_tiny64 --out qwen36_tiny64_c --ebits 4 --gs 64
+  $PY tools/make_qwen38_tiny.py --out qwen38_tiny
+  $PY tools/make_qwen38_tiny.py --out qwen38_tiny_int4_mtp --fp8-experts --int4-experts --expert-gain 3 --mtp
+  $PY tools/make_qwen38_tiny.py --out qwen38_tiny_mtp --mtp
+  $PY tools/make_edge_tiny_tokenizer.py --vocab-size 64 ./qwen38_tiny_mtp   # serve speaks text
+  csan() {  # <engine> <tag> <env and argv...>
+    local eng=$1 tag=$2; shift 2
+    rm -f chain.usage
+    env OMP_NUM_THREADS=2 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 "$@" > san.log 2>&1 || true
+    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    [ "$(chain_count "$eng" san.log)" -gt 0 ] || { cat san.log; fail "$tag: the chain never ran"; }
+    echo "OK $tag: sanitizers clean, $(chain_count "$eng" san.log) chain forwards"
+  }
+  csan qwen36 "asan chain qwen36 int8 experts" COLI_DENSE_I8=0 SNAP=qwen36_tiny_c ./qwen36 1 8 qwen36_tiny/ref_full.json
+  csan qwen36 "asan chain qwen36 int8 dense, chunks of 3" COLI_VK_CHAIN_ROWS=3 SNAP=qwen36_tiny_c ./qwen36 8 8 qwen36_tiny/ref_full.json
+  csan qwen36 "asan chain qwen36 int4-g64 planar" COLI_DENSE_I8=0 SNAP=qwen36_tiny64_c ./qwen36 8 4 qwen36_tiny64/ref_full.json
+  csan qwen36 "asan chain qwen36 dense model" COLI_DENSE_I8=0 SNAP=qwen38_27b_tiny_c ./qwen36 8 8 qwen38_27b_tiny/ref_full.json
+  csan qwen38 "asan chain qwen38 batch=0" Q38_PREFILL_BATCH=0 SNAP=qwen38_tiny ./qwen38 4 8 qwen38_tiny/ref.json
+  csan qwen38 "asan chain qwen38 int8 trunk, chunks of 3" Q38_TRUNK_MIN_KB=0 COLI_VK_CHAIN_ROWS=3 SNAP=qwen38_tiny ./qwen38 4 8 qwen38_tiny/ref.json
+  csan qwen38 "asan chain qwen38 MTP reject" Q38_MTP=1 Q38_MTP_FORCE=reject SNAP=qwen38_tiny_int4_mtp ./qwen38 2 8 qwen38_tiny_int4_mtp/ref.json
+  csan qwen38 "asan chain qwen38 MTP mixed" Q38_MTP=1 Q38_MTP_FORCE=mixed SNAP=qwen38_tiny_int4_mtp ./qwen38 2 8 qwen38_tiny_int4_mtp/ref.json
+  $PY tests/vulkan_chain_serve.py ./qwen38 qwen38_tiny_mtp Q38_MTP=1 > san.log 2>&1 || { cat san.log; fail "asan chain qwen38 serve"; }
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan chain qwen38 serve: sanitizer diagnostic"; fi
+  echo "OK asan chain qwen38 serve: $(tail -1 san.log)"
+  make clean >/dev/null 2>&1 || true
+}
+
+# inkling's and olmoe's fixtures for their dense chain: the family inkling-olmoe's (the
+# bf16 copy of the f32 snapshot, the dense-int4g64 container, the expert containers and
+# the tokenizers), and Inkling at its real width (--wide: D = 6144, head dim 128).
+inkling_olmoe_chain_fixtures() {
+  $PY tools/make_tiny_inkling.py tiny_inkling
+  $PY tools/make_tiny_inkling.py tiny_inkling_wide --wide
+  mkdir -p tiny_inkling_bf16
+  cp tiny_inkling/config.json tiny_inkling/generation_config.json tiny_inkling_bf16/
+  $PY - <<'EOF'
+import json, struct, numpy as np
+src, dst = "tiny_inkling/model.safetensors", "tiny_inkling_bf16/model.safetensors"
+raw = open(src, "rb").read(); n = struct.unpack("<Q", raw[:8])[0]; hdr = json.loads(raw[8:8 + n])
+out, blobs, off = {}, [], 0
+for k, v in hdr.items():
+    if k == "__metadata__": out[k] = v; continue
+    a = np.frombuffer(raw[8 + n + v["data_offsets"][0]: 8 + n + v["data_offsets"][1]], np.float32)
+    u = a.view(np.uint32).astype(np.uint64)
+    b = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype(np.uint16).tobytes()
+    out[k] = {"dtype": "BF16", "shape": v["shape"], "data_offsets": [off, off + len(b)]}
+    blobs.append(b); off += len(b)
+h = json.dumps(out).encode(); h += b" " * (-len(h) % 8)
+with open(dst, "wb") as f:
+    f.write(struct.pack("<Q", len(h))); f.write(h); [f.write(b) for b in blobs]
+EOF
+  rm -rf tiny_inkling_q && cp -r tiny_inkling tiny_inkling_q
+  $PY - tools/convert_inkling_dense_int4.py tiny_inkling_q <<'EOF'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("conv", sys.argv[1])
+conv = importlib.util.module_from_spec(spec); spec.loader.exec_module(conv)
+conv.MIN_ELEMS = 0
+conv.ATTN_BITS = 4
+base = conv.classify
+conv.classify = lambda n, s, d: "int8" if n.endswith(".mlp.down_proj.weight") else base(n, s, d)
+sys.argv = ["convert_inkling_dense_int4.py", "--dir", sys.argv[2]]
+conv.main()
+EOF
+  mkdir -p tiny_inkling_q/dense-int4g64
+  mv tiny_inkling_q/dense-int4g64.safetensors tiny_inkling_q/dense-int4g64/dense.safetensors
+  $PY tools/make_olmoe_tiny.py --output olmoe_tiny --force
+  $PY tools/convert_olmoe_merged.py --model olmoe_tiny --out olmoe_tiny_c
+  inkling_olmoe_tier_fixtures
+}
+
+# chain_gate for a bf16 snapshot: where this CPU's bf16 dot rounds the activations
+# (AVX512-BF16), the per-matrix path keeps bf16 on the CPU and so does the chain, which
+# must then decline cleanly ("bf16 stays on the CPU") with the CPU's tokens.
+chain_gate_bf16() {  # <engine> <tag> <env...> -- <argv...>
+  local eng=$1 tag=$2; shift 2
+  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  env "${envs[@]}" COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 ./"$eng" "$@" > vk.log 2>&1 || true
+  if grep -qa 'bf16 stays on the CPU' vk.log; then
+    env "${envs[@]}" ./"$eng" "$@" > cpu.log 2>&1 || true
+    same_tokens cpu.log vk.log "$tag"
+    echo "OK $tag: tokens = CPU, the chain declined (this CPU's bf16 dot keeps bf16 on the CPU)"
+  else
+    chain_gate "$eng" "$tag" 1 "${envs[@]}" -- "$@"
+  fi
+}
+
+# lost_gate for olmoe: attention only, so nothing to rebuild; the CPU redoes the step
+# the device was lost in from its first position and runs from there.
+lost_gate_redo() {  # <engine> <tag> <frame> <env...> -- <argv...>
+  local eng=$1 tag=$2 k=$3; shift 3
+  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  rm -f chain.usage
+  env "${envs[@]}" ./"$eng" "$@" > cpu.log 2>&1 || true
+  env "${envs[@]}" COLI_VK_CHAIN_FAULT=$k COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 \
+    ./"$eng" "$@" > vk.log 2>&1 || true
+  same_tokens cpu.log vk.log "$tag"
+  grep -q "the CPU redoes the step from position [1-9]" vk.log || { cat vk.log; fail "$tag: no step was redone"; }
+  echo "OK $tag: tokens = CPU, $(grep -o 'redoes the step from position [0-9]*' vk.log)"
+}
+
+# The device lost `back` frames before the end of a run (a probe run counts the frames,
+# so the fault lands mid-decode on any device, whatever its setup submits): lost_gate
+# (the state rebuilt on the CPU) or lost_gate_redo (the step redone there).
+lost_late() {  # <engine> <tag> <frames back> rebuild|redo <env...> -- <argv...>
+  local eng=$1 tag=$2 back=$3 kind=$4; shift 4
+  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  env "${envs[@]}" COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 ./"$eng" "$@" > vk.log 2>&1 || true
+  local f; f=$(sed -n "s/^\[VK\] $eng chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p" vk.log | tail -1)
+  { [ -n "$f" ] && [ "$f" -gt "$back" ]; } || { cat vk.log; fail "$tag: the probe run reports no frames"; }
+  if [ "$kind" = rebuild ]; then lost_gate "$eng" "$tag" $((f - back)) "${envs[@]}" -- "$@"
+  else lost_gate_redo "$eng" "$tag" $((f - back)) "${envs[@]}" -- "$@"; fi
+}
+
+# The dense chain (COLI_VK_CHAIN=1) of inkling and olmoe on Lavapipe, each configuration
+# against the CPU run's tokens and logits (chain_gate: every forward's logits within 1e-4
+# of the largest): inkling's resident forms (f32, bf16, the dense-int4g64 container's
+# int8 and int4-g64), its expert containers and runtime quantizations, TOPP, the tier
+# off, the trunk's device copies shared with the per-matrix path (COLI_VK_DENSE=1),
+# prefill in chunks of 3, the tiled GEMM and the per-row GEMV inside the chain, its real
+# width (D = 6144, beside the tier's expert batch at that width); olmoe's caps, PILOT's
+# prefetch from the chain's residual rows (cap 1: the slot the forward pass reads is
+# never the prefetcher's victim), an eviction budget and the same chain settings; both
+# with prompts only (COLI_VK_CHAIN=2), the device lost mid-run, and the serve, prefix
+# and dashboard tests with the chain on.
+family_inkling_olmoe_chain() {
+  export OMP_NUM_THREADS=2   # tiny models: a wide team only waits for itself (and for Lavapipe's)
+  make inkling olmoe tests/test_vk_chain VK=1
+  ./tests/test_vk_chain shaders/qmatmul.spv | tee vk_chain.log
+  tail -1 vk_chain.log | grep -qx PASS || fail "the chain's ops"
+  inkling_olmoe_chain_fixtures
+  local fx cap bits R=tiny_inkling/ref_inkling.json OR=olmoe_tiny/ref_olmoe.json
+  for fx in tiny_inkling tiny_inkling_q tiny_inkling_x-i4 tiny_inkling_x-i8; do
+    for cap in 1 8; do chain_gate inkling "chain inkling $fx cap=$cap" 1 SNAP=$fx -- $cap 0 $R; done
+  done
+  chain_gate_bf16 inkling "chain inkling bf16" SNAP=tiny_inkling_bf16 -- 8 0 $R
+  for bits in 4 8; do chain_gate inkling "chain inkling runtime int$bits" 1 SNAP=tiny_inkling -- 2 $bits $R; done
+  chain_gate inkling "chain inkling TOPP" 1 TOPP=0.3 SNAP=tiny_inkling_x-i4 -- 2 0 $R
+  chain_gate inkling "chain inkling tier off" 1 COLI_VK_TIER=0 SNAP=tiny_inkling -- 8 0 $R
+  chain_gate inkling "chain inkling trunk shared with the per-matrix path" 1 COLI_VK_DENSE=1 SNAP=tiny_inkling_q -- 8 0 $R
+  chain_gate inkling "chain inkling prefill in chunks of 3" 1 COLI_VK_CHAIN_ROWS=3 SNAP=tiny_inkling -- 8 0 $R
+  chain_gate inkling "chain inkling tiled GEMM" 1 COLI_VK_GEMM_MIN_S=2 SNAP=tiny_inkling -- 8 0 $R
+  chain_gate inkling "chain inkling the per-row GEMV" 1 COLI_VK_CHAIN_GEMV=0 SNAP=tiny_inkling -- 8 0 $R
+  CHAINMODE=2 chain_gate inkling "chain inkling prompts only" 1 SNAP=tiny_inkling -- 8 0 $R
+  # D = 6144: the CPU's tokens through the chain, and through the tier's expert batch
+  # (its gate/up shader stages x up to 6144 floats) with the chain off
+  chain_gate inkling "chain inkling D=6144" 1 SNAP=tiny_inkling_wide -- 8 0 tiny_inkling_wide/ref_inkling.json
+  tier_gate inkling "inkling tier D=6144" COLI_VK_CHAIN=0 SNAP=tiny_inkling_wide -- 8 0 tiny_inkling_wide/ref_inkling.json
+  # the device lost mid-decode, in the last step but one: in a shared-expert frame
+  # nobody waits for (20 frames before the end) and at a layer's router (19): the
+  # state rebuilt on the CPU from the prefix record, the run finished there
+  lost_late inkling "chain inkling device lost in a shared-expert frame" 20 rebuild SNAP=tiny_inkling -- 8 0 $R
+  lost_late inkling "chain inkling device lost at a router" 19 rebuild SNAP=tiny_inkling -- 8 0 $R
+
+  for cap in 1 8; do chain_gate olmoe "chain olmoe cap=$cap" 1 SNAP=olmoe_tiny_c -- $cap 8 $OR; done
+  chain_gate olmoe "chain olmoe 4-bit experts" 1 SNAP=olmoe_tiny_c -- 8 4 $OR
+  for cap in 1 2; do chain_gate olmoe "chain olmoe PILOT cap=$cap" 1 PILOT=1 WIDE=2 SNAP=olmoe_tiny_c -- $cap 8 $OR; done
+  chain_gate olmoe "chain olmoe PILOT=3" 1 PILOT=3 SNAP=olmoe_tiny_c -- 8 8 $OR
+  chain_gate olmoe "chain olmoe tier off" 1 COLI_VK_TIER=0 SNAP=olmoe_tiny_c -- 8 8 $OR
+  chain_gate olmoe "chain olmoe trunk shared with the per-matrix path" 1 COLI_VK_DENSE=1 SNAP=olmoe_tiny_c -- 8 8 $OR
+  chain_gate olmoe "chain olmoe a budget of three experts" 1 COLI_VK_TIER_GB=0.000025 SNAP=olmoe_tiny_c -- 8 8 $OR
+  chain_gate olmoe "chain olmoe prefill in chunks of 3" 1 COLI_VK_CHAIN_ROWS=3 SNAP=olmoe_tiny_c -- 8 8 $OR
+  chain_gate olmoe "chain olmoe tiled GEMM" 1 COLI_VK_GEMM_MIN_S=2 SNAP=olmoe_tiny_c -- 8 8 $OR
+  chain_gate olmoe "chain olmoe the per-row GEMV" 1 COLI_VK_CHAIN_GEMV=0 SNAP=olmoe_tiny_c -- 8 8 $OR
+  CHAINMODE=2 chain_gate olmoe "chain olmoe prompts only" 1 SNAP=olmoe_tiny_c -- 8 8 $OR
+  lost_late olmoe "chain olmoe device lost mid-decode" 7 redo SNAP=olmoe_tiny_c -- 8 8 $OR
+
+  # serve: a session of pins, prompt-cache extensions, a divergent prompt and logprobs
+  # against the CPU's, frame by frame (and with prompts only); the prefix-reuse and
+  # dashboard contracts with the chain on
+  $PY tests/vulkan_chain_serve.py ./inkling tiny_inkling INK_PREFIX_LOG=1
+  COLI_VK_CHAIN=2 $PY tests/vulkan_chain_serve.py ./inkling tiny_inkling INK_PREFIX_LOG=1
+  $PY tests/vulkan_chain_serve.py ./olmoe olmoe_tiny_c
+  $PY tests/vulkan_chain_serve.py ./olmoe olmoe_tiny_c PILOT=1 WIDE=2
+  COLI_VK_CHAIN=2 $PY tests/vulkan_chain_serve.py ./olmoe olmoe_tiny_c
+  # (these compare a warm session's logprobs with a cold one's to the last printed
+  # digit: no history file and COLI_VK_TIER_BALANCE=0, so both sessions split their
+  # experts between the device and the CPU alike)
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 INKLING_TINY=tiny_inkling \
+    $PY -m unittest tests.test_inkling_prefix_serve tests.test_inkling_dashboard_hits
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 OLMOE_TINY=olmoe_tiny_c \
+    $PY -m unittest tests.test_olmoe_prefix_serve tests.test_olmoe_dashboard_hits tests.test_brio_serve
+}
+
+# inkling's and olmoe's chain under ASan and UBSan: memory safety is the gate (a
+# sanitized build vectorizes differently, so tokens are not compared); each run must
+# have run the chain. detect_stack_use_after_return=0: ASan's fake stack does not keep
+# the 64-byte alignment an AVX-512 build gives its locals.
+family_inkling_olmoe_chain_sanitize() {
+  make clean >/dev/null 2>&1 || true
+  make inkling olmoe tests/test_vk_chain VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
+  ./tests/test_vk_chain shaders/qmatmul.spv > san.log 2>&1 || true
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log || ! tail -1 san.log | grep -qx PASS; then cat san.log; fail "asan: the chain's ops"; fi
+  echo "OK asan: the chain's ops"
+  inkling_olmoe_chain_fixtures
+  csan() {  # <engine> <tag> <env and argv...>
+    local eng=$1 tag=$2; shift 2
+    rm -f chain.usage
+    env OMP_NUM_THREADS=2 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=${CHAINMODE:-1} "$@" > san.log 2>&1 || true
+    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    [ "$(chain_count "$eng" san.log)" -gt 0 ] || { cat san.log; fail "$tag: the chain never ran"; }
+    echo "OK $tag: sanitizers clean, $(chain_count "$eng" san.log) chain forwards"
+  }
+  local R=tiny_inkling/ref_inkling.json OR=olmoe_tiny/ref_olmoe.json
+  csan inkling "asan chain inkling f32 cap=1" SNAP=tiny_inkling ./inkling 1 0 $R
+  csan inkling "asan chain inkling dense-int4g64, the trunk shared" COLI_VK_DENSE=1 SNAP=tiny_inkling_q ./inkling 8 0 $R
+  csan inkling "asan chain inkling TOPP, chunks of 3" TOPP=0.3 COLI_VK_CHAIN_ROWS=3 SNAP=tiny_inkling_x-i4 ./inkling 2 0 $R
+  csan inkling "asan chain inkling D=6144" SNAP=tiny_inkling_wide ./inkling 8 0 tiny_inkling_wide/ref_inkling.json
+  CHAINMODE=2 csan inkling "asan chain inkling prompts only" SNAP=tiny_inkling ./inkling 8 0 $R
+  csan inkling "asan chain inkling device lost" COLI_VK_CHAIN_FAULT=60 SNAP=tiny_inkling ./inkling 8 0 $R
+  csan olmoe "asan chain olmoe PILOT cap=1" PILOT=1 WIDE=2 SNAP=olmoe_tiny_c ./olmoe 1 8 $OR
+  csan olmoe "asan chain olmoe eviction, chunks of 3" COLI_VK_TIER_GB=0.000025 COLI_VK_CHAIN_ROWS=3 SNAP=olmoe_tiny_c ./olmoe 8 8 $OR
+  csan olmoe "asan chain olmoe device lost" COLI_VK_CHAIN_FAULT=20 SNAP=olmoe_tiny_c ./olmoe 8 8 $OR
+  local eng
+  for eng in inkling olmoe; do
+    local snap=tiny_inkling; [ $eng = olmoe ] && snap=olmoe_tiny_c
+    $PY tests/vulkan_chain_serve.py ./$eng $snap OMP_NUM_THREADS=2 INK_PREFIX_LOG=1 > san.log 2>&1 || { cat san.log; fail "asan chain $eng serve"; }
+    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan chain $eng serve: sanitizer diagnostic"; fi
+    echo "OK asan chain $eng serve: $(tail -1 san.log)"
+  done
+  make clean >/dev/null 2>&1 || true
+}
+
+# The dense chain of the MLA engines: GLM-5.2 (colibri) and GLM-5.3 Flash (glm53).
+# mla_gate <engine> <tag> <tol 0|1> <env...> -- <argv...>: the CPU run's token lines
+# (colibri: the generated tokens, the teacher-forced predictions and the oracle's
+# mismatches; glm53: teacher_forcing and greedy), every logits row within 1e-4 of the
+# largest |logit| (tol 1; DUMP= writes them), and a "[VK] <engine> chain: N forwards"
+# line with N > 0. FAULT_BACK=k: the device is lost k frames before the end of the same
+# run without a fault (COLI_VK_CHAIN_FAULT counted from that run's frames, so the loss
+# lands in the same forward on every device, whatever frames its setup took), and the
+# run must say so (and, for glm53 with REBUILD=1, rebuild the KDA state of some positions).
+mla_toks() {  # <engine> <log>
+  if [ "$1" = colibri ]; then grep -aE '^GLM C engine|^PREFILL|^\[ORACLE\] mismatch' "$2" | sed 's/ | [0-9.]* pos\/s//'
+  else grep -aE '^teacher_forcing|^greedy' "$2"; fi
+}
+mla_gate() {
+  local eng=$1 tag=$2 tol=$3; shift 3
+  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  rm -f chain.usage cpu.f32 vk.f32
+  env "${envs[@]}" COLI_USAGE=chain.usage USAGE_SAVE=0 DUMP=cpu.f32 ./"$eng" "$@" > cpu.log 2>&1 || true
+  if [ -n "${FAULT_BACK:-}" ]; then
+    rm -f chain.usage
+    env "${envs[@]}" COLI_USAGE=chain.usage USAGE_SAVE=0 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 \
+      ./"$eng" "$@" > vk.log 2>&1 || true
+    local frames; frames=$(sed -n "s/^\[VK\] $eng chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p" vk.log | tail -1)
+    [ -n "$frames" ] && [ "$frames" -gt "$FAULT_BACK" ] || { cat vk.log; fail "$tag: no fault-free run to count frames from"; }
+    envs+=("COLI_VK_CHAIN_FAULT=$((frames - FAULT_BACK + 1))")
+  fi
+  rm -f chain.usage
+  env "${envs[@]}" COLI_USAGE=chain.usage USAGE_SAVE=0 DUMP=vk.f32 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 \
+    COLI_VK_CHAIN=${CHAINMODE:-1} ./"$eng" "$@" > vk.log 2>&1 || true
+  mla_toks "$eng" cpu.log > cpu.tok; mla_toks "$eng" vk.log > vk.tok
+  { [ -s cpu.tok ] && cmp -s cpu.tok vk.tok; } || { cat cpu.tok vk.tok; tail -20 vk.log; fail "$tag: the chain's tokens differ from the CPU"; }
+  if [ -n "${FAULT_BACK:-}" ]; then
+    grep -q "$eng chain: the device was lost" vk.log || { cat vk.log; fail "$tag: no loss was handled"; }
+    if [ "${REBUILD:-0}" = 1 ]; then grep -q "rebuilding the state of [1-9]" vk.log || { cat vk.log; fail "$tag: no state was rebuilt"; }; fi
+  else
+    [ "$(chain_count "$eng" vk.log)" -gt 0 ] || { cat vk.log; fail "$tag: the chain never ran"; }
+  fi
+  local lg=""
+  if [ "$tol" = 1 ]; then lg=$(logits_close cpu.f32 vk.f32) || { echo "$lg"; fail "$tag: logits"; }; lg=", $lg"; fi
+  echo "OK $tag: tokens = CPU$lg, $(chain_count "$eng" vk.log) chain forwards$(grep -o 'rebuilding the state of [0-9]* positions' vk.log | sed 's/^/, /')"
+}
+glm_chain_fixtures() {
+  glm_fixtures
+  $PY tools/make_glm_mtp_tiny.py --src glm_tiny --out glm_tiny_mtp > /dev/null && cp ref_glm.json glm_tiny_mtp/
+  rm -rf glm_tiny_serve && cp -r glm_tiny glm_tiny_serve
+  $PY tools/make_edge_tiny_tokenizer.py --vocab-size 256 ./glm_tiny_serve > /dev/null   # serve speaks text
+  rm -rf glm53_serve && cp -r glm53_stream-i4 glm53_serve
+  $PY tools/make_edge_tiny_tokenizer.py --vocab-size 128 ./glm53_serve > /dev/null
+  $PY tools/make_glm53_multimodal_tiny.py --output glm53_mm_tiny > /dev/null
+  rm -rf glm53_lim0 && cp -r glm53_stream-i4 glm53_lim0   # swiglu_limit 0: the tier declines, the chain does not
+  $PY - <<'PY'
+import json
+p = "glm53_lim0/config.json"; c = json.load(open(p))
+(c["text_config"] if "text_config" in c else c)["swiglu_limit"] = 0.0
+json.dump(c, open(p, "w"))
+PY
+}
+
+# Every configuration the chain takes: colibri in every expert format (IDOT=0 where the
+# CPU would round activations to int8: the device matches IDOT=0, as for the tier),
+# decode and teacher-forced prefill in chunks, the DSA indexer's selection active
+# (DSA_TOPK=4 on the 12-token prompt, and DSA_FORCE), n-gram and MTP drafts accepted and
+# rejected (the MTP fixture's head is the last layer's copy), the tier off, the per-matrix
+# trunk and attention core beside it, prompts only, a device lost mid-decode and in a
+# prompt, serve sessions (pins, the prompt cache, two KV slots, the prefill read-out);
+# glm53 with f32, int8 and int4 trunks, streamed and resident experts, an image, prefill
+# chunks and chain chunks, swiglu_limit 0, a lost device whose KDA state is rebuilt on
+# the CPU, serve sessions, and its pin-branch harness with the chain on.
+family_glm_chain() {
+  make colibri glm53 tests/test_vk_chain VK=1
+  ./tests/test_vk_chain shaders/qmatmul.spv | tee vk_chain.log
+  tail -1 vk_chain.log | grep -qx PASS || fail "the chain's ops"
+  glm_chain_fixtures
+  export OMP_NUM_THREADS=2 CAP_RAISE=0
+  local cap b fx d
+  for cap in 1 64; do mla_gate colibri "chain colibri f32 cap=$cap" 1 SNAP=glm_tiny REF=ref_glm.json -- $cap 16 16; done
+  mla_gate colibri "chain colibri f32 prefill" 1 SNAP=glm_tiny REF=ref_glm.json TF=1 -- 64 16 16
+  mla_gate colibri "chain colibri prefill in chunks of 3" 1 SNAP=glm_tiny REF=ref_glm.json TF=1 COLI_VK_CHAIN_ROWS=3 -- 64 16 16
+  for b in 8 4 3; do
+    mla_gate colibri "chain colibri ${b}-bit trunk and experts" 1 SNAP=glm_tiny REF=ref_glm.json IDOT=0 -- 2 $b $b
+  done
+  mla_gate colibri "chain colibri int4-g64 experts" 1 SNAP=glm_tiny_fmt4 REF=glm_tiny_fmt4/ref_glm.json -- 2 16 16
+  mla_gate colibri "chain colibri E8/IQ3 experts on the CPU" 1 SNAP=glm_tiny_fmt6 REF=glm_tiny_fmt6/ref_glm.json -- 2 16 16
+  for fx in i4 i4r i3 d3; do
+    mla_gate colibri "chain colibri $fx container" 1 SNAP=glm_tiny_$fx REF=glm_tiny_$fx/ref_glm.json IDOT=0 -- 1 4 4
+  done
+  mla_gate colibri "chain colibri i4 container, prefill" 1 SNAP=glm_tiny_i4 REF=glm_tiny_i4/ref_glm.json IDOT=0 TF=1 -- 2 4 4
+  # the DSA indexer's selection on the device: index_topk 4 against a 32-token context
+  mla_gate colibri "chain colibri DSA top-4" 1 SNAP=glm_tiny REF=ref_glm.json DSA_TOPK=4 -- 64 16 16
+  mla_gate colibri "chain colibri DSA top-4, prefill in chunks of 5" 1 SNAP=glm_tiny REF=ref_glm.json DSA_TOPK=4 TF=1 COLI_VK_CHAIN_ROWS=5 -- 64 16 16
+  mla_gate colibri "chain colibri DSA_FORCE" 1 SNAP=glm_tiny REF=ref_glm.json DSA_FORCE=1 -- 64 16 16
+  # drafts: n-gram, and the MTP head at depths 1 to 3 (accepted and rejected)
+  mla_gate colibri "chain colibri n-gram drafts" 1 SNAP=glm_tiny REF=ref_glm.json DRAFT=3 -- 64 16 16
+  for d in 1 2 3; do mla_gate colibri "chain colibri MTP depth $d" 1 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=$d -- 64 16 16; done
+  mla_gate colibri "chain colibri MTP with DSA top-4" 1 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DSA_TOPK=4 -- 64 16 16
+  mla_gate colibri "chain colibri MTP, 4-bit" 1 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json IDOT=0 DRAFT=2 -- 2 4 4
+  # around the chain: the tier off, the per-matrix trunk and core, the GEMM and GEMV choices
+  mla_gate colibri "chain colibri tier off" 1 SNAP=glm_tiny REF=ref_glm.json COLI_VK_TIER=0 -- 64 16 16
+  mla_gate colibri "chain colibri beside COLI_VK_DENSE=1 COLI_VK_ATTN=1" 1 SNAP=glm_tiny_i4 REF=glm_tiny_i4/ref_glm.json IDOT=0 COLI_VK_DENSE=1 COLI_VK_ATTN=1 -- 2 4 4
+  # COLI_VK_DEV2 beside the chain: a second logical device holds what the capped tier does not
+  SNAP=glm_tiny_i4r REF=glm_tiny_i4r/ref_glm.json IDOT=0 STATS=glm_tiny_i4r/.coli_usage ./colibri 64 4 4 > /dev/null 2>&1 || true
+  mla_gate colibri "chain colibri beside COLI_VK_DEV2" 1 SNAP=glm_tiny_i4r REF=glm_tiny_i4r/ref_glm.json IDOT=0 COLI_VK_EXPERTS=4 COLI_VK_DEV2=0 -- 64 4 4
+  grep -qaE 'lru \+ [1-9][0-9]* vk /' vk.log || { cat vk.log; fail "chain colibri beside COLI_VK_DEV2: no expert on the devices"; }
+  rm -f glm_tiny_i4r/.coli_usage
+  mla_gate colibri "chain colibri tiled GEMM from 2 rows" 1 SNAP=glm_tiny REF=ref_glm.json TF=1 COLI_VK_GEMM_MIN_S=2 -- 64 16 16
+  mla_gate colibri "chain colibri the per-row GEMV" 1 SNAP=glm_tiny REF=ref_glm.json COLI_VK_CHAIN_GEMV=0 -- 64 16 16
+  CHAINMODE=2 mla_gate colibri "chain colibri prompts only, drafts" 1 SNAP=glm_tiny REF=ref_glm.json DRAFT=3 -- 64 16 16
+  # the device lost: mid-decode, in the prompt (the teacher-forced pass is one forward),
+  # between MTP drafts
+  FAULT_BACK=12 mla_gate colibri "chain colibri device lost mid-decode" 1 SNAP=glm_tiny REF=ref_glm.json -- 64 16 16
+  FAULT_BACK=3 mla_gate colibri "chain colibri device lost in the prompt" 1 SNAP=glm_tiny REF=ref_glm.json TF=1 -- 64 16 16
+  FAULT_BACK=12 mla_gate colibri "chain colibri device lost with MTP" 1 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json -- 64 16 16
+  # serve sessions frame for frame: pins, the prompt cache, the prefill read-out, two KV slots
+  CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0
+  CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 DSA_TOPK=4 DRAFT=3
+  CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 KV_SLOTS=2
+  COLI_VK_CHAIN=2 CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 DSA_TOPK=4
+
+  # glm53
+  local ids bits
+  ids=$($PY -c "print(','.join(str((i*37+5)%120+2) for i in range(100)))")
+  mla_gate glm53 "chain glm53 decode" 1 GLM53_BITS=32 -- --model glm53_stream-i4 --ids 5,7,9,11,13,17,19,23 --greedy 8
+  for bits in 32 8 4; do
+    mla_gate glm53 "chain glm53 100-token prompt, ${bits}-bit trunk" 1 GLM53_BITS=$bits -- --model glm53_stream-i4 --ids $ids --greedy 4
+  done
+  mla_gate glm53 "chain glm53 prefill chunks of 7, one cache slot" 1 GLM53_BITS=4 GLM53_PREFILL_CHUNK=7 GLM53_EXPERT_GB=0.000001 -- --model glm53_stream-i4 --ids $ids --greedy 4
+  mla_gate glm53 "chain glm53 chain chunks of 3" 1 GLM53_BITS=32 COLI_VK_CHAIN_ROWS=3 -- --model glm53_stream-i4 --ids $ids --greedy 4
+  mla_gate glm53 "chain glm53 resident experts" 1 GLM53_BITS=32 -- --model glm53_tiny --ids $ids --greedy 6
+  mla_gate glm53 "chain glm53 tier off" 1 GLM53_BITS=32 COLI_VK_TIER=0 -- --model glm53_stream-i4 --ids $ids --greedy 6
+  mla_gate glm53 "chain glm53 an image" 1 GLM53_BITS=32 -- --model glm53_mm_tiny --ids 103,117,268,268,268,268,120,121 --patches glm53_mm_tiny/patches.f32 --grid 4x4 --greedy 4
+  mla_gate glm53 "chain glm53 swiglu_limit 0" 1 GLM53_BITS=32 -- --model glm53_lim0 --ids $ids --greedy 4
+  grep -qa 'tier glm53: swiglu_limit is 0' vk.log || { cat vk.log; fail "chain glm53 swiglu_limit 0: the tier did not decline"; }
+  CHAINMODE=2 mla_gate glm53 "chain glm53 prompts only" 1 GLM53_BITS=32 GLM53_PREFILL_CHUNK=16 -- --model glm53_stream-i4 --ids $ids --greedy 6
+  FAULT_BACK=7 REBUILD=1 mla_gate glm53 "chain glm53 device lost, the KDA state rebuilt" 1 GLM53_BITS=32 GLM53_PREFILL_CHUNK=16 -- --model glm53_stream-i4 --ids $ids --greedy 6
+  FAULT_BACK=5 REBUILD=1 mla_gate glm53 "chain glm53 device lost after an image" 1 GLM53_BITS=32 -- --model glm53_mm_tiny --ids 103,117,268,268,268,268,120,121 --patches glm53_mm_tiny/patches.f32 --grid 4x4 --greedy 4
+  CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=32
+  CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=4 COLI_VK_CHAIN_ROWS=3
+  CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=32 KV_SLOTS=2
+  COLI_VK_CHAIN=2 CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=32
+  # a pin restored over rows another branch rewrote: the KDA state goes up from the pin,
+  # the MLA rows' watermark comes down
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_USAGE=$PWD/chain.usage $PY tests/glm53_pin_branch_harness.py --binary ./glm53 --fixture glm53_mm_tiny
+  unset OMP_NUM_THREADS CAP_RAISE
+}
+
+# The same chains under ASan and UBSan: memory safety is the gate; each run must have run
+# the chain (or handled the loss). detect_stack_use_after_return=0 as in every sanitized
+# family (ASan's fake stack breaks 64-byte aligned AVX-512 locals).
+family_glm_chain_sanitize() {
+  make clean >/dev/null 2>&1 || true
+  make colibri glm53 tests/test_vk_chain VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
+  ./tests/test_vk_chain shaders/qmatmul.spv > san.log 2>&1 || true
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log || ! tail -1 san.log | grep -qx PASS; then cat san.log; fail "asan: the chain's ops"; fi
+  echo "OK asan: the chain's ops"
+  glm_chain_fixtures
+  export OMP_NUM_THREADS=2 CAP_RAISE=0
+  msan() {  # <engine> <tag> <env and argv...>
+    local eng=$1 tag=$2; shift 2
+    rm -f chain.usage
+    env COLI_USAGE=chain.usage USAGE_SAVE=0 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 "$@" > san.log 2>&1 || true
+    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    grep -q "$eng chain: \([1-9][0-9]* forwards\|the device was lost\)" san.log || { cat san.log; fail "$tag: the chain never ran"; }
+    echo "OK $tag: sanitizers clean, $(chain_count "$eng" san.log) chain forwards"
+  }
+  local ids
+  ids=$($PY -c "print(','.join(str((i*37+5)%120+2) for i in range(100)))")
+  msan colibri "asan chain colibri f32 decode" SNAP=glm_tiny REF=ref_glm.json ./colibri 1 16 16
+  msan colibri "asan chain colibri DSA top-4 prefill, chunks of 3" SNAP=glm_tiny REF=ref_glm.json TF=1 DSA_TOPK=4 COLI_VK_CHAIN_ROWS=3 ./colibri 64 16 16
+  msan colibri "asan chain colibri i4 container" SNAP=glm_tiny_i4 REF=glm_tiny_i4/ref_glm.json IDOT=0 ./colibri 2 4 4
+  msan colibri "asan chain colibri MTP depth 2" SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 ./colibri 64 16 16
+  msan colibri "asan chain colibri device lost" SNAP=glm_tiny REF=ref_glm.json COLI_VK_CHAIN_FAULT=30 ./colibri 64 16 16
+  msan glm53 "asan chain glm53 decode" GLM53_BITS=32 ./glm53 --model glm53_stream-i4 --ids 5,7,9,11,13,17,19,23 --greedy 8
+  msan glm53 "asan chain glm53 int4 trunk, chain chunks of 3" GLM53_BITS=4 COLI_VK_CHAIN_ROWS=3 ./glm53 --model glm53_stream-i4 --ids $ids --greedy 4
+  msan glm53 "asan chain glm53 an image" GLM53_BITS=32 ./glm53 --model glm53_mm_tiny --ids 103,117,268,268,268,268,120,121 --patches glm53_mm_tiny/patches.f32 --grid 4x4 --greedy 4
+  msan glm53 "asan chain glm53 device lost, rebuilt" GLM53_BITS=32 GLM53_PREFILL_CHUNK=16 COLI_VK_CHAIN_FAULT=20 ./glm53 --model glm53_stream-i4 --ids $ids --greedy 6
+  local args
+  for args in "./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 KV_SLOTS=2" "./glm53 glm53_serve GLM53_BITS=32 KV_SLOTS=2"; do
+    # shellcheck disable=SC2086
+    CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=$([ "${args%% *}" = ./colibri ] && echo colibri || echo numeric) \
+      $PY tests/vulkan_chain_serve.py $args > san.log 2>&1 || { cat san.log; fail "asan chain serve $args"; }
+    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan chain serve $args: sanitizer diagnostic"; fi
+    echo "OK asan chain serve ${args%% *}: $(tail -1 san.log)"
+  done
+  unset OMP_NUM_THREADS CAP_RAISE
+  make clean >/dev/null 2>&1 || true
+}
+
 case "${1:-}" in
   shader)         shader_formats ;;
   qwen)           family_qwen ;;
@@ -1163,7 +1894,15 @@ case "${1:-}" in
   deepseek-sanitize) family_deepseek_sanitize ;;
   kimi)           family_kimi ;;
   kimi-mimo-sanitize) family_kimi_mimo_sanitize ;;
+  mimo-chain)     family_mimo_chain ;;
+  mimo-chain-sanitize) family_mimo_chain_sanitize ;;
   glm)            family_glm ;;
   glm-sanitize)   family_glm_sanitize ;;
-  *) echo "usage: $0 shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize" >&2; exit 2 ;;
+  qwen-chain)     family_qwen_chain ;;
+  qwen-chain-sanitize) family_qwen_chain_sanitize ;;
+  inkling-olmoe-chain) family_inkling_olmoe_chain ;;
+  inkling-olmoe-chain-sanitize) family_inkling_olmoe_chain_sanitize ;;
+  glm-chain)      family_glm_chain ;;
+  glm-chain-sanitize) family_glm_chain_sanitize ;;
+  *) echo "usage: $0 shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize|mimo-chain|mimo-chain-sanitize|inkling-olmoe-chain|inkling-olmoe-chain-sanitize|glm-chain|glm-chain-sanitize" >&2; exit 2 ;;
 esac

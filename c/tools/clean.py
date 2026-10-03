@@ -29,7 +29,7 @@ FILES = [
     # VK=1, XDNA=1 and METAL=1 (qwen36's qpack) objects. Left behind once
     # their .d is cleaned, an object would sit in the tree with no record of
     # the headers it read.
-    "backend_vulkan.o", "vk_tier.o", "backend_xdna.o", "qwen36_qpack.o", "qpack.o",
+    "backend_vulkan.o", "vk_tier.o", "vk_chain.o", "backend_xdna.o", "qwen36_qpack.o", "qpack.o",
     "backend_cuda_test", "backend_cuda_test.exe",
     "mxfp4_expert_cuda_test", "mxfp4_expert_cuda_test.exe",
     "backend_cuda_bench", "backend_cuda_bench.exe",
@@ -41,6 +41,7 @@ FILES = [
     "deepseek_v41", "deepseek_v41.exe",
     "mimo", "mimo.exe",
     "qwenimage", "qwenimage.exe",
+    "laya", "laya.exe",
     "native_quant.o", "native_quant_parallel.o", "native_quant_dual.o",
     "native_quant_batch_avx512.o", "native_quant_fp4_rows16.o",
 ]

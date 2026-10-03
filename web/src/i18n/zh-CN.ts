@@ -1,6 +1,7 @@
 const zhCN: Record<string, string> = {
   "nav.chat": "对话",
   "nav.brain": "大脑",
+  "nav.brio": "System One",
   "nav.profiling": "性能分析",
 
   "brand.tagline": "本地巨人，极小足迹",

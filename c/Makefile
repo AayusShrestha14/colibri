@@ -529,6 +529,7 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41 test_st_f16_bf16_simd_sse41 test_qwen38_tier_engine \
 	test_e8x4g64_loader test_qwenimage_vae test_vk_tier \
 	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract
+TEST_EXCLUDE += test_vk_chain
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
@@ -709,6 +710,20 @@ VK_OBJ    = backend_vulkan.o vk_tier.o
 VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/attention_absorb.spv shaders/rmsnorm.spv \
             shaders/qmatmul_gemm.spv shaders/qmatmul_coop.spv shaders/expert_act.spv \
             shaders/expert_act_v4.spv
+# vk_chain.o: a layer's dense chain recorded into one submission (vk_chain.h), and
+# its shaders; an engine that does not call it links nothing from it.
+VK_OBJ   += vk_chain.o
+VK_SPV   += shaders/chain_norm.spv shaders/chain_rope.spv shaders/chain_attn.spv shaders/chain_dnconv.spv \
+            shaders/chain_dnrec.spv shaders/chain_ew.spv shaders/chain_qsa.spv shaders/chain_ple.spv \
+            shaders/chain_gemv.spv
+# the MLA ops (vk_chain.h): attention core, RoPE and LayerNorm rows, per-head weight
+# blocks, the DSA indexer's selection
+VK_SPV   += shaders/chain_mla.spv shaders/chain_hgemv.spv shaders/chain_dsa.spv
+# Kimi Delta Attention and manifold-constrained hyper-connections (vk_chain.h)
+VK_SPV   += shaders/chain_kda.spv shaders/chain_mhc.spv
+# inkling's chain ops (made on first use): the short convolution and the attention
+# with its relative-position bias
+VK_SPV   += shaders/chain_sconv.spv shaders/chain_relattn.spv
 endif
 
 # Optional AMD XDNA2 (Ryzen AI NPU) lane, Windows. Same opt-in shape as VK=1:
@@ -844,6 +859,8 @@ backend_vulkan.o: backend_vulkan.c .build-config
 	$(CC) $(CFLAGS) -c backend_vulkan.c -o $@
 vk_tier.o: vk_tier.c .build-config
 	$(CC) $(CFLAGS) -c vk_tier.c -o $@
+vk_chain.o: vk_chain.c .build-config
+	$(CC) $(CFLAGS) -c vk_chain.c -o $@
 shaders/%.spv: shaders/%.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@
@@ -1264,6 +1281,36 @@ endif
 qwenimage$(EXE): qwenimage.c $(VK_OBJ) $(VK_SPV) .build-config
 	$(CC) $(CFLAGS) qwenimage.c $(VK_OBJ) -o qwenimage$(EXE) $(LDFLAGS)
 
+# Laya (Convai Innovations), a decision model: ModernBERT encoder + decision
+# head, served on POST /v1/systemone through the DECIDE command (docs/laya.md).
+# One file; qi_gemm.h is its matrix kernel, decide_serve.h its serve loop.
+ifneq ($(EXE),)
+.PHONY: laya
+laya: laya$(EXE)
+endif
+laya$(EXE): laya.c .build-config
+	$(CC) $(CFLAGS) laya.c -o laya$(EXE) $(LDFLAGS)
+
+# Tiny Laya checkpoint + the laya package's own answers on it. The generator is
+# numpy and deterministic; laya_tiny/ref.json is committed and comes from the
+# `laya` package (tools/make_laya_ref.py, maintainer-run, fixture SHA-256
+# pinned), so CI needs neither torch nor network. The second module is the same
+# fixture through `coli serve`'s gateway: POST /v1/systemone end to end.
+.PHONY: laya-tiny-generate laya-tiny-check
+laya-tiny-generate:
+	$(PYTHON) tools/make_laya_tiny.py --output ./laya_tiny
+
+laya-tiny-check: laya-tiny-generate laya$(EXE)
+	LAYA_TINY_REQUIRED=1 $(PYTHON) -m unittest -v tests.test_laya_tiny tests.test_decision_serve
+
+# TypeSafe's own SDKs (Python and TypeScript), unmodified, against `coli serve`
+# on a language model (tiny MiMo) and a decision engine (tiny Laya): switching
+# from Jev is a base-URL change. Needs the pinned SDKs first:
+#   pip install -r tools/requirements-jev-sdk.txt && (cd tools/jev-sdk && npm ci)
+.PHONY: jev-sdk-check
+jev-sdk-check: mimo$(EXE) laya$(EXE) mimo-tiny-generate laya-tiny-generate
+	JEV_SDK_REQUIRED=1 $(PYTHON) -m unittest -v tests.test_jev_sdk
+
 # In make check: every format and ragged edges against the naive product, and
 # the int8 x int8 VNNI path against the exact integer sum.
 tests/test_qi_gemm$(EXE): tests/test_qi_gemm.c
@@ -1295,13 +1342,13 @@ mimo-tiny-generate:
 mimo-tiny-check: mimo-tiny-generate mimo$(EXE)
 	$(PYTHON) tests/mimo_tiny_harness.py --binary ./mimo$(EXE) --fixture ./mimo_tiny
 
-# The same fixture served: KV prefix reuse, Brio photos (the windowed layers' rings,
-# pictures, nested and stale photos), and /v1/brio and chat logprobs through the
-# gateway. Every comparison is against a cold engine, to the last printed digit.
+# The same fixture served: KV prefix reuse, System One photos (the windowed layers'
+# rings, pictures, nested and stale photos), and /v1/systemone and chat logprobs
+# through the gateway. Every comparison is against a cold engine.
 .PHONY: mimo-tiny-serve-check
 mimo-tiny-serve-check: mimo-tiny-generate mimo$(EXE)
 	$(PYTHON) -m unittest -v tests.test_mimo_prefix_serve tests.test_brio_serve.MimoBrioServe \
-		tests.test_brio_api.MimoBrioEndToEnd
+		tests.test_systemone_api.MimoSystemOneEndToEnd
 
 # Qwen3.8-Flash-Next text-only sibling. qwen38.c owns the direct checkpoint
 # loader and SERVE=1 protocol. With CUDA=1 it links the same expert tier as
@@ -1958,6 +2005,16 @@ tests/test_vk_tier$(EXE): tests/test_vk_tier.c $(VK_OBJ) $(VK_SPV)
 vk-tier-check: tests/test_vk_tier$(EXE)
 	./tests/test_vk_tier$(EXE) shaders/qmatmul.spv
 
+# The dense chain's ops (vk_chain.c, shaders/chain_*.comp) against CPU references, on
+# a Vulkan device (CI: Lavapipe); like test_vk_tier it needs VK=1 and stays out of
+# `check`.
+tests/test_vk_chain$(EXE): tests/test_vk_chain.c $(VK_OBJ) $(VK_SPV)
+	@[ "$(VK)" = 1 ] || { echo "tests/test_vk_chain needs VK=1" >&2; exit 1; }
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+.PHONY: vk-chain-check
+vk-chain-check: tests/test_vk_chain$(EXE)
+	./tests/test_vk_chain$(EXE) shaders/qmatmul.spv
+
 tests/test_rans$(EXE): tests/test_rans.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -2372,7 +2429,15 @@ tests/test_qwen36_dnproj_batch$(EXE): tests/test_qwen36_dnproj_batch.c qwen36.c 
 tests/test_qwen36_tier_withdraw$(EXE): tests/test_qwen36_tier_withdraw.c qwen36_tier.c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
+# QT_HOME=layer: expert homes per layer range, the cards as a pipeline (fake backend, two devices).
+tests/test_qwen36_tier_layer_home$(EXE): tests/test_qwen36_tier_layer_home.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
 tests/test_qwen36_tier_int8_engine$(EXE): tests/test_qwen36_tier_int8_engine.c qwen36.c qwen36_tier.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# The DeltaNet layer on the GPU (Q36_DN_GPU=1): outputs and state against the CPU path, fake backend.
+tests/test_qwen36_dn_gpu$(EXE): tests/test_qwen36_dn_gpu.c qwen36.c qwen36_tier.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # dnout / attnproj / shexp offered, placed and served from VRAM (fake backend).
@@ -2650,7 +2715,7 @@ check:
 	$(MAKE) portable
 	$(MAKE) test
 
-install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) qwen38$(EXE) deepseek_v41$(EXE) mimo$(EXE) qwenimage$(EXE) \
+install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) qwen38$(EXE) deepseek_v41$(EXE) mimo$(EXE) qwenimage$(EXE) laya$(EXE) \
 	$(if $(filter 1,$(COLI_V4_SUPPORTED)),deepseek-v4,)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
@@ -2664,6 +2729,7 @@ install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen3
 	$(INSTALL) -m 755 qwen36$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwen36$(EXE)
 	$(INSTALL) -m 755 qwen38$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwen38$(EXE)
 	$(INSTALL) -m 755 qwenimage$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwenimage$(EXE)
+	$(INSTALL) -m 755 laya$(EXE) $(DESTDIR)$(LIBEXECDIR)/laya$(EXE)
 	$(INSTALL) -m 755 deepseek_v41$(EXE) $(DESTDIR)$(LIBEXECDIR)/deepseek_v41$(EXE)
 	$(INSTALL) -m 755 mimo$(EXE) $(DESTDIR)$(LIBEXECDIR)/mimo$(EXE)
 	@if [ -f deepseek_v4$(EXE) ]; then \

@@ -727,6 +727,10 @@ typedef struct {
 } GModel;
 #ifdef COLI_VULKAN
 static void glm53_vk_report(const GModel *m, const char *scope);   /* the [VK] lines of a run or turn */
+/* the dense chain (glm53_chain.h): the session's KDA state between the host and the device */
+static void g53c_sync_host(const GModel *m, const GSession *s);
+static void g53c_host_wrote(const GSession *s);
+static void g53c_session_gone(const GSession *s);
 #endif
 
 /* `want` e' quanti valori legge chi usa il tensore, contati dalla config. Il
@@ -2026,8 +2030,10 @@ static void ffn_layer_vk(GModel *m, int index, const float *x, int tokens, const
  *
  * Fare l'unione paga due volte: le letture vanno insieme, e un esperto che
  * serve a piu' token del blocco si legge una volta sola. */
-static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
-                      int tokens, float *out) {
+/* with_shared 0 (the dense chain, glm53_chain.h): the routed experts only, from out = 0;
+ * the device runs the shared expert. */
+static void ffn_layer_ex(GModel *m, const GLayer *l, int index, const float *x,
+                         int tokens, float *out, int with_shared) {
     const Cfg *c = &m->c;
     const int wide = c->dense_inter > c->moe_inter ? c->dense_inter : c->moe_inter;
 
@@ -2105,7 +2111,8 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     if (!sg || !su || !tmp || !xg || !row_t || !row_w) { fprintf(stderr, "OOM in MoE\n"); exit(1); }
 
     /* l'esperto condiviso e' sempre attivo e non passa dalla cache */
-    mlp3_rows(out, x, tokens, &l->rg, &l->ru, &l->rd, c->swiglu_limit, sg, su);
+    if (with_shared) mlp3_rows(out, x, tokens, &l->rg, &l->ru, &l->rd, c->swiglu_limit, sg, su);
+    else memset(out, 0, (size_t)tokens * c->hidden * sizeof(float));
 
     if (!m->streaming) {
         for (int t = 0; t < tokens; t++)
@@ -2241,6 +2248,11 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     }
     free(to_read); free(slot_of); free(union_ids);
     free(row_w); free(row_t); free(xg); free(tmp); free(su); free(sg); free(weight); free(chosen);
+}
+
+static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
+                      int tokens, float *out) {
+    ffn_layer_ex(m, l, index, x, tokens, out, 1);
 }
 
 /* ---------- caricamento ---------- */
@@ -2583,6 +2595,9 @@ static GSession *session_open(const GModel *m, int cap) {
 
 static void session_close(const GModel *m, GSession *s) {
     if (!s) return;
+#ifdef COLI_VULKAN
+    g53c_session_gone(s);   /* the dense chain's copy of its state goes with it */
+#endif
     for (int i = 0; i < m->c.n_layers; i++) {
         GLayerState *st = &s->layer[i];
         free(st->latent); free(st->ikeys); free(st->igates);
@@ -2600,10 +2615,22 @@ static void session_close(const GModel *m, GSession *s) {
  * `next` e' il secondo banco, della stessa misura: il passaggio li scambia a
  * ogni sito, quindi alla fine il risultato puo' essere in uno o nell'altro, e
  * la funzione restituisce quale. */
+#ifdef COLI_VULKAN
+static int g53c_forward(GModel *m, GSession *s, float *streams, int n, int start);
+static void g53c_cpu_step(const GModel *m, const GSession *s, int start);
+static int g_vk_chain;
+#endif
 static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
                          int n, int start, int begin, int end) {
     const Cfg *c = &m->c;
     const int H = c->hc_mult, D = c->hidden;
+#ifdef COLI_VULKAN
+    /* every layer on the device (glm53_chain.h); 0: the CPU below, its state current first */
+    if (g_vk_chain && begin == 0 && end == c->n_layers) {
+        if (g53c_forward(m, s, streams, n, start)) return streams;
+        g53c_cpu_step(m, s, start);
+    }
+#endif
     float *collapsed = malloc((size_t)n * D * sizeof(float));
     float *normed = malloc((size_t)n * D * sizeof(float));
     float *branch = malloc((size_t)n * D * sizeof(float));
@@ -2651,6 +2678,9 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
     free(comb); free(post); free(branch); free(normed); free(collapsed);
     return streams;
 }
+#ifdef COLI_VULKAN
+#include "glm53_chain.h"   /* COLI_VK_CHAIN: every layer's dense chain on the device */
+#endif
 
 /* Rilascio completo del modello.
  *
@@ -2852,6 +2882,13 @@ static float *forward_span_rows(GModel *m, GSession *s, const int *tokens, int n
     if (need < 1 || need > n) need = n;
     mm(logits + (size_t)(n - need) * c->vocab, &m->head, normed + (size_t)(n - need) * D, need);
     m->t_head += now_s() - t_head0;
+#ifdef COLI_VULKAN
+    {   /* DUMP=<path> (VK=1 builds): every logits row computed, raw f32, for the Vulkan gates */
+        static FILE *dump; static int said;
+        if (!said) { said = 1; const char *p = getenv("DUMP"); if (p && *p) dump = fopen(p, "wb"); }
+        if (dump) { fwrite(logits + (size_t)(n - need) * c->vocab, sizeof(float), (size_t)need * c->vocab, dump); fflush(dump); }
+    }
+#endif
     m->forwards++;
 
     free(normed); free(collapsed);
@@ -3174,6 +3211,9 @@ static int slot_pin_save(const GModel *m, KVSlot *slot, const int *tokens, int n
     /* Sessione nuova: gli scatti vecchi parlano di righe DSA che non esistono
      * piu, e rimetterli risponderebbe da posizioni inventate, in silenzio. */
     if (slot->pin_session != slot->session) slot_pin_drop(m, slot);
+#ifdef COLI_VULKAN
+    g53c_sync_host(m, slot->session);   /* the dense chain may hold the newest state */
+#endif
     coli_pin_pool_init(&slot->pins, c->vocab);
     ColiPin *k = coli_pin_store(&slot->pins, tokens, n, logit);
     if (!k) return 0;
@@ -3232,6 +3272,9 @@ static int slot_pin_restore(const GModel *m, KVSlot *slot, const int *tokens, in
                 memcpy(ls->kda_state,  st->state[i],  ns * sizeof(float));
                 memcpy(ls->kda_window, st->window[i], nw * sizeof(float));
             }
+#ifdef COLI_VULKAN
+            g53c_host_wrote(slot->session);   /* the dense chain's copy goes up again */
+#endif
             slot->session->filled = k->len;
             coli_pin_touch(&slot->pins, s);
             return k->len;
@@ -3247,6 +3290,9 @@ static int slot_pin_restore(const GModel *m, KVSlot *slot, const int *tokens, in
  * 64x128x128 piu' la finestra della convoluzione. */
 static int glm53_state_capture(const GModel *m, Glm53PinState **into, const GSession *s) {
     const Cfg *c = &m->c;
+#ifdef COLI_VULKAN
+    g53c_sync_host(m, s);   /* the dense chain may hold the newest state */
+#endif
     const size_t ns = (size_t)c->kda_heads * c->kda_hd * c->kda_hd;
     const size_t nw = (size_t)3 * c->kda_proj * c->conv_k;
     Glm53PinState *st = *into;
@@ -3275,6 +3321,9 @@ static int glm53_state_capture(const GModel *m, Glm53PinState **into, const GSes
 
 static void glm53_state_restore(const GModel *m, const Glm53PinState *st, GSession *s) {
     const Cfg *c = &m->c;
+#ifdef COLI_VULKAN
+    g53c_host_wrote(s);   /* the dense chain's copy goes up again */
+#endif
     const size_t ns = (size_t)c->kda_heads * c->kda_hd * c->kda_hd;
     const size_t nw = (size_t)3 * c->kda_proj * c->conv_k;
     for (int i = 0; i < c->n_layers; i++) {
@@ -3886,6 +3935,7 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
                rss_gb(), prompt_tokens, limited);
 #ifdef COLI_VULKAN
     glm53_vk_report(m, "turn");
+    g53c_report();   /* the dense chain's line, when it ran */
 #endif
     free(sequence);
     return input_eof ? -1 : 0;
@@ -4153,7 +4203,9 @@ int main(int argc, char **argv) {
         model_load(&served, snap);
         glm53_telemetry_init(snap, &served.c);
 #ifdef COLI_VULKAN
+        g53c_start(&served);            /* COLI_VK_CHAIN: the trunk on the device, before the tier sizes itself */
         glm53_vk_tier_start(&served);   /* after the history: the warm start reads it */
+        g53c_atexit();                  /* after the tier's: the chain goes before the device */
 #endif
         Tok serve_tok;
         char tokenizer_path[1024];
@@ -4214,7 +4266,9 @@ int main(int argc, char **argv) {
     model_load(&model, dir);
     glm53_telemetry_init(dir, &model.c);
 #ifdef COLI_VULKAN
+    g53c_start(&model);            /* COLI_VK_CHAIN: the trunk on the device, before the tier sizes itself */
     glm53_vk_tier_start(&model);   /* after the history: the warm start reads it */
+    g53c_atexit();                 /* after the tier's: the chain goes before the device */
 #endif
     const double load_seconds = now_s() - load_start;
     if (getenv("GLM53_VERBOSE")) cfg_report(&model.c);
@@ -4317,6 +4371,7 @@ int main(int argc, char **argv) {
                model.hits, model.miss, (unsigned long long)model.ebytes);
 #ifdef COLI_VULKAN
     glm53_vk_report(&model, "run");
+    g53c_report();
 #endif
 #ifdef COLI_METAL
     if (g_metal_ready && getenv("GLM53_VERBOSE") && atoi(getenv("GLM53_VERBOSE")))
