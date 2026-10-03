@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from "react"
 import { FileUp, ListChecks, LoaderCircle, Plus, X } from "lucide-react"
 
-import { askBrio, type BrioResponse } from "@/lib/api"
+import { askSystemOne, type DecisionResponse } from "@/lib/api"
 import { useLocale } from "./i18n"
 
-/* Modalita brio.
+/* System One mode (the page is still Brio in the code).
  *
  * Lo stesso modello con cui si chatta smette di scrivere: gli si da un insieme
  * chiuso di opzioni e lui dice quanto e probabile ciascuna.
@@ -29,7 +29,7 @@ interface Row {
   id: number
   text: string
   options: string          /* vuoto = usa le opzioni comuni */
-  result?: BrioResponse
+  result?: DecisionResponse
   seconds?: number
   error?: string
 }
@@ -84,7 +84,7 @@ export default function Brio({ baseUrl, apiKey, model, connected }: {
       setRunning(row.id)
       const started = performance.now()
       try {
-        const result = await askBrio(baseUrl, apiKey, model, state, row.text, lines(row.options), controller.signal)
+        const result = await askSystemOne(baseUrl, apiKey, model, state, row.text, lines(row.options), controller.signal)
         patch(row.id, { result, seconds: (performance.now() - started) / 1000 })
       } catch (cause) {
         if (controller.signal.aborted) break   /* fermato apposta: le domande dopo restano intatte */
@@ -165,8 +165,8 @@ export default function Brio({ baseUrl, apiKey, model, connected }: {
                   <div className="brio-foot" data-level={level}>
                     <strong>{row.result.answer}</strong>
                     <span>{t("brio.entropy")} {row.result.entropy.toFixed(3)} · {t(`brio.${level}`)}</span>
-                    <em>{row.seconds?.toFixed(1)}s · {row.result.usage.read_tokens} {t("brio.readTokens")} ·{" "}
-                      <b>{row.result.usage.completion_tokens} {t("brio.generatedTokens")}</b></em>
+                    <em>{row.seconds?.toFixed(1)}s · {row.result.usage.input_tokens + row.result.usage.output_tokens} {t("brio.readTokens")} ·{" "}
+                      <b>0 {t("brio.generatedTokens")}</b></em>
                   </div>
                 </div>
               ) : null}

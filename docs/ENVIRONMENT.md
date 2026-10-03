@@ -576,6 +576,15 @@ Read **only** by `c/olmoe.c`. This is the sister engine used for streaming-cache
 | `EXPERT_DROP` | `0` (off) | Drop experts below the confidence threshold instead of loading them (quality/speed experiment). |
 | `COLI_VULKAN` | `0` | `VK=1` build: attention, router and lm_head on the Vulkan device, and the routed experts (int8 rows) on the shared expert tier (`COLI_VK_TIER*`, `COLI_VK_DENSE`, see [Vulkan](#vulkan-any-gpu-with-a-vulkan-12-driver)). The warm start reads the history `COLI_USAGE` names; without it the tier fills as experts pass by. |
 
+## Laya engine (`laya`)
+
+Read **only** by `c/laya.c`, the decision engine ([laya.md](laya.md)).
+
+| Variable | Default | Effect |
+|---|---|---|
+| `COLI_LAYA_MAX_LEN` | the checkpoint's `max_len` | Tokens per question sequence (512 on the English checkpoint, capped at the encoder's 8192 positions). |
+| `COLI_LAYA_HEAD_MAX_LEN` | the checkpoint's `head_max_len` | Tokens shared by a question's instructions and options; raise it for questions with many options. |
+
 ---
 
 ## Server / CLI (`openai_server.py`, `coli`)

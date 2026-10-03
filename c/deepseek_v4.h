@@ -124,7 +124,7 @@ typedef struct {
  * uninterruptible as before. */
 typedef int (*ColiV4SessionAbortFn)(void *user_data);
 
-/* The numeric channel (SUBMIT logprobs=k, docs/brio.md): raw head scores,
+/* The numeric channel (SUBMIT logprobs=k, docs/systemone.md): raw head scores,
  * vocab_size floats, valid only for the duration of the callback. on_echo
  * fires once per prompt position whose predictor this call computed, with the
  * token that actually stands there; on_scores fires right before the on_token

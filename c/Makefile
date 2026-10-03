@@ -1281,6 +1281,36 @@ endif
 qwenimage$(EXE): qwenimage.c $(VK_OBJ) $(VK_SPV) .build-config
 	$(CC) $(CFLAGS) qwenimage.c $(VK_OBJ) -o qwenimage$(EXE) $(LDFLAGS)
 
+# Laya (Convai Innovations), a decision model: ModernBERT encoder + decision
+# head, served on POST /v1/systemone through the DECIDE command (docs/laya.md).
+# One file; qi_gemm.h is its matrix kernel, decide_serve.h its serve loop.
+ifneq ($(EXE),)
+.PHONY: laya
+laya: laya$(EXE)
+endif
+laya$(EXE): laya.c .build-config
+	$(CC) $(CFLAGS) laya.c -o laya$(EXE) $(LDFLAGS)
+
+# Tiny Laya checkpoint + the laya package's own answers on it. The generator is
+# numpy and deterministic; laya_tiny/ref.json is committed and comes from the
+# `laya` package (tools/make_laya_ref.py, maintainer-run, fixture SHA-256
+# pinned), so CI needs neither torch nor network. The second module is the same
+# fixture through `coli serve`'s gateway: POST /v1/systemone end to end.
+.PHONY: laya-tiny-generate laya-tiny-check
+laya-tiny-generate:
+	$(PYTHON) tools/make_laya_tiny.py --output ./laya_tiny
+
+laya-tiny-check: laya-tiny-generate laya$(EXE)
+	LAYA_TINY_REQUIRED=1 $(PYTHON) -m unittest -v tests.test_laya_tiny tests.test_decision_serve
+
+# TypeSafe's own SDKs (Python and TypeScript), unmodified, against `coli serve`
+# on a language model (tiny MiMo) and a decision engine (tiny Laya): switching
+# from Jev is a base-URL change. Needs the pinned SDKs first:
+#   pip install -r tools/requirements-jev-sdk.txt && (cd tools/jev-sdk && npm ci)
+.PHONY: jev-sdk-check
+jev-sdk-check: mimo$(EXE) laya$(EXE) mimo-tiny-generate laya-tiny-generate
+	JEV_SDK_REQUIRED=1 $(PYTHON) -m unittest -v tests.test_jev_sdk
+
 # In make check: every format and ragged edges against the naive product, and
 # the int8 x int8 VNNI path against the exact integer sum.
 tests/test_qi_gemm$(EXE): tests/test_qi_gemm.c
@@ -1312,13 +1342,13 @@ mimo-tiny-generate:
 mimo-tiny-check: mimo-tiny-generate mimo$(EXE)
 	$(PYTHON) tests/mimo_tiny_harness.py --binary ./mimo$(EXE) --fixture ./mimo_tiny
 
-# The same fixture served: KV prefix reuse, Brio photos (the windowed layers' rings,
-# pictures, nested and stale photos), and /v1/brio and chat logprobs through the
-# gateway. Every comparison is against a cold engine, to the last printed digit.
+# The same fixture served: KV prefix reuse, System One photos (the windowed layers'
+# rings, pictures, nested and stale photos), and /v1/systemone and chat logprobs
+# through the gateway. Every comparison is against a cold engine.
 .PHONY: mimo-tiny-serve-check
 mimo-tiny-serve-check: mimo-tiny-generate mimo$(EXE)
 	$(PYTHON) -m unittest -v tests.test_mimo_prefix_serve tests.test_brio_serve.MimoBrioServe \
-		tests.test_brio_api.MimoBrioEndToEnd
+		tests.test_systemone_api.MimoSystemOneEndToEnd
 
 # Qwen3.8-Flash-Next text-only sibling. qwen38.c owns the direct checkpoint
 # loader and SERVE=1 protocol. With CUDA=1 it links the same expert tier as
@@ -2685,7 +2715,7 @@ check:
 	$(MAKE) portable
 	$(MAKE) test
 
-install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) qwen38$(EXE) deepseek_v41$(EXE) mimo$(EXE) qwenimage$(EXE) \
+install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) qwen38$(EXE) deepseek_v41$(EXE) mimo$(EXE) qwenimage$(EXE) laya$(EXE) \
 	$(if $(filter 1,$(COLI_V4_SUPPORTED)),deepseek-v4,)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
@@ -2699,6 +2729,7 @@ install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen3
 	$(INSTALL) -m 755 qwen36$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwen36$(EXE)
 	$(INSTALL) -m 755 qwen38$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwen38$(EXE)
 	$(INSTALL) -m 755 qwenimage$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwenimage$(EXE)
+	$(INSTALL) -m 755 laya$(EXE) $(DESTDIR)$(LIBEXECDIR)/laya$(EXE)
 	$(INSTALL) -m 755 deepseek_v41$(EXE) $(DESTDIR)$(LIBEXECDIR)/deepseek_v41$(EXE)
 	$(INSTALL) -m 755 mimo$(EXE) $(DESTDIR)$(LIBEXECDIR)/mimo$(EXE)
 	@if [ -f deepseek_v4$(EXE) ]; then \

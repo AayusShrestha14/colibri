@@ -56,14 +56,14 @@ $ ./coli chat
 <p align="center">
   <img src="docs/media/colibri-dashboard.png" width="900" alt="colibrì Web ダッシュボード — ライブメトリクス、ハードウェアパネル、エキスパートのティア">
 </p>
-<p align="center"><em>Web ダッシュボード（<code>./coli web</code>）。1.12.0 で再設計され、チャット、Brio モード、Brain ページ、
+<p align="center"><em>Web ダッシュボード（<code>./coli web</code>）。1.12.0 で再設計され、チャット、System One モード、Brain ページ、
 Profiling のためのドックを備えたワークスペースになりました。ライトテーマとダークテーマに対応します。ここでは CPU マシン上の
 Qwen3.6 が、ディスクからストリーミングされるエキスパートで応答しています。</em></p>
 
 <p align="center">
-  <img src="docs/media/colibri-brio.png" width="900" alt="Brio ページ: 1 回だけ読まれる文書、許可された各回答の確率、そしてエントロピー">
+  <img src="docs/media/colibri-brio.png" width="900" alt="System One ページ: 1 回だけ読まれる文書、許可された各回答の確率、そしてエントロピー">
 </p>
-<p align="center"><em><strong>Brio モード</strong>: 同じモデルに、書くのをやめるよう指示したものです。文書と、選んでよい回答だけを渡すと、
+<p align="center"><em><strong>System One モード</strong>: 同じモデルに、書くのをやめるよう指示したものです。文書と、選んでよい回答だけを渡すと、
 各回答の確率を読み取り、何も生成せず、確信がないときにそれを示すエントロピーを報告します。ここでは
 <strong>request changes が 99.9%</strong>、エントロピー 0.005、読み取り 4 トークン、生成 0 トークンです。</em></p>
 
@@ -510,6 +510,7 @@ GLM-5.2 がリファレンスモデルですが、同じストリーミング手
 | **Qwen3-Coder-30B-A3B**（Alibaba） | 30B / 3B | [`Justvugg/Qwen3-Coder-30B-A3B-colibri-int4`](https://huggingface.co/Justvugg/Qwen3-Coder-30B-A3B-colibri-int4)（19 GB、int4-gs64）、[`Qwen/Qwen3-Coder-30B-A3B-Instruct`](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct) から変換。Qwen3.6 エンジンで動く全層アテンションの Qwen3 MoE で、128 エキスパートの top-8、独自の XML 形式のツール呼び出しを持ち、思考モードはなし。teacher forcing で、int4 コンテナは 96.9% の位置で bf16 リリースと同じ top-1 トークンを選ぶ | `make -C c qwen36` | [qwen36.md](docs/qwen36.md#qwen3-coder-30b-a3b) |
 | **OLMoE**（AI2） | 7B / 1B | `c/tools/convert_olmoe_merged.py` で変換 — **int8** コンテナ、約 7 GB | `make -C c olmoe` | — |
 | **Qwen-Image-2.1**（Alibaba） | 画像モデル | [`Qwen/Qwen-Image-2.1`](https://huggingface.co/Qwen/Qwen-Image-2.1)（約 33 GB）、公式 diffusers チェックポイント、**変換不要**: テキストエンコーダと拡散トランスフォーマーはロード時に int8 に量子化。`coli chat` では画像をインライン表示し、`coli serve` では `POST /v1/images/generations` で提供。Qwen Research License: 非商用利用のみ | `make -C c qwenimage` | [qwen-image.md](docs/qwen-image.md) |
+| **Laya**（Convai Innovations） | 判定モデル、421M | [`convaiinnovations/laya`](https://huggingface.co/convaiinnovations/laya)（842 MB）、公式チェックポイント、**変換不要**: ModernBERT エンコーダと判定ヘッドで、型付きの質問（choice、score、noul）に生成ではなく較正済みの確率で答える。`coli serve` の `POST /v1/systemone` で提供。Apache-2.0 | `make -C c laya` | [laya.md](docs/laya.md) |
 
 Qwen3.6 には変換済みコンテナが 3 つあります: **int4-gs64**（推奨 — int8 のアンカーに対するコサイン類似度は
 行単位と比べて 0.98777 → 0.99313、KL は 0.109 → 0.080 と計測されており、量子化誤差が約 44% 少ない）、
@@ -555,33 +556,32 @@ COLI_MODEL=/nvme/glm52_i4 ./coli tune     # このマシンで最速かつ安全
 ./coli serve --model /nvme/glm52_i4       # API + ダッシュボード、ブラウザなし（ヘッドレス）
 ```
 
-#### Brio モード: クローズドな質問をする
+#### System One モード: クローズドな質問をする
 
 人がモデルに求めることの多くは、段落ではなく選択です: どのキューか、どの判定か、あるフィールドが取り得る
-4 つの値のどれか。Brio モードはエンジンに選択肢を渡し、生成する代わりにそれぞれの確率を読み取ります:
-`completion_tokens` は 0 で、どの回答もリストの外に出ることはなく、すべての回答にエントロピーが付くため、
+4 つの値のどれか。System One モードはエンジンに選択肢を渡し、生成する代わりにそれぞれの確率を読み取ります:
+何も生成されず、どの回答もリストの外に出ることはなく、すべての回答に確信度 (confidence) が付くため、
 「モデルに確信がない」ことが閾値を設定できる数値になります。10 のファミリーすべてで、同じサーバー上で
 動作し、リクエストごとのオプトインです: 求めない人にとって、チャットはバイト単位で同一のままです。
 
 ```bash
 # in the TUI: the same model, told to stop writing
 ./coli chat --model /nvme/qwen36_i4_gs64
-> /brio merge | request changes | close
+> /decide merge | request changes | close
 > 340 lines, 8 files, no tests. CI is green but nothing covers that path.
 
 # from anywhere: one JSON request on the running server
-curl -s http://127.0.0.1:8000/v1/brio -H 'Content-Type: application/json' -d '{
-  "model": "qwen36",
+curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -d '{
   "state": "340 lines, 8 files, no tests. CI is green but nothing covers that path.",
-  "question": "What should the reviewer do?",
-  "options": ["merge", "request changes", "close"]}'
+  "questions": {"review": {"type": "choice", "instructions": "What should the reviewer do?",
+                           "criteria": {"merge": null, "request changes": null, "close": null}}}}'
 ```
 
-`questions` は 1 回だけ読んだ 1 つの文書について多くのことを尋ね、`schema` は JSON オブジェクトを
-1 フィールドずつ埋めるため、構造上必ず妥当になります。Qwen3.6 で、同じ CPU マシン上で同じ回答を
-生成する場合と比べて計測したところ、4 フィールドのスキーマで 2.4 倍、1 つの文書に対する 4 つの質問で
-5.7 倍でした。モード全体、リクエストとレスポンスの形、そして役に立たない場面については
-[docs/brio.md](docs/brio.md) を参照してください。ダッシュボードにも Brio ページがあります。
+`POST /v1/systemone` は TypeSafe の Jev API と同じリクエストとレスポンスを話します: Jev のクライアントは
+base URL を変えるだけで colibri に切り替えられます。1 つの文書への複数の質問は文書を 1 回だけ読みます:
+Qwen3.6 で、同じ CPU マシン上で同じ回答を生成する場合と比べて計測したところ、1 つの文書に対する
+4 つの質問で 5.7 倍でした。モード全体、リクエストとレスポンスの形、そして役に立たない場面については
+[docs/systemone.md](docs/systemone.md) を参照してください。ダッシュボードにも System One ページがあります。
 
 
 Windows ではリリースアーカイブに `coli.cmd` が同梱されています。ダブルクリックでクイックスタート、
@@ -638,7 +638,7 @@ GLM 以外のエンジンでは、`coli chat` がローカルでゲートウェ�
 | Vulkan バックエンド（任意の GPU: RADV 経由の AMD、ROCm がサポートを終了したカードを含む） | [docs/vulkan.md](docs/vulkan.md) |
 | Apple Silicon Metal バックエンド | [docs/metal.md](docs/metal.md) |
 | OpenAI 互換 API、KV スロット、Web ダッシュボード | [docs/api.md](docs/api.md) |
-| Brio モード: 生成する代わりに、閉じた選択肢の集合をスコアリング | [docs/brio.md](docs/brio.md) |
+| System One モード: 生成する代わりに、閉じた選択肢の集合をスコアリング | [docs/systemone.md](docs/systemone.md) |
 | 実験的なレイヤーセグメント埋め込み ABI | [docs/segment-runtime.md](docs/segment-runtime.md) |
 | 実験的なトークナイザ/埋め込み/ヘッドの Edge ABI | [docs/edge-runtime.md](docs/edge-runtime.md) |
 | 文法強制ドラフト（構造化出力） | [docs/grammar-draft.md](docs/grammar-draft.md) |

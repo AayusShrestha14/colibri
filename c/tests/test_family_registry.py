@@ -1054,6 +1054,8 @@ class FamilyRegistryTest(unittest.TestCase):
             # An image model has no chat template and nothing to tune; the
             # template is the identity and `coli tune` refuses the modality.
             "qwen_image": "hello {world}",
+            # A decision model answers questions; it has no prompt to replay.
+            "laya": "hello {world}",
         }
         self.assertEqual(
             {family.id: tuning_replay_prompt(family, prompt) for family in FAMILIES},
