@@ -412,6 +412,9 @@ static const VkAccessFlags ALL_RW = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER
 #define ALL_STAGES (VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT)
 
 int vkc_begin(void) {
+    /* the backend found the device lost (a staged upload's fence): this frame fails as a
+     * lost device's would, and the engine takes over on the CPU */
+    if (K.ready && !K.lost && !coli_vk_available()) lose("the backend's device", VK_ERROR_DEVICE_LOST);
     if (!vkc_ready()) return 0;
     if (K.cur >= 0) return 1;                     /* already open */
     int i = (int)(K.serial % VKC_FRAMES);

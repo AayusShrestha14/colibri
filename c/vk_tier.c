@@ -33,7 +33,7 @@ typedef struct {
     uint8_t state;
 } VSlot;
 typedef struct { int layer, eid; uint8_t *buf; } VQ;
-typedef struct { int layer, eid, ok; ColiVkTensor *g, *u, *d; } VDone;
+typedef struct { int layer, eid, ok, copy_failed; ColiVkTensor *g, *u, *d; } VDone;
 
 static struct {
     int on;
@@ -189,7 +189,8 @@ static void convert(VktFmt f, int I, int O, const uint8_t *codes, const void *sc
     memcpy(sc, scales, src_scale_bytes(f, I, O));
 }
 
-/* Upload one expert from its RAM form (any thread). 0 when the pool refused. */
+/* Upload one expert from its RAM form (any thread). 0 when the pool refused, -1 when the
+ * copy to the device failed (staged uploads: the room was there, and is given back). */
 static int upload(const uint8_t *g, const uint8_t *u, const uint8_t *d,
                   const void *gs, const void *us, const void *ds, ColiVkTensor *t[3]) {
     const int H = T.c.hidden, F = T.c.inter;
@@ -210,7 +211,7 @@ static int upload(const uint8_t *g, const uint8_t *u, const uint8_t *d,
      * mapped memory) */
     if (!coli_vk_tensor_commit(t, 3)) {
         for (int k = 0; k < 3; k++) { coli_vk_tensor_free(t[k]); t[k] = NULL; }
-        return 0;
+        return -1;
     }
     return 1;
 }
@@ -230,7 +231,7 @@ size_t vkt_expert_bytes(int H, int F, VktFmt gu, VktFmt dn) {
 }
 
 /* ---- the uploader -------------------------------------------------------------- */
-static void push_done(int layer, int eid, int ok, ColiVkTensor *t[3]) {
+static void push_done(int layer, int eid, int ok, int copy_failed, ColiVkTensor *t[3]) {
     pthread_mutex_lock(&T.mx);
     if (T.ndone == T.cdone) {
         int nc = T.cdone ? 2 * T.cdone : 64;
@@ -243,7 +244,7 @@ static void push_done(int layer, int eid, int ok, ColiVkTensor *t[3]) {
         }
         T.done = n; T.cdone = nc;
     }
-    T.done[T.ndone++] = (VDone){layer, eid, ok, t[0], t[1], t[2]};
+    T.done[T.ndone++] = (VDone){layer, eid, ok, copy_failed, t[0], t[1], t[2]};
     T.busy = 0; pthread_cond_broadcast(&T.cv_done);
     pthread_mutex_unlock(&T.mx);
 }
@@ -265,17 +266,19 @@ static void *uploader(void *arg) {
         const uint8_t *g = b, *u = g + T.gu_codes, *d = u + T.gu_codes;
         const uint8_t *gs = d + T.d_codes, *us = gs + T.gu_scales, *ds = us + T.gu_scales;
         ColiVkTensor *t[3];
-        int ok = 0;
+        int ok = 0, r = 0;
         /* Refused: the pool is at its budget until the engine thread frees the victim
          * this promotion displaced, at its next quiescent point (a join: every layer
          * in decode, after a chunk's CPU work in prefill). Wait for room to be made
          * and try again; refused again after three frees, or nothing freed for a
          * minute (the engine stopped stepping), the pool is full for real. */
         for (int frees = 0, waited = 0; !ok; ) {
-            ok = upload(g, u, d, gs, us, ds, t);
+            r = upload(g, u, d, gs, us, ds, t);
+            ok = r > 0;
             /* sync: every free decided so far came first (above), and the engine now waits
-             * on us, not we on it: the pool is full for real */
-            if (ok || frees >= 3 || waited >= 600 || T.sync) break;
+             * on us, not we on it: the pool is full for real. A failed copy is no question
+             * of room: no waiting for one. */
+            if (ok || r < 0 || frees >= 3 || waited >= 600 || T.sync) break;
             pthread_mutex_lock(&T.mx);
             unsigned long gen = T.room_gen;
             while (T.room_gen == gen && !T.stop && waited < 600) {
@@ -290,7 +293,7 @@ static void *uploader(void *arg) {
         }
         free(e.buf);
         if (!ok) t[0] = t[1] = t[2] = NULL;
-        push_done(e.layer, e.eid, ok, t);
+        push_done(e.layer, e.eid, ok, r < 0, t);
     }
 }
 
@@ -329,9 +332,10 @@ static void quiesce(void) {
         } else {
             for (int k = 0; k < 3; k++) { ColiVkTensor *t = k == 0 ? d[i].g : k == 1 ? d[i].u : d[i].d; if (t) coli_vk_tensor_free(t); }
             v->state = VS_NONE; T.failed++;
-            /* the budget holds fewer than the count said (fragmentation, or the device
-             * ran out first): stop planning past what is there */
-            if (T.max_resident > T.resident + T.queued) T.max_resident = T.resident + T.queued;
+            /* refused: the budget holds fewer than the count said (fragmentation, or the
+             * device ran out first): stop planning past what is there. A failed copy gave
+             * its room back: the budget stands, the expert may come again. */
+            if (!d[i].copy_failed && T.max_resident > T.resident + T.queued) T.max_resident = T.resident + T.queued;
         }
     }
     free(d);
@@ -472,9 +476,9 @@ int vkt_plan(int *layers, int *eids, int max) {
 int vkt_put(int layer, int eid, const VktExpertSrc *src) {
     if (!T.on || layer < 0 || layer >= T.c.layers || eid < 0 || eid >= T.c.experts) return 0;
     ColiVkTensor *t[3] = {NULL, NULL, NULL};
-    int ok = src && src->g && src->u && src->d &&
-             upload(src->g, src->u, src->d, src->gs, src->us, src->ds, t);
-    push_done(layer, eid, ok, t);
+    int r = src && src->g && src->u && src->d ? upload(src->g, src->u, src->d, src->gs, src->us, src->ds, t) : 0;
+    int ok = r > 0;
+    push_done(layer, eid, ok, r < 0, t);
     if (ok) __atomic_add_fetch(&T.warm, 1, __ATOMIC_RELAXED);
     return ok;
 }

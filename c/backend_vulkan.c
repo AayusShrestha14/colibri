@@ -60,8 +60,9 @@ typedef struct {
     int cur, open; size_t used;       /* the slot being filled: commands recorded, bytes used */
     VkBuffer sbuf; VkDeviceMemory smem; uint8_t *sptr;   /* VK_UP_SLOTS slots of VK_UP_SLOT bytes */
     int fill;                         /* zero-fill a fresh device-local block before its first use */
-    int failed;                       /* a submit or a wait failed: the device is gone */
-    VkResult err; const char *what;   /* the first failure, for the message */
+    int failed;                       /* the upload under way failed (cleared by up_finish) */
+    int lost;                         /* a fence wait failed: the device is gone, for good */
+    VkResult err; const char *what;   /* the failure, for the message */
     unsigned long long bytes, copies, submits, blocks_filled;
     char why[200];
 } VkUp;
@@ -75,6 +76,29 @@ static VkResult vk_submit(int dev, VkQueue q, const VkSubmitInfo *si, VkFence f)
     VkResult r = vkQueueSubmit(q, 1, si, f);
     pthread_mutex_unlock(&g_qmx[dev]);
     return r;
+}
+/* COLI_VK_STAGED_FAULT=<point>[:n] (tests): the n-th time (the first by default) a staged
+ * upload reaches <point> it fails there, as a driver can: stage (the uploader's staging
+ * buffer), pwstage (the KV mirror's), block (a weight pool's device-local block), kvbuf (a
+ * KV mirror or norm-weight buffer), record (a command buffer's begin or end), submit, wait
+ * (a fence wait: the device is then taken as lost), commit (a tier expert's commit, after
+ * its first matrix). One stderr line says when it fired. */
+static char g_fault_point[16];
+static long g_fault_at, g_fault_n;
+static void up_fault_init(void) {
+    const char *e = getenv("COLI_VK_STAGED_FAULT"), *c = e ? strchr(e, ':') : NULL;
+    size_t n = e ? (c ? (size_t)(c - e) : strlen(e)) : 0;
+    g_fault_point[0] = 0; g_fault_n = 0;
+    if (!n || n >= sizeof g_fault_point) return;
+    memcpy(g_fault_point, e, n); g_fault_point[n] = 0;
+    g_fault_at = c ? atol(c + 1) : 1;
+    if (g_fault_at < 1) g_fault_at = 1;
+}
+static int up_fault(const char *point) {
+    if (!g_fault_point[0] || strcmp(point, g_fault_point)) return 0;
+    if (__atomic_add_fetch(&g_fault_n, 1, __ATOMIC_RELAXED) != g_fault_at) return 0;
+    fprintf(stderr, "[VK] COLI_VK_STAGED_FAULT: %s #%ld fails\n", point, g_fault_at);
+    return 1;
 }
 
 typedef struct {
@@ -314,7 +338,7 @@ static int up_init(VkUp *u) {
     if (vkCreateBuffer(u->dev, &bi, NULL, &u->sbuf) != VK_SUCCESS) return 0;
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(u->dev, u->sbuf, &req);
-    if (!(req.memoryTypeBits & (1u << u->mt_stage))) return 0;
+    if (!(req.memoryTypeBits & (1u << u->mt_stage)) || up_fault("stage")) return 0;
     VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
         .allocationSize = req.size, .memoryTypeIndex = u->mt_stage};
     if (vkAllocateMemory(u->dev, &ai, NULL, &u->smem) != VK_SUCCESS) return 0;
@@ -330,7 +354,7 @@ static void up_destroy(VkUp *u) {
     if (u->cpool) vkDestroyCommandPool(u->dev, u->cpool, NULL);
     u->sbuf = VK_NULL_HANDLE; u->smem = VK_NULL_HANDLE; u->sptr = NULL; u->cpool = VK_NULL_HANDLE;
     for (int s = 0; s < VK_UP_SLOTS; s++) { u->fence[s] = VK_NULL_HANDLE; u->cmd[s] = VK_NULL_HANDLE; u->pending[s] = 0; }
-    u->open = 0; u->used = 0; u->cur = 0;
+    u->open = 0; u->used = 0; u->cur = 0; u->failed = u->lost = 0; u->what = NULL;
 }
 
 static int alloc_buf_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr, uint32_t memtype,
@@ -578,6 +602,7 @@ static int g_vk_prof;
 
 int coli_vk_init(const char *spv_path) {
     if (G.ready) return 1;
+    up_fault_init();
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .apiVersion = VK_API_VERSION_1_2};
     VkInstanceCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
@@ -1020,43 +1045,56 @@ static void up_lost(int dev);
  * The caller holds u->mx from its first up_add to its up_finish. The bytes go through
  * the slots: a slot fills up with copies and is submitted, the next one fills while it
  * runs, and up_finish submits the last and waits for every slot, so what was added is
- * on the device when it returns (its fence waited: any queue may read it next). */
+ * on the device when it returns (its fence waited: any queue may read it next).
+ * Failures: a command buffer that would not record or a submit refused fails this upload
+ * only (up_finish still waits for the slots already sent, so the caller may free the
+ * tensors, and the next upload starts clean); a fence wait that fails means the copy may
+ * still run: the device is taken as lost (up_lost), as for every other wait. */
 typedef void (*UpFill)(uint8_t *dst, size_t off, size_t n, const void *ctx);
 static int up_fail(VkUp *u, VkResult r, const char *what) {
     if (!u->failed) { u->err = r; u->what = what; }
     u->failed = 1;
+    if (r == VK_ERROR_DEVICE_LOST) u->lost = 1;
     return 0;
 }
 static int up_wait(VkUp *u, int s) {
     if (!u->pending[s]) return 1;
     u->pending[s] = 0;
     VkResult r = vk_fence_wait(u->dev, u->fence[s]);
-    return r == VK_SUCCESS ? 1 : up_fail(u, r, "fence wait");
+    if (r == VK_SUCCESS && up_fault("wait")) r = VK_TIMEOUT;
+    if (r == VK_SUCCESS) return 1;
+    up_fail(u, r, "fence wait");
+    u->lost = 1;
+    return 0;
 }
 static int up_open(VkUp *u) {
-    if (u->failed) return 0;
+    if (u->failed || u->lost) return 0;
     if (u->open) return 1;
     if (!up_wait(u, u->cur)) return 0;
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     VkResult r = vkResetCommandBuffer(u->cmd[u->cur], 0);
+    if (r == VK_SUCCESS && up_fault("record")) r = VK_ERROR_OUT_OF_HOST_MEMORY;
     if (r == VK_SUCCESS) r = vkBeginCommandBuffer(u->cmd[u->cur], &bi);
     if (r != VK_SUCCESS) return up_fail(u, r, "command buffer");
     u->open = 1; u->used = 0;
     return 1;
 }
 static int up_submit(VkUp *u, int dev) {
-    if (!u->open) return !u->failed;
+    if (!u->open) return !u->failed && !u->lost;
     VkCommandBuffer c = u->cmd[u->cur];
     u->open = 0;
-    if (u->failed) { vkEndCommandBuffer(c); return 0; }
+    if (u->failed) { vkEndCommandBuffer(c); return 0; }   /* out of recording; never submitted */
     /* the copies' writes made available to every later access, on whatever queue */
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
         .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
     vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &c};
     VkResult r = vkEndCommandBuffer(c);
-    if (r == VK_SUCCESS) r = vkResetFences(u->dev, 1, &u->fence[u->cur]);
+    if (r == VK_SUCCESS && up_fault("record")) r = VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (r != VK_SUCCESS) return up_fail(u, r, "command buffer");
+    r = vkResetFences(u->dev, 1, &u->fence[u->cur]);
+    if (r == VK_SUCCESS && up_fault("submit")) r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
     if (r == VK_SUCCESS) r = vk_submit(dev, u->q, &si, u->fence[u->cur]);
     if (r != VK_SUCCESS) return up_fail(u, r, "submit");
     u->pending[u->cur] = 1; u->submits++;
@@ -1078,10 +1116,21 @@ static int up_add(VkUp *u, int dev, VkBuffer dst, size_t dst_off, size_t bytes, 
     }
     return 1;
 }
-static int up_finish(VkUp *u, int dev) {   /* always called, also after a failed up_add */
+/* Always called, also after a failed up_add: the slots sent are waited for. 1 = all on
+ * the device; 0 = this upload failed (u->lost: and the device with it). */
+static int up_finish(VkUp *u, int dev) {
     int ok = up_submit(u, dev);
     for (int s = 0; s < VK_UP_SLOTS; s++) ok &= up_wait(u, s);
-    return ok && !u->failed;
+    ok = ok && !u->failed && !u->lost;
+    if (!u->lost) u->failed = 0;   /* the next upload starts clean */
+    return ok;
+}
+/* An upload failed (u->what says where): the device lost with it, or only this one. */
+static void up_failed(int dev, const char *what) {
+    VkUp *u = &g_up[dev];
+    if (u->lost) { up_lost(dev); return; }
+    fprintf(stderr, "[VK] %sstaged upload failed (%s: %d): %s\n", dev ? "dev2 " : "",
+            u->what ? u->what : "?", (int)u->err, what);
 }
 typedef struct { const uint8_t *w; size_t cpu_rb, stride; } UpRows;
 /* the rows at their padded stride, zeros past each row's bytes */
@@ -1121,16 +1170,16 @@ static void up_zero(int dev, VkDeviceMemory mem, uint64_t cap) {
     if (vkCreateBuffer(u->dev, &bi, NULL, &b) != VK_SUCCESS) return;
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(u->dev, b, &req);
-    int done = 1;
+    int lost = 0;
     if (req.size <= cap && (req.memoryTypeBits & (1u << u->mt_dev)) && vkBindBufferMemory(u->dev, b, mem, 0) == VK_SUCCESS) {
         pthread_mutex_lock(&u->mx);
         if (up_open(u)) vkCmdFillBuffer(u->cmd[u->cur], b, 0, VK_WHOLE_SIZE, 0);
-        done = up_finish(u, dev);
-        if (done) u->blocks_filled++;
+        if (up_finish(u, dev)) u->blocks_filled++;
+        else up_failed(dev, "the block is used unfilled");
+        lost = u->lost;
         pthread_mutex_unlock(&u->mx);
     }
-    if (done) vkDestroyBuffer(u->dev, b, NULL);   /* a failed wait: the device is gone, leave it */
-    else up_lost(dev);
+    if (!lost) vkDestroyBuffer(u->dev, b, NULL);   /* a failed wait: the fill may still run, leave it */
 }
 
 /* Block memory for a pool (lock held). */
@@ -1146,6 +1195,7 @@ static VkBlk *pool_new_block(VkWPool *P, uint64_t cap) {
 #endif
     VkDevice dev = pool_device(P);
     int staged = g_up[P->dev].on;   /* device-local, never mapped: the uploader fills it */
+    if (staged && up_fault("block")) { free(bk); return NULL; }
     if (vkAllocateMemory(dev, &ai, NULL, &bk->mem) != VK_SUCCESS ||
         (!staged && vkMapMemory(dev, bk->mem, 0, cap, 0, (void **)&bk->base) != VK_SUCCESS)) {
         if (bk->mem) vkFreeMemory(dev, bk->mem, NULL);
@@ -1286,7 +1336,11 @@ static int upload_tensor_pool(VkWPool *P, ColiVkTensor **out, const void *weight
                  up_add(u, P->dev, t->sbuf, 0, sb, up_fill_bytes, fmt == 10 || fmt == 11 ? (const void *)&one : scales);
         ok = up_finish(u, P->dev) && ok;
         pthread_mutex_unlock(&u->mx);
-        if (!ok) { up_lost(P->dev); tensor_release(t); return 0; }
+        if (!ok) {   /* the matrix stays on the CPU (with the device, if it was lost) */
+            up_failed(P->dev, "a matrix stays on the CPU");
+            tensor_release(t);
+            return 0;
+        }
         *out = t;
         return 1;
     }
@@ -1850,9 +1904,10 @@ static uint32_t pool_memtype(const VkWPool *P) {
 }
 /* An upload's fence failed: the device is gone, as for any other wait. */
 static void up_lost(int dev) {
-    fprintf(stderr, "[VK] %sstaged upload failed (%s: %d): disabling %s\n", dev ? "dev2 " : "",
+    fprintf(stderr, "[VK] %sstaged upload failed (%s: %d): the device is lost, disabling %s\n", dev ? "dev2 " : "",
             g_up[dev].what ? g_up[dev].what : "?", (int)g_up[dev].err, dev ? "dev2 offload" : "GPU offload");
-    if (dev) G2.ready = 0; else G.ready = 0;
+    /* another thread (the tier's uploader) may be the one that finds out */
+    if (dev) __atomic_store_n(&G2.ready, 0, __ATOMIC_RELEASE); else __atomic_store_n(&G.ready, 0, __ATOMIC_RELEASE);
 }
 static int pool_has_prio(const VkWPool *P) { return P->dev ? 0 : G.has_prio; }
 static int upload_tensor_d2(ColiVkTensor **out, const void *weights, const float *scales,
@@ -2150,7 +2205,8 @@ static int pw_add(VkBuffer dst, size_t dst_off, const void *src, size_t bytes) {
             size_t cap = (size_t)4 << 20;
             while (cap < bytes) cap *= 2;
             void *p;
-            if (!alloc_buf_mt(cap, &PW.buf, &PW.mem, &p, g_up[0].mt_stage, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) {
+            if (up_fault("pwstage") ||
+                !alloc_buf_mt(cap, &PW.buf, &PW.mem, &p, g_up[0].mt_stage, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) {
                 PW.buf = VK_NULL_HANDLE; PW.mem = VK_NULL_HANDLE; return 0;
             }
             PW.ptr = p; PW.cap = cap;
@@ -2170,6 +2226,7 @@ static int pw_add(VkBuffer dst, size_t dst_off, const void *src, size_t bytes) {
 }
 /* A device-local buffer the main queue writes (PW) and reads, never mapped. */
 static int alloc_dev(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem) {
+    if (up_fault("kvbuf")) return 0;
     return alloc_buf_mt(bytes, buf, mem, NULL, g_up[0].mt_dev,
                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
 }
@@ -2904,7 +2961,7 @@ int coli_vk_xb_init(int D, int I, int act, float limit, float a, float b) {
     XB.ready = 1;
     return 1;
 }
-int coli_vk_xb_ready(void) { return XB.ready; }
+int coli_vk_xb_ready(void) { return XB.ready && G.ready; }   /* a device lost elsewhere stops the tier too */
 int coli_vk_xb_queue_shared(void) { return G.tq_shared; }
 
 ColiVkExpert *coli_vk_xb_expert(ColiVkTensor *g, ColiVkTensor *u, ColiVkTensor *d) {
@@ -3202,11 +3259,12 @@ int coli_vk_tensor_commit(ColiVkTensor *const *t, int n) {
         size_t sb = scale_floats(t[k]->fmt, t[k]->I, t[k]->O, t[k]->gs) * sizeof(float);
         ok = up_add(u, dev, t[k]->wbuf, 0, t[k]->wbytes, up_fill_bytes, t[k]->img) &&
              up_add(u, dev, t[k]->sbuf, 0, sb, up_fill_bytes, t[k]->img + t[k]->wbytes);
+        if (ok && k == 0 && n > 1 && up_fault("commit")) ok = up_fail(u, VK_ERROR_OUT_OF_DEVICE_MEMORY, "commit");
     }
     ok = up_finish(u, dev) && ok;
+    if (!ok) up_failed(dev, "the tensors are not resident");
     pthread_mutex_unlock(&u->mx);
     for (int k = 0; k < n; k++) if (t[k]) { free(t[k]->img); t[k]->img = NULL; }
-    if (!ok) up_lost(dev);
     return ok;
 }
 int coli_vk_staged(void) { return G.ready && g_up[0].on; }
@@ -3231,12 +3289,12 @@ static void place_report(void) {
     size_t host = ((fd & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? 0 : w.peak_used + t.peak_used + kv + ln);
     const double M = 1048576.0;
     fprintf(stderr, "[VK] memory at exit: weights %.1f MiB, expert tier %.1f MiB (peaks), KV mirror %.1f MiB in "
-            "device-local memory type %u (%s); the dense chain's state in type %u (%s); %.1f MiB staged in %llu copies, "
-            "%llu blocks zero-filled; resident data in host memory: %.1f MiB\n",
+            "device-local memory type %u (%s); the dense chain's state in type %u (%s); %.1f MiB staged in %llu copies "
+            "(%llu submits), %llu blocks zero-filled; resident data in host memory: %.1f MiB\n",
             w.peak_used / M, t.peak_used / M, (kv + ln) / M, u->mt_dev,
             (fd & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ? "host-visible" : "not host-visible", G.memtype_dev,
             (fc & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? "device-local" : "host memory",
-            (u->bytes + PW.bytes) / M, u->copies, u->blocks_filled,
+            (u->bytes + PW.bytes) / M, u->copies, u->submits, u->blocks_filled,
             host / M);
 }
 
