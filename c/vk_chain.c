@@ -767,6 +767,47 @@ int vkc_ple(VkcBuf *keys, VkcBuf *hyp, VkcBuf *val, VkcBuf *prm, VkcBuf *gated, 
     return record(K.pipe[P_PLE], bd, 8, p, sizeof *p, gx, gy, 1);
 }
 
+/* ---- inkling's ops: chain_sconv.comp and chain_relattn.comp, made on first use ---- */
+static struct { VkShaderModule mod[2]; VkPipeline pipe[2]; int tried[2]; } KX;
+static VkPipeline kx_pipe(int k) {
+    static const char *const file[2] = {"chain_sconv.spv", "chain_relattn.spv"};
+    if (KX.pipe[k] || KX.tried[k] || !vkc_ready()) return KX.pipe[k];
+    KX.tried[k] = 1;
+    if ((KX.mod[k] = load_module(K.core.spv_path, file[k]))) KX.pipe[k] = make_pipe(KX.mod[k], NULL);
+    return KX.pipe[k];
+}
+static void kx_shutdown(void) {
+    for (int k = 0; k < 2; k++) {
+        if (KX.pipe[k]) vkDestroyPipeline(K.dev, KX.pipe[k], NULL);
+        if (KX.mod[k]) vkDestroyShaderModule(K.dev, KX.mod[k], NULL);
+    }
+    memset(&KX, 0, sizeof KX);
+}
+int vkc_sconv_ready(void) { return kx_pipe(0) != VK_NULL_HANDLE; }
+int vkc_relattn_ready(void) { return kx_pipe(1) != VK_NULL_HANDLE; }
+int vkc_sconv(VkcBuf *x, VkcBuf *w, VkcBuf *ring, const VkcSconv *p) {
+    VkPipeline pipe = kx_pipe(0);
+    if (!pipe || (p->mode == 0 && (p->CK < 1 || p->CK > 9))) return 0;
+    K.kind = p->mode == 0 ? PK_DNCONV : PK_EW;
+    uint32_t gx, gy;
+    if (p->mode == 0) {
+        VkcBind bd[3] = {B(x, 1), B(w, 0), B(ring, 1)};
+        grid(((uint64_t)p->C + 63) / 64, &gx, &gy);
+        return record(pipe, bd, 3, p, sizeof *p, gx, gy, 1);
+    }
+    VkcBind bd[1] = {B(x, 1)};
+    grid(((uint64_t)p->n + 63) / 64, &gx, &gy);
+    return record(pipe, bd, 1, p, sizeof *p, gx, gy, 1);
+}
+int vkc_relattn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *kvs, VkcBuf *r, VkcBuf *relp, VkcBuf *tau,
+                const VkcRelAttn *p) {
+    VkPipeline pipe = kx_pipe(1);
+    if (!pipe || p->hd > 256 || p->d_rel > 64 || p->d_rel < 0 || p->KVH < 1 || p->H % p->KVH || p->cap < 1) return 0;
+    K.kind = PK_ATTN;
+    VkcBind bd[8] = {B(q, 0), B(kc, 0), B(vc, 0), B(o, 1), B(kvs, 0), B(r, 0), B(relp, 0), B(tau, 0)};
+    return record(pipe, bd, 8, p, sizeof *p, (uint32_t)p->H, (uint32_t)p->S, 1);
+}
+
 void vkc_stats(VkcStats *st) { *st = K.st; }
 void vkc_prof_print(void) {
     if (!K.prof) return;
@@ -802,6 +843,7 @@ void vkc_shutdown(void) {
         vka_pool_destroy(P);
     }
     if (K.cpool) vkDestroyCommandPool(K.dev, K.cpool, NULL);
+    kx_shutdown();
     for (int i = 0; i < P_NPIPE; i++) {
         if (K.pipe[i]) vkDestroyPipeline(K.dev, K.pipe[i], NULL);
         if (K.mod[i]) vkDestroyShaderModule(K.dev, K.mod[i], NULL);

@@ -67,6 +67,7 @@
 #include "backend_vulkan.h"
 #include "vk_tier.h"
 static int g_vk_ready = 0;
+static int g_vk_chain = 0;   /* COLI_VK_CHAIN decided on, and the chain's pipelines are up (olmoe_chain.h) */
 #endif
 
 #ifdef _WIN32
@@ -102,8 +103,12 @@ typedef struct {
  * meccanismo che fa stare GLM-5.2 nei 15 GB. dequant-on-use nel matmul. */
 /* pinned=1 means this slot is strongly preferred to keep (hot expert); it will
  * not be evicted during normal LRU eviction, but may be displaced under extreme
- * cache pressure when all slots are pinned or in-flight. */
-typedef struct { int eid; int pinned; int8_t *g, *u, *d; float *gs, *us, *ds; uint64_t used; } Slot;
+ * cache pressure when all slots are pinned or in-flight.
+ * busy counts the computations reading the slot, from expert_get to expert_put
+ * (under g_pilot_mx): neither eviction takes a busy slot. Without it the PILOT
+ * worker could pick the slot the forward pass was multiplying with as its LRU
+ * victim and read another expert into it mid-matmul (at cap 1 the only slot). */
+typedef struct { int eid; int pinned; int busy; int8_t *g, *u, *d; float *gs, *us, *ds; uint64_t used; } Slot;
 typedef struct {
     Slot *slots;
     int *slot_by_expert;                  /* expert id -> resident slot, -1 if absent */
@@ -117,6 +122,7 @@ typedef struct {
     float *embed, *lm_head, *final_norm;
 #ifdef COLI_VULKAN
     void *vk_lm_head;
+    void *vkchain;          /* the dense chain's device state (olmoe_chain.h), NULL until it runs */
 #endif
     Layer *L;
     LCache *cache;          /* [n_layers] */
@@ -715,6 +721,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
 
 #ifdef COLI_VULKAN
 static void olmoe_vk_tier_start(Model *m);
+static void olc_start(Model *m);
 #endif
 static void model_init(Model *m, const char *snap, int cap, int bits) {
     model_init_range(m, snap, cap, bits, 0, 0, 1, 1);
@@ -732,6 +739,7 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
                 "go to the GPU on first use; %s\n", 5 * m->c.n_layers + 1,
                 vkt_ready() ? "routed experts go to the expert tier, the embedding lookup stays on the CPU"
                             : "routed experts and the embedding lookup stay on the CPU");
+    olc_start(m);   /* COLI_VK_CHAIN: every layer's dense part as one frame on the device */
 #endif
 }
 
@@ -874,7 +882,7 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
         hit = slot_indexed(m, layer, eid);
     }
     if (hit) {
-        m->hits++; hit->used = ++m->clock; *out = hit;
+        m->hits++; hit->used = ++m->clock; hit->busy++; *out = hit;
         if (m->last_access) m->last_access[layer * m->c.n_experts + eid] = m->clock;
         pthread_mutex_unlock(&g_pilot_mx);
         return;
@@ -886,17 +894,17 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
         s = &lc->slots[lc->n++];
         slot_ensure_allocated(m, s);
     } else {
-        /* LRU eviction — skip pinned and in-flight (eid==-1) slots */
+        /* LRU eviction: skip pinned, in-flight (eid==-1) and busy slots */
         int lru = -1;
         for (int i = 0; i < lc->n; i++) {
-            if (lc->slots[i].pinned || lc->slots[i].eid < 0) continue;
+            if (lc->slots[i].pinned || lc->slots[i].eid < 0 || lc->slots[i].busy) continue;
             if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
         }
         if (lru < 0) {
-            /* All slots are pinned or in-flight; find oldest non-in-flight slot
-             * (may be pinned, but never select one currently being loaded). */
+            /* All slots are pinned, in-flight or busy; find oldest non-in-flight slot
+             * (may be pinned, but never select one currently being loaded or read). */
             for (int i = 0; i < lc->n; i++) {
-                if (lc->slots[i].eid < 0) continue; /* never evict in-flight */
+                if (lc->slots[i].eid < 0 || lc->slots[i].busy) continue; /* never evict in-flight */
                 if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
             }
         }
@@ -912,7 +920,7 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
             sleep_ms(1);
             pthread_mutex_lock(&g_pilot_mx);
             for (int i = 0; i < lc->n; i++) {
-                if (lc->slots[i].eid < 0) continue;
+                if (lc->slots[i].eid < 0 || lc->slots[i].busy) continue;
                 if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
             }
         }
@@ -929,9 +937,16 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     cache_publish(m, layer, s, eid);
     s->pinned = m->is_pinned[layer * c->n_experts + eid];
     s->used = ++m->clock;
+    s->busy++;
     if (m->last_access) m->last_access[layer * c->n_experts + eid] = m->clock;
     *out = s;
     pthread_cond_broadcast(&g_pilot_cv);
+    pthread_mutex_unlock(&g_pilot_mx);
+}
+/* The computation that expert_get handed the slot to is done reading it. */
+static void expert_put(Slot *s) {
+    pthread_mutex_lock(&g_pilot_mx);
+    s->busy--;
     pthread_mutex_unlock(&g_pilot_mx);
 }
 
@@ -1172,6 +1187,7 @@ static void moe_vk_cpu(Model *m, int layer, const float *x, int n, const int *ib
         moe_expert_row(m, e, x + (int64_t)(i / K) * D, g, u, ctb + (int64_t)i * D);
         pthread_mutex_lock(&g_pilot_mx);
         if (e->eid == ib[i]) { VktExpertSrc vs = olmoe_vk_src(e); vkt_note(layer, ib[i], &vs); }
+        e->busy--;   /* expert_put, under the lock already held */
         pthread_mutex_unlock(&g_pilot_mx);
     }
 }
@@ -1213,16 +1229,15 @@ static void moe_vk_run(Model *m, int layer, const float *x, int S, float *logits
 }
 #endif
 
-/* MoE sui token x[S,hidden] -> out[S,hidden] */
-static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
+/* MoE sui token x[S,hidden] -> out[S,hidden], from the router's logits[S,E] (turned
+ * into probabilities in place). moe() computes the logits first; the dense chain
+ * (olmoe_chain.h) hands over the ones the device computed. */
+static void moe_routed(Model *m, int layer, float *x, int S, float *logits, float *out) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
-    float *logits = falloc((int64_t)S*E);
-    MATMUL_RES(logits, x, l->gate, l->vk_gate, S, D, E);
     memset(out, 0, (int64_t)S*D*sizeof(float));
 #ifdef COLI_VULKAN
     if (vkt_ready()) {   /* the Vulkan expert tier (moe_vk_run) */
         moe_vk_run(m, layer, x, S, logits, out);
-        free(logits);
         rt_trace_end();
         return;
     }
@@ -1235,12 +1250,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         for (int kk = 0; kk < K; kk++) {
             Slot *e; expert_get(m, layer, idx[kk], &e);
             moe_expert_row(m, e, xs, g, u, hh);
+            expert_put(e);
             float w = val[kk];
             float *os = out + (int64_t)s*D;
             for (int d = 0; d < D; d++) os[d] += w * hh[d];
         }
     }
-    free(logits); free(g); free(u); free(hh);
+    free(g); free(u); free(hh);
     /* Advance the trace call counter: once per moe() invocation, after all of
      * its rows are traced. rt_trace_end() is a no-op when no stream is open.
      *
@@ -1250,6 +1266,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
      * call ids") rather than merging two forwards into one position space. GLM
      * and glm53 advance theirs the same way. */
     rt_trace_end();
+}
+static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
+    Cfg *c = &m->c; int D = c->hidden, E = c->n_experts;
+    float *logits = falloc((int64_t)S*E);
+    MATMUL_RES(logits, x, l->gate, l->vk_gate, S, D, E);
+    moe_routed(m, layer, x, S, logits, out);
+    free(logits);
 }
 
 /* PROF phases (#1449): wall time in attention, in the MoE blocks (expert
@@ -1314,6 +1337,10 @@ static void olmoe_echo(const char *id, int pos, int token, const float *lo, int 
     fputc('\n', stdout); fflush(stdout);
 }
 
+#ifdef COLI_VULKAN
+#include "olmoe_chain.h"   /* COLI_VK_CHAIN: every layer's dense chain on the device */
+#endif
+
 static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
     if (g_pilot && m->token_count > 0) {
@@ -1330,6 +1357,19 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     }
     float *x = falloc((int64_t)S*D);
     for (int s = 0; s < S; s++) memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
+#ifdef COLI_VULKAN
+    /* COLI_VK_CHAIN: the layers, the final norm and lm_head on the device; x comes
+     * back only when the prefill read-out below needs every row */
+    float *chain_logit = NULL;
+    if (g_vk_chain) {
+        chain_logit = falloc(c->vocab);
+        if (!olc_forward(m, x, S, pos_base, g_echo_k > 0 && g_echo_id && S > 1, chain_logit)) {
+            free(chain_logit); chain_logit = NULL;
+            olc_cpu_step(m, pos_base);
+        }
+    }
+    if (!chain_logit)
+#endif
     layers_forward_range(m, x, S, pos_base, 0, c->n_layers, 1);
     /* count actual tokens processed (S>1 during prefill) */
     m->token_count += S; m->freq_token_count += S;
@@ -1355,6 +1395,13 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         }
         free(erow); free(elog);
     }
+#ifdef COLI_VULKAN
+    if (chain_logit) {   /* the chain's last frame ran the final norm and lm_head */
+        g_prof_forwards += 1;
+        free(x);
+        return chain_logit;
+    }
+#endif
     float *last = falloc(D);
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
     float *logit = falloc(c->vocab);
@@ -1386,16 +1433,16 @@ static void pilot_realload(Model *m, int layer, int eid) {
         s = &lc->slots[lc->n++];
         slot_ensure_allocated(m, s);
     } else {
-        /* LRU eviction — skip pinned and in-flight (eid==-1) slots */
+        /* LRU eviction: skip pinned, in-flight (eid==-1) and busy slots */
         int lru = -1;
         for (int i = 0; i < lc->n; i++) {
-            if (lc->slots[i].pinned || lc->slots[i].eid < 0) continue;
+            if (lc->slots[i].pinned || lc->slots[i].eid < 0 || lc->slots[i].busy) continue;
             if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
         }
         if (lru < 0) {
             m->is_queued[layer * c->n_experts + eid] = 0;
             pthread_mutex_unlock(&g_pilot_mx);
-            return; /* all pinned/in-flight, skip */
+            return; /* all pinned/in-flight/busy, skip */
         }
 
         /* LFRU eviction guard: don't displace a warm resident expert with a speculation */
@@ -1576,9 +1623,14 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
         m->V[i] = falloc((int64_t)c->n_heads * m->max_t * c->head_dim);
     }
     for (int i = 0; i < np; i++) out[i] = prompt[i];
+    /* DUMP=<path>: every forward's logits (vocab raw float32 each, in order), for a
+     * comparison of two runs (tests/vulkan_engines.sh compares the dense chain's) */
+    const char *dp = getenv("DUMP");
+    FILE *df = dp && *dp ? fopen(dp, "wb") : NULL;
     float *logit = step(m, prompt, np, 0);          /* PREFILL */
     int len = np;
     for (int s = 0; s < n_new; s++) {
+        if (df) fwrite(logit, sizeof(float), (size_t)c->vocab, df);
         int best = 0; float bv = logit[0];
         for (int i = 1; i < c->vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
         free(logit);
@@ -1587,6 +1639,7 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
         int one = best;
         logit = step(m, &one, 1, len - 1);          /* DECODE */
     }
+    if (df) fclose(df);
 }
 
 /* teacher-forced NLL of full_ids[np..nfull): feed the REFERENCE token at each step
@@ -1721,7 +1774,7 @@ static void run_chat(Model *m, Tok *T, int ctx_cap) {
         printf("%s\n", outbuf);
         fflush(stdout);
 #ifdef COLI_VULKAN
-        olmoe_vk_report(); vkt_report("turn", m->hits, m->miss);
+        olmoe_vk_report(); vkt_report("turn", m->hits, m->miss); olc_report(m);
 #endif
     }
     free(line); free(turn); free(newids); free(gen); free(outbuf); free(hist);
@@ -1958,7 +2011,7 @@ static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
            g_prof_attn_s - attn0, g_prof_head_s - head0, g_prof_forwards - fwd0);
     fflush(stdout);
 #ifdef COLI_VULKAN
-    olmoe_vk_report(); vkt_report("turn", m->hits, m->miss);
+    olmoe_vk_report(); vkt_report("turn", m->hits, m->miss); olc_report(m);
 #endif
     serve_hits(m);
     free(ids);
@@ -2212,7 +2265,7 @@ int main(int argc, char **argv) {
                (unsigned long long)m.hits, (unsigned long long)m.miss);
         printf("Speed: %.2f tok/s (%.1fs for %d tokens) | PEAK RSS: %.2f GB\n", scored/dt, dt, scored, rss_gb());
 #ifdef COLI_VULKAN
-        fflush(stdout); olmoe_vk_report(); vkt_report("run", m.hits, m.miss);
+        fflush(stdout); olmoe_vk_report(); vkt_report("run", m.hits, m.miss); olc_report(&m);
 #endif
         free(buf); free(arena);
         return 0;      /* PPL is a measurement run: no rt_save on purpose, so a loss
@@ -2265,7 +2318,7 @@ int main(int argc, char **argv) {
      * rates this engine runs at). */
     printf("TUNE decode: %d tokens in %.3fs\n", n_new, dt);
 #ifdef COLI_VULKAN
-    fflush(stdout); olmoe_vk_report(); vkt_report("run", m.hits, m.miss);
+    fflush(stdout); olmoe_vk_report(); vkt_report("run", m.hits, m.miss); olc_report(&m);
 #endif
     free(buf); free(arena);
     return 0;
