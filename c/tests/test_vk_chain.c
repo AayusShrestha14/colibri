@@ -1166,7 +1166,7 @@ static void test_ds_index(int S, int pos_base, int ratio, int IH, int ID, int to
     int *keep = calloc((size_t)S * scrow, 4), *lst = malloc((size_t)S * lrow * 4), *lstm = malloc((size_t)S * lrow * 4);
     for (int s = 0; s < S; s++) {
         int lens = (pos_base + s + 1) / ratio;
-        float wt[64];
+        float wt[128];
         for (int h = 0; h < IH; h++) { wt[h] = w[2 + s * wrow + h]; wt[h] *= wscale; }
         for (int j = 0; j < width; j++) {
             if (j >= lens) { ref[s * scrow + j] = -INFINITY; continue; }
@@ -1547,6 +1547,7 @@ int main(int argc, char **argv) {
         test_ds_index(1, 30, 1, 4, 32, 4, 2, 2, 0); test_ds_index(5, 40, 2, 4, 32, 4, 2, 2, 0); test_ds_index(3, 0, 1, 2, 16, 8, 2, 3, 0);
         test_ds_index(2, 900, 1, 3, 64, 100, 4, 8, 0); test_ds_index(4, 300, 4, 16, 64, 16, 1, 3, 1); test_ds_index(3, 1, 2, 2, 16, 4, 2, 1, 0);
         test_ds_engram(1, 4, 128); test_ds_engram(3, 2, 300);
+        test_ds_index(3, 37, 4, 64, 128, 16, 2, 2, 1); test_ds_index(2, 60, 4, 96, 64, 8, 2, 2, 0);   /* DeepSeek V4's 64 x 128, past the staging */
         printf("dsv4 done\n");
         int in;
         for (in = 0; in < 2; in++) {

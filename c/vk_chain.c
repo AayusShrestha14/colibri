@@ -1092,11 +1092,13 @@ int vkc_dsv4_compress(VkcBuf *kv, VkcBuf *sc, VkcBuf *ring, VkcBuf *prm, VkcBuf 
     return dsv4_rec(PK_DSA, 2, p, sizeof *p, bd, 8, 1, 1);
 }
 int vkc_dsv4_score(VkcBuf *iq, VkcBuf *hw, VkcBuf *keys, VkcBuf *mask, VkcBuf *sc, const VkcDsScore *p) {
-    if (p->S < 1 || p->S > 65535 || p->IH < 1 || p->IH > 64 || p->ID < 1 || p->IH * p->ID > 4096 || p->ratio < 1 ||
+    /* queries above 4096 floats: mode 9, the same sums with the queries read from memory */
+    int wide = p->IH > 64 || p->IH * p->ID > 4096;
+    if (p->S < 1 || p->S > 65535 || p->IH < 1 || p->IH > 4096 || p->ID < 1 || p->ratio < 1 ||
         p->width < 0 || p->sc_row < p->width || (p->mask_row > 0 && !mask)) return 0;
     if (p->width == 0) return open_frame() && !K.lost;
     VkcBind bd[6] = {B(iq, 0), B(hw, 0), B(keys, 0), B(p->mask_row > 0 ? mask : NULL, 0), B(NULL, 0), B(sc, 1)};
-    return dsv4_rec(PK_DSA, 3, p, sizeof *p, bd, 6, (uint32_t)p->S, 1);
+    return dsv4_rec(PK_DSA, wide ? 9 : 3, p, sizeof *p, bd, 6, (uint32_t)p->S, 1);
 }
 int vkc_dsv4_cand(VkcBuf *sc, VkcBuf *mask, const VkcDsCand *p) {
     if (p->S < 1 || p->S > 65535 || p->block < 1 || p->ratio < 1 || p->width < 0 ||

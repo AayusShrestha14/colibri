@@ -312,7 +312,8 @@ int vkc_mhc(int mode, VkcBuf *x, VkcBuf *m, VkcBuf *hp, VkcBuf *prm, VkcBuf *y, 
  *                     j < lens = (pos + 1) / ratio (and mask[mask_off + s*mask_row + j] != 0
  *                     when mask_row > 0) as sum_h [dot > 0] dot * hw_h * wscale, dot = q_h .
  *                     key[j]; every other j < width scores -inf; into sc[sc_off + s*sc_row
- *                     + j]. IH <= 64, IH*ID <= 4096.
+ *                     + j]. IH <= 4096; IH <= 64 and IH*ID <= 4096 stage the queries in
+ *                     shared memory, larger ones read them from memory (the same sums).
  *   vkc_dsv4_cand     the candidate blocks: per row, each block's best score, the block of
  *                     column lens - 1 pinned, then the best min(topb, blocks) blocks (the
  *                     lower on a tie), mask 1 on their columns. At most 4096 blocks.
