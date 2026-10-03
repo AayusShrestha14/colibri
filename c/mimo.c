@@ -1333,7 +1333,8 @@ static void vk_tier_start(Model *m) {
                     .gate_up = f, .down = f, .act = VKT_ACT_SWIGLU,
                     .max_rows = MIMO_VK_ROWS * c->topk,
                     .ram_reserve = (size_t)(m->e_bytes + 8192) * (size_t)cap * (size_t)nmoe,
-                    .dense_bytes = coli_vk_dense() ? vk_dense_bytes(m, 1) : g_vk_chain ? vk_dense_bytes(m, 0) : 0,
+                    .dense_bytes = (coli_vk_dense() ? vk_dense_bytes(m, 1) : g_vk_chain ? vk_dense_bytes(m, 0) : 0) +
+                                   (g_vk_chain ? mc_kv_bytes(m) : 0),   /* the chain's KV caches */
                     .in_ram = vk_in_ram, .ram_ctx = m};
     atexit(coli_vk_shutdown);   /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
     if (vkt_init(&vc, NULL)) atexit(vkt_shutdown);

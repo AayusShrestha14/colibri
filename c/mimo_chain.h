@@ -89,6 +89,13 @@ static McGeo mc_geo(const Model *m, int li) {
 
 static int mc_ctensor(DW *d) { return dw_upload(d) && d->vk; }
 
+/* the device's KV caches, in bytes (the tier's budget leaves them room) */
+static size_t mc_kv_bytes(const Model *m) {
+    size_t b = 0;
+    for (int i = 0; i < m->c.n_layers; i++) { McGeo g = mc_geo(m, i); b += (size_t)g.rows * (g.kd + g.vdd) * sizeof(float); }
+    return b;
+}
+
 /* The model's parameters on the device, its tensors resolved, its caches allocated;
  * NULL = the chain cannot run. */
 static MimoChain *mc_setup(Model *m) {
