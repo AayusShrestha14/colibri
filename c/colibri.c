@@ -495,6 +495,7 @@ typedef struct {
     float **ln_dev;                              /* in_ln/post_ln cached on device: [layer*2+{0,1}] (Inc.4) */
 #ifdef COLI_VULKAN
     int *vk_kv_valid;                            /* righe [0,v) specchiate nella cache KV Vulkan */
+    void *vkchain;                               /* the dense chain's device state (glm_chain.h), NULL until it starts */
 #endif
     ESlot ws[64];                                /* working set del layer corrente (load paralleli) */
     ESlot **pin; int *npin;                      /* HOT-STORE: expert pinnati in RAM (mai evicted) */
@@ -4446,11 +4447,17 @@ static void kv_lc_rows_f32(Model *m, int layer, int64_t t0, int64_t n, float *ds
                                  dst+(t-t0)*c->kv_lora, c->kv_lora);
     }
 }
+#ifdef COLI_VULKAN
+static void glmc_cpu_rows(Model *m, int layer, KVState *const *kvs, const int *positions, int pos_base, int S);
+#endif
 static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int pos_base,
                            KVState *const *kvs, const int *positions, float *out){
     Cfg *c=&m->c; int H=c->n_heads, D=c->hidden, qh=c->qk_head, vh=c->v_head;
     int kvb_dim=H*(c->qk_nope+vh), Tk=pos_base+S;
     double ta0=now_s();
+#ifdef COLI_VULKAN
+    glmc_cpu_rows(m,layer,kvs,positions,pos_base,S);   /* the dense chain's KV mirror: these rows change here */
+#endif
 #ifdef COLI_METAL
     /* Fused decode attention on GPU: whole layer in one command buffer (keeps the GPU hot).
      * S<=4 absorption path with st0==0, DSA selection inactive, and GLM-5.2 int4 dims.
@@ -7451,11 +7458,23 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
 static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_base, float *nrm, float *tmp){
     layer_forward_rows(m,l,li,x,S,pos_base,NULL,NULL,nrm,tmp);
 }
+#ifdef COLI_VULKAN
+#include "glm_chain.h"   /* COLI_VK_CHAIN: every layer's dense chain on the device */
+#endif
 static void layers_forward_rows_range(Model *m, float *x, int S, int pos_base,
                                       KVState *const *kvs,
                                       const int *positions,
                                       int layer_begin, int layer_end){
     Cfg *c=&m->c; int D=c->hidden;
+#ifdef COLI_VULKAN
+    /* the whole forward on the device (glm_chain.h); 0: the CPU path below, as before.
+     * A decode batch of one row of the bound KV state (a single-slot serve) is a step
+     * like any other; rows of several states stay on the CPU. */
+    if(g_vk_chain && layer_begin==0 && layer_end==c->n_layers){
+        if(!kvs && !positions && glmc_forward(m,x,S,pos_base)) return;
+        if(kvs && S==1 && kvs[0]==m->kv && glmc_forward(m,x,1,positions?positions[0]:pos_base)) return;
+    }
+#endif
     if(g_pilot_real){   /* nuovo forward: il possesso-layer riparte da -1 (i layer si rifanno da 0) */
         pthread_mutex_lock(&g_pilot_mx);
         atomic_store_explicit(&g_cur_moe_layer,-1,memory_order_release);
@@ -7566,6 +7585,7 @@ static void kv_alloc(Model *m, int max_t){
         coli_vk_kv_reset();
         for(int i=0;i<c->n_layers+1;i++) m->vk_kv_valid[i]=0;
     }
+    glmc_kv_reset(m);                                    /* the dense chain's mirror too */
 #endif
     if(k->Lc){ for(int i=0;i<c->n_layers+1;i++){
 #ifdef COLI_METAL
@@ -7634,6 +7654,19 @@ static void kv_bind(Model *m, KVState *k){
     m->max_t=k->max_t; m->kv_start=k->kv_start;
 }
 
+#ifdef COLI_VULKAN
+/* DUMP=<path>: every logits row step(), step_all() and the teacher-forced pass compute,
+ * appended as raw f32, for the Vulkan gates (tests/vulkan_engines.sh glm-chain) to
+ * compare the device's with the CPU's. */
+static FILE *g_dump; static int g_dump_init;
+static void dump_logits(const float *lo, int64_t n){
+    if(!g_dump_init){ g_dump_init=1; const char *p=getenv("DUMP"); if(p&&*p) g_dump=fopen(p,"wb"); }
+    if(g_dump){ fwrite(lo,sizeof(float),(size_t)n,g_dump); fflush(g_dump); }
+}
+#define DUMP_LOGITS(lo,n) dump_logits((lo),(n))
+#else
+#define DUMP_LOGITS(lo,n) ((void)0)
+#endif
 static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int pos_base);
 static float *step(Model *m, const int *ids, int S, int pos_base){
     Cfg *c=&m->c; int D=c->hidden;
@@ -7669,6 +7702,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base){
     double th0=now_s();
     float *logit=falloc(c->vocab); matmul_qt(logit,last,&m->lm_head,1);
     m->t_head += now_s()-th0;
+    DUMP_LOGITS(logit,c->vocab);
     free(x); free(last); return logit;
 }
 
@@ -7683,6 +7717,7 @@ static float *step_all(Model *m, const int *ids, int S, int pos_base){
     float *lo=falloc((int64_t)S*c->vocab), *row=falloc(D);
     for(int s=0;s<S;s++){ rmsnorm(row, x+(int64_t)s*D, m->final_norm, D, c->eps);
         matmul_qt(lo+(int64_t)s*c->vocab, row, &m->lm_head, 1); }
+    DUMP_LOGITS(lo,(int64_t)S*c->vocab);
     free(x); free(row); return lo;
 }
 
@@ -8207,6 +8242,7 @@ static int forward_all(Model *m, const int *ids, int S, int *pred, const int *re
     for(int s=0;s<S;s++){
         rmsnorm(row, x+(int64_t)s*D, m->final_norm, D, c->eps);   /* heap row (#183) */
         matmul_qt(lo, row, &m->lm_head, 1);
+        DUMP_LOGITS(lo,c->vocab);
         if(!oracle_logits_finite(lo,c->vocab)){
             fprintf(stderr,"[ORACLE] non-finite logits at teacher-forcing position %d\n",s);
             finite=0; pred[s]=-1; continue;
@@ -10224,6 +10260,9 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
                            (size_t)n*cc->index_hd*sizeof(float));
             }
             memcpy(sc->hist+from,tmp+from,(size_t)n*sizeof(int));
+#ifdef COLI_VULKAN
+            glmc_host_rows(m,&sc->kv,from);   /* the dense chain's mirror of this slot, from `from` on */
+#endif
             sc->len=blen;
             if(m->has_mtp) m->kv_start[cc->n_layers]=-1;   /* MTP rows are per-slot decode state */
             fprintf(stderr,"[API] KV cross-slot adopt: slot %d took rows [%d,%d) from slot %d\n",
@@ -12940,8 +12979,10 @@ int main(int argc, char **argv){
       if(g_prof) prof_config(&m, ram_env, est_ctx); }
 #ifdef COLI_VULKAN
     vk_dense_preload(&m);   /* dense claims VRAM first — the tier sizes to the remainder */
+    glmc_start(&m);         /* COLI_VK_CHAIN: the chain's trunk on the device, before the tier sizes itself */
     vk_tier_start(&m);      /* the shared expert tier: needs the usage history and the cap above */
     vk_dev2_fill(&m);       /* COLI_VK_DEV2: the hottest experts the tier does not hold */
+    glmc_atexit(&m);        /* after the tier's: the chain goes before the device */
 #endif
     const char *stats=getenv("STATS");   /* STATS=<file> -> istogramma uso expert a fine run */
 
