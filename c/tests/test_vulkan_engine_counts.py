@@ -7,6 +7,9 @@ import tempfile
 import unittest
 
 
+# Use the resolved executable: Windows can otherwise launch System32's WSL
+# shim instead of the MSYS2 Bash found on PATH.
+BASH = shutil.which("bash")
 SCRIPT = Path(__file__).with_name("vulkan_engines.sh").read_text()
 # Load only these production helpers: sourcing the full script runs a family.
 HELPERS = re.search(r"^fail\(\).*?$", SCRIPT, re.M).group() + "\n"
@@ -14,16 +17,16 @@ for name in ("vk_count", "need_gpu"):
     HELPERS += re.search(rf"^{name}\(\).*?^\}}", SCRIPT, re.M | re.S).group() + "\n"
 
 
-@unittest.skipUnless(shutil.which("bash"), "the Vulkan harness requires bash")
+@unittest.skipUnless(BASH, "the Vulkan harness requires bash")
 class VulkanEngineCounts(unittest.TestCase):
     def run_helper(self, log, engine="qwen36", helper="vk_count"):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "run.log"
             path.write_text(log)
             return subprocess.run(
-                ["bash", "-eu", "-o", "pipefail", "-c",
+                [BASH, "-eu", "-o", "pipefail", "-c",
                  HELPERS + f'{helper} "$1" "$2" regression',
-                 "counts-test", engine, str(path)],
+                 "counts-test", engine, path.as_posix()],
                 capture_output=True, text=True, check=False,
             )
 
