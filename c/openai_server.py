@@ -4941,13 +4941,65 @@ def decision_state_type(value):
     return "number"
 
 
-def systemone_decision_record(body):
+def decision_json_sorted(value):
+    """A JSON value the way a raw-form engine's reference writes it (Clef's
+    render(): compact separators, keys sorted)."""
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _raw_decision_record(body):
+    """The raw form (docs/systemone.md, "Decision engines"): the caller's own
+    values, for an engine that renders the request the way its reference does.
+    Nothing is substituted: instructions are null when none were sent, an empty
+    text stays empty, a noul side the caller did not describe has no "text" key
+    (and null when it was described as null), and JSON values are written with
+    sorted keys and marked "json"."""
+    def option(label, value, given=True):
+        out = {"label": label}
+        if not given:
+            return out
+        if value is None or isinstance(value, str):
+            out["text"] = value
+        else:
+            out["text"] = decision_json_sorted(value)
+            out["json"] = True
+        return out
+
+    questions = []
+    for qid, question in body["questions"].items():
+        kind = question["type"]
+        criteria = question.get("criteria")
+        instructions = question.get("instructions")
+        if kind == "choice":
+            options = [option(str(label), text) for label, text in criteria.items()]
+        elif kind == "score":
+            options = [option(str(i), text) for i, text in enumerate(criteria)]
+        else:
+            given = criteria if isinstance(criteria, dict) else {}
+            options = [option(side, given.get(side), side in given) for side in ("false", "true")]
+        questions.append({"id": qid, "type": kind,
+                          "instructions": (instructions if instructions is None or
+                                           isinstance(instructions, str)
+                                           else decision_json_sorted(instructions)),
+                          "options": options})
+    state = body["state"]
+    return {"record": "raw",
+            "state": state if isinstance(state, str) else decision_json_sorted(state),
+            "state_type": decision_state_type(state), "questions": questions}
+
+
+def systemone_decision_record(body, form=None):
     """The DECIDE record for a /v1/systemone request that passed validation.
 
     Each question keeps its options in the caller's order: a choice's labels with
     their descriptions, a score's levels (level 0 first), a noul's false then true
     with the optional criteria. Instructions left out get the same default text the
-    LLM path asks with."""
+    LLM path asks with. form="raw" is the form an engine asks for with
+    `CAPS decide_record=raw` (_raw_decision_record)."""
+    if form == "raw":
+        return _raw_decision_record(body)
+    if form is not None:
+        raise ValueError(f"unknown DECIDE record form: {form!r}")
     defaults = {"noul": "Is this true?", "choice": "Which of the following applies?",
                 "score": "Rate this on the scale below."}
     questions = []
@@ -4983,7 +5035,7 @@ def _decision_texts(record):
         yield question["instructions"]
         for option in question["options"]:
             yield option["label"]
-            yield option["text"]
+            yield option.get("text")          # a raw record's undescribed noul side has none
 
 
 def decision_payload(record):
@@ -5111,6 +5163,10 @@ class Engine:
         # means it has nothing else: the generating endpoints answer 400.
         self.decides = self.caps.get("decide") == "1"
         self.chats = self.caps.get("chat") != "0"
+        # decide_record=raw: the engine renders the request the way its own reference
+        # does (Clef), so the record carries the caller's values, not the gateway's
+        # defaults (systemone_decision_record). None: the default form.
+        self.decide_record = self.caps.get("decide_record")
         self.dispatcher = threading.Thread(target=self._dispatch_stdout,
                                            name="colibri-stdout", daemon=True)
         self.dispatcher.start()
@@ -6783,7 +6839,11 @@ class APIHandler(BaseHTTPRequestHandler):
         """The native path: the request as one DECIDE record, the engine's
         probabilities back, shaped exactly like the LLM path's reply. No prompt is
         rendered and no option is scored on its own: one round trip, one forward."""
-        record = systemone_decision_record(body)
+        form = getattr(self.server.engine, "decide_record", None)
+        if form not in (None, "raw"):
+            raise APIError(502, f"The decision engine asks for a record form this server does not "
+                                f"write ({form!r}).", None, "engine_error", "server_error")
+        record = systemone_decision_record(body, form)
         if cache_slot is None:
             cache_slot = conversation_cache_slot([{"role": "system", "content": record["state"]}],
                                                  self.server.kv_slots)

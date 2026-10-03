@@ -347,6 +347,26 @@ def main():
         if Path(extra_path).is_file():
             shutil.copy2(extra_path, out / extra)
             print(f"{extra} -> {out / extra}")
+    # A decision head over the backbone (Cloudflare's Clef: docs/clef.md) is two
+    # files next to the shards, outside the index. They are copied as they are:
+    # the engine reads the head from them, and coli recognises the checkpoint by
+    # them. Both or neither: half a head would load as a chat model that cannot
+    # say why it does not decide.
+    head_files = ("joint_head_config.json", "joint_head.safetensors")
+    if args.repo:
+        listed = set(HfApi(token=token).list_repo_files(args.repo))
+        head_paths = ([hf_hub_download(args.repo, name, token=token) for name in head_files]
+                      if all(name in listed for name in head_files) else [])
+    else:
+        head_paths = [str(src_dir / name) for name in head_files]
+    present = [path for path in head_paths if Path(path).is_file()]
+    if len(present) == len(head_files):
+        for name, path in zip(head_files, head_paths):
+            shutil.copy2(path, out / name)
+            print(f"{name} -> {out / name}")
+    elif present:
+        sys.exit(f"ERROR: {Path(present[0]).name} without its sibling: a decision head needs "
+                 f"both {' and '.join(head_files)}")
 
     # ---- build weight map (key -> shard file) ----
     if idx_path:
@@ -357,6 +377,8 @@ def main():
             sys.exit("remote repo without index.json is unsupported; download the repo first")
         wm = {}
         for sh in sorted(src_dir.glob("*.safetensors")):
+            if sh.name in head_files:      # the decision head, copied above
+                continue
             with safe_open_np(str(sh), framework="np") as f:
                 for k in f.keys():
                     wm[k] = sh.name

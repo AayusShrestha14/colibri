@@ -65,6 +65,8 @@ static int qwen36_max_ctx(void) {
 #include "pin_pool.h"   /* riuso del prefisso tra turni (shared) */
 #include "decode_batch.h" /* ColiSubmit + coli_submit_ext: le chiavi key=value di SUBMIT */
 #include "json.h"   /* tokenizer.json parsing (reuse minimal parser) */
+#include "tok_unicode.h"        /* is_S/is_L/is_N: the exact pre-tokenizer classes (Clef) */
+#include "qwen38_nfc.h"         /* NFC, the tokenizer.json normalizer (Clef) */
 #include "qwen36_tier.h"   /* optional CUDA VRAM expert tier */
 #include "vk_tier.h"       /* optional Vulkan routed-expert tier (COLI_VULKAN=1; stubs without VK=1) */
 #include "route_trace.h"   /* the tier's expert history (.coli_usage), kept only while the tier is on */
@@ -133,7 +135,23 @@ static const char *jstr(jval *o,const char *k){ jval *v=json_get(o,k); return (v
 static double jnum(jval *o,const char *k){ jval *v=json_get(o,k); return (v&&v->t==J_NUM)?v->num:0; }
 
 enum { U_W=0, U_L=1, U_M=2, U_N=3, U_P=4, U_O=5 };
+/* Clef (clef_head.h) renders every request into the prompt its reference
+ * tokenizes, so its token ids must be the reference's to the last one: the full
+ * Unicode classes and the NFC normalizer. The regex is the one its tokenizer.json
+ * and transformers' Qwen2Tokenizer apply, `[^\r\n\p{L}\p{N}]?\p{L}+` and
+ * ` ?[^\s\p{L}\p{N}]+[\r\n]*`: a combining mark is not part of a letter run there
+ * (measured: "x" U+0303 U+0304 "y" is three pieces), so it is classed with
+ * punctuation and U_M never comes out. The ranges below are the original
+ * approximation, kept for every other checkpoint so their ids do not move. */
+static int g_tok_exact = 0;
+static int g_clef = 0;        /* a Clef decision head is loaded (DECIDE answered) */
 static int uclass(unsigned cp){
+    if (g_tok_exact) {
+        if (is_S(cp)) return U_W;
+        if (is_L(cp)) return U_L;
+        if (is_N(cp)) return U_N;
+        return U_P;
+    }
     if (cp==0x20||cp==0x09||cp==0x0A||cp==0x0D||cp==0x0B||cp==0x0C) return U_W;
     if (cp==0x00A0||cp==0x2000||cp==0x2001||cp==0x2002||cp==0x2003||cp==0x2004||cp==0x2005||cp==0x2006||cp==0x2007||cp==0x2008||cp==0x2009||cp==0x200A||cp==0x2028||cp==0x2029||cp==0x202F||cp==0x205F||cp==0x3000||cp==0xFEFF) return U_W;
     if (cp>=0x30&&cp<=0x39) return U_N;
@@ -320,6 +338,21 @@ static void encode_text(const char *text,int **out_ids,int *out_n){
         /* Ordinary text runs to the next added token, and the pre-tokenizer
          * sees that boundary as the end of its input, exactly as HF's does. */
         int end=next_special(text,i+1,tlen);
+        if(g_tok_exact){
+            /* the added tokens are matched on the original bytes (normalized=false),
+             * the ordinary span is NFC-normalized before the regex (qwen38.c) */
+            char *norm=NULL; size_t nl=0;
+            if(q38_nfc_normalize(text+i,(size_t)(end-i),&norm,&nl)||nl>(size_t)INT_MAX){
+                free(norm); fprintf(stderr,"[enc] NFC normalization failed\n"); exit(1);
+            }
+            for(int k=0;k<(int)nl;){
+                int j=pretok_end(norm,k,(int)nl); if(j<=k) j=k+utf8_adv(norm,k,(int)nl);
+                if(j>(int)nl) j=(int)nl;
+                bpe_piece(norm+k,j-k,&ids,&n,&cap);
+                k=j;
+            }
+            free(norm); i=end; continue;
+        }
         while(i<end){
             int j=pretok_end(text,i,end); if(j<=i) j=i+utf8_adv(text,i,end);
             if(j>end) j=end;
@@ -3573,6 +3606,10 @@ static int   g_echo_k  = 0;      /* 0 = spento */
 static const char *g_echo_id = NULL;
 static void serve_echo(const char *id, int pos, int token, const float *lo, int V, int k);
 #endif
+/* Clef's decision head reads the final-normed hidden state of EVERY position of
+ * the prompt (clef_head.h). When set, step() writes them here, [S, hidden]; the
+ * DECIDE path sets it around its one prefill and nothing else ever does. */
+static float *g_hidden_sink = NULL;
 
 #ifdef COLI_VULKAN
 #include "qwen36_chain.h"  /* COLI_VK_CHAIN: every layer's dense chain on the device */
@@ -3616,6 +3653,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
 #ifndef QWEN36_NO_MAIN
         echo = g_echo_k > 0 && g_echo_id && S > 1;
 #endif
+        if (g_hidden_sink) echo = 1;   /* the head reads every row */
         chain_logit = falloc(c->vocab);
         if (!q36c_forward(m, x, S, pos_base, lf, echo, chain_logit)) {
             free(chain_logit); chain_logit = NULL;
@@ -3625,6 +3663,11 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     if (!chain_logit)
 #endif
     layers_forward_range(m, x, S, pos_base, 0, c->n_layers, 1, lf);
+    if (g_hidden_sink) {
+        #pragma omp parallel for schedule(static)
+        for (int s = 0; s < S; s++)
+            rmsnorm_row(g_hidden_sink + (int64_t)s*D, x + (int64_t)s*D, m->final_norm, D, c->eps);
+    }
     /* Recorded HERE, where the tokens actually entered the state, rather than
      * derived from the caller's bookkeeping: the invariant that fed[0..len-1]
      * are the ids the state was built from is the whole safety argument. */
@@ -4112,6 +4155,24 @@ static int serve_read_req(ServeReq *q){
         g_pending_image.grid_h = gh; g_pending_image.grid_w = gw; g_pending_image.present = 1;
         return 0;
     }
+    if(g_clef && !strcmp(cmd,"DECIDE")){
+        /* DECIDE <id> <slot> <bytes>, then the record and a newline (Clef only:
+         * an engine without the head never announced decide=1). As for IMAGE, a
+         * header that does not say how long the payload is ends the session. */
+        int dslot; unsigned long long bytes;
+        if(sscanf(line,"%*s %*s %d %llu",&dslot,&bytes)!=2 || dslot<0 || bytes>(64ull<<20)){
+            printf("ERROR %s BAD_FRAME\n",id); fflush(stdout); return -1;
+        }
+        char *payload=malloc((size_t)bytes+1);
+        if(!payload){ printf("ERROR %s DECIDE_FAILED out of memory\n",id); fflush(stdout); return -1; }
+        if(bytes && fread(payload,1,(size_t)bytes,stdin)!=(size_t)bytes){ free(payload); return -1; }
+        int t = fgetc(stdin); if(t=='\r') t = fgetc(stdin);
+        if(t!='\n'){ free(payload); return -1; }
+        payload[bytes]=0;
+        snprintf(q->id,sizeof(q->id),"%s",id);
+        q->payload=payload; q->plen=(int)bytes;
+        return 3;
+    }
     if(!strcmp(cmd,"CANCEL")||!strcmp(cmd,"STOP")) return 0;
     if(strcmp(cmd,"SUBMIT")) return 0;
     int slot, plen, max_tok; float temp, top_p;
@@ -4467,13 +4528,313 @@ static void serve_one(Model *m, ServeReq *q){
 #endif
 }
 
+/* ======================= Clef: DECIDE on the same engine ======================= *
+ * Cloudflare's Clef (docs/clef.md) is Qwen3.8-27B post-trained with a joint schema
+ * head: a container converted from it carries joint_head_config.json and
+ * joint_head.safetensors next to its shards (tools/convert_qwen36.py copies them).
+ * With them the engine still chats, and also answers DECIDE: the record is
+ * rendered the way the reference renders it (clef_head.h), the backbone reads it
+ * in one prefill, and the head scores every option from the final-normed hidden
+ * state of every position. Without the two files none of this runs: g_clef stays
+ * 0, CAPS says what it always said, and a DECIDE frame is not even parsed. */
+#include "clef_head.h"
+
+static ClefHead g_clef_head;
+static int g_clef_max_len = CLEF_MAX_LENGTH;
+
+static int q36_has_clef_head(const char *snap){
+    char a[2048], b[2048];
+    snprintf(a, sizeof a, "%s/joint_head_config.json", snap);
+    snprintf(b, sizeof b, "%s/joint_head.safetensors", snap);
+    FILE *fa = fopen(a, "rb"), *fb = fopen(b, "rb");
+    int both = fa && fb;
+    if (fa) fclose(fa);
+    if (fb) fclose(fb);
+    return both;
+}
+
+/* A tensor of joint_head.safetensors (st_init indexed it with the shards) as f32. */
+static float *q36_clef_tensor(void *ctx, const char *name, int64_t numel){
+    Model *m = (Model *)ctx;
+    st_tensor *t = st_find(&m->S, name);
+    if (!t || t->numel != numel || t->dtype > 2) return NULL;   /* BF16, F16, F32 */
+    float *p = (float *)malloc((size_t)numel * sizeof(float));
+    if (!p) return NULL;
+    st_read_f32(&m->S, name, p, 0);
+    return p;
+}
+
+/* The LM head's row for a token, at the precision on disk: the lexical option
+ * vectors average them, and the dense copy the engine multiplies with may be
+ * int8 or int4. */
+static int q36_clef_lm_row(void *ctx, int id, float *out){
+    Model *m = (Model *)ctx;
+    int D = m->c.hidden;
+    if (id < 0 || id >= m->c.vocab) return 0;
+    if (m->lm_head.w) { memcpy(out, m->lm_head.w + (int64_t)id * D, (size_t)D * sizeof(float)); return 1; }
+    char rn[QW_DENSE_NAME_MAX];
+    st_tensor *t = st_find(&m->S, dense_resolve(m, "lm_head.weight", rn, sizeof rn));
+    if (!t || t->numel != (int64_t)m->c.vocab * D || t->dtype > 2) return 0;
+    int esz = st_dtype_esz(t->dtype);
+    uint16_t *raw = (uint16_t *)malloc((size_t)D * esz);
+    if (!raw) return 0;
+    st_read_range_raw_cap(&m->S, t->fd, t->off + (int64_t)id * D * esz, (int64_t)D * esz,
+                          raw, (int64_t)D * esz, 0, "clef lm_head row");
+    if (t->dtype == 0) bf16_to_f32_bulk(raw, out, D);
+    else if (t->dtype == 1) f16_to_f32_bulk(raw, out, D);
+    else memcpy(out, raw, (size_t)D * sizeof(float));
+    free(raw);
+    return 1;
+}
+
+static int q36_clef_encode(void *ctx, const char *text, int **ids, int *count){
+    (void)ctx;
+    encode_text(text, ids, count);
+    return 1;
+}
+
+/* joint_head_config.json -> the head's shape, checked against the backbone, then
+ * every tensor. A broken head is a refusal at load, never a chat model that
+ * quietly cannot decide. */
+static void q36_clef_load(Model *m, const char *snap){
+    char path[2048];
+    snprintf(path, sizeof path, "%s/joint_head_config.json", snap);
+    FILE *f = fopen(path, "rb");
+    if (!f) { perror(path); exit(1); }
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    if (n <= 0 || n > (1L << 20)) { fprintf(stderr, "[clef] %s: empty or larger than 1 MB\n", path); exit(1); }
+    char *buf = (char *)malloc((size_t)n + 1);
+    if (!buf || fread(buf, 1, (size_t)n, f) != (size_t)n) { fprintf(stderr, "[clef] cannot read %s\n", path); exit(1); }
+    buf[n] = 0; fclose(f);
+    jval *cfg = json_parse_checked(buf);
+    free(buf);
+    if (!cfg || cfg->t != J_OBJ) { fprintf(stderr, "[clef] %s is not a JSON object\n", path); exit(1); }
+    ClefHead *h = &g_clef_head;
+    memset(h, 0, sizeof(*h));
+    #define CLEF_KEY(key, field, lo, hi) do { jval *v = json_get(cfg, key); \
+        if (!v || v->t != J_NUM || v->num != floor(v->num) || v->num < (lo) || v->num > (hi)) { \
+            fprintf(stderr, "[clef] %s: \"%s\" missing or outside %d..%d -- refusing\n", path, key, lo, hi); exit(1); } \
+        h->field = (int)v->num; } while (0)
+    CLEF_KEY("hidden_size", hidden, 1, 65536);
+    CLEF_KEY("width", width, 1, 16384);
+    CLEF_KEY("routing_layers", routing_layers, 0, 64);
+    CLEF_KEY("layers", layers, 0, 64);
+    CLEF_KEY("heads", heads, 1, 256);
+    CLEF_KEY("feedforward", feedforward, 1, 65536);
+    #undef CLEF_KEY
+    json_free(cfg);
+    if (h->hidden != m->c.hidden || h->width % h->heads) {
+        fprintf(stderr, "[clef] head hidden_size %d / width %d / heads %d do not fit a %d-wide backbone -- refusing\n",
+                h->hidden, h->width, h->heads, m->c.hidden);
+        exit(1);
+    }
+    char err[256];
+    if (!clef_head_load(h, m, q36_clef_tensor, err, sizeof err)) {
+        fprintf(stderr, "[clef] joint_head.safetensors: %s -- refusing\n", err);
+        exit(1);
+    }
+    const char *e = getenv("COLI_CLEF_MAX_LEN");
+    if (e && *e) {
+        g_clef_max_len = atoi(e);
+        if (g_clef_max_len < 1) { fprintf(stderr, "[clef] COLI_CLEF_MAX_LEN must be positive\n"); exit(1); }
+    }
+    g_clef = 1;
+    fprintf(stderr, "[clef] decision head: %d routing + %d decoder layers, width %d, %d heads; "
+            "a record reads up to %d tokens (the engine's context is %d)\n",
+            h->routing_layers, h->layers, h->width, h->heads, g_clef_max_len, qwen36_max_ctx());
+}
+
+/* One record: rendered, one prefill that keeps every position's hidden state,
+ * the head, a softmax per question. `keep` (the --records test mode) leaves the
+ * rendered input in *last for the caller to print. */
+static int q36_clef_decide(Model *m, const DecideRecord *rec, DecideAnswer *answers, int *input_tokens,
+                           ClefInput *last, char *err, size_t cap){
+    Cfg *c = &m->c;
+    ClefInput in;
+    if (!clef_render(rec, q36_clef_encode, NULL, g_clef_max_len, &in, err, cap)) return 0;
+    int max_ctx = qwen36_max_ctx();
+    if (in.n > max_ctx) {
+        int n = in.n;
+        clef_input_free(&in);
+        return decide_fail(err, cap, "record: %d tokens do not fit this engine's context of %d "
+                           "(Q36_MAXT; Clef itself reads up to %d)", n, max_ctx, g_clef_max_len);
+    }
+    float *hidden = (float *)malloc((size_t)in.n * c->hidden * sizeof(float));
+    double **logits = (double **)calloc((size_t)in.n_q, sizeof(double *));
+    int ok = hidden && logits;
+    for (int q = 0; ok && q < in.n_q; q++) ok = (logits[q] = (double *)calloc((size_t)in.q[q].n, sizeof(double))) != NULL;
+    if (!ok) snprintf(err, cap, "out of memory for %d positions", in.n);
+    if (ok) {
+        /* a decision reads from position 0, with no picture and no reuse: the
+         * attention rows and the recurrence it leaves behind are recorded in kvp
+         * by step(), so the next chat turn or snapshot checks them as usual */
+        q36_vision_detach(m);
+        m->max_t = in.n;
+        ensure_kv(m);
+        reset_recurrent(m);
+        m->kv_len = 0;
+        m->first_step = 1;
+        if (m->seen) memset(m->seen, 0, (size_t)c->n_layers * c->n_experts);
+        if (m->momentum_logits) memset(m->momentum_logits, 0, (size_t)c->n_layers * c->n_experts * sizeof(float));
+        g_hidden_sink = hidden;
+        float *lo = step(m, in.ids, in.n, 0);
+        g_hidden_sink = NULL;
+        free(lo);
+        ok = clef_head_forward(&g_clef_head, hidden, &in, q36_clef_lm_row, m, logits, err, cap);
+    }
+    for (int q = 0; ok && q < in.n_q; q++) {
+        ok = clef_answer(&in.q[q], logits[q], &answers[q]);
+        answers[q].tokens = in.n;
+        answers[q].state_tokens = in.state_tokens;
+        answers[q].state_dropped = in.state_tokens - in.state_used;
+        if (!ok) snprintf(err, cap, "out of memory");
+    }
+    if (logits) for (int q = 0; q < in.n_q; q++) free(logits[q]);
+    free(logits); free(hidden);
+    *input_tokens = in.n;
+    if (ok && last) *last = in;
+    else clef_input_free(&in);
+    return ok;
+}
+
+/* DECIDE <id>: DECISION + DONE, or ERROR <id> DECIDE_INVALID|DECIDE_FAILED. */
+static void clef_serve_one(Model *m, ServeReq *q){
+    char reason[1024] = "";
+    DecideRecord rec;
+    if (!decide_record_parse(q->payload, &rec, reason, sizeof reason)) {
+        decide_write_refusal(stdout, q->id, "DECIDE_INVALID", reason);
+        return;
+    }
+    DecideAnswer *answers = (DecideAnswer *)calloc((size_t)rec.n_questions, sizeof(DecideAnswer));
+    int tokens = 0;
+    double started = decide_now_ms();
+    int ok = answers && q36_clef_decide(m, &rec, answers, &tokens, NULL, reason, sizeof reason);
+    double elapsed = decide_now_ms() - started;
+    if (!ok) {
+        if (!answers) snprintf(reason, sizeof reason, "out of memory");
+        decide_write_refusal(stdout, q->id, decide_is_request_error(reason) ? "DECIDE_INVALID" : "DECIDE_FAILED",
+                             reason);
+    } else {
+        size_t length = 0;
+        char *json = decide_answers_json(&rec, answers, tokens, elapsed, &length);
+        if (!json) coli_serve_write_error(stdout, q->id, "DECIDE_FAILED out of memory");
+        else {
+            ColiServeDone done = {0, elapsed > 0 ? tokens / (elapsed / 1e3) : 0.0, 0.0, rss_gb(), tokens, 0};
+            coli_serve_write_decision(stdout, q->id, json, length);
+            coli_serve_write_done(stdout, q->id, &done);
+            free(json);
+        }
+    }
+    fprintf(stderr, "[clef] DECIDE %s: %d question(s), %d tokens, %.1f ms\n", q->id, rec.n_questions, tokens, elapsed);
+    decide_answers_free(answers, answers ? rec.n_questions : 0);
+    free(answers);
+    decide_record_free(&rec);
+}
+
+static char *q36_read_file(const char *path){
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    char *buf = n >= 0 ? (char *)malloc((size_t)n + 1) : NULL;
+    if (!buf || fread(buf, 1, (size_t)n, f) != (size_t)n) { free(buf); fclose(f); return NULL; }
+    buf[n] = 0; fclose(f);
+    return buf;
+}
+
+/* Test modes (tests/test_clef_tiny.py), the path the serve loop takes minus the
+ * wire: CLEF_TOKENIZE=<json array of strings> prints their ids; CLEF_RECORDS=
+ * <json array of {"payload": record}> prints one DECISION object per record, and
+ * with CLEF_IDS=1 the rendered input (ids, spans, option order) beside it. */
+static int q36_clef_test_modes(Model *m){
+    const char *tok = getenv("CLEF_TOKENIZE"), *recs = getenv("CLEF_RECORDS");
+    if (tok) {
+        char *text = q36_read_file(tok);
+        jval *root = text ? json_parse_checked(text) : NULL;
+        if (!root || root->t != J_ARR) { fprintf(stderr, "%s: expected a JSON array of strings\n", tok); return 1; }
+        printf("[");
+        for (int i = 0; i < root->len; i++) {
+            if (root->kids[i]->t != J_STR) { fprintf(stderr, "%s: entry %d is not a string\n", tok, i); return 1; }
+            int *ids = NULL, n = 0;
+            encode_text(root->kids[i]->str, &ids, &n);
+            printf("%s[", i ? "," : "");
+            for (int t = 0; t < n; t++) printf("%s%d", t ? "," : "", ids[t]);
+            printf("]");
+            free(ids);
+        }
+        printf("]\n");
+        json_free(root); free(text);
+        return 0;
+    }
+    if (!g_clef) { fprintf(stderr, "CLEF_RECORDS: this checkpoint has no decision head\n"); return 1; }
+    int dump = getenv("CLEF_IDS") && getenv("CLEF_IDS")[0] == '1';
+    char *text = q36_read_file(recs);
+    jval *root = text ? json_parse_checked(text) : NULL;
+    if (!root || root->t != J_ARR) { fprintf(stderr, "%s: expected a JSON array of records\n", recs); return 1; }
+    for (int i = 0; i < root->len; i++) {
+        jval *payload = json_get(root->kids[i], "payload");
+        char reason[1024] = "";
+        DecideRecord rec;
+        DecideBuf out = {0};
+        if (!payload || payload->t != J_STR || !decide_record_parse(payload->str, &rec, reason, sizeof reason)) {
+            if (!payload || payload->t != J_STR) snprintf(reason, sizeof reason, "record %d has no string payload", i);
+            decide_buf_put(&out, "{\"error\":", 9); decide_buf_string(&out, reason); decide_buf_put(&out, "}", 1);
+            printf("%s\n", out.data); fflush(stdout); free(out.data);
+            continue;
+        }
+        DecideAnswer *answers = (DecideAnswer *)calloc((size_t)rec.n_questions, sizeof(DecideAnswer));
+        ClefInput in; memset(&in, 0, sizeof in);
+        int tokens = 0;
+        double t0 = decide_now_ms();
+        int ok = answers && q36_clef_decide(m, &rec, answers, &tokens, &in, reason, sizeof reason);
+        double ms = decide_now_ms() - t0;
+        if (!ok) {
+            decide_buf_put(&out, "{\"error\":", 9); decide_buf_string(&out, reason); decide_buf_put(&out, "}", 1);
+        } else {
+            size_t len = 0;
+            char *json = decide_answers_json(&rec, answers, tokens, ms, &len);
+            if (json && len > 1) {
+                decide_buf_put(&out, json, len - 1);            /* reopen the object */
+                if (dump) {
+                    decide_buf_put(&out, ",\"input_ids\":[", 14);
+                    for (int t = 0; t < in.n; t++) decide_buf_printf(&out, "%s%d", t ? "," : "", in.ids[t]);
+                    decide_buf_printf(&out, "],\"state_tokens\":%d,\"state_used\":%d,\"spans\":[",
+                                      in.state_tokens, in.state_used);
+                    for (int q = 0; q < in.n_q; q++) {
+                        const ClefQuestion *cq = &in.q[q];
+                        decide_buf_printf(&out, "%s{\"type\":%d,\"question\":[%d,%d],\"options\":[",
+                                          q ? "," : "", cq->type, cq->qs, cq->qe);
+                        for (int k = 0; k < cq->n; k++) decide_buf_printf(&out, "%s[%d,%d]", k ? "," : "", cq->os[k], cq->oe[k]);
+                        decide_buf_put(&out, "],\"order\":[", 11);
+                        for (int k = 0; k < cq->n; k++) decide_buf_printf(&out, "%s%d", k ? "," : "", cq->record_index[k]);
+                        decide_buf_put(&out, "]}", 2);
+                    }
+                    decide_buf_put(&out, "]", 1);
+                }
+                decide_buf_put(&out, "}", 1);
+            }
+            free(json);
+        }
+        printf("%s\n", out.data ? out.data : "{\"error\":\"out of memory\"}");
+        fflush(stdout);
+        free(out.data);
+        clef_input_free(&in);
+        decide_answers_free(answers, answers ? rec.n_questions : 0);
+        free(answers);
+        decide_record_free(&rec);
+    }
+    json_free(root); free(text);
+    return 0;
+}
+
 static void serve_loop(Model *m){
     coli_serve_binary_mode();
     setvbuf(stdin,NULL,_IONBF,0);
     fputs("\x01\x01READY\x01\x01\n",stdout);
     /* fra READY e STAT: il gateway lo legge nella stretta di mano, quindi sa che
      * modalita' serve prima della prima richiesta (docs/serve_protocol.md) */
-    printf("CAPS vision=%d\n",m->vis_ready?1:0);
+    /* Clef answers DECIDE too, and still chats: decide=1 without chat=0. Its
+     * records come in the raw form (decide_record=raw, decide_serve.h). */
+    printf("CAPS vision=%d%s\n",m->vis_ready?1:0,g_clef?" decide=1 decide_record=raw":"");
     printf("STAT 0 0.00 0.0 %.2f\n",rss_gb());
     fflush(stdout);
     emap_emit(m);          /* dopo READY e STAT: il boot reader legge STAT dopo il sentinel */
@@ -4490,6 +4851,7 @@ static void serve_loop(Model *m){
          * inkling.c, kimi_k3.c, qwen38.c, deepseek_v41.c and colibri.c
          * already do this. */
         if(r==2){ serve_one(m,&q); q36_vision_detach(m); free(q.payload); emap_emit(m); }
+        if(r==3){ clef_serve_one(m,&q); free(q.payload); }
     }
 }
 
@@ -4713,6 +5075,7 @@ int main(int argc, char **argv) {
      * is ever reached — which is exactly how `coli` launches it (SERVE=1, no
      * prompt argument). */
     int serve_mode = getenv("SERVE") && getenv("SERVE")[0]=='1';
+    if (getenv("CLEF_RECORDS") || getenv("CLEF_TOKENIZE")) serve_mode = 1;   /* Clef's test modes: no prompt */
 
     /* load tokenizer early so text-prompt mode can encode before model_init */
     {
@@ -4720,6 +5083,9 @@ int main(int argc, char **argv) {
         if (tokpath && *tokpath) load_tokenizer(tokpath);
         else if (argc > 4 && argv[4] && *argv[4]) load_tokenizer(argv[4]);
         else { char tpb[2048]; snprintf(tpb,sizeof tpb,"%s/tokenizer.json",snap); load_tokenizer(tpb); }
+        /* Clef: its requests are rendered into prompts, and the ids must be the
+         * reference tokenizer's (see g_tok_exact) */
+        if (q36_has_clef_head(snap)) g_tok_exact = 1;
     }
 
     if (serve_mode) {
@@ -4754,6 +5120,7 @@ int main(int argc, char **argv) {
      * with the run's tokens already correct (#1262). Static storage outlives
      * every thread, so the pointer the worker holds stays valid. */
     static Model m; model_init(&m, snap, cap, bits);
+    if (g_tok_exact) q36_clef_load(&m, snap);
     g_expert_gs = m.c.expert_gs;
     if (g_expert_gs) fprintf(stderr, "[qwen36] group-scaled experts: gs=%d\n", g_expert_gs);
     fprintf(stderr, "resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
@@ -4964,6 +5331,10 @@ int main(int argc, char **argv) {
     /* coli serve mode: speak the gateway wire protocol instead of argv
      * generation. AFTER the tier init: serve sessions ride the VRAM experts
      * exactly like argv runs, and serve_loop never returns. */
+    if (getenv("CLEF_RECORDS") || getenv("CLEF_TOKENIZE")) {
+        if (!g_tok) { fprintf(stderr, "[clef] tokenizer.json required\n"); return 1; }
+        return q36_clef_test_modes(&m);
+    }
     if (getenv("SERVE") && getenv("SERVE")[0] == '1') {
         if (!g_tok) { fprintf(stderr, "[serve] tokenizer.json required (put in SNAP or set TOK)\n"); return 1; }
         serve_loop(&m);
