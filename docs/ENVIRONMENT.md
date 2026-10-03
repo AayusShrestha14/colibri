@@ -228,6 +228,8 @@ Per-drive byte counts are reported in a `MIRROR:` stats line. Combine with `DIRE
 | `COLI_VK_COOP_SG` | `64` where allowed | Subgroup size the cooperative-matrix pipeline requires (RDNA3: wave64 measured fastest). Tuning only. |
 | `COLI_VK_GEMM_TILE` | measured | `bm,bn,bk,tm,tn[,pf]`: one tile for every width of the fp32 GEMM instead of the measured pair. Tuning only (`COLI_VK_TEST_GEMM_BENCH`). |
 | `COLI_VK_COOP_TILE` | measured | `bm,bn,wm,wn,bk`: one tile for every width of the cooperative-matrix GEMM. Tuning only. |
+| `COLI_VK_STAGED` | auto | Staged uploads: resident data (the weights, the expert tier, the MLA KV mirror, `COLI_VK_DEV2`'s experts) copied into device-local memory the host does not map, through a host staging buffer, instead of written through a mapping of the host-visible device-local memory. `1` on, `0` off. Unset: on when the host-visible device-local heap is under a quarter of the largest device-local heap, as on a discrete card without Resizable BAR (about 256 MB of 8 GB, where the mapped path fails or spills to system RAM); off on a card with Resizable BAR, an integrated GPU or Lavapipe. See [vulkan.md](vulkan.md#memory-placement-without-resizable-bar). |
+| `COLI_VK_HOST_VISIBLE_CAP_MB` | unset | Tests: treat the host-visible device-local heap as at most this many MiB in the `COLI_VK_STAGED` decision, so a device with Resizable BAR or unified memory takes the decision a card without it would (`246` emulates an RTX 3070 on its launch VBIOS). |
 
 ### The routed-expert tier (`vk_tier.c`, every MoE engine)
 
@@ -365,6 +367,7 @@ These are for testing, benchmarking, or internal use — not part of the everyda
 | `COLI_GPU_FAIL_AFTER` | unset | Fault injection: make GPU compute calls start failing after N of them, to exercise the CPU fallback without real hardware faults. Uploads and queries are not gated. |
 | `COLI_VK_TEST_BALLAST` | `0` | Allocate N extra dummy Vulkan buffers to reproduce decode attention degrading with expert-tier size even when VRAM is free (measured 7.9s @2.6k buffer objects → 15.6s @4.3k with 2.9 GB still free). |
 | `COLI_VK_TEST_GEMM_BENCH` | unset | In the `VK_TEST` harness, time the GEMV against the fp32 and the cooperative-matrix GEMM per weight format and S, in GFLOP/s, instead of running the cases. `COLI_VK_TEST_GEMM_FMT=a,b,...`, `COLI_VK_TEST_GEMM_S=a,b,...` and `COLI_VK_TEST_GEMM_SHAPE=I,O` (default `2560,6144`) narrow it. |
+| `COLI_VK_TEST_NOFILL` | unset | In the `VK_TEST` harness with staged uploads, skip the zero fill of a fresh device-local block (the run-to-run difference #1338 measured on Polaris without it). |
 | `COLI_VK_TEST_HOSTMEM` | unset | In the `VK_TEST` harness, time the expert batch reading Qwen3.8-shaped int4-g64 experts from the tier's device memory against host memory imported with `VK_EXT_external_memory_host` (no copy), and what a copy into the tier costs, instead of running the cases. |
 | `COLI_SERVE_ALL_STOPS` | unset | In batched serve mode, keep every stop token instead of filtering to the EOS-like ones. Trades the #401 tool-call safety for behaviour some non-tool clients prefer. |
 | `VK_PROF` | unset | If set, time the Vulkan expert-group path and report it, and print at exit how the resident matmuls split between the GEMV, the fp32 GEMM and the cooperative-matrix GEMM, with their wall time. |

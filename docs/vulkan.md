@@ -26,15 +26,14 @@ Set `COLI_NO_OMP_TUNE=1` on multi-core boxes: the engine's OMP self-tune
 Vulkan, and spinning worker threads starve the async I/O pool (measured
 CPU expert bandwidth 28 → 5 GB/s without it).
 
-**Discrete cards need Resizable BAR.** The weight tiers allocate
-HOST_VISIBLE|DEVICE_LOCAL memory; with ReBAR disabled that combination only
-exists in a ~256 MB BAR window, and the driver silently places everything
-beyond it in system RAM — the tier then *reports* resident experts while every
-access crosses PCIe, slower than the CPU path (measured 0.11 vs 0.24 tok/s
-either side of the BIOS toggle on an RX 9070 XT). The engine now warns at init
-when the host-visible slice of VRAM is small; if you see that warning, enable
-Resizable BAR / Smart Access Memory in the BIOS. Unified-memory APUs are
-unaffected.
+**Discrete cards without Resizable BAR** expose HOST_VISIBLE|DEVICE_LOCAL memory
+only as a ~256 MB window. Writing the weights through a mapping of that window, as
+the backend does on every other device, either fails past it (NVIDIA) or lands in
+system RAM read over PCIe (RADV: measured 0.11 against 0.24 tok/s either side of
+the BIOS toggle on an RX 9070 XT). On such a card the backend now copies resident
+data into device-local memory through a staging buffer instead, on its own; see
+[Memory placement without Resizable BAR](#memory-placement-without-resizable-bar).
+Unified-memory APUs and cards with Resizable BAR keep the mapped path.
 
 The compiled shaders are found via `COLI_VK_SHADERS` (either the
 `qmatmul.spv` file or the directory holding the `.spv` set); unset, the
@@ -1193,6 +1192,127 @@ in short:
    forward's start for a model whose layer index never goes back (a single MoE layer).
 4. **Report**: `vkt_report("run"|"turn", ram_hits, disk_loads)` beside the engine's
    `[VK]` line; `vkt_resident(l, e)` gives EMAP its tier 2.
+
+## Memory placement without Resizable BAR
+
+Resident data (the dense weights, the routed-expert tier, the MLA KV mirror) is written
+by the host once and read by the device for the rest of the run. The mapped path puts it
+in the HOST_VISIBLE|DEVICE_LOCAL memory type and writes it through a mapping. On an
+integrated GPU, a CPU device (Lavapipe) or a discrete card with Resizable BAR, that type
+covers the device's memory. A discrete card without Resizable BAR (every Turing card,
+every Ampere card on its launch VBIOS, older AMD cards with the option off) exposes it
+as a window of about 256 MB of 8 GB or more. NVIDIA's driver refuses allocations past the
+window: on an RTX 3070 with its launch VBIOS the backend warned "only 246 of 8192 MB VRAM
+is host-visible", placed no matrix, every tier upload failed and the chain stopped at its
+first matrix. RADV places them in system RAM instead, where every access crosses PCIe.
+
+**Staged uploads** put resident data in a DEVICE_LOCAL memory type the host does not map
+and copy it there from a host staging buffer with `vkCmdCopyBuffer`.
+
+**The rule** (`place_decide` in `backend_vulkan.c`). `COLI_VK_STAGED=1` stages,
+`COLI_VK_STAGED=0` keeps the mapped path. Unset: staged when the host-visible
+device-local heap holds less than a quarter of the largest device-local heap, or there is
+no host-visible device-local type at all. That is a card without Resizable BAR (256 MB of
+8 GB) and never a card with it, an integrated GPU or Lavapipe, whose host-visible heap is
+the whole device-local heap. `COLI_VK_HOST_VISIBLE_CAP_MB=N` treats the host-visible heap
+as at most N MiB, so a device with Resizable BAR or unified memory takes the decision a
+card without it would (the tests use 246). The device-local target is a type that is not
+host-visible on the largest device-local heap (else that heap's device-local type:
+Lavapipe has one type for everything); the staging type is host-visible and coherent and
+not device-local where one exists, so staging never takes the window. Vendor types
+(AMD's uncached and device-coherent ones) are passed over.
+
+**What moves where, staged:**
+
+| Data | Mapped path | Staged |
+|---|---|---|
+| Dense resident tensors (`coli_vk_tensor_ensure`, `coli_vk_matmul`'s first call) | weight pool, host-visible | weight pool in device-local blocks; rows and scales streamed through two 16 MiB staging slots, the upload complete when the call returns |
+| The routed-expert tier's pool (`vk_tier.c`) | tier pool, host-visible, filled in place by the uploader thread | device-local; the uploader fills a host image (`coli_vk_tier_tensor`) and `coli_vk_tensor_commit` copies it, all three matrices of an expert in one submission |
+| `COLI_VK_DEV2`'s experts | its pool, host-visible | its pool in its device-local memory, by the same rule on that device |
+| MLA KV mirror and q-prep norm weights (`COLI_VK_ATTN`) | host-visible, written per row | device-local; each row is a pending copy recorded at the head of the next absorb or q-prep command buffer, their only readers |
+| The dense chain: state, KV caches, parameters (`VKC_DEV`) | device-local already, written through the frame's staging | unchanged |
+| The chain's host-written buffers (`VKC_UP`: frame staging, the rows each layer step uploads) | the host-visible device-local type | host staging memory, out of the window |
+| Readbacks (`VKC_DOWN`, `y` scratches) | host-visible, cached | unchanged |
+| Per-call input scratches, device-only scratches | unchanged | unchanged (a few MB, they fit the window) |
+
+**Synchronization.** One uploader per device, its own command pool, two command buffers
+and two fences (a slot is filled while the other copies), one upload at a time under its
+mutex. Its queue: a transfer-only family (a copy engine) when the device has one, else a
+spare queue of a family the backend already uses (the 780M's second compute queue, a third
+queue of the Iris Xe's main family), else the main queue (Lavapipe has one queue), in
+which case every submit of the backend and of the chain takes the same lock
+(`vk_submit`, `coli_vk_queue_submit`). An upload waits for its fences before it returns,
+so a tensor is complete before any queue reads it: the tier's uploader thread hands an
+expert to the engine thread only after its commit returned. When the uploader's family
+differs from the main or the tier queue's, the staged tensors' buffers are created
+`VK_SHARING_MODE_CONCURRENT` over those families. The KV mirror's pending copies ride the
+main queue in the same command buffer as their reader; a row written again before that
+(a rewound cache) first sends what is pending, so no two pending copies overlap.
+
+**A fresh device-local block is zero-filled** (`vkCmdFillBuffer`) before its first
+tensor. On an RX 580 (RADV, Polaris) the author of #1338, where this approach comes from,
+measured results that differed slightly from run to run when read from a block the GPU had
+never touched, and identical ones after a fill of any value. Skipping the fill
+(`COLI_VK_TEST_NOFILL=1` in the harness) changed nothing on Lavapipe, the Iris Xe or the
+780M: the harness's digest of every result was the same with and without it. It costs one
+fill per 256 MB block and stays.
+
+**Lines it prints.** At startup, staged only:
+
+```
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 21466 MiB heap) copied from host staging memory (type 2) on a queue of its own (246 of 21466 MiB of device-local memory is host-visible (COLI_VK_HOST_VISIBLE_CAP_MB))
+```
+
+and at exit, where the data ended up (the tests read the last field; qwen36's tiny
+fixture with the chain on the 780M, `COLI_VK_STAGED=1`):
+
+```
+[VK] memory at exit: weights 0.8 MiB, expert tier 0.4 MiB (peaks), KV mirror 0.0 MiB in device-local memory type 0 (not host-visible); the dense chain's state in type 0 (device-local); 1.2 MiB staged in 530 copies, 2 blocks zero-filled; resident data in host memory: 0.0 MiB
+```
+
+With `COLI_VK_STAGED=0` on a small-window card, the old warnings stay.
+
+**Tested.** None of our devices lacks Resizable BAR, so the path is forced
+(`COLI_VK_STAGED=1`) or the decision emulated (`COLI_VK_HOST_VISIBLE_CAP_MB=246`):
+
+- the `VK_TEST` harness prints a digest of every result the device returns (every
+  format, the tiled GEMMs, the expert batch, and in the full run the gate_up, the expert
+  group, the absorb core, the q-prep chain and a rewound KV mirror): mapped, staged,
+  staged without the zero fill and under the emulated window, the digest is the same on
+  Lavapipe, the Iris Xe through Dozen and the Radeon 780M, and for the format and
+  expert-batch cases the same as the backend's before this change;
+- `tests/vulkan_engines.sh staged`: that comparison, then the tier (`test_vk_tier`) and
+  the chain's ops (`test_vk_chain`) staged, each ending with no resident data in host
+  memory; `<family>-staged` runs a family with `COLI_VK_STAGED=1`, and `qwen-staged`
+  first runs qwen36's tier and chain under the emulated window with the decision left to
+  the backend (CI: the staged family and the shader family staged in the Vulkan job,
+  `qwen-staged` and `qwen-chain-staged` in the engines matrix);
+- on the 780M, qwen36's tiny fixture with the tier and the trunk on the device, and with
+  the chain: the CPU's tokens, and logits bit for bit the mapped run's, staged and under
+  the emulated window.
+
+**Measured on the 780M**, where staging is not needed (unified memory: the default stays
+mapped), to see what it costs: Qwen3.6-35B-A3B, the method of [the tier's
+measurements](#measured-on-a-radeon-780m) (int4 gs64 at cap 64, `OMP_NUM_THREADS=8`, the
+model files evicted from the page cache before each run, 1-min load under 2, every arm
+from the same history), the same binary, `COLI_VK_STAGED=0` against `1`. Decode is 100
+tokens after a 25-token prompt (in brackets the whole process, the warm start's 11 GiB of
+staged experts included), prefill a 512-token prompt (time to the first token):
+
+| | mapped | staged |
+|---|---|---|
+| decode, tier (trunk on the CPU) | 7.94 tok/s (22.96 s) | 7.96 tok/s (22.60 s) |
+| decode, tier and chain (`COLI_VK_CHAIN=1`) | 9.91 tok/s (20.16 s) | 9.96 tok/s (20.09 s) |
+| prefill, tier | 12.26, 12.22 s | 12.29, 12.15 s |
+| prefill, tier and chain | 9.53 s | 9.43 s |
+
+The same within what one run to the next varies on this box, and each pair printed the
+same text. On
+unified memory a device-local copy is a RAM copy and the mapped path reads the same RAM,
+so this says only that staging costs nothing here. **Not measured: a discrete card without
+Resizable BAR**, the case staging is for (none is available); there the copies cross PCIe
+once per upload and the device then reads VRAM instead of the window or system RAM. The
+contributor who reported the RTX 3070 offered to run it.
 
 ## Correctness
 
