@@ -773,15 +773,16 @@ typedef struct {
  * vk/vk_off: the Vulkan device copy (COLI_VULKAN=1) of whichever of q4, q or w
  * matmul_d reads, uploaded at the first matmul_d and kept; vk_off = the upload
  * failed once, this matrix stays on the CPU. Both stay zero without VK=1. */
+/* h: the matrix as f16 (COLI_DENSE_BITS=16), the only copy then. */
 typedef struct { const float *w; int8_t *q; float *sc; int I, O; uint8_t *q4; float *sg; int ng;
-                 void *vk; int vk_off; } QW;
+                 void *vk; int vk_off; uint16_t *h; } QW;
 static void qw_free(QW *w) {
 #ifdef COLI_VULKAN
     if (w->vk) coli_vk_tensor_free((ColiVkTensor *)w->vk);
     w->vk = NULL; w->vk_off = 0;
 #endif
-    free((void*)w->w); free(w->q); free(w->sc); free(w->q4); free(w->sg);
-    w->w = NULL; w->q = NULL; w->sc = NULL; w->q4 = NULL; w->sg = NULL; w->ng = 0;
+    free((void*)w->w); free(w->q); free(w->sc); free(w->q4); free(w->sg); free(w->h);
+    w->w = NULL; w->q = NULL; w->sc = NULL; w->q4 = NULL; w->sg = NULL; w->ng = 0; w->h = NULL;
 }
 
 /* ---------- per-layer dense weights ---------- */
@@ -827,6 +828,7 @@ typedef struct {
     shards S;
     int quant_bits;
     float *embed, *final_norm;
+    uint16_t *embed_h;      /* COLI_DENSE_BITS=16: the table in f16, embed is NULL */
     QW lm_head;
     Layer *L;
     LCache *cache;          /* [n_layers] */
@@ -1235,7 +1237,10 @@ static void matmul_qd(float *y, const float *x, const int8_t *q, const float *sc
  * the token reads; lm_head alone goes from 508 to 254 MB. It implies the
  * integer dot (that layout has no f32 kernel). Same gate: measured. */
 static int dense_idot_on(void){ static int v=-1; if(v<0){ const char *e=getenv("COLI_DENSE_IDOT"); v=!(e&&*e=='0'); } return v; }
-static int dense_bits(void){ static int v=-1; if(v<0){ const char *e=getenv("COLI_DENSE_BITS"); v=(e&&atoi(e)==4)?4:8; } return v; }
+/* COLI_DENSE_BITS: 8 (default) int8 rows, 4 the int4 planar copy per
+ * COLI_DENSE_INT4, 16 the container's own f16 values (no quantization: twice
+ * the RAM of int8, the precision the checkpoint was converted at). */
+static int dense_bits(void){ static int v=-1; if(v<0){ const char *e=getenv("COLI_DENSE_BITS"); int b=e?atoi(e):8; v=b==4?4:b==16?16:8; } return v; }
 
 /* f32 rows -> int4 in blocks of 64 with one f32 scale per block, packed as the
  * K1b planar layout (unsigned nibbles v+8, block b: lo nibbles = elements
@@ -1438,6 +1443,76 @@ static void vk_report(void) {
             g_vk_placed[0], g_vk_placed[1], g_vk_placed[2]);
 }
 #endif
+/* f32 -> f16, round to nearest even: exact for a value that came from f16 (the
+ * container), which is the only use (COLI_DENSE_BITS=16). */
+static uint16_t f32_to_f16_bits(float f){
+    uint32_t x; memcpy(&x, &f, 4);
+    uint32_t sign = (x >> 16) & 0x8000u, mant = x & 0x7fffffu;
+    int exp = (int)((x >> 23) & 0xff) - 127 + 15;
+    if (((x >> 23) & 0xff) == 0xff) return (uint16_t)(sign | 0x7c00u | (mant ? 0x200u : 0));
+    if (exp >= 31) return (uint16_t)(sign | 0x7c00u);
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign;
+        mant |= 0x800000u;
+        int shift = 14 - exp;
+        uint32_t half = 1u << (shift - 1), rest = mant & ((1u << shift) - 1), v = mant >> shift;
+        if (rest > half || (rest == half && (v & 1))) v++;
+        return (uint16_t)(sign | v);
+    }
+    uint32_t v = ((uint32_t)exp << 10) | (mant >> 13), rest = mant & 0x1fffu;
+    if (rest > 0x1000u || (rest == 0x1000u && (v & 1))) v++;
+    return (uint16_t)(sign | v);
+}
+
+/* y[S,O] = x[S,I] @ W^T with W in f16 (COLI_DENSE_BITS=16). A thread converts
+ * 16 rows of W to f32 at a time and runs every row of x against them, four
+ * outputs per pass over x, so W is read once per call and x stays in cache. */
+#define Q36_H16_TILE 16
+static inline void dot4_f32_lanes(const float *x, const float *w, int I, float *out){
+    float a0[16] = {0}, a1[16] = {0}, a2[16] = {0}, a3[16] = {0};
+    const float *w1 = w + I, *w2 = w + 2 * (int64_t)I, *w3 = w + 3 * (int64_t)I;
+    int i = 0;
+    for (; i + 16 <= I; i += 16)
+        for (int j = 0; j < 16; j++) {
+            float xv = x[i + j];
+            a0[j] = MATMUL_F32_MADD(a0[j], xv, w[i + j]);
+            a1[j] = MATMUL_F32_MADD(a1[j], xv, w1[i + j]);
+            a2[j] = MATMUL_F32_MADD(a2[j], xv, w2[i + j]);
+            a3[j] = MATMUL_F32_MADD(a3[j], xv, w3[i + j]);
+        }
+    for (int j = 0; i + j < I; j++) {
+        float xv = x[i + j];
+        a0[j] = MATMUL_F32_MADD(a0[j], xv, w[i + j]);
+        a1[j] = MATMUL_F32_MADD(a1[j], xv, w1[i + j]);
+        a2[j] = MATMUL_F32_MADD(a2[j], xv, w2[i + j]);
+        a3[j] = MATMUL_F32_MADD(a3[j], xv, w3[i + j]);
+    }
+    for (int h = 8; h > 0; h >>= 1)
+        for (int j = 0; j < h; j++) { a0[j] += a0[j + h]; a1[j] += a1[j + h]; a2[j] += a2[j + h]; a3[j] += a3[j + h]; }
+    out[0] = a0[0]; out[1] = a1[0]; out[2] = a2[0]; out[3] = a3[0];
+}
+static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, int O){
+    int tiles = (O + Q36_H16_TILE - 1) / Q36_H16_TILE;
+    #pragma omp parallel
+    {
+        float *wt = malloc((size_t)Q36_H16_TILE * I * sizeof(float));
+        if (!wt) { fprintf(stderr, "OOM in the f16 dense GEMM\n"); exit(1); }
+        #pragma omp for schedule(dynamic, 1)
+        for (int t = 0; t < tiles; t++) {
+            int o0 = t * Q36_H16_TILE, n = O - o0 < Q36_H16_TILE ? O - o0 : Q36_H16_TILE;
+            f16_to_f32_bulk(W + (int64_t)o0 * I, wt, (int64_t)n * I);
+            for (int s = 0; s < S; s++) {
+                const float *xs = x + (int64_t)s * I;
+                float *ys = y + (int64_t)s * O + o0;
+                int r = 0;
+                for (; r + 4 <= n; r += 4) dot4_f32_lanes(xs, wt + (int64_t)r * I, I, ys + r);
+                for (; r < n; r++) ys[r] = dot_f32_lanes(xs, wt + (int64_t)r * I, I);
+            }
+        }
+        free(wt);
+    }
+}
+
 static void matmul_d(float *y, const float *x, const QW *w, int S, int I, int O){
 #ifdef COLI_QWEN_BATCH_TEST
     g_qwen_matmul_d_calls++;
@@ -1445,6 +1520,7 @@ static void matmul_d(float *y, const float *x, const QW *w, int S, int I, int O)
 #ifdef COLI_VULKAN
     if (g_vk_ready && g_vk_dense && (w->q || w->q4 || w->w) && vk_dense_matmul(y, x, w, S, I, O)) return;
 #endif
+    if (w->h) { matmul_h(y, x, w->h, S, I, O); return; }
     if (w->q || w->q4) {
         if (w->q4 || dense_idot_on()) {
             /* integer dot: the activation rows to int8 once, then the K1b
@@ -1880,8 +1956,17 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
     float *p = load_t_n(m, name, (int64_t)I * O);
     out->w = p; out->q = NULL; out->sc = NULL; out->I = I; out->O = O;
     out->q4 = NULL; out->sg = NULL; out->ng = 0;
-    out->vk = NULL; out->vk_off = 0;
+    out->vk = NULL; out->vk_off = 0; out->h = NULL;
     if (!quantize || !dense_i8_on()) return;
+    if (dense_bits() == 16) {
+        uint16_t *h = malloc((size_t)I * O * sizeof(uint16_t));
+        if (!h) { fprintf(stderr, "OOM keeping %s in f16\n", name); exit(1); }
+        #pragma omp parallel for schedule(static)
+        for (int64_t k = 0; k < (int64_t)I * O; k++) h[k] = f32_to_f16_bits(p[k]);
+        out->h = h;
+        free(p); out->w = NULL;
+        return;
+    }
     qw_quantize(p, I, O, tag, out);
     if (getenv("COLI_KEEP_F32")) out->w = p; else { free(p); out->w = NULL; }
 }
@@ -2049,8 +2134,18 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     int qcount = 0; double qfreed = 0;
     if (load_boundaries) {
         m->embed = load_t_n(m, "model.embed_tokens.weight", (int64_t)c->vocab * c->hidden);
+#ifndef COLI_VULKAN
+        if (quantize_dense && dense_bits() == 16) {   /* 16-bit trunk: the table too, 2.5 GB less on the 27B */
+            int64_t n = (int64_t)c->vocab * c->hidden;
+            m->embed_h = malloc((size_t)n * sizeof(uint16_t));
+            if (!m->embed_h) { fprintf(stderr, "OOM keeping the embeddings in f16\n"); exit(1); }
+            #pragma omp parallel for schedule(static)
+            for (int64_t k = 0; k < n; k++) m->embed_h[k] = f32_to_f16_bits(m->embed[k]);
+            free(m->embed); m->embed = NULL;
+        }
+#endif
         load_tq(m, "lm_head.weight", c->hidden, c->vocab, quantize_dense, "lmhead", &m->lm_head);
-        if (m->lm_head.q || m->lm_head.q4) { qcount++; qfreed += (double)c->hidden * c->vocab * sizeof(float); }
+        if (m->lm_head.q || m->lm_head.q4 || m->lm_head.h) { qcount++; qfreed += (double)c->hidden * c->vocab * sizeof(float); }
         m->final_norm = load_norm_n(m, "model.norm.weight", c->hidden);
         q36_load_vision(m);
     }
@@ -2062,7 +2157,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     for (int i = 0; i < c->n_layers; i++) m->active_of[i] = i;
     char nm[256];
     int q_out = c->q_heads * c->q_head_dim, kv_out = c->kv_heads * c->k_head_dim;
-    #define QCOUNT(field) do { if ((field).q || (field).q4) { qcount++; qfreed += (double)(field).I * (field).O * sizeof(float); } } while (0)
+    #define QCOUNT(field) do { if ((field).q || (field).q4 || (field).h) { qcount++; qfreed += (double)(field).I * (field).O * sizeof(float); } } while (0)
     for (int i = layer_begin; i < layer_end; i++) {
         int ai = m->active_of[i];        /* == i for Phase 2 */
         Layer *l = &m->L[i];
@@ -2136,7 +2231,8 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     }
     #undef QCOUNT
     if (quantize_dense)
-        fprintf(stderr, "[dense-i8] %d matrices quantized during load, %.1f GB f32 freed\n", qcount, qfreed/1073741824.0);
+        fprintf(stderr, "[dense-i8] %d matrices %s during load, %.1f GB f32 freed\n", qcount,
+                dense_bits() == 16 ? "kept in f16" : "quantized", qfreed/1073741824.0);
     m->cache = calloc((size_t)c->n_layers, sizeof(LCache));
     for (int i = layer_begin; i < layer_end; i++) {
         m->cache[i].cap = cap;
@@ -3722,6 +3818,8 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         int vrow = (m->vis_map && pos_base + s < m->vis_map_len) ? m->vis_map[pos_base + s] : -1;
         if (vrow >= 0 && vrow < m->vis_rows_n)   /* an image placeholder: the tower's row */
             memcpy(x + (int64_t)s*D, m->vis_rows + (int64_t)vrow*D, D*sizeof(float));
+        else if (m->embed_h)
+            f16_to_f32_bulk(m->embed_h + (int64_t)ids[s]*D, x + (int64_t)s*D, D);
         else
             memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
     }
@@ -4656,6 +4754,7 @@ static int q36_clef_lm_row(void *ctx, int id, float *out){
     int D = m->c.hidden;
     if (id < 0 || id >= m->c.vocab) return 0;
     if (m->lm_head.w) { memcpy(out, m->lm_head.w + (int64_t)id * D, (size_t)D * sizeof(float)); return 1; }
+    if (m->lm_head.h) { f16_to_f32_bulk(m->lm_head.h + (int64_t)id * D, out, D); return 1; }
     char rn[QW_DENSE_NAME_MAX];
     st_tensor *t = st_find(&m->S, dense_resolve(m, "lm_head.weight", rn, sizeof rn));
     if (!t || t->numel != (int64_t)m->c.vocab * D || t->dtype > 2) return 0;
