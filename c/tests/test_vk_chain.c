@@ -20,14 +20,38 @@
  *   qsa      block keys, and the selection with ties broken as the CPU sorts
  *   ple      the gate and the dilated convolution with its ring and snapshot
  *   frames   vkc_write, vkc_read, a frame left in flight and one ordered after it
+ *   mla      the per-head weight blocks in every format, both ways, with a gate; RoPE
+ *            interleaved and rotate-half, in place and into a cache row; LayerNorm;
+ *            the layer op against colibri.c's absorbed attention over several
+ *            geometries (q latent or none, NoPE, kv_b or the split halves, selection
+ *            lists with skipped entries, a gate, prefill rows, a long context from
+ *            kv_start, latents up to 1024)
+ *   dsa      the indexer's top-k selection bit for bit, ties included
+ *   kpool    the k-pooled indexer (GLM-5.3): pooled keys, the pools' rank order and
+ *            the tail, slot for slot against sparse_index.h
+ *   kda      GLM-5.3's KDA layer around delta_attention.h's step: the convolution
+ *            and its window, the recurrence and its state over two submissions, the
+ *            decay, beta, output norm and gate
+ *   mhc      hyper_connections.h's split, collapse and write back, the mean, and the
+ *            clamped SwiGLU
+ *   sconv    inkling's short convolution (residual inside, the ring carried across
+ *            calls) and its scalar multiply and divide
+ *   relattn  inkling's attention: the relative-position bias, tau, a sliding window
+ *            over a ring the step wraps, the step's rows read from its own K/V, and a
+ *            global layer; the shared experts' weighted add (HC_APPLY over one stream)
+ *   inkling's hidden size: the GEMV and the norm at D = 6144, the GEMV at I = 24576
  *
  *   make vk-chain-check VK=1   (VK_ICD_FILENAMES=.../lvp_icd.json for Lavapipe) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <float.h>
 #include "../backend_vulkan.h"
 #include "../vk_chain.h"
+#include "../delta_attention.h"      /* the KDA step the KDA ops follow */
+#include "../hyper_connections.h"    /* the mHC arithmetic */
+#include "../sparse_index.h"         /* GLM-5.3's k-pooled indexer */
 
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -382,6 +406,145 @@ static void test_ew(void) {
     free(a); free(b); free(c); free(e); free(ref);
 }
 
+/* ---- inkling: the short convolution, the scale, the attention ----------------------- */
+/* inkling.c's sconv_apply for S rows of C channels, in place, the ring (CK-1 raw inputs) carried */
+static void sconv_ref(int S, int C, int CK, float *x, const float *w, float *ring) {
+    int P = CK - 1;
+    float *col = malloc((size_t)(P + S) * sizeof *col);
+    for (int c = 0; c < C; c++) {
+        for (int j = 0; j < P; j++) col[j] = ring[c * P + j];
+        for (int t = 0; t < S; t++) col[P + t] = x[(size_t)t * C + c];
+        for (int t = 0; t < S; t++) {
+            float acc = 0.f;
+            for (int j = 0; j < CK; j++) acc += w[c * CK + j] * col[t + j];
+            x[(size_t)t * C + c] = acc + col[P + t];
+        }
+        for (int j = 0; j < P; j++) ring[c * P + j] = col[S + j];
+    }
+    free(col);
+}
+static void test_sconv(int C, int CK) {
+    int S1 = 6, S2 = 1, P = CK - 1, xo = 8, ro = 4;
+    size_t nx = (size_t)(S1 + S2) * C;
+    float *w = fvec((size_t)C * CK, 0.5f), *x = fvec(nx, 1.f), *ring = fvec((size_t)C * P, 1.f);
+    float *xr = malloc(nx * sizeof *xr), *rr = malloc((size_t)C * P * sizeof *rr);
+    memcpy(xr, x, nx * sizeof *xr); memcpy(rr, ring, (size_t)C * P * sizeof *rr);
+    sconv_ref(S1, C, CK, xr, w, rr);
+    sconv_ref(S2, C, CK, xr + (size_t)S1 * C, w, rr);
+    VkcBuf *wb = up(w, (size_t)C * CK), *xb = vkc_buf((xo + nx) * 4, VKC_DEV), *rb = vkc_buf((ro + (size_t)C * P) * 4, VKC_DEV);
+    vkc_begin(); vkc_write(xb, xo, x, nx * 4); vkc_write(rb, ro, ring, (size_t)C * P * 4); vkc_submit(1);
+    VkcSconv p1 = {0, S1, C, CK, xo, C, 0, ro, 0, 1.f}, p2 = {0, S2, C, CK, xo + S1 * C, C, 0, ro, 0, 1.f};
+    vkc_begin(); int ok = vkc_sconv(xb, wb, rb, &p1); vkc_submit(0);     /* left in flight */
+    vkc_begin(); ok &= vkc_sconv(xb, wb, rb, &p2); vkc_submit(1);
+    float *o = down(xb, xo, nx), *r = down(rb, ro, (size_t)C * P);
+    double e1 = relerr(o, xr, nx, 1e-3), e2 = relerr(r, rr, (size_t)C * P, 1e-3);
+    CHECK(ok && e1 < 1e-6 && e2 == 0, "sconv C %d CK %d: out %.2e ring %.2e", C, CK, e1, e2);
+    /* the scalar multiply and divide over n floats at an offset */
+    int n = 3 * C + 5; float fc = 24.f;
+    for (int mode = 1; mode <= 2; mode++) {
+        vkc_begin(); vkc_write(xb, xo, x, (size_t)n * 4); vkc_submit(1);
+        VkcSconv ps = {mode, 0, 0, 0, xo, 0, 0, 0, n, fc};
+        vkc_begin(); ok = vkc_sconv(xb, NULL, NULL, &ps); vkc_submit(1);
+        float *y = down(xb, xo, n), *ref = malloc((size_t)n * sizeof *ref);
+        for (int i = 0; i < n; i++) ref[i] = mode == 1 ? x[i] * fc : x[i] / fc;
+        double e = relerr(y, ref, n, 1e-6);
+        CHECK(ok && e < 1e-6, "sconv mode %d: err %.2e", mode, e);
+        free(y); free(ref);
+    }
+    vkc_free(wb); vkc_free(xb); vkc_free(rb);
+    free(w); free(x); free(ring); free(xr); free(rr); free(o); free(r);
+}
+/* inkling.c's attention() for S rows from pos_base: the K/V of every position in kt/vt
+ * ([T][KVH*hd]), r [S][H*dr], relp [dr][ext], tau [S]; the device sees the positions
+ * before pos_base through a ring of cap rows (t % cap, the latest such t < pos_base)
+ * and the step's own rows in a scratch, k at ks, v at vs, kvd floats a row. */
+static void test_relattn(int S, int pos_base, int window, int cap, int hd, int dr, int ext) {
+    int H = 4, KVH = 2, kvd = KVH * hd, T = pos_base + S, koff = 32, roff = 16, poff = 24, toff = 8;
+    float *q = fvec((size_t)S * H * hd, 1.f), *kt = fvec((size_t)T * kvd, 1.f), *vt = fvec((size_t)T * kvd, 1.f);
+    float *r = fvec((size_t)S * H * dr, 0.5f), *relp = fvec((size_t)dr * ext, 0.5f), *tau = malloc(S * sizeof *tau);
+    for (int s = 0; s < S; s++) tau[s] = 1.f + (rnd() % 1000) / 2000.f;
+    float scale = 1.f / (float)hd;
+    float *ref = malloc((size_t)S * H * hd * sizeof *ref);
+    for (int s = 0; s < S; s++) for (int h = 0; h < H; h++) {
+        int kvh = h / (H / KVH), qpos = pos_base + s, t0 = window > 0 && qpos - window + 1 > 0 ? qpos - window + 1 : 0;
+        int n = qpos - t0 + 1;
+        double *sc = malloc(n * sizeof *sc), mx = -1e300, sum = 0;
+        for (int j = 0; j < n; j++) {
+            int t = t0 + j, dist = qpos - t;
+            double a = 0; for (int d = 0; d < hd; d++) a += (double)q[((size_t)s * H + h) * hd + d] * kt[(size_t)t * kvd + kvh * hd + d];
+            double b = 0; if (dist < ext) for (int k = 0; k < dr; k++) b += (double)r[((size_t)s * H + h) * dr + k] * relp[k * ext + dist];
+            sc[j] = tau[s] * (a * scale + b); if (sc[j] > mx) mx = sc[j];
+        }
+        for (int j = 0; j < n; j++) { sc[j] = exp(sc[j] - mx); sum += sc[j]; }
+        for (int d = 0; d < hd; d++) {
+            double a = 0; for (int j = 0; j < n; j++) a += sc[j] / sum * vt[(size_t)(t0 + j) * kvd + kvh * hd + d];
+            ref[((size_t)s * H + h) * hd + d] = (float)a;
+        }
+        free(sc);
+    }
+    /* the ring as the host keeps it after the positions before pos_base, and the scratch */
+    size_t nr = (size_t)koff + (size_t)KVH * cap * hd;
+    float *kr = calloc(nr, sizeof *kr), *vr = calloc(nr, sizeof *vr);
+    for (int t = 0; t < pos_base; t++) for (int h = 0; h < KVH; h++) {
+        memcpy(kr + koff + ((size_t)h * cap + t % cap) * hd, kt + (size_t)t * kvd + h * hd, hd * sizeof(float));
+        memcpy(vr + koff + ((size_t)h * cap + t % cap) * hd, vt + (size_t)t * kvd + h * hd, hd * sizeof(float));
+    }
+    size_t ks = 4, vs = ks + (size_t)S * kvd, nsc = vs + (size_t)S * kvd;
+    float *scr = calloc(nsc, sizeof *scr);
+    memcpy(scr + ks, kt + (size_t)pos_base * kvd, (size_t)S * kvd * sizeof(float));
+    memcpy(scr + vs, vt + (size_t)pos_base * kvd, (size_t)S * kvd * sizeof(float));
+    float *rbuf = calloc(roff + (size_t)S * H * dr, sizeof *rbuf), *pbuf = calloc(poff + (size_t)dr * ext, sizeof *pbuf), *tbuf = calloc(toff + S, sizeof *tbuf);
+    memcpy(rbuf + roff, r, (size_t)S * H * dr * sizeof(float)); memcpy(pbuf + poff, relp, (size_t)dr * ext * sizeof(float));
+    memcpy(tbuf + toff, tau, S * sizeof(float));
+    VkcBuf *qb = up(q, (size_t)S * H * hd), *kb = up(kr, nr), *vb = up(vr, nr), *sb = up(scr, nsc), *rb = up(rbuf, roff + (size_t)S * H * dr);
+    VkcBuf *pb = up(pbuf, poff + (size_t)dr * ext), *tb = up(tbuf, toff + S), *ob = vkc_buf((size_t)S * H * hd * 4, VKC_DOWN);
+    VkcRelAttn p = {S, H, KVH, hd, pos_base, cap, window, ext, dr, 0, H * hd, 0, H * hd, koff, koff, (int)ks, (int)vs, kvd,
+                    roff, H * dr, poff, toff, scale};
+    vkc_begin(); int ok = vkc_relattn(qb, kb, vb, ob, sb, rb, pb, tb, &p); vkc_submit(1);
+    double e = relerr((float *)vkc_ptr(ob), ref, (size_t)S * H * hd, 1e-3);
+    CHECK(ok && e < 2e-5, "relattn S %d pos %d window %d cap %d hd %d d_rel %d ext %d: err %.2e", S, pos_base, window, cap, hd, dr, ext, e);
+    vkc_free(qb); vkc_free(kb); vkc_free(vb); vkc_free(sb); vkc_free(rb); vkc_free(pb); vkc_free(tb); vkc_free(ob);
+    free(q); free(kt); free(vt); free(r); free(relp); free(tau); free(ref); free(kr); free(vr); free(scr); free(rbuf); free(pbuf); free(tbuf);
+}
+/* the shared experts joining the routed sum: y = routed; y += w_j[r] * sh_j[r] in order */
+static void test_weighted_add(void) {
+    int R = 3, D = 70, NS = 2;
+    float *routed = fvec((size_t)R * D, 2.f), *sh = fvec((size_t)NS * R * D, 2.f), *w = fvec((size_t)NS * R, 1.f), *ref = malloc((size_t)R * D * sizeof *ref);
+    memcpy(ref, routed, (size_t)R * D * sizeof *ref);
+    for (int j = 0; j < NS; j++) for (int r = 0; r < R; r++) for (int d = 0; d < D; d++) ref[r * D + d] += w[j * R + r] * sh[((size_t)j * R + r) * D + d];
+    VkcBuf *yb = up(routed, (size_t)R * D), *sb = up(sh, (size_t)NS * R * D), *wb = up(w, (size_t)NS * R);
+    vkc_begin(); int ok = 1;
+    for (int j = 0; j < NS; j++) { VkcEw p = {VKC_EW_HC_APPLY, R * D, D, 1, 0, 1, 0, j * R, j * R * D, 0, 0, 1.f}; ok &= vkc_ew(yb, wb, sb, NULL, NULL, &p); }
+    vkc_submit(1);
+    float *y = down(yb, 0, (size_t)R * D);
+    double e = relerr(y, ref, (size_t)R * D, 1e-3);
+    CHECK(ok && e < 1e-6, "weighted add: err %.2e", e);
+    vkc_free(yb); vkc_free(sb); vkc_free(wb); free(routed); free(sh); free(w); free(ref); free(y);
+}
+static void test_inkling(void) {
+    test_sconv(37, 4); test_sconv(6144, 4); test_sconv(9, 1); test_sconv(5, 9);
+    test_relattn(1, 0, 0, 64, 16, 4, 32);              /* the first position, global */
+    test_relattn(5, 200, 0, 300, 32, 16, 64);          /* global, distances past ext (bias 0) */
+    test_relattn(1, 40, 16, 16, 32, 4, 16);            /* decode, a sliding window over a wrapped ring */
+    test_relattn(20, 30, 16, 16, 16, 4, 16);           /* a step that wraps the ring more than once */
+    test_relattn(130, 3, 0, 200, 24, 4, 200);          /* two tiles of positions */
+    test_relattn(3, 513, 512, 512, 128, 16, 512);      /* the real window and ring, hd 128 */
+    test_relattn(2, 9, 0, 64, 256, 64, 8);             /* the largest head and bank */
+    test_weighted_add();
+    for (int k = 0; k < 4; k++) { int f[4] = {1, 4, 10, 11}; test_matmul(f[k], 1, 6144, 48, 0, 0); }
+    test_matmul(10, 1, 24576, 16, 0, 0);               /* past chain_gemv's staging: qmatmul.comp */
+    test_matmul(4, 1, 24576, 16, 0, 0);
+    VkcNorm np = {2, 6144, 1, 0, 6144, 6144, 0, 6144, 6144, 0, 0, 0, 1e-6f, 1.f};
+    float *x = fvec(2 * 6144, 1.f), *w = fvec(6144, 1.f), *ref = malloc(2 * 6144 * sizeof *ref);
+    for (int r = 0; r < 2; r++) { double ms = 0; for (int i = 0; i < 6144; i++) ms += (double)x[r * 6144 + i] * x[r * 6144 + i];
+        float rr = 1.f / sqrtf((float)(ms / 6144) + 1e-6f); for (int i = 0; i < 6144; i++) ref[r * 6144 + i] = x[r * 6144 + i] * rr * w[i]; }
+    VkcBuf *xb = up(x, 2 * 6144), *wb = up(w, 6144), *yb = vkc_buf(2 * 6144 * 4, VKC_DOWN);
+    vkc_begin(); int ok = vkc_norm(xb, wb, yb, &np); vkc_submit(1);
+    double e = relerr((float *)vkc_ptr(yb), ref, 2 * 6144, 1e-3);
+    CHECK(ok && e < 1e-5, "norm D 6144: err %.2e", e);
+    vkc_free(xb); vkc_free(wb); vkc_free(yb); free(x); free(w); free(ref);
+}
+
 /* ---- QSA: block keys and selection ----------------------------------------------------- */
 static void test_qsa(void) {
     int ID = 12, R = 2, half = 3, cap = 40, nbmax = cap / R, IQ = 2, budget = 6;   /* take = 3 blocks */
@@ -488,6 +651,525 @@ static void test_ple(void) {
     free(hd); free(rd); free(sd);
 }
 
+/* ---- MLA: weight blocks, RoPE and LayerNorm rows, the layer op, the DSA selection ------ */
+static float e4m3f(uint8_t b) {   /* the CPU's E4M3_LUT */
+    int e = (b >> 3) & 15, m = b & 7;
+    float v = e == 0 ? m * 0.001953125f : ldexpf(1.f + m * 0.125f, e - 7);
+    return (b & 0x80) ? -v : v;
+}
+/* A resident [O x I] tensor in fmt with random codes (values about `scale`); W gets the
+ * dequantized weights. Groups of 64 for the grouped formats. */
+static ColiVkTensor *mk_tensor(int fmt, int O, int I, float scale, float *W) {
+    void *codes = NULL; float *sc = NULL; int gs = 0, ng64 = (I + 63) / 64;
+    size_t n = (size_t)O * I;
+    if (fmt == 1 || fmt == 13) {
+        int8_t *q = malloc(n); gs = fmt == 13 ? 64 : 0;
+        int ns = fmt == 13 ? O * ng64 : O;
+        sc = malloc((size_t)ns * sizeof *sc);
+        for (int k = 0; k < ns; k++) sc[k] = scale * (0.5f + (rnd() % 100) / 100.f) / 127.f;
+        for (int o = 0; o < O; o++) for (int i = 0; i < I; i++) {
+            q[(size_t)o * I + i] = (int8_t)((int)(rnd() % 255) - 127);
+            W[(size_t)o * I + i] = q[(size_t)o * I + i] * sc[fmt == 13 ? o * ng64 + i / 64 : o];
+        }
+        codes = q;
+    } else if (fmt == 2 || fmt == 4) {
+        size_t rb = (size_t)(I + 1) / 2; uint8_t *q = calloc((size_t)O * rb, 1); gs = fmt == 4 ? 64 : 0;
+        int ns = fmt == 4 ? O * ng64 : O;
+        sc = malloc((size_t)ns * sizeof *sc);
+        for (int k = 0; k < ns; k++) sc[k] = scale * (0.5f + (rnd() % 100) / 100.f) / 7.f;
+        for (int o = 0; o < O; o++) for (int i = 0; i < I; i++) {
+            int v = (int)(rnd() % 16);
+            q[(size_t)o * rb + i / 2] |= (uint8_t)(v << ((i & 1) * 4));
+            W[(size_t)o * I + i] = (v - 8) * sc[fmt == 4 ? o * ng64 + i / 64 : o];
+        }
+        codes = q;
+    } else if (fmt == 5) {               /* int3-g64: 16 bytes of 2-bit lows, 8 of high bits, a scale per 64 */
+        size_t rb = (size_t)ng64 * 24; uint8_t *q = calloc((size_t)O * rb, 1);
+        sc = malloc((size_t)O * ng64 * sizeof *sc);
+        for (int k = 0; k < O * ng64; k++) sc[k] = scale * (0.5f + (rnd() % 100) / 100.f) / 4.f;
+        for (int o = 0; o < O; o++) for (int i = 0; i < I; i++) {
+            int u = (int)(rnd() % 8), g = i / 64, j = i % 64;
+            uint8_t *gb = q + (size_t)o * rb + (size_t)g * 24;
+            gb[j / 4] |= (uint8_t)((u & 3) << ((j & 3) * 2));
+            gb[16 + j / 8] |= (uint8_t)(((u >> 2) & 1) << (j & 7));
+            W[(size_t)o * I + i] = (u - 4) * sc[o * ng64 + g];
+        }
+        codes = q;
+    } else if (fmt == 12) {              /* fp8 e4m3, a scale per 64 */
+        uint8_t *q = malloc(n); gs = 64;
+        sc = malloc((size_t)O * ng64 * sizeof *sc);
+        for (int k = 0; k < O * ng64; k++) sc[k] = scale * (0.5f + (rnd() % 100) / 100.f) / 8.f;
+        for (int o = 0; o < O; o++) for (int i = 0; i < I; i++) {
+            uint8_t b; do b = (uint8_t)rnd(); while ((b & 0x7f) == 0x7f || ((b >> 3) & 15) > 10);
+            q[(size_t)o * I + i] = b; W[(size_t)o * I + i] = e4m3f(b) * sc[o * ng64 + i / 64];
+        }
+        codes = q;
+    } else if (fmt == 10) {
+        float *w = fvec(n, scale); memcpy(W, w, n * sizeof *W); codes = w;
+    } else {                             /* 11 bf16 */
+        uint16_t *w = malloc(n * 2);
+        for (size_t i = 0; i < n; i++) { w[i] = f2bf(frnd() * scale); W[i] = bf2f(w[i]); }
+        codes = w;
+    }
+    ColiVkTensor *t = NULL;
+    int ok = coli_vk_tensor_ensure(&t, codes, sc, fmt, I, O, gs);
+    free(codes); free(sc);
+    return ok ? t : NULL;
+}
+
+/* the per-head weight blocks, both directions, every format, a gate */
+static void test_hgemv(int fmt, int trans) {
+    int S = 3, H = 3, n = trans ? 24 : 20, I = 128, hstride = n + 9, hoff = 5, O = (H - 1) * hstride + hoff + n + 2;
+    float *W = malloc((size_t)O * I * sizeof *W);
+    ColiVkTensor *t = mk_tensor(fmt, O, I, 0.1f, W);
+    if (!t) { CHECK(0, "hgemv fmt %d: upload", fmt); free(W); return; }
+    int xin = trans ? n : I, xseg = xin + 3, xrow = H * xseg + 1, yout = trans ? I : n, yseg = yout + 2, yrow = H * yseg;
+    float *x = fvec((size_t)S * xrow + 7, 1.f), *g = fvec((size_t)S * H * n, 2.f);
+    float *ref = calloc((size_t)S * yrow, sizeof *ref);
+    for (int s = 0; s < S; s++) for (int h = 0; h < H; h++) {
+        const float *xs = x + 7 + (size_t)s * xrow + h * xseg;
+        float *ys = ref + (size_t)s * yrow + h * yseg;
+        if (trans) for (int i = 0; i < I; i++) {
+            double a = 0; for (int d = 0; d < n; d++) a += (double)W[(size_t)(h * hstride + hoff + d) * I + i] * xs[d];
+            ys[i] = (float)a;
+        } else for (int o = 0; o < n; o++) {
+            double a = 0; for (int i = 0; i < I; i++) a += (double)W[(size_t)(h * hstride + hoff + o) * I + i] * xs[i];
+            ys[o] = (float)a * sigm(g[(size_t)s * H * n + h * n + o]);
+        }
+    }
+    VkcBuf *xb = up(x, (size_t)S * xrow + 7), *gb = up(g, (size_t)S * H * n), *yb = vkc_buf((size_t)S * yrow * 4, VKC_DEV);
+    VkcHgemv p = {trans, S, H, n, hstride, hoff, 7, xrow, xseg, 0, yrow, yseg, 0, H * n, !trans};
+    vkc_begin(); int ok = vkc_mla_hgemv(t, xb, yb, trans ? NULL : gb, &p); vkc_submit(1);
+    float *y = down(yb, 0, (size_t)S * yrow);
+    double e = relerr(y, ref, (size_t)S * yrow, 1e-3);
+    CHECK(ok && e < 2e-5, "hgemv fmt %d trans %d: ok %d err %.2e", fmt, trans, ok, e);
+    vkc_free(xb); vkc_free(gb); vkc_free(yb); coli_vk_tensor_free(t);
+    free(W); free(x); free(g); free(ref); free(y);
+}
+
+/* interleaved and rotate-half RoPE, in place and into another place; LayerNorm */
+static void test_mla_rows(void) {
+    int rows = 4, per = 3, seg = 20, rd = 12, xrow = per * seg + 5, yrow = per * (seg + 2), half = rd / 2;
+    float *x = fvec((size_t)rows * xrow, 1.f), *cs = malloc((size_t)rows * rd * sizeof *cs);
+    for (int r = 0; r < rows; r++) for (int j = 0; j < half; j++) {
+        float ang = (float)(500 + 91 * r) * powf(10000.f, -2.f * j / rd);
+        cs[r * rd + 2 * j] = cosf(ang); cs[r * rd + 2 * j + 1] = sinf(ang);
+    }
+    VkcBuf *cb = up(cs, (size_t)rows * rd);
+    for (int style = 0; style < 2; style++) for (int inplace = 0; inplace < 2; inplace++) {
+        int yr = inplace ? xrow : yrow, ys = inplace ? seg : seg + 2;
+        float *ref = calloc((size_t)rows * yr, sizeof *ref);
+        if (inplace) memcpy(ref, x, (size_t)rows * xrow * sizeof *ref);
+        for (int r = 0; r < rows; r++) for (int j = 0; j < per; j++) {
+            const float *v = x + r * xrow + j * seg; float *o = ref + r * yr + j * ys;
+            for (int i = 0; i < half; i++) {
+                float a = style ? v[2 * i] : v[i], b = style ? v[2 * i + 1] : v[i + half];
+                float c = cs[r * rd + 2 * i], sn = cs[r * rd + 2 * i + 1];
+                o[i] = a * c - b * sn; o[i + half] = b * c + a * sn;
+            }
+            for (int i = rd; i < seg; i++) o[i] = v[i];
+        }
+        VkcBuf *xb = up(x, (size_t)rows * xrow), *yb = inplace ? xb : vkc_buf((size_t)rows * yr * 4, VKC_DEV);
+        VkcMlaRow p = {rows * per, per, rd, seg, style, 0, xrow, seg, 0, yr, ys, 0, rd, 0, 0, 0, 0.f};
+        vkc_begin(); int ok = vkc_mla_rope(xb, cb, yb, &p); vkc_submit(1);
+        float *y = down(yb, 0, (size_t)rows * yr);
+        double e = relerr(y, ref, (size_t)rows * yr, 1e-3);
+        CHECK(ok && e < 1e-6, "mla rope style %d in place %d: ok %d err %.2e", style, inplace, ok, e);
+        if (!inplace) vkc_free(yb);
+        vkc_free(xb); free(ref); free(y);
+    }
+    /* LayerNorm, with and without the bias, into the next segment's place */
+    float *prm = fvec(2 * seg, 1.f);
+    VkcBuf *pb = up(prm, 2 * seg);
+    for (int hb = 0; hb < 2; hb++) {
+        float *ref = calloc((size_t)rows * yrow, sizeof *ref);
+        for (int r = 0; r < rows; r++) for (int j = 0; j < per; j++) {
+            const float *v = x + r * xrow + j * seg; float *o = ref + r * yrow + j * (seg + 2);
+            double mu = 0, var = 0; for (int i = 0; i < seg; i++) mu += v[i]; mu /= seg;
+            for (int i = 0; i < seg; i++) var += (v[i] - mu) * (v[i] - mu); var /= seg;
+            float rr = 1.f / sqrtf((float)var + 1e-6f);
+            for (int i = 0; i < seg; i++) o[i] = (float)(v[i] - mu) * rr * prm[i] + (hb ? prm[seg + i] : 0.f);
+        }
+        VkcBuf *xb = up(x, (size_t)rows * xrow), *yb = vkc_buf((size_t)rows * yrow * 4, VKC_DEV);
+        VkcMlaRow p = {rows * per, per, 0, seg, 0, 0, xrow, seg, 0, yrow, seg + 2, 0, 0, 0, seg, hb, 1e-6f};
+        vkc_begin(); int ok = vkc_mla_lnorm(xb, pb, yb, &p); vkc_submit(1);
+        float *y = down(yb, 0, (size_t)rows * yrow);
+        double e = relerr(y, ref, (size_t)rows * yrow, 1e-3);
+        CHECK(ok && e < 2e-6, "mla layernorm bias %d: ok %d err %.2e", hb, ok, e);
+        vkc_free(xb); vkc_free(yb); free(ref); free(y);
+    }
+    vkc_free(pb); vkc_free(cb); free(prm); free(x); free(cs);
+}
+
+/* The MLA layer op against a double reference of colibri.c's absorbed attention:
+ * geometry and formats from the caller; `split` gives the weights as [H*K x Q] and
+ * [H*V x K] instead of kv_b; `list` gives every other row a selection list with a
+ * skipped entry; `gate` a sigmoid gate on the values. The cache holds random rows
+ * before pos_base (from kv_start); the step writes S more. Two frames: the step's
+ * projections, then (after the host's selection lists) the attention. */
+typedef struct { int H, Q, R, V, K, q_lora, D, S, pos_base, kv_start, style, split, list, gate, fq, fkv, fo; } MlaCase;
+static void rmsref(double *y, const double *x, const float *w, int n, float eps) {
+    double ss = 0; for (int i = 0; i < n; i++) ss += x[i] * x[i];
+    double r = 1.0 / sqrt(ss / n + eps); for (int i = 0; i < n; i++) y[i] = x[i] * r * w[i];
+}
+static void test_mla(MlaCase c) {
+    int H = c.H, Q = c.Q, R = c.R, V = c.V, K = c.K, D = c.D, S = c.S, pb = c.pos_base, QR = Q + R, KR = K + R;
+    int cap = pb + S + 3, qin = c.q_lora > 0 ? c.q_lora : D, half = R / 2;
+    float eps = 1e-5f, scale = 1.f / sqrtf((float)QR) * 1.1f;
+    float *Wqa = c.q_lora ? malloc((size_t)c.q_lora * D * 4) : NULL, *Wqb = malloc((size_t)H * QR * qin * 4);
+    float *Wkva = malloc((size_t)KR * D * 4), *Wo = malloc((size_t)D * H * V * 4);
+    float *Wkvb = malloc((size_t)H * (Q + V) * K * 4), *Wk = malloc((size_t)H * K * Q * 4), *Wv = malloc((size_t)H * V * K * 4);
+    VkcMla m = {H, Q, R, V, K, D, c.q_lora, eps, scale, c.style, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0};
+    if (c.q_lora) m.q_a = mk_tensor(c.fq, c.q_lora, D, 1.f / sqrtf((float)D) * 2.f, Wqa);
+    m.q_b = mk_tensor(c.fq, H * QR, qin, 1.f / sqrtf((float)qin) * 2.f, Wqb);
+    m.kv_a = mk_tensor(c.fkv, KR, D, 1.f / sqrtf((float)D) * 2.f, Wkva);
+    if (c.split) { m.k_abs = mk_tensor(c.fkv, H * K, Q, 1.f / sqrtf((float)Q), Wk); m.v_abs = mk_tensor(c.fkv, H * V, K, 1.f / sqrtf((float)K), Wv); }
+    else {
+        m.kv_b = mk_tensor(c.fkv, H * (Q + V), K, 1.f / sqrtf((float)K), Wkvb);
+        for (int h = 0; h < H; h++) {      /* the same weights seen as the two halves */
+            for (int d = 0; d < Q; d++) for (int i = 0; i < K; i++) Wk[((size_t)h * K + i) * Q + d] = Wkvb[((size_t)h * (Q + V) + d) * K + i];
+            for (int v = 0; v < V; v++) for (int i = 0; i < K; i++) Wv[((size_t)h * V + v) * K + i] = Wkvb[((size_t)h * (Q + V) + Q + v) * K + i];
+        }
+    }
+    m.o = mk_tensor(c.fo, D, H * V, 1.f / sqrtf((float)(H * V)), Wo);
+    float *prm = malloc((size_t)(qin + K + 8) * 4);
+    for (int i = 0; i < qin + K + 8; i++) prm[i] = 0.5f + (rnd() % 100) / 100.f;
+    m.prm = up(prm, (size_t)qin + K + 8); m.q_norm = 3; m.kv_norm = 3 + qin;
+    /* the cache: rows before pos_base as the device holds them (normalized, rotated) */
+    float *lat = fvec((size_t)cap * K, 1.f), *rope = R ? fvec((size_t)cap * R, 1.f) : NULL;
+    float *x = fvec((size_t)S * D, 1.f), *cs = R ? malloc((size_t)S * R * 4) : NULL, *gate = fvec((size_t)S * H * V, 2.f);
+    for (int s = 0; s < S; s++) for (int j = 0; j < half; j++) {
+        float ang = (float)(pb + s) * powf(10000.f, -2.f * j / R);
+        cs[s * R + 2 * j] = cosf(ang); cs[s * R + 2 * j + 1] = sinf(ang);
+    }
+    int selrow = 2 + cap;
+    int *sel = calloc((size_t)S * selrow, sizeof *sel);
+    for (int s = 0; s < S; s++) {
+        int vis = pb + s + 1, n = 0;
+        if (!c.list || s % 2) { sel[s * selrow] = -1; continue; }
+        for (int t = vis - 1; t >= c.kv_start; t -= 2) sel[s * selrow + 1 + n++] = t;   /* newest first, every other */
+        sel[s * selrow + 1 + n++] = -1;                                              /* a skipped entry */
+        sel[s * selrow] = n;
+    }
+    /* reference */
+    double *q = calloc((size_t)S * H * QR, 8), *kvr = calloc((size_t)S * KR, 8), *qa = calloc((size_t)S * qin, 8);
+    double *latr = malloc((size_t)cap * K * 8), *roper = malloc((size_t)cap * (R ? R : 1) * 8);
+    for (size_t i = 0; i < (size_t)cap * K; i++) latr[i] = lat[i];
+    for (size_t i = 0; R && i < (size_t)cap * R; i++) roper[i] = rope[i];
+    for (int s = 0; s < S; s++) {
+        const float *xs = x + (size_t)s * D;
+        if (c.q_lora) {
+            double *a = qa + (size_t)s * qin;
+            for (int o = 0; o < c.q_lora; o++) { double t = 0; for (int i = 0; i < D; i++) t += (double)Wqa[(size_t)o * D + i] * xs[i]; a[o] = t; }
+            rmsref(a, a, prm + 3, c.q_lora, eps);
+        } else for (int i = 0; i < D; i++) qa[(size_t)s * qin + i] = xs[i];
+        for (int o = 0; o < H * QR; o++) { double t = 0; for (int i = 0; i < qin; i++) t += (double)Wqb[(size_t)o * qin + i] * qa[(size_t)s * qin + i]; q[(size_t)s * H * QR + o] = t; }
+        for (int o = 0; o < KR; o++) { double t = 0; for (int i = 0; i < D; i++) t += (double)Wkva[(size_t)o * D + i] * xs[i]; kvr[(size_t)s * KR + o] = t; }
+        rmsref(latr + (size_t)(pb + s) * K, kvr + (size_t)s * KR, prm + 3 + qin, K, eps);
+        for (int h = 0; h <= H; h++) {      /* the heads' rotated parts, then the shared key's */
+            double *v = h < H ? q + (size_t)s * H * QR + h * QR + Q : kvr + (size_t)s * KR + K, in[256];
+            double *o = h < H ? v : roper + (size_t)(pb + s) * R;
+            for (int i = 0; i < R; i++) in[i] = v[i];
+            for (int i = 0; i < half; i++) {
+                double a = c.style ? in[2 * i] : in[i], b = c.style ? in[2 * i + 1] : in[i + half];
+                double cc = cs[s * R + 2 * i], sn = cs[s * R + 2 * i + 1];
+                o[i] = a * cc - b * sn; o[i + half] = b * cc + a * sn;
+            }
+        }
+    }
+    float *ref = malloc((size_t)S * D * 4);
+    double *ctx = calloc((size_t)H * V, 8);
+    for (int s = 0; s < S; s++) {
+        for (int h = 0; h < H; h++) {
+            const double *qs = q + (size_t)s * H * QR + h * QR;
+            double qabs[1024], clat[1024], *sc = malloc((size_t)cap * 8);
+            for (int i = 0; i < K; i++) { double t = 0; for (int d = 0; d < Q; d++) t += (double)Wk[((size_t)h * K + i) * Q + d] * qs[d]; qabs[i] = t; }
+            const int *ls = sel + s * selrow;
+            int n = ls[0] >= 0 ? ls[0] : pb + s + 1 - c.kv_start, used = 0;
+            int *pos = malloc((size_t)(n + 1) * sizeof *pos);
+            for (int j = 0; j < n; j++) { int t = ls[0] >= 0 ? ls[1 + j] : c.kv_start + j; if (t >= 0) pos[used++] = t; }
+            double mx = -1e300, sum = 0;
+            for (int j = 0; j < used; j++) {
+                double a = 0; int t = pos[j];
+                for (int i = 0; i < K; i++) a += qabs[i] * latr[(size_t)t * K + i];
+                for (int i = 0; i < R; i++) a += qs[Q + i] * roper[(size_t)t * R + i];
+                sc[j] = a * scale; if (sc[j] > mx) mx = sc[j];
+            }
+            for (int j = 0; j < used; j++) { sc[j] = exp(sc[j] - mx); sum += sc[j]; }
+            for (int i = 0; i < K; i++) { double a = 0; for (int j = 0; j < used; j++) a += sc[j] / sum * latr[(size_t)pos[j] * K + i]; clat[i] = a; }
+            for (int v = 0; v < V; v++) {
+                double a = 0; for (int i = 0; i < K; i++) a += (double)Wv[((size_t)h * V + v) * K + i] * clat[i];
+                if (c.gate) a *= 1.0 / (1.0 + exp(-(double)gate[(size_t)s * H * V + h * V + v]));
+                ctx[h * V + v] = a;
+            }
+            free(sc); free(pos);
+        }
+        for (int o = 0; o < D; o++) { double t = 0; for (int i = 0; i < H * V; i++) t += (double)Wo[(size_t)o * H * V + i] * ctx[i]; ref[(size_t)s * D + o] = (float)t; }
+    }
+    /* the device */
+    VkcMlaCache cc = {up(lat, (size_t)cap * K), R ? up(rope, (size_t)cap * R) : NULL, cap};
+    VkcMlaScratch scr = {0};
+    VkcBuf *xb = vkc_buf((size_t)(S * D + 16) * 4, VKC_DEV), *csb = R ? up(cs, (size_t)S * R) : NULL;
+    VkcBuf *gb = up(gate, (size_t)S * H * V), *ob = vkc_buf((size_t)S * D * 4, VKC_DEV);
+    VkcBuf *dn = vkc_buf((size_t)S * KR * 4, VKC_DOWN), *sb = vkc_buf((size_t)S * selrow * 4, VKC_DEV);
+    int ok = vkc_mla_scratch(&scr, &m, S) && vkc_begin() && vkc_write(xb, 16, x, (size_t)S * D * 4) &&
+             vkc_mla_qkv(&m, &scr, xb, 16, S, pb, csb, &cc, dn, 0) && vkc_submit(0) &&
+             vkc_begin() && vkc_write(sb, 0, sel, (size_t)S * selrow * 4) &&
+             vkc_mla_attn(&m, &scr, S, pb, c.kv_start, &cc, c.list ? sb : NULL, 0, selrow, c.gate ? gb : NULL, 0, ob, 0) &&
+             vkc_submit(1);
+    float *y = down(ob, 0, (size_t)S * D);
+    double e = relerr(y, ref, (size_t)S * D, 1e-3);
+    /* the new cache rows, as the host's copy receives them */
+    float *nl = (float *)vkc_ptr(dn);
+    double el = 0, er = 0;
+    for (int s = 0; s < S; s++) {
+        for (int i = 0; i < K; i++) { double d = fabs(nl[(size_t)s * K + i] - latr[(size_t)(pb + s) * K + i]); if (d > el) el = d; }
+        for (int i = 0; i < R; i++) { double d = fabs(nl[(size_t)S * K + (size_t)s * R + i] - roper[(size_t)(pb + s) * R + i]); if (d > er) er = d; }
+    }
+    CHECK(ok && e < 2e-5 && el < 2e-5 && er < 2e-5 && !bad(y, (size_t)S * D),
+          "mla H %d Q %d R %d V %d K %d q_lora %d S %d pos %d kv_start %d style %d split %d list %d gate %d fmt %d/%d/%d: "
+          "ok %d err %.2e latent %.2e rope %.2e", H, Q, R, V, K, c.q_lora, S, pb, c.kv_start, c.style, c.split, c.list, c.gate,
+          c.fq, c.fkv, c.fo, ok, e, el, er);
+    if (getenv("VKC_TEST_VERBOSE")) printf("mla case H %d K %d S %d: err %.2e latent %.2e rope %.2e\n", H, K, S, e, el, er);
+    vkc_mla_scratch_free(&scr);
+    vkc_free(cc.lat); vkc_free(cc.rope); vkc_free(xb); vkc_free(csb); vkc_free(gb); vkc_free(ob); vkc_free(dn); vkc_free(sb);
+    vkc_free(m.prm);
+    ColiVkTensor *ts[7] = {m.q_a, m.q_b, m.kv_a, m.kv_b, m.k_abs, m.v_abs, m.o};
+    for (int i = 0; i < 7; i++) if (ts[i]) coli_vk_tensor_free(ts[i]);
+    free(Wqa); free(Wqb); free(Wkva); free(Wo); free(Wkvb); free(Wk); free(Wv); free(prm); free(lat); free(rope);
+    free(x); free(cs); free(gate); free(sel); free(q); free(kvr); free(qa); free(latr); free(roper); free(ref); free(ctx); free(y);
+}
+
+/* The DSA selection against colibri.c's, bit for bit: quarter-step queries and keys
+ * and power-of-two scales make every score exact on both sides, and the many zero
+ * scores (every head negative) make ties the selection must break as the CPU does. */
+/* negw: every head weight <= 0, so every score is 0 or below and the zeros tie at the
+ * threshold far beyond top-k (the second band's order over long chunks) */
+static void test_dsa(int S, int pos_base, int IH, int ID, int topk, int force, int negw) {
+    int T = pos_base + S, krow = ID + 3, qrow = IH * ID + 1, wrow = IH + 2, selrow = 1 + topk + 2, scrow = T + 5;
+    /* the buffers start at offsets 1 (queries), 2 (weights) and 3 (keys) */
+    float *q = malloc((size_t)(S * qrow + 1) * 4), *k = malloc((size_t)(T * krow + 3) * 4), *w = malloc((size_t)(S * wrow + 2) * 4);
+    for (int i = 0; i < S * qrow + 1; i++) q[i] = ((int)(rnd() % 17) - 8) * 0.25f;
+    for (int i = 0; i < T * krow + 3; i++) k[i] = ((int)(rnd() % 17) - 8) * 0.25f;
+    for (int i = 0; i < S * wrow + 2; i++) w[i] = ((int)(rnd() % 9) - (negw ? 8 : 4)) * 0.5f;
+    for (int t = 0; t < T; t += 5) for (int i = 0; i < ID; i++) k[3 + t * krow + i] = k[3 + (t / 5) * krow + i];   /* equal keys: ties */
+    float qs = 0.25f, wsc = 0.5f;
+    int *ref = calloc((size_t)S * selrow, sizeof *ref), fails0 = fails;
+    for (int s = 0; s < S; s++) {
+        int nk = pos_base + s + 1, *dst = ref + s * selrow;
+        if (nk <= topk && !force) { dst[0] = -1; continue; }
+        int keep = nk < topk ? nk : topk;
+        float *isc = malloc((size_t)nk * 4), *tmp = malloc((size_t)nk * 4);
+        for (int t = 0; t < nk; t++) {
+            float a = 0;
+            for (int h = 0; h < IH; h++) {
+                float d0 = 0; for (int i = 0; i < ID; i++) d0 += q[1 + s * qrow + h * ID + i] * k[3 + t * krow + i];
+                d0 *= qs; if (d0 > 0) a += w[2 + s * wrow + h] * d0;
+            }
+            isc[t] = a * wsc;
+        }
+        memcpy(tmp, isc, (size_t)nk * 4);
+        for (int a = 0; a < nk; a++) for (int b = a + 1; b < nk; b++) if (tmp[b] > tmp[a]) { float x = tmp[a]; tmp[a] = tmp[b]; tmp[b] = x; }
+        float thr = tmp[keep - 1];
+        int nd = 0;
+        for (int t = 0; t < nk && nd < keep; t++) if (isc[t] > thr) dst[1 + nd++] = t;
+        for (int t = 0; t < nk && nd < keep; t++) if (isc[t] == thr) dst[1 + nd++] = t;
+        dst[0] = nd;
+        free(isc); free(tmp);
+    }
+    VkcBuf *qb = up(q, (size_t)S * qrow + 1), *kb = up(k, (size_t)T * krow + 3), *wb = up(w, (size_t)S * wrow + 2);
+    VkcBuf *scb = vkc_buf((size_t)S * scrow * 4, VKC_DEV), *sb = vkc_buf((size_t)S * selrow * 4, VKC_DOWN);
+    VkcDsa p = {S, pos_base, IH, ID, topk, force, 1, qrow, 2, wrow, 3, krow, scrow, selrow, qs, wsc};
+    vkc_begin(); int ok = vkc_dsa_select(qb, wb, kb, scb, sb, &p); vkc_submit(1);
+    const int *got = (const int *)vkc_ptr(sb);
+    CHECK(ok, "dsa S %d pos %d: not recorded", S, pos_base);
+    for (int s = 0; ok && s < S && fails == fails0; s++) {
+        int n = ref[s * selrow] < 0 ? 0 : ref[s * selrow];
+        int same = got[s * selrow] == ref[s * selrow];
+        for (int j = 0; same && j < n; j++) same = got[s * selrow + 1 + j] == ref[s * selrow + 1 + j];
+        CHECK(same, "dsa S %d pos %d IH %d ID %d topk %d force %d: row %d differs (count %d, expected %d)",
+              S, pos_base, IH, ID, topk, force, s, got[s * selrow], ref[s * selrow]);
+        if (!same && getenv("DSA_DEBUG")) { for (int j = 0; j < n; j++) printf(" %d/%d", got[s * selrow + 1 + j], ref[s * selrow + 1 + j]); printf("\n"); }
+    }
+    vkc_free(qb); vkc_free(kb); vkc_free(wb); vkc_free(scb); vkc_free(sb);
+    free(q); free(k); free(w); free(ref);
+}
+
+/* ---- KDA, mHC, k-pooling ----------------------------------------------------------------- */
+/* glm53.c's KDA layer around delta_attention.h's step, S rows over two calls (the state
+ * and the window carried on the device between them) */
+static void test_kda(int H, int KD, int CK, float xs) {   /* xs: the inputs' scale (small: the l2 eps counts) */
+    int VD = KD, P = H * KD, C = 3 * P, S = 5;
+    float lb = -5.f, neps = 1e-6f, eps = 1e-5f;
+    float *qkv = fvec((size_t)S * C, xs), *f = fvec((size_t)S * P, 1.f), *b = fvec((size_t)S * H, 2.f), *g = fvec((size_t)S * P, 2.f);
+    float *taps = fvec((size_t)C * CK, 0.7f), *win = fvec((size_t)C * CK, 1.f), *state = fvec((size_t)H * KD * VD, 0.3f);
+    float *prm = malloc((size_t)(H + P + VD) * 4);
+    for (int i = 0; i < H; i++) prm[i] = frnd() * 0.5f;
+    for (int i = 0; i < P; i++) prm[H + i] = frnd() * 0.5f;
+    for (int i = 0; i < VD; i++) prm[H + P + i] = 0.5f + (rnd() % 100) / 100.f;
+    /* reference: glm53.c's kda_layer row by row */
+    float *rs = malloc((size_t)H * KD * VD * 4), *rw = malloc((size_t)C * CK * 4), *ref = malloc((size_t)S * P * 4);
+    memcpy(rs, state, (size_t)H * KD * VD * 4); memcpy(rw, win, (size_t)C * CK * 4);
+    float *scratch = malloc((size_t)coli_kda_scratch_floats(H, KD, VD) * 4), *core = malloc((size_t)P * 4);
+    float *dk = malloc((size_t)P * 4), *bt = malloc((size_t)H * 4);
+    for (int s = 0; s < S; s++) {
+        for (int h = 0; h < H; h++) for (int d = 0; d < KD; d++) {
+            int i = h * KD + d; float sv = expf(prm[h]) * (f[s * P + i] + prm[H + i]);
+            float sg = sv >= 0 ? 1.f / (1.f + expf(-sv)) : expf(sv) / (1.f + expf(sv));
+            dk[i] = lb * sg;
+        }
+        for (int h = 0; h < H; h++) { float v = b[s * H + h]; bt[h] = v >= 0 ? 1.f / (1.f + expf(-v)) : expf(v) / (1.f + expf(v)); }
+        coli_kda_step(core, rs, rw, qkv + (size_t)s * C, taps, dk, bt, H, KD, VD, CK, neps, scratch);
+        for (int h = 0; h < H; h++) {
+            float sq = 0; for (int d = 0; d < VD; d++) sq += core[h * VD + d] * core[h * VD + d];
+            float inv = 1.f / sqrtf(sq / VD + eps);
+            for (int d = 0; d < VD; d++) {
+                float gv = g[s * P + h * VD + d], sg = gv >= 0 ? 1.f / (1.f + expf(-gv)) : expf(gv) / (1.f + expf(gv));
+                ref[s * P + h * VD + d] = core[h * VD + d] * inv * prm[H + P + d] * sg;
+            }
+        }
+    }
+    /* the device: q, k, v in three blocks [3][S][P] (in_part = S*P) */
+    float *blk = malloc((size_t)3 * S * P * 4);
+    for (int s = 0; s < S; s++) for (int part = 0; part < 3; part++)
+        memcpy(blk + (size_t)part * S * P + (size_t)s * P, qkv + (size_t)s * C + (size_t)part * P, (size_t)P * 4);
+    VkcBuf *ib = up(blk, (size_t)3 * S * P), *tb = up(taps, (size_t)C * CK), *wb = up(win, (size_t)C * CK), *sb = up(state, (size_t)H * KD * VD);
+    VkcBuf *fb = up(f, (size_t)S * P), *bb = up(b, (size_t)S * H), *gb = up(g, (size_t)S * P), *pb = up(prm, (size_t)H + P + VD);
+    VkcBuf *mb = vkc_buf((size_t)S * C * 4, VKC_DEV), *yb = vkc_buf((size_t)S * P * 4, VKC_DEV);
+    int ok = 1, s0 = 0;
+    for (int part = 0; part < 2 && ok; part++) {
+        int n = part ? S - 3 : 3;
+        VkcKdaConv cp = {n, C, CK, P, s0 * P, P, S * P, 0, C, 0, 0};
+        VkcKdaRec rp = {n, H, VD, P, 0, C, s0 * P, P, s0 * H, H, s0 * P, P, s0 * P, P, 0, 0, lb, neps, eps};
+        ok = vkc_begin() && vkc_kda_conv(ib, tb, wb, mb, &cp) && vkc_kda_rec(KD, mb, fb, bb, gb, pb, sb, yb, &rp) && vkc_submit(part);
+        s0 += n;
+    }
+    float *y = down(yb, 0, (size_t)S * P), *st2 = down(sb, 0, (size_t)H * KD * VD), *w2 = down(wb, 0, (size_t)C * CK);
+    double e = relerr(y, ref, (size_t)S * P, 1e-3), es = relerr(st2, rs, (size_t)H * KD * VD, 1e-3), ew = relerr(w2, rw, (size_t)C * CK, 1e-3);
+    CHECK(ok && e < 1e-5 && es < 1e-5 && ew == 0 && !bad(y, (size_t)S * P), "kda H %d KD %d K %d: ok %d out %.2e state %.2e window %.2e",
+          H, KD, CK, ok, e, es, ew);
+    if (getenv("VKC_TEST_VERBOSE")) printf("kda H %d KD %d: out %.2e state %.2e\n", H, KD, e, es);
+    vkc_free(ib); vkc_free(tb); vkc_free(wb); vkc_free(sb); vkc_free(fb); vkc_free(bb); vkc_free(gb); vkc_free(pb); vkc_free(mb); vkc_free(yb);
+    free(qkv); free(f); free(b); free(g); free(taps); free(win); free(state); free(prm); free(rs); free(rw); free(ref);
+    free(scratch); free(core); free(dk); free(bt); free(blk); free(y); free(st2); free(w2);
+}
+
+/* hyper_connections.h's pre and post against the split, collapse and write back, the
+ * mean, and the clamped SwiGLU */
+static void test_mhc(int H, int D, int iters) {
+    int S = 3, HD = H * D, nm = (2 + H) * H;
+    float eps = 1e-5f, hce = 1e-6f, lim = 1.5f;
+    float *x = fvec((size_t)S * HD, 1.f), *fn = fvec((size_t)nm * HD, 0.05f), *br = fvec((size_t)S * D, 1.f);
+    float *prm = malloc((size_t)(3 + nm) * 4);
+    for (int i = 0; i < 3; i++) prm[i] = 0.5f + (rnd() % 100) / 100.f;
+    for (int i = 0; i < nm; i++) prm[3 + i] = frnd() * 0.5f;
+    float *rpre = malloc((size_t)S * D * 4), *rpost = malloc((size_t)S * H * 4), *rcomb = malloc((size_t)S * H * H * 4);
+    float *rout = malloc((size_t)S * HD * 4), *rmean = malloc((size_t)S * D * 4);
+    for (int s = 0; s < S; s++) {
+        coli_hc_pre(rpre + s * D, rpost + s * H, rcomb + s * H * H, x + s * HD, fn, prm, prm + 3, H, D, iters, eps, hce);
+        coli_hc_post(rout + s * HD, br + s * D, x + s * HD, rpost + s * H, rcomb + s * H * H, H, D);
+        for (int d = 0; d < D; d++) { float sm = 0; for (int i = 0; i < H; i++) sm += x[s * HD + i * D + d]; rmean[s * D + d] = sm / H; }
+    }
+    ColiVkTensor *t = NULL;
+    if (!coli_vk_tensor_ensure(&t, fn, NULL, 10, HD, nm, 0)) { CHECK(0, "mhc: upload"); return; }
+    VkcBuf *xb = up(x, (size_t)S * HD), *bb = up(br, (size_t)S * D), *pb = up(prm, 3 + (size_t)nm);
+    VkcBuf *mb = vkc_buf((size_t)S * nm * 4, VKC_DEV), *hb = vkc_buf((size_t)S * (2 * H + H * H) * 4, VKC_DEV);
+    VkcBuf *cb = vkc_buf((size_t)S * D * 4, VKC_DEV), *ob = vkc_buf((size_t)S * HD * 4, VKC_DEV), *eb = vkc_buf((size_t)S * D * 4, VKC_DEV);
+    int hrow = 2 * H + H * H;
+    VkcMhc sp = {S, H, D, iters, 0, HD, 0, nm, 0, hrow, 0, D, 0, 0, eps, hce, 0.f};
+    VkcMhc po = {S, H, D, iters, 0, HD, 0, D, 0, hrow, 0, HD, 0, 0, eps, hce, 0.f};
+    int ok = vkc_begin() && vkc_matmul(t, xb, 0, mb, 0, S) && vkc_mhc(VKC_MHC_SPLIT, xb, mb, hb, pb, NULL, &sp) &&
+             vkc_mhc(VKC_MHC_COLLAPSE, xb, NULL, hb, NULL, cb, &sp) && vkc_mhc(VKC_MHC_POST, xb, bb, hb, NULL, ob, &po) &&
+             vkc_mhc(VKC_MHC_MEAN, xb, NULL, NULL, NULL, eb, &sp) && vkc_submit(1);
+    float *hp = down(hb, 0, (size_t)S * hrow), *col = down(cb, 0, (size_t)S * D), *out = down(ob, 0, (size_t)S * HD), *mean = down(eb, 0, (size_t)S * D);
+    /* pre, post and comb from coli_hc_split_sinkhorn on the CPU's own mixes */
+    float *rp = malloc((size_t)S * hrow * 4), *mixs = malloc((size_t)nm * 4);
+    for (int s = 0; s < S; s++) {
+        float ms = 0; for (int i = 0; i < HD; i++) ms += x[s * HD + i] * x[s * HD + i];
+        float ir = 1.f / sqrtf(ms / HD + eps);
+        for (int r = 0; r < nm; r++) { float a = 0; for (int i = 0; i < HD; i++) a += fn[(size_t)r * HD + i] * x[s * HD + i]; mixs[r] = a * ir; }
+        coli_hc_split_sinkhorn(rp + s * hrow, rp + s * hrow + H, rp + s * hrow + 2 * H, mixs, prm, prm + 3, H, iters, hce);
+    }
+    double epre = 0;
+    for (int s = 0; s < S; s++) for (int i = 0; i < hrow; i++) { double d = fabs(hp[s * hrow + i] - rp[s * hrow + i]); if (d > epre) epre = d; }
+    free(rp); free(mixs);
+    double ep = 0, ec = relerr(col, rpre, (size_t)S * D, 1e-3), eo = relerr(out, rout, (size_t)S * HD, 1e-3), em = relerr(mean, rmean, (size_t)S * D, 1e-3);
+    for (int s = 0; s < S; s++) {
+        for (int i = 0; i < H; i++) { double d = fabs(hp[s * hrow + H + i] - rpost[s * H + i]); if (d > ep) ep = d; }
+        for (int i = 0; i < H * H; i++) { double d = fabs(hp[s * hrow + 2 * H + i] - rcomb[s * H * H + i]); if (d > ep) ep = d; }
+    }
+    CHECK(ok && ep < 2e-5 && epre < 5e-7 && ec < 2e-5 && eo < 2e-5 && em < 1e-6,
+          "mhc H %d D %d iters %d: ok %d split %.2e post/comb %.2e collapse %.2e write back %.2e mean %.2e",
+          H, D, iters, ok, epre, ep, ec, eo, em);
+    if (getenv("VKC_TEST_VERBOSE")) printf("mhc H %d D %d: split %.2e post/comb %.2e collapse %.2e write back %.2e mean %.2e\n", H, D, epre, ep, ec, eo, em);
+    /* the clamped SwiGLU, on values both sides of the limit */
+    int n = 333;
+    float *ga = fvec(n, 3.f), *ua = fvec(n, 3.f), *rr = malloc((size_t)n * 4);
+    for (int i = 0; i < n; i++) { float gg = ga[i] > lim ? lim : ga[i], uu = ua[i] < -lim ? -lim : (ua[i] > lim ? lim : ua[i]); rr[i] = gg / (1.f + expf(-gg)) * uu; }
+    VkcBuf *gab = up(ga, n), *uab = up(ua, n), *yb = vkc_buf((size_t)n * 4, VKC_DEV);
+    VkcMhc sw = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, n, 0.f, 0.f, lim};
+    ok = vkc_begin() && vkc_mhc(VKC_SWIGLU_CLAMP, gab, uab, NULL, NULL, yb, &sw) && vkc_submit(1);
+    float *yy = down(yb, 0, n);
+    double es = relerr(yy, rr, n, 1e-3);
+    CHECK(ok && es < 1e-6, "swiglu clamp: ok %d err %.2e", ok, es);
+    vkc_free(xb); vkc_free(bb); vkc_free(pb); vkc_free(mb); vkc_free(hb); vkc_free(cb); vkc_free(ob); vkc_free(eb);
+    vkc_free(gab); vkc_free(uab); vkc_free(yb); coli_vk_tensor_free(t);
+    free(x); free(fn); free(br); free(prm); free(rpre); free(rpost); free(rcomb); free(rout); free(rmean);
+    free(hp); free(col); free(out); free(mean); free(ga); free(ua); free(rr); free(yy);
+}
+
+/* k-pooling against sparse_index.h. Equal gates and no bias make each pooled key the
+ * exact mean of its members, so with quarter-step values and power-of-two scales the
+ * scores are exact on both sides and the selection must be the CPU's slot for slot;
+ * a second pass with random gates and bias checks the pooled keys to rounding. */
+static void test_kpool(int S, int pos_base, int IH, int ID, int pool, int topk, int tail) {
+    int T = pos_base + S, width = coli_sparse_index_width(topk, pool, tail), selrow = width + 1;
+    int npool = T / pool, scrow = npool + 1;
+    float *keys = malloc((size_t)T * ID * 4), *gates = calloc((size_t)T * ID, 4), *ape = calloc((size_t)pool * ID, 4);
+    float *q = malloc((size_t)S * IH * ID * 4), *hw = malloc((size_t)S * IH * 4);
+    for (int i = 0; i < T * ID; i++) keys[i] = ((int)(rnd() % 17) - 8) * 0.25f;
+    for (int i = 0; i < S * IH * ID; i++) q[i] = ((int)(rnd() % 17) - 8) * 0.25f;
+    for (int i = 0; i < S * IH; i++) hw[i] = ((int)(rnd() % 9) - 4) * 0.5f * sqrtf((float)IH);
+    for (int t = 0; t < T; t += 7) for (int i = 0; i < ID; i++) keys[t * ID + i] = keys[(t % 3) * ID + i];   /* equal pools: ties */
+    unsigned char *valid = malloc((size_t)T); memset(valid, 1, (size_t)T);
+    int *ref = malloc((size_t)S * width * sizeof(int));
+    float *hwd = malloc((size_t)S * IH * 4);
+    for (int i = 0; i < S * IH; i++) hwd[i] = hw[i] / sqrtf((float)IH);
+    coli_sparse_index_select_range(ref, q, keys, gates, hwd, ape, valid, T, IH, ID, pool, topk, tail, pos_base, T);
+    VkcBuf *kb = up(keys, (size_t)T * ID), *gb = up(gates, (size_t)T * ID), *ab = up(ape, (size_t)pool * ID);
+    VkcBuf *qb = up(q, (size_t)S * IH * ID), *wb = up(hw, (size_t)S * IH), *pk = vkc_buf((size_t)(npool + 1) * ID * 4, VKC_DEV);
+    VkcBuf *scb = vkc_buf((size_t)S * scrow * 4, VKC_DEV), *sb = vkc_buf((size_t)S * selrow * 4, VKC_DOWN);
+    VkcDsaPool kp = {npool, pool, 0, ID, 0, ID, 0, 0, 0, ID};
+    VkcDsaPick sp = {S, pos_base, IH, ID, topk, pool, 0, IH * ID, 0, IH, 0, tail, scrow, selrow, sqrtf((float)IH), 1.f / sqrtf((float)ID)};
+    int ok = vkc_begin() && vkc_dsa_pool_keys(kb, gb, ab, pk, &kp) && vkc_dsa_pool_select(qb, wb, pk, scb, sb, &sp) && vkc_submit(1);
+    const int *got = (const int *)vkc_ptr(sb);
+    int same = ok;
+    for (int s = 0; same && s < S; s++) {
+        same = got[s * selrow] == width;
+        for (int i = 0; same && i < width; i++) same = got[s * selrow + 1 + i] == ref[s * width + i];
+        if (!same && getenv("DSA_DEBUG")) { for (int i = 0; i < width; i++) printf(" %d/%d", got[s * selrow + 1 + i], ref[s * width + i]); printf("\n"); }
+    }
+    CHECK(same, "kpool S %d pos %d IH %d ID %d pool %d topk %d tail %d: ok %d, the selection differs", S, pos_base, IH, ID, pool, topk, tail, ok);
+    /* the pooled keys with real gates and bias, against sparse_index.h's arithmetic */
+    for (int i = 0; i < T * ID; i++) gates[i] = frnd() * 2.f;
+    for (int i = 0; i < pool * ID; i++) ape[i] = frnd() * 0.5f;
+    float *rk = malloc((size_t)npool * ID * 4);
+    for (int p = 0; p < npool; p++) for (int d = 0; d < ID; d++) {
+        float mx = -FLT_MAX, tot = 0, mix = 0;
+        for (int j = 0; j < pool; j++) { float l = gates[(p * pool + j) * ID + d] + ape[j * ID + d]; if (l > mx) mx = l; }
+        for (int j = 0; j < pool; j++) tot += expf(gates[(p * pool + j) * ID + d] + ape[j * ID + d] - mx);
+        for (int j = 0; j < pool; j++) mix += expf(gates[(p * pool + j) * ID + d] + ape[j * ID + d] - mx) / tot * keys[(p * pool + j) * ID + d];
+        rk[p * ID + d] = mix;
+    }
+    ok = vkc_begin() && vkc_write(gb, 0, gates, (size_t)T * ID * 4) && vkc_write(ab, 0, ape, (size_t)pool * ID * 4) &&
+         vkc_dsa_pool_keys(kb, gb, ab, pk, &kp) && vkc_submit(1);
+    float *gk = down(pk, 0, (size_t)npool * ID);
+    double e = relerr(gk, rk, (size_t)npool * ID, 1e-3);
+    CHECK(ok && e < 2e-6, "kpool keys pool %d ID %d: ok %d err %.2e", pool, ID, ok, e);
+    vkc_free(kb); vkc_free(gb); vkc_free(ab); vkc_free(qb); vkc_free(wb); vkc_free(pk); vkc_free(scb); vkc_free(sb);
+    free(keys); free(gates); free(ape); free(q); free(hw); free(valid); free(ref); free(hwd); free(rk); free(gk);
+}
+
 /* ---- frames: many ops, frames in flight, ordering ---------------------------------------- */
 static void test_frames(void) {
     int n = 1000;
@@ -579,6 +1261,43 @@ int main(int argc, char **argv) {
     test_qsa();
     test_ple();
     test_frames();
+    if (!vkc_mla_ready()) { fails++; printf("FAIL: the MLA shaders did not load\n"); }
+    else {
+        int hf[9] = {1, 2, 4, 5, 7, 10, 11, 12, 13};
+        for (int k = 0; k < 9; k++) if (hf[k] != 7) { test_hgemv(hf[k], 0); test_hgemv(hf[k], 1); }
+        test_mla_rows();
+        printf("mla ops done\n");
+        /* H Q R V K q_lora D S pos kv_start style split list gate fq fkv fo */
+        MlaCase cases[] = {
+            {4, 24, 8, 32, 32, 64, 128, 1, 12, 0, 1, 0, 0, 0, 10, 10, 10},     /* colibri's tiny, decode */
+            {4, 24, 8, 32, 32, 64, 128, 5, 7, 0, 1, 0, 0, 0, 10, 10, 10},      /* prefill rows after earlier ones */
+            {4, 24, 8, 32, 32, 64, 128, 1, 70, 0, 1, 0, 1, 0, 10, 10, 10},     /* a selection list */
+            {3, 16, 16, 20, 48, 0, 96, 3, 9, 0, 0, 1, 0, 1, 1, 1, 1},          /* no q latent, rotate-half, split, gate, int8 */
+            {2, 64, 0, 64, 128, 64, 128, 4, 66, 0, 0, 1, 1, 0, 4, 4, 4},       /* NoPE, int4-g64, lists */
+            {2, 32, 64, 16, 64, 128, 128, 1, 300, 5, 1, 0, 0, 0, 2, 2, 11},    /* a long context from kv_start, int4 rows, bf16 */
+            {2, 192, 64, 256, 512, 128, 256, 2, 70, 0, 1, 0, 0, 0, 4, 4, 4},   /* GLM-5.2's heads */
+            {1, 16, 8, 16, 1024, 32, 64, 1, 20, 0, 1, 0, 0, 1, 10, 5, 10},     /* the largest latent, int3-g64 */
+        };
+        for (size_t k = 0; k < sizeof cases / sizeof *cases; k++) test_mla(cases[k]);
+        printf("mla done\n");
+        test_dsa(1, 30, 2, 16, 8, 0, 0); test_dsa(4, 40, 4, 32, 16, 0, 0); test_dsa(3, 5, 2, 16, 64, 0, 0);
+        test_dsa(3, 5, 2, 16, 64, 1, 0); test_dsa(2, 700, 3, 64, 100, 0, 0); test_dsa(1, 9, 64, 64, 4, 0, 0);
+        test_dsa(2, 900, 2, 16, 50, 0, 1);
+        printf("dsa done\n");
+        test_kpool(3, 20, 4, 16, 2, 8, 1); test_kpool(2, 9, 1, 16, 4, 8, 1); test_kpool(4, 300, 4, 64, 4, 64, 1);
+        test_kpool(1, 2, 4, 16, 2, 4, 0); test_kpool(2, 30, 16, 16, 2, 6, 1);
+        printf("kpool done\n");
+    }
+    if (!vkc_kda_ready() || !vkc_mhc_ready()) { fails++; printf("FAIL: the KDA or mHC shaders did not load\n"); }
+    else {
+        test_kda(3, 16, 4, 1.f); test_kda(2, 32, 4, 1.f); test_kda(4, 128, 3, 1.f); test_kda(1, 64, 2, 1.f);
+        test_kda(2, 16, 4, 0.002f);
+        printf("kda done\n");
+        test_mhc(2, 64, 3); test_mhc(4, 96, 20); test_mhc(3, 40, 1);
+        printf("mhc done\n");
+    }
+    if (vkc_sconv_ready() && vkc_relattn_ready()) { test_inkling(); printf("inkling done\n"); }
+    else CHECK(0, "inkling's ops: chain_sconv.spv or chain_relattn.spv did not load");
     VkcStats st; vkc_stats(&st);
     printf("chain: %llu frames, %llu ops, %llu matmuls (%llu GEMM), %llu barriers\n", st.frames, st.ops, st.matmuls, st.gemms, st.barriers);
     vkc_shutdown();

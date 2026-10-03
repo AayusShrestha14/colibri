@@ -25,6 +25,10 @@
  *     fp32 tiled GEMM; and the chain's shaders (shaders/chain_*.comp), each documented
  *     at its top: chain_norm, chain_rope, chain_attn, chain_dnconv, chain_dnrec,
  *     chain_ew, chain_qsa, chain_ple. Offsets and strides are in floats.
+ *   - multi-head latent attention: the MLA ops and the layer op below (chain_mla,
+ *     chain_hgemv, chain_dsa, its k-pooled modes included), Kimi Delta Attention
+ *     (chain_kda) and manifold-constrained hyper-connections (chain_mhc): loaded beside
+ *     the others but optional.
  *
  * Threading: the engine thread only (the main queue is the backend's, used from the
  * same thread by coli_vk_matmul; the expert tier submits on its own queue).
@@ -128,6 +132,184 @@ typedef struct { int mode, S, C, H, CK, NG, keys_off, hyp_off, val_off, snap_row
                  int prm_off, conv_off, ring_off; } VkcPle;
 int  vkc_ple(VkcBuf *keys, VkcBuf *hyp, VkcBuf *val, VkcBuf *prm, VkcBuf *gated, VkcBuf *normv,
              VkcBuf *conv, VkcBuf *ring, const VkcPle *p);
+
+/* ---- multi-head latent attention (MLA) -------------------------------------------
+ * The attention of GLM-5.2, GLM-5.3, DeepSeek V3-style and Kimi K3's MLA layers, for S
+ * rows (one at decode, a prompt chunk at prefill), with the KV cache on the device. Per
+ * head h the query has Q no-position floats and R rotated ones; the cache holds, per
+ * position, the normalized latent (K floats, kv_lora) and the rotated shared key (R).
+ * Weight absorption: the no-position query enters the latent space once per head
+ * (qa = W_k^T q_nope), the scores are qa . latent + q_rot . rope_key, and the value
+ * rows apply once to the softmax-weighted latent (ctx = W_v clat). Nothing assumes a
+ * model's shapes: H, Q, R (0 = NoPE), V, K, q_lora (0 = no q latent), the RoPE style,
+ * the softmax scale (YaRN's mscale^2 included by the caller) and the cos/sin table
+ * (YaRN's frequencies and mscale included by the caller) are all the caller's.
+ *
+ * Two levels. The ops (shaders/chain_mla.comp, chain_hgemv.comp, chain_dsa.comp):
+ *   vkc_mla_core   the attention core over the cache: scores, online softmax, clat;
+ *                  the causal range or a selection list (a DSA indexer's)
+ *   vkc_mla_hgemv  per-head block matmuls of a resident tensor (the absorbed query
+ *                  from kv_b's key rows, transposed, or from a [H*K x Q] key matrix;
+ *                  the value rows; an optional sigmoid gate on the values)
+ *   vkc_mla_rope   RoPE from a host cos/sin table, rotate-half or interleaved pairs in
+ *                  and halves out, in place or into a cache row
+ *   vkc_mla_lnorm  LayerNorm with weight and bias (the indexer's key norm)
+ *   vkc_dsa_select a token-level DSA indexer's scores and top-k, in the CPU's order
+ * and the layer op, vkc_mla_qkv + vkc_mla_attn (or vkc_mla for both): q_a, its norm,
+ * q_b (or q straight from the hidden rows), kv_a, the latent norm, RoPE, the new rows
+ * into the cache (and a copy for the host's), then the absorbed core, the values, the
+ * gate and o_proj. Between the two an engine records what reads the projections (a
+ * DSA indexer reads the normalized q latent, s->qa).
+ * The cache is the caller's (VkcMlaCache): positions [kv_start, pos_base) must be there
+ * before a step from pos_base (the engine keeps a watermark, as for the GQA caches);
+ * the step writes [pos_base, pos_base + S).
+ * Limits: K <= 1024, R <= 128 and even, Q <= 1024 for kv_b's transposed absorption,
+ * IH <= 64 and IH*ID <= 4096 for the indexer. The ops return 0 (nothing recorded) when
+ * the MLA shaders are missing or a limit is passed; vkc_mla_ready() says whether the
+ * shaders are there. */
+int vkc_mla_ready(void);
+
+/* chain_mla.comp mode 0: clat[s][h] (o_off + s*o_row + h*o_seg) from the absorbed query
+ * qabs (qa_off + s*qa_row + h*qa_seg, K floats) and the rotated query (qr_off + ..., R),
+ * over lat (lat_off + t*lat_row) and rope (rope_off + t*rope_row) at the positions
+ * kv_start..pos_base+s or sel's list (sel_row 0: none; sel[sel_off + s*sel_row] = count,
+ * -1 the causal range, then the positions, a negative one skipped). rope may be NULL with R 0. */
+typedef struct { int S, H, K, R, pos_base, kv_start, qa_off, qa_row, qa_seg, qr_off, qr_row, qr_seg,
+                 lat_off, lat_row, rope_off, rope_row, sel_off, sel_row, o_off, o_row, o_seg; float scale; } VkcMlaCore;
+int vkc_mla_core(VkcBuf *qabs, VkcBuf *qr, VkcBuf *lat, VkcBuf *rope, VkcBuf *sel, VkcBuf *clat, const VkcMlaCore *p);
+/* chain_mla.comp modes 1 and 2: nseg segments, segment g at row g / per_row, index
+ * g % per_row: x_off + row*x_row + j*x_seg (y likewise; y may be x).
+ * RoPE: the first rd floats rotate with the cos/sin pairs at cs_off + row*cs_row, the
+ * rest of seg_len is copied when y is elsewhere. LayerNorm: seg_len floats, weight at
+ * w_off and bias at b_off (has_b) in prm. */
+#define VKC_ROPE_HALF        0   /* a = x[i], b = x[i + rd/2] */
+#define VKC_ROPE_INTERLEAVED 1   /* a = x[2i], b = x[2i + 1], written to i and i + rd/2 */
+typedef struct { int nseg, per_row, rd, seg_len, style, x_off, x_row, x_seg, y_off, y_row, y_seg,
+                 cs_off, cs_row, w_off, b_off, has_b; float eps; } VkcMlaRow;
+int vkc_mla_rope(VkcBuf *x, VkcBuf *cs, VkcBuf *y, const VkcMlaRow *p);
+int vkc_mla_lnorm(VkcBuf *x, VkcBuf *prm, VkcBuf *y, const VkcMlaRow *p);
+/* chain_hgemv.comp: head h's block is t's rows h*hstride + hoff + [0, n).
+ * trans 0: y[s][h][o] = W[row o] . x[s][h][0..I), o < n (has_gate: times
+ *          sigmoid(gate[g_off + s*g_row + h*n + o]));
+ * trans 1: y[s][h][i] = sum_d W[row d][i] * x[s][h][d], d < n, i < I.
+ * x[s][h] at x_off + s*x_row + h*x_seg, y[s][h] at y_off + s*y_row + h*y_seg. */
+typedef struct { int trans, S, H, n, hstride, hoff, x_off, x_row, x_seg, y_off, y_row, y_seg, g_off, g_row, has_gate; } VkcHgemv;
+int vkc_mla_hgemv(ColiVkTensor *t, VkcBuf *x, VkcBuf *y, VkcBuf *gate, const VkcHgemv *p);
+/* chain_dsa.comp mode 0: row s (position pos_base + s) scores its pos_base+s+1 positions
+ * as (sum_h [d_h > 0] w_h d_h) * wscale, d_h = (q_h . k_t) * qscale (q at q_off +
+ * s*q_row, IH x ID; w at w_off + s*w_row; k_t at k_off + t*k_row), into sc[s*sc_row + t],
+ * and writes sel[s*sel_row] = keep, then the positions: those above the keep-th largest
+ * score in position order, then those equal to it in position order. With no more
+ * positions than topk (and force 0), sel[s*sel_row] = -1: every position. */
+typedef struct { int S, pos_base, IH, ID, topk, force, q_off, q_row, w_off, w_row, k_off, k_row, sc_row, sel_row;
+                 float qscale, wscale; } VkcDsa;
+int vkc_dsa_select(VkcBuf *iq, VkcBuf *hw, VkcBuf *keys, VkcBuf *sc, VkcBuf *sel, const VkcDsa *p);
+
+/* chain_dsa.comp with k-pooling (GLM-5.3): mode 1, the pooled keys of the np complete
+ * pools from p0 on, each the per-channel softmax mixture (gate logits plus ape, at
+ * ape_off in prm, [pool][ID]) of its members' keys, into pk[pk_off + p*ID]; mode 2, row
+ * s's selection: the complete pools visible to position pos_base + s scored
+ * sum_h [dot > 0] (w_h / wdiv) * dot * scale (dot = q_h . pk[p]), the top topk/pool in
+ * rank order filling `pool` slots each, the incomplete tail from slot topk (tail), -1
+ * elsewhere; sel[s*sel_row] = topk (+ pool - 1 with the tail). sc: [S][sc_row] scores. */
+typedef struct { int np, pool, p0, ID, g_off, g_row, ape_off, pk_off, k_off, k_row; } VkcDsaPool;
+int vkc_dsa_pool_keys(VkcBuf *keys, VkcBuf *gates, VkcBuf *prm, VkcBuf *pk, const VkcDsaPool *p);
+typedef struct { int S, pos_base, IH, ID, topk, pool, q_off, q_row, w_off, w_row, pk_off, tail, sc_row, sel_row;
+                 float wdiv, scale; } VkcDsaPick;
+int vkc_dsa_pool_select(VkcBuf *iq, VkcBuf *hw, VkcBuf *pk, VkcBuf *sc, VkcBuf *sel, const VkcDsaPick *p);
+
+/* The layer op. Tensors are the resident copies the per-matrix path uploads
+ * (coli_vk_tensor_ensure), in any format the backend holds. */
+typedef struct {
+    int H, Q, R, V, K;            /* heads; per head qk_nope, qk_rope (0 = NoPE), v_head; kv_lora */
+    int D, q_lora;                /* hidden; q_lora 0: no q latent, q_b reads the hidden rows */
+    float eps;                    /* the latent RMSNorms' eps */
+    float scale;                  /* the softmax scale */
+    int rope_style;               /* VKC_ROPE_HALF or VKC_ROPE_INTERLEAVED */
+    ColiVkTensor *q_a;            /* [q_lora x D]; NULL with q_lora 0 */
+    ColiVkTensor *q_b;            /* [H*(Q+R) x (q_lora or D)] */
+    ColiVkTensor *kv_a;           /* [K+R x D]: the latent, then the shared key's rotated part */
+    ColiVkTensor *kv_b;           /* [H*(Q+V) x K], per head Q key rows then V value rows; or: */
+    ColiVkTensor *k_abs, *v_abs;  /*   [H*K x Q] (W_k^T per head) and [H*V x K] */
+    ColiVkTensor *o;              /* [D x H*V]; NULL: the context stays in s->ctx */
+    VkcBuf *prm;                  /* the norm weights: q latent at q_norm (unused with q_lora 0), */
+    size_t q_norm, kv_norm;       /*   kv latent at kv_norm (floats) */
+} VkcMla;
+typedef struct { VkcBuf *qa, *q, *kv, *qabs, *clat, *ctx; int rows; } VkcMlaScratch;
+typedef struct { VkcBuf *lat, *rope; int cap; } VkcMlaCache;   /* [cap][K] and [cap][R] (rope NULL with R 0) */
+/* scratch for `rows` rows (grows, never shrinks); free releases it */
+int  vkc_mla_scratch(VkcMlaScratch *s, const VkcMla *m, int rows);
+void vkc_mla_scratch_free(VkcMlaScratch *s);
+/* x: S rows of D floats at x_off (the layer's normalized input). cs: the cos/sin pairs
+ * of the S positions, R floats a row (NULL with R 0). Leaves s->qa = the normalized q
+ * latent [S][q_lora] and s->q = the queries [S][H*(Q+R)], rotated; writes the cache's
+ * rows [pos_base, pos_base+S) and, when down is given, copies them to down at down_off
+ * (S*K latent floats, then S*R rope floats) for the host's cache. */
+int vkc_mla_qkv(const VkcMla *m, VkcMlaScratch *s, VkcBuf *x, size_t x_off, int S, int pos_base,
+                VkcBuf *cs, VkcMlaCache *c, VkcBuf *down, size_t down_off);
+/* The core over positions kv_start..pos_base+s (or sel's lists, sel_row > 0), the values
+ * (times sigmoid(gate[gate_off + s*H*V + h*V + v]) when gate is given) into s->ctx, then
+ * out[out_off + s*D] = o(ctx) when m->o and out are given. */
+int vkc_mla_attn(const VkcMla *m, VkcMlaScratch *s, int S, int pos_base, int kv_start, VkcMlaCache *c,
+                 VkcBuf *sel, size_t sel_off, int sel_row, VkcBuf *gate, size_t gate_off, VkcBuf *out, size_t out_off);
+/* both, the causal range */
+int vkc_mla(const VkcMla *m, VkcMlaScratch *s, VkcBuf *x, size_t x_off, int S, int pos_base, int kv_start,
+            VkcBuf *cs, VkcMlaCache *c, VkcBuf *out, size_t out_off);
+
+/* ---- Kimi Delta Attention (chain_kda.comp) --------------------------------------------
+ * delta_attention.h's coli_kda_step for S rows in order, the state and the short
+ * convolution's window on the device (GLM-5.3's linear layers; Kimi K3's KDA).
+ * vkc_kda_conv: C = 3P channels (q, k, v), the input of part c / P at in_off + part*in_part
+ *   + s*in_row + c % P, the window [C][K] at win_off (the last K inputs, oldest first, as
+ *   the CPU keeps it), taps [C][K] at w_off; out[out_off + s*out_row + c] = silu(sum).
+ * vkc_kda_rec: one workgroup per head, the key dim KD a specialization (<= 256), VD <= 128;
+ *   m = the convolution's output rows (q at h*KD, k at P + h*KD, v at 2P + h*VD); f, b, g
+ *   the raw decay, beta and output-gate projections; prm at prm_off: A_log[H], dt[P],
+ *   norm[VD]; alpha = exp(lb * sigmoid(exp(A_log) * (f + dt))), beta = sigmoid(b), q and k
+ *   l2-normalized with neps inside the root; y = RMSNorm(o, eps) * norm * sigmoid(g).
+ *   The state [H][KD][VD] at st_off. */
+int vkc_kda_ready(void);
+typedef struct { int S, C, K, P, in_off, in_row, in_part, out_off, out_row, w_off, win_off; } VkcKdaConv;
+int vkc_kda_conv(VkcBuf *in, VkcBuf *w, VkcBuf *win, VkcBuf *out, const VkcKdaConv *p);
+typedef struct { int S, H, VD, P, m_off, m_row, f_off, f_row, b_off, b_row, g_off, g_row, y_off, y_row, st_off, prm_off;
+                 float lb, neps, eps; } VkcKdaRec;
+int vkc_kda_rec(int KD, VkcBuf *m, VkcBuf *f, VkcBuf *b, VkcBuf *g, VkcBuf *prm, VkcBuf *st, VkcBuf *y, const VkcKdaRec *p);
+
+/* ---- manifold-constrained hyper-connections (chain_mhc.comp) ------------------------
+ * hyper_connections.h for S rows of H <= 8 streams of D floats ([S][H*D] at x_off,
+ * x_row apart), GLM-5.3's (and DeepSeek V4's) residual:
+ *   VKC_MHC_SPLIT     m: the raw mix products hc_fn . x ([S][(2+H)*H], from a matmul),
+ *                     scaled by the rows' 1/rms (eps); pre, post and the Sinkhorn-projected
+ *                     comb (iters, hc_eps; scale[3] and base at prm_off in prm) into
+ *                     hp[hp_off + s*hp_row]: H pre, H post, H*H comb
+ *   VKC_MHC_COLLAPSE  y[s][d] = sum_i pre[i] x[s][i*D + d]
+ *   VKC_MHC_POST      y[s][j*D + d] = sum_i comb[i*H + j] x[s][i*D + d] + post[j] m[s][d]
+ *   VKC_MHC_MEAN      y[s][d] = (sum_i x[s][i*D + d]) / H
+ *   VKC_SWIGLU_CLAMP  y[i] = silu(min(x[i], lim)) * clamp(m[i], -lim, lim), i < n */
+#define VKC_MHC_SPLIT    0
+#define VKC_MHC_COLLAPSE 1
+#define VKC_MHC_POST     2
+#define VKC_MHC_MEAN     3
+#define VKC_SWIGLU_CLAMP 4
+int vkc_mhc_ready(void);
+typedef struct { int S, H, D, iters, x_off, x_row, m_off, m_row, hp_off, hp_row, y_off, y_row, prm_off, n;
+                 float eps, hc_eps, lim; } VkcMhc;
+int vkc_mhc(int mode, VkcBuf *x, VkcBuf *m, VkcBuf *hp, VkcBuf *prm, VkcBuf *y, const VkcMhc *p);
+/* Inkling's ops, their pipelines made on first use (an engine checks *_ready at setup:
+ * a build without the shader keeps every other op, and that engine's chain off).
+ * chain_sconv.comp (mode 0: the depthwise causal short convolution, residual inside, in
+ * place, its ring carried; mode 1: x *= fc over n floats; mode 2: x /= fc) */
+typedef struct { int mode, S, C, CK, x_off, x_row, w_off, ring_off, n; float fc; } VkcSconv;
+int  vkc_sconv_ready(void);
+int  vkc_sconv(VkcBuf *x, VkcBuf *w, VkcBuf *ring, const VkcSconv *p);
+/* chain_relattn.comp: attention with a relative-position bias bank, a per-row scale
+ * tau and a sliding window over a ring cache, the step's own rows read from kvs */
+typedef struct { int S, H, KVH, hd, pos_base, cap, window, ext, d_rel;
+                 int q_off, q_row, o_off, o_row, k_off, v_off, ks_off, vs_off, kv_row;
+                 int r_off, r_row, relp_off, tau_off; float scale; } VkcRelAttn;
+int  vkc_relattn_ready(void);
+int  vkc_relattn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *kvs, VkcBuf *r, VkcBuf *relp, VkcBuf *tau,
+                 const VkcRelAttn *p);
 
 /* counters, for the engines' [VK] lines */
 typedef struct {

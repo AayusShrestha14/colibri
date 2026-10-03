@@ -35,9 +35,17 @@ static const char *const pipe_file[P_NPIPE] = {
 #define VKC_PROF_Q 512
 /* COLI_VK_CHAIN_PROF=1: device time per kind of op (timestamps after every op; ops
  * that run side by side between two barriers share the time unevenly) */
-enum { PK_GEMV8, PK_GEMV, PK_GEMM, PK_NORM, PK_ROPE, PK_ATTN, PK_DNCONV, PK_DNREC, PK_EW, PK_QSA, PK_PLE, PK_COPY, PK_N };
+enum { PK_GEMV8, PK_GEMV, PK_GEMM, PK_NORM, PK_ROPE, PK_ATTN, PK_DNCONV, PK_DNREC, PK_EW, PK_QSA, PK_PLE, PK_COPY,
+       PK_MLA, PK_MLAW, PK_DSA, PK_KDA, PK_MHC, PK_N };
 static const char *const pk_name[PK_N] = {"GEMV int8", "GEMV other", "tiled GEMM", "norm", "rope", "attention",
-                                          "dn conv", "dn recurrence", "element-wise", "qsa", "ple", "copy"};
+                                          "dn conv", "dn recurrence", "element-wise", "qsa", "ple", "copy",
+                                          "mla", "mla weights", "dsa", "kda", "mhc"};
+/* the MLA, KDA and mHC pipelines: optional (an engine without such layers needs none
+ * of them, and a missing one turns off only its own ops) */
+enum { PM_MLA, PM_HGEMV, PM_DSA, PM_KDA, PM_MHC, PM_N };
+static const char *const mla_file[PM_N] = {"chain_mla.spv", "chain_hgemv.spv", "chain_dsa.spv", "chain_kda.spv",
+                                           "chain_mhc.spv"};
+#define VKC_KDA_MAX 8
 
 /* ---- memory: blocks per kind, buffers bound at offsets inside them -------------- */
 typedef struct { VkDeviceMemory mem; uint8_t *map; } VkcBlock;
@@ -74,6 +82,8 @@ static struct {
     VkPipeline gemm[VKC_GEMM_MAX]; int gemm_bm[VKC_GEMM_MAX], gemm_bn[VKC_GEMM_MAX], ngemm;
     VkPipeline dnrec[VKC_DNREC_MAX]; int dnrec_kd[VKC_DNREC_MAX], ndnrec;
     VkShaderModule mod_gemv4; VkPipeline gemv4; int gemv4_xs;   /* chain_gemv.comp: the vectorized decode GEMV */
+    VkShaderModule mmod[PM_N]; VkPipeline mpipe[PM_N]; int mla_ok;   /* chain_mla, chain_hgemv, chain_dsa */
+    VkPipeline kdarec[VKC_KDA_MAX]; int kdarec_kd[VKC_KDA_MAX], nkdarec;   /* chain_kda's recurrence per key dim */
     VkCommandPool cpool;
     VkcFrame fr[VKC_FRAMES];
     int cur;                          /* the open frame, -1 none */
@@ -275,6 +285,20 @@ int vkc_init(void) {
             if ((K.gemv4 = make_pipe(K.mod_gemv4, &si))) K.gemv4_xs = xs;
         }
     }
+    /* the MLA, KDA and mHC shaders, optional: without one only its ops decline */
+    for (int i = 0; i < PM_N; i++) {
+        char path[1200];
+        const char *sl = strrchr(K.core.spv_path, '/');
+        size_t pre = sl ? (size_t)(sl - K.core.spv_path) + 1 : 0;
+        FILE *f = NULL;
+        if (pre + strlen(mla_file[i]) + 1 < sizeof path) {
+            memcpy(path, K.core.spv_path, pre); strcpy(path + pre, mla_file[i]);
+            f = fopen(path, "rb");
+        }
+        if (f) fclose(f);
+        if (f && (K.mmod[i] = load_module(K.core.spv_path, mla_file[i]))) K.mpipe[i] = make_pipe(K.mmod[i], NULL);
+    }
+    K.mla_ok = K.mpipe[PM_MLA] && K.mpipe[PM_HGEMV] && K.mpipe[PM_DSA];
     /* the fp32 tiled GEMM at the backend's tiles; none = every S on the GEMV */
     K.mod_gemm = K.core.gemm_tiles ? load_module(K.core.spv_path, "qmatmul_gemm.spv") : VK_NULL_HANDLE;
     for (int k = 0; K.mod_gemm && k < K.core.gemm_tiles && k < VKC_GEMM_MAX; k++) {
@@ -767,6 +791,243 @@ int vkc_ple(VkcBuf *keys, VkcBuf *hyp, VkcBuf *val, VkcBuf *prm, VkcBuf *gated, 
     return record(K.pipe[P_PLE], bd, 8, p, sizeof *p, gx, gy, 1);
 }
 
+/* ---- multi-head latent attention ------------------------------------------------- */
+int vkc_mla_ready(void) { return vkc_ready() && K.mla_ok; }
+
+int vkc_mla_core(VkcBuf *qabs, VkcBuf *qr, VkcBuf *lat, VkcBuf *rope, VkcBuf *sel, VkcBuf *clat, const VkcMlaCore *p) {
+    K.kind = PK_MLA;
+    if (!K.mla_ok || p->S < 1 || p->H < 1 || p->K < 1 || p->K > 1024 || p->R < 0 || p->R > 128 ||
+        (p->R > 0 && !rope) || p->pos_base < 0 || p->kv_start < 0 || p->kv_start > p->pos_base) return 0;
+    struct { int mode; VkcMlaCore b; } pc = {0, *p};
+    if (!sel) pc.b.sel_row = 0;
+    VkcBind bd[6] = {B(qabs, 0), B(qr, 0), B(lat, 0), B(p->R > 0 ? rope : NULL, 0), B(pc.b.sel_row > 0 ? sel : NULL, 0),
+                     B(clat, 1)};
+    return record(K.mpipe[PM_MLA], bd, 6, &pc, sizeof pc, (uint32_t)p->H, (uint32_t)p->S, 1);
+}
+static int mla_rowop(int mode, VkcBuf *x, VkcBuf *aux, VkcBuf *y, const VkcMlaRow *p) {
+    if (!K.mla_ok || !open_frame() || K.lost || p->nseg < 0) return 0;
+    if (p->nseg == 0) return 1;
+    if (mode == 1 && (p->rd < 2 || p->rd > 256 || (p->rd & 1) || p->rd > p->seg_len)) return 0;
+    if (mode == 2 && p->seg_len < 1) return 0;
+    struct { int mode; VkcMlaRow b; int copy_rest; } pc = {mode, *p, x != y};
+    VkcBind bd[6] = {B(x, x == y), B(aux, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(y, 1)};
+    uint32_t gx, gy; grid((uint64_t)p->nseg, &gx, &gy);
+    return record(K.mpipe[PM_MLA], bd, 6, &pc, sizeof pc, gx, gy, 1);
+}
+int vkc_mla_rope(VkcBuf *x, VkcBuf *cs, VkcBuf *y, const VkcMlaRow *p) { K.kind = PK_ROPE; return mla_rowop(1, x, cs, y, p); }
+int vkc_mla_lnorm(VkcBuf *x, VkcBuf *prm, VkcBuf *y, const VkcMlaRow *p) { K.kind = PK_NORM; return mla_rowop(2, x, prm, y, p); }
+
+int vkc_mla_hgemv(ColiVkTensor *t, VkcBuf *x, VkcBuf *y, VkcBuf *gate, const VkcHgemv *p) {
+    K.kind = PK_MLAW;
+    ColiVkTensorInfo ti;
+    if (!K.mla_ok || !open_frame() || K.lost || !coli_vk_tensor_info(t, &ti) || p->S < 1 || p->S > 65535 ||
+        p->H < 1 || p->H > 65535 || p->n < 1 || (p->trans && p->n > 1024)) return 0;
+    int f = ti.fmt;
+    if (!(f == 1 || f == 2 || f == 4 || f == 5 || f == 7 || f == 10 || f == 11 || f == 12 || f == 13)) return 0;
+    if ((f == 4 || f == 7 || f == 12 || f == 13) && ti.gs < 1) return 0;
+    if ((int64_t)(p->H - 1) * p->hstride + p->hoff + p->n > (int64_t)ti.O) return 0;   /* the rows exist */
+    struct { int mode, fmt, I, rowWords, gs, S, H, n, hstride, hoff, x_off, x_row, x_seg, y_off, y_row, y_seg,
+             g_off, g_row, has_gate; } pc = {p->trans, f, ti.I, ti.rowWords, ti.gs, p->S, p->H, p->n, p->hstride, p->hoff,
+             p->x_off, p->x_row, p->x_seg, p->y_off, p->y_row, p->y_seg, p->g_off, p->g_row, gate && p->has_gate};
+    VkcBind bd[5] = {B(x, 0), {(VkBuffer)ti.wbuf, 0, 0, 0}, {(VkBuffer)ti.sbuf, 0, 0, 0}, B(y, 1), B(pc.has_gate ? gate : NULL, 0)};
+    if (p->trans) return record(K.mpipe[PM_HGEMV], bd, 5, &pc, sizeof pc, (uint32_t)p->H, (uint32_t)p->S, 1);
+    /* rows: a subgroup each, grid-stride (at least four subgroups a workgroup) */
+    int64_t rows = (int64_t)p->H * p->n, wg = (rows + 7) / 8;
+    if (wg > 4096) wg = 4096;
+    return record(K.mpipe[PM_HGEMV], bd, 5, &pc, sizeof pc, (uint32_t)wg, (uint32_t)p->S, 1);
+}
+
+int vkc_dsa_select(VkcBuf *iq, VkcBuf *hw, VkcBuf *keys, VkcBuf *sc, VkcBuf *sel, const VkcDsa *p) {
+    K.kind = PK_DSA;
+    if (!K.mla_ok || p->S < 1 || p->S > 65535 || p->IH < 1 || p->IH > 64 || p->ID < 1 || p->IH * p->ID > 4096 ||
+        p->topk < 1 || p->pos_base < 0 || p->sc_row < p->pos_base + p->S ||
+        p->sel_row < 1 + (p->topk < p->pos_base + p->S ? p->topk : p->pos_base + p->S)) return 0;
+    struct { int mode; VkcDsa b; } pc = {0, *p};
+    VkcBind bd[5] = {B(iq, 0), B(hw, 0), B(keys, 0), B(sc, 1), B(sel, 1)};
+    return record(K.mpipe[PM_DSA], bd, 5, &pc, sizeof pc, (uint32_t)p->S, 1, 1);
+}
+
+/* k-pooling (chain_dsa.comp modes 1 and 2) */
+int vkc_dsa_pool_keys(VkcBuf *keys, VkcBuf *gates, VkcBuf *prm, VkcBuf *pk, const VkcDsaPool *p) {
+    K.kind = PK_DSA;
+    if (!K.mla_ok || p->np < 0 || p->pool < 1 || p->p0 < 0 || p->ID < 1) return 0;
+    if (p->np == 0) return open_frame() && !K.lost;
+    struct { int mode; VkcDsaPool b; } pc = {1, *p};
+    VkcBind bd[8] = {B(NULL, 0), B(NULL, 0), B(keys, 0), B(NULL, 0), B(NULL, 0), B(pk, 1), B(gates, 0), B(prm, 0)};
+    return record(K.mpipe[PM_DSA], bd, 8, &pc, sizeof pc, (uint32_t)p->np, 1, 1);
+}
+int vkc_dsa_pool_select(VkcBuf *iq, VkcBuf *hw, VkcBuf *pk, VkcBuf *sc, VkcBuf *sel, const VkcDsaPick *p) {
+    K.kind = PK_DSA;
+    if (!K.mla_ok || p->S < 1 || p->S > 65535 || p->IH < 1 || p->IH > 64 || p->ID < 1 || p->IH * p->ID > 4096 ||
+        p->pool < 1 || p->topk < p->pool || p->topk % p->pool || p->topk / p->pool > 1024 || p->pos_base < 0 ||
+        p->sc_row < (p->pos_base + p->S) / p->pool || p->sel_row < 1 + p->topk + (p->tail ? p->pool - 1 : 0)) return 0;
+    struct { int mode; VkcDsaPick b; } pc = {2, *p};
+    VkcBind bd[6] = {B(iq, 0), B(hw, 0), B(NULL, 0), B(sc, 1), B(sel, 1), B(pk, 0)};
+    return record(K.mpipe[PM_DSA], bd, 6, &pc, sizeof pc, (uint32_t)p->S, 1, 1);
+}
+
+/* ---- Kimi Delta Attention (chain_kda.comp) ------------------------------------------ */
+int vkc_kda_ready(void) { return vkc_ready() && K.mpipe[PM_KDA]; }
+int vkc_kda_conv(VkcBuf *in, VkcBuf *w, VkcBuf *win, VkcBuf *out, const VkcKdaConv *p) {
+    K.kind = PK_KDA;
+    if (!K.mpipe[PM_KDA] || p->K < 1 || p->K > 8 || p->P < 1 || p->C < 1 || p->S < 1) return 0;
+    struct { int mode; VkcKdaConv b; } pc = {0, *p};
+    VkcBind bd[4] = {B(in, 0), B(w, 0), B(win, 1), B(out, 1)};
+    uint32_t gx, gy; grid(((uint64_t)p->C + 127) / 128, &gx, &gy);
+    return record(K.mpipe[PM_KDA], bd, 4, &pc, sizeof pc, gx, gy, 1);
+}
+static VkPipeline kda_pipe(int KD) {
+    for (int i = 0; i < K.nkdarec; i++) if (K.kdarec_kd[i] == KD) return K.kdarec[i];
+    if (K.nkdarec == VKC_KDA_MAX || !K.mmod[PM_KDA]) return VK_NULL_HANDLE;
+    int32_t kd = KD;
+    VkSpecializationMapEntry me = {0, 0, 4};
+    VkSpecializationInfo si = {1, &me, 4, &kd};
+    VkPipeline p = make_pipe(K.mmod[PM_KDA], &si);
+    if (!p) return VK_NULL_HANDLE;
+    K.kdarec[K.nkdarec] = p; K.kdarec_kd[K.nkdarec++] = KD;
+    return p;
+}
+int vkc_kda_rec(int KD, VkcBuf *m, VkcBuf *f, VkcBuf *b, VkcBuf *g, VkcBuf *prm, VkcBuf *st, VkcBuf *y, const VkcKdaRec *p) {
+    K.kind = PK_KDA;
+    if (!K.mpipe[PM_KDA] || KD < 1 || KD > 256 || p->VD < 1 || p->VD > 128 || p->H < 1 || p->S < 1) return 0;
+    VkPipeline pipe = kda_pipe(KD);
+    if (!pipe) return 0;
+    struct { int mode; VkcKdaRec b; } pc = {1, *p};
+    VkcBind bd[7] = {B(m, 0), B(prm, 0), B(st, 1), B(y, 1), B(f, 0), B(b, 0), B(g, 0)};
+    return record(pipe, bd, 7, &pc, sizeof pc, (uint32_t)p->H, 1, 1);
+}
+
+/* ---- manifold-constrained hyper-connections (chain_mhc.comp) ------------------------ */
+int vkc_mhc_ready(void) { return vkc_ready() && K.mpipe[PM_MHC]; }
+int vkc_mhc(int mode, VkcBuf *x, VkcBuf *m, VkcBuf *hp, VkcBuf *prm, VkcBuf *y, const VkcMhc *p) {
+    K.kind = PK_MHC;
+    if (!K.mpipe[PM_MHC] || mode < 0 || mode > 4 || p->S < 0 || (mode != 4 && (p->H < 1 || p->H > 8 || p->D < 1))) return 0;
+    if (mode == 0 && p->iters < 1) return 0;
+    struct { int mode; VkcMhc b; } pc = {mode, *p};
+    VkcBind bd[5] = {B(x, 0), B(m, 0), B(hp, mode == 0), B(prm, 0), B(y, mode != 0)};
+    uint64_t n = mode == 4 ? (uint64_t)p->n : mode == 2 ? (uint64_t)p->S * p->H * p->D : (uint64_t)p->S * p->D;
+    if (mode == 0) return p->S == 0 || record(K.mpipe[PM_MHC], bd, 5, &pc, sizeof pc, (uint32_t)p->S, 1, 1);
+    uint32_t gx, gy; grid((n + 255) / 256, &gx, &gy);
+    return n == 0 || record(K.mpipe[PM_MHC], bd, 5, &pc, sizeof pc, gx, gy, 1);
+}
+
+int vkc_mla_scratch(VkcMlaScratch *s, const VkcMla *m, int rows) {
+    if (s->rows >= rows && s->q) return 1;
+    size_t r = (size_t)rows, H = (size_t)m->H;
+    int ok = vkc_reserve(&s->qa, (m->q_lora > 0 ? r * m->q_lora : 1) * 4, VKC_DEV) &&
+             vkc_reserve(&s->q, r * H * (m->Q + m->R) * 4, VKC_DEV) &&
+             vkc_reserve(&s->kv, r * (m->K + m->R) * 4, VKC_DEV) &&
+             vkc_reserve(&s->qabs, r * H * m->K * 4, VKC_DEV) &&
+             vkc_reserve(&s->clat, r * H * m->K * 4, VKC_DEV) &&
+             vkc_reserve(&s->ctx, r * H * m->V * 4, VKC_DEV);
+    s->rows = ok ? rows : 0;
+    return ok;
+}
+void vkc_mla_scratch_free(VkcMlaScratch *s) {
+    vkc_free(s->qa); vkc_free(s->q); vkc_free(s->kv); vkc_free(s->qabs); vkc_free(s->clat); vkc_free(s->ctx);
+    memset(s, 0, sizeof *s);
+}
+/* the tensor is there and has the shape [O x I] */
+static int mla_shape(ColiVkTensor *t, int O, int I) {
+    ColiVkTensorInfo ti;
+    return t && coli_vk_tensor_info(t, &ti) && ti.I == I && ti.O == O;
+}
+int vkc_mla_qkv(const VkcMla *m, VkcMlaScratch *s, VkcBuf *x, size_t x_off, int S, int pos_base,
+                VkcBuf *cs, VkcMlaCache *c, VkcBuf *down, size_t down_off) {
+    int H = m->H, QR = m->Q + m->R, KR = m->K + m->R;
+    if (!K.mla_ok || S < 1 || S > s->rows || pos_base < 0 || (int64_t)pos_base + S > c->cap || m->R < 0 ||
+        (m->R & 1) || m->R > 128 || m->K < 1 || m->K > 1024 || (m->R > 0 && (!cs || !c->rope)) ||
+        !mla_shape(m->q_b, H * QR, m->q_lora > 0 ? m->q_lora : m->D) || !mla_shape(m->kv_a, KR, m->D) ||
+        (m->q_lora > 0 && !mla_shape(m->q_a, m->q_lora, m->D))) return 0;
+    int ok;
+    if (m->q_lora > 0) {
+        VkcNorm qn = {S, m->q_lora, 1, 0, m->q_lora, m->q_lora, 0, m->q_lora, m->q_lora, (int)m->q_norm, 0, 0, m->eps, 1.f};
+        ok = vkc_matmul(m->q_a, x, x_off, s->qa, 0, S) && vkc_norm(s->qa, m->prm, s->qa, &qn) &&
+             vkc_matmul(m->q_b, s->qa, 0, s->q, 0, S);
+    } else ok = vkc_matmul(m->q_b, x, x_off, s->q, 0, S);
+    ok = ok && vkc_matmul(m->kv_a, x, x_off, s->kv, 0, S);
+    VkcNorm ln = {S, m->K, 1, 0, KR, KR, pos_base * m->K, m->K, m->K, (int)m->kv_norm, 0, 0, m->eps, 1.f};
+    ok = ok && vkc_norm(s->kv, m->prm, c->lat, &ln);
+    if (ok && m->R > 0) {
+        VkcMlaRow rq = {S * H, H, m->R, m->R, m->rope_style, m->Q, H * QR, QR, m->Q, H * QR, QR, 0, m->R, 0, 0, 0, 0.f};
+        VkcMlaRow rk = {S, 1, m->R, m->R, m->rope_style, m->K, KR, 0, pos_base * m->R, m->R, 0, 0, m->R, 0, 0, 0, 0.f};
+        ok = vkc_mla_rope(s->q, cs, s->q, &rq) && vkc_mla_rope(s->kv, cs, c->rope, &rk);
+    }
+    if (ok && down)
+        ok = vkc_copy(down, down_off, c->lat, (size_t)pos_base * m->K, (size_t)S * m->K) &&
+             (m->R == 0 || vkc_copy(down, down_off + (size_t)S * m->K, c->rope, (size_t)pos_base * m->R, (size_t)S * m->R));
+    return ok;
+}
+int vkc_mla_attn(const VkcMla *m, VkcMlaScratch *s, int S, int pos_base, int kv_start, VkcMlaCache *c,
+                 VkcBuf *sel, size_t sel_off, int sel_row, VkcBuf *gate, size_t gate_off, VkcBuf *out, size_t out_off) {
+    int H = m->H, QR = m->Q + m->R, HK = H * m->K, HV = H * m->V;
+    if (!K.mla_ok || S < 1 || S > s->rows || (int64_t)pos_base + S > c->cap) return 0;
+    if (m->kv_b ? !mla_shape(m->kv_b, H * (m->Q + m->V), m->K)
+                : !(mla_shape(m->k_abs, HK, m->Q) && mla_shape(m->v_abs, HV, m->K))) return 0;
+    if (m->o && out && !mla_shape(m->o, m->D, HV)) return 0;
+    int ok;
+    if (m->kv_b) {   /* qa[s][h][i] = sum_d kv_b[h*(Q+V) + d][i] q[s][h][d], d < Q */
+        VkcHgemv a = {1, S, H, m->Q, m->Q + m->V, 0, 0, H * QR, QR, 0, HK, m->K, 0, 0, 0};
+        ok = vkc_mla_hgemv(m->kv_b, s->q, s->qabs, NULL, &a);
+    } else {         /* qa[s][h][i] = k_abs[h*K + i] . q[s][h][0..Q) */
+        VkcHgemv a = {0, S, H, m->K, m->K, 0, 0, H * QR, QR, 0, HK, m->K, 0, 0, 0};
+        ok = vkc_mla_hgemv(m->k_abs, s->q, s->qabs, NULL, &a);
+    }
+    VkcMlaCore cp = {S, H, m->K, m->R, pos_base, kv_start, 0, HK, m->K, m->Q, H * QR, QR, 0, m->K, 0, m->R,
+                     (int)sel_off, sel ? sel_row : 0, 0, HK, m->K, m->scale};
+    ok = ok && vkc_mla_core(s->qabs, s->q, c->lat, c->rope, sel, s->clat, &cp);
+    VkcHgemv v = {0, S, H, m->V, m->kv_b ? m->Q + m->V : m->V, m->kv_b ? m->Q : 0, 0, HK, m->K, 0, HV, m->V,
+                  (int)gate_off, HV, gate != NULL};
+    ok = ok && vkc_mla_hgemv(m->kv_b ? m->kv_b : m->v_abs, s->clat, s->ctx, gate, &v);
+    if (ok && m->o && out) ok = vkc_matmul(m->o, s->ctx, 0, out, out_off, S);
+    return ok;
+}
+int vkc_mla(const VkcMla *m, VkcMlaScratch *s, VkcBuf *x, size_t x_off, int S, int pos_base, int kv_start,
+            VkcBuf *cs, VkcMlaCache *c, VkcBuf *out, size_t out_off) {
+    return vkc_mla_qkv(m, s, x, x_off, S, pos_base, cs, c, NULL, 0) &&
+           vkc_mla_attn(m, s, S, pos_base, kv_start, c, NULL, 0, 0, NULL, 0, out, out_off);
+}
+/* ---- inkling's ops: chain_sconv.comp and chain_relattn.comp, made on first use ---- */
+static struct { VkShaderModule mod[2]; VkPipeline pipe[2]; int tried[2]; } KX;
+static VkPipeline kx_pipe(int k) {
+    static const char *const file[2] = {"chain_sconv.spv", "chain_relattn.spv"};
+    if (KX.pipe[k] || KX.tried[k] || !vkc_ready()) return KX.pipe[k];
+    KX.tried[k] = 1;
+    if ((KX.mod[k] = load_module(K.core.spv_path, file[k]))) KX.pipe[k] = make_pipe(KX.mod[k], NULL);
+    return KX.pipe[k];
+}
+static void kx_shutdown(void) {
+    for (int k = 0; k < 2; k++) {
+        if (KX.pipe[k]) vkDestroyPipeline(K.dev, KX.pipe[k], NULL);
+        if (KX.mod[k]) vkDestroyShaderModule(K.dev, KX.mod[k], NULL);
+    }
+    memset(&KX, 0, sizeof KX);
+}
+int vkc_sconv_ready(void) { return kx_pipe(0) != VK_NULL_HANDLE; }
+int vkc_relattn_ready(void) { return kx_pipe(1) != VK_NULL_HANDLE; }
+int vkc_sconv(VkcBuf *x, VkcBuf *w, VkcBuf *ring, const VkcSconv *p) {
+    VkPipeline pipe = kx_pipe(0);
+    if (!pipe || (p->mode == 0 && (p->CK < 1 || p->CK > 9))) return 0;
+    K.kind = p->mode == 0 ? PK_DNCONV : PK_EW;
+    uint32_t gx, gy;
+    if (p->mode == 0) {
+        VkcBind bd[3] = {B(x, 1), B(w, 0), B(ring, 1)};
+        grid(((uint64_t)p->C + 63) / 64, &gx, &gy);
+        return record(pipe, bd, 3, p, sizeof *p, gx, gy, 1);
+    }
+    VkcBind bd[1] = {B(x, 1)};
+    grid(((uint64_t)p->n + 63) / 64, &gx, &gy);
+    return record(pipe, bd, 1, p, sizeof *p, gx, gy, 1);
+}
+int vkc_relattn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *kvs, VkcBuf *r, VkcBuf *relp, VkcBuf *tau,
+                const VkcRelAttn *p) {
+    VkPipeline pipe = kx_pipe(1);
+    if (!pipe || p->hd > 256 || p->d_rel > 64 || p->d_rel < 0 || p->KVH < 1 || p->H % p->KVH || p->cap < 1) return 0;
+    K.kind = PK_ATTN;
+    VkcBind bd[8] = {B(q, 0), B(kc, 0), B(vc, 0), B(o, 1), B(kvs, 0), B(r, 0), B(relp, 0), B(tau, 0)};
+    return record(pipe, bd, 8, p, sizeof *p, (uint32_t)p->H, (uint32_t)p->S, 1);
+}
+
 void vkc_stats(VkcStats *st) { *st = K.st; }
 void vkc_prof_print(void) {
     if (!K.prof) return;
@@ -802,9 +1063,15 @@ void vkc_shutdown(void) {
         vka_pool_destroy(P);
     }
     if (K.cpool) vkDestroyCommandPool(K.dev, K.cpool, NULL);
+    kx_shutdown();
     for (int i = 0; i < P_NPIPE; i++) {
         if (K.pipe[i]) vkDestroyPipeline(K.dev, K.pipe[i], NULL);
         if (K.mod[i]) vkDestroyShaderModule(K.dev, K.mod[i], NULL);
+    }
+    for (int i = 0; i < K.nkdarec; i++) vkDestroyPipeline(K.dev, K.kdarec[i], NULL);
+    for (int i = 0; i < PM_N; i++) {
+        if (K.mpipe[i]) vkDestroyPipeline(K.dev, K.mpipe[i], NULL);
+        if (K.mmod[i]) vkDestroyShaderModule(K.dev, K.mmod[i], NULL);
     }
     for (int i = 0; i < K.ngemm; i++) vkDestroyPipeline(K.dev, K.gemm[i], NULL);
     for (int i = 0; i < K.ndnrec; i++) vkDestroyPipeline(K.dev, K.dnrec[i], NULL);
