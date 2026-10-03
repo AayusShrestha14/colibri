@@ -674,7 +674,8 @@ to the next. qwen36 (Qwen3.6, Qwen3-Coder, Qwen3.8-27B) and qwen38 (Qwen3.8 Flas
 Next) run it: by default on a discrete GPU, and for qwen36 on an integrated one with
 the expert tier (see [the default](#the-chain-on-a-radeon-780m)); `COLI_VK_CHAIN=1`
 anywhere. colibri (GLM-5.2) and glm53 (GLM-5.3 Flash) run it too, with the MLA,
-KDA and hyper-connection ops ([below](#glm-52-and-glm-53-flash-on-the-chain)).
+KDA and hyper-connection ops ([below](#glm-52-and-glm-53-flash-on-the-chain)), and
+deepseek_v41 with DeepSeek's own ([below](#deepseek-v41-flash-and-deepseek-v4-on-the-chain)).
 
 **What runs where, per layer** (S rows: one at decode, a prompt chunk at prefill):
 
@@ -741,7 +742,7 @@ f32 throughout, as the CPU's f32 path.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `COLI_VK_CHAIN` | on for a discrete GPU; on an integrated GPU with the expert tier, what the engine measured (qwen36 on, qwen38 off; colibri and glm53 off: not measured); off on a CPU device | `1`: every layer's dense chain on the device; `2`: prompts only (forwards of more than two rows; decode and MTP verifies on the per-matrix path, the state moving between the two); `0`: the per-matrix path. The `[VK] <engine>: dense chain ...` line says which and why. |
+| `COLI_VK_CHAIN` | on for a discrete GPU; on an integrated GPU with the expert tier, what the engine measured (qwen36 on, qwen38 off; colibri, glm53 and deepseek_v41 off: not measured); off on a CPU device | `1`: every layer's dense chain on the device; `2`: prompts only (forwards of more than two rows; decode and MTP verifies on the per-matrix path, the state moving between the two); `0`: the per-matrix path. The `[VK] <engine>: dense chain ...` line says which and why. |
 | `COLI_VK_CHAIN_ROWS` | `512` | Prompt rows per chunk: a longer prompt runs every layer chunk by chunk (the device's scratch is sized for one chunk). |
 | `COLI_VK_CHAIN_GEMV` | on | `0`: the decode matrices take `qmatmul.comp`'s GEMV instead of `chain_gemv.comp`'s. |
 | `COLI_VK_CHAIN_SPIN_US` | `2000` | How long a wait on a chain frame polls the fence before blocking. |
@@ -887,6 +888,63 @@ the tiny fixtures, on Lavapipe and on the 780M:
 [VK] colibri: dense chain off (an integrated GPU with the expert tier: not measured; COLI_VK_CHAIN=0 off, 1 on, 2 prompts only)
 ```
 
+### DeepSeek V4.1 Flash and DeepSeek V4 on the chain
+
+`deepseek_v41_chain.h` (deepseek_v41) follows the recipe below with the
+[DeepSeek ops](#deepseek-v41-flash-and-deepseek-v4s-attention-vkc_dsv4), the mHC ops and
+the per-head blocks of `vkc_mla_hgemv`. The residual is `hc_mult` streams per position,
+and V4.1 collapses a site with the mix the site before it computed. What runs where, per
+layer:
+
+| | deepseek_v41 (DeepSeek V4.1 Flash) |
+|---|---|
+| device, frame A1 | the previous layer's FFN branch (the routed sum plus the shared expert) written back into the streams; on an engram layer the engram (`eng_wkv` over the n-gram rows the host looked up, the gate into each stream); on a DSpark target layer the streams' mean for the draft head; the attention site's mix, split with Sinkhorn, collapse and norm; the attention: `wq_a`, its norm, `wq_b`, `wkv`, its norm, RoPE on interleaved pairs, the new rows into the window ring; on a kv_source layer the compressor's rolling group, the pooled latent's norm, the index keys and the compressed rows' RoPE; on an index source the indexer (its queries and RoPE, `weights_proj`, the scores against the keys the CPU would read, the candidate blocks, the top-k); the sparse attention with the sink over the window and the selection, the inverse RoPE, the grouped `wo_a`, `wo_b`; the write back; the FFN site's mix, collapse and norm |
+| host | `moe_run_at` without the shared expert: the router and the routed experts (the tier's batch and the CPU's share); an engram layer's n-gram rows are looked up (on disk) as its frame is recorded |
+| device, frame A2 (not waited for) | the shared expert (clamped SwiGLU) |
+| after the last layer | the final streams and the last site's mix back to the host, which collapses them and runs the final norm and the head as before |
+
+**The state.** The host's stays canonical. What a forward changes there, the window ring
+and its position map, the compressed rows and index keys, the compressor's group and the
+published index keys, is written back once the forward's last frame is through, exactly
+as the CPU would have left it, a speculative verify's undo rows included. The device
+mirrors the window ring (window + chunk rows, so a chunk never overwrites a row one of
+its earlier rows still reads) behind a watermark, each kv_source layer's compressed rows
+and index keys behind one of their own (grown in powers of two), and takes the
+compressor's group up at every forward. Every host write lowers the watermarks: a CPU
+forward, a rejected draft, a reset. The index keys each layer scores follow the engine's
+published-key rule (the released behaviour; per row on a verify) and `V41_INDEX_OWNER=1`.
+
+**Drafts.** DSpark's stages stay on the CPU and read the host's window rings and the
+chain's means; a verify's rows go through the chain (its matrices on the per-row GEMV,
+so each row gets a decode step's bits), a rejection is the host's rollback and the
+watermarks follow.
+
+**A lost device.** The forward that failed runs again on the CPU from its input (the
+chain leaves it, and the host's state, untouched until every chunk is through), and the
+CPU runs from there. There is nothing to rebuild.
+
+**Declined** (the CPU runs the layers, the watermarks follow): `V41_TRACE`, prompts only
+when the forward has two rows or fewer, and a model the ops or the chain do not take: a
+head above 1024 floats, a window plus top-k above 3072 entries, an indexer above 64 heads
+or 4096 query floats, more than 8 streams, a compressed layer reading the index list of
+another ratio (or of none), a candidate mask read across ratios.
+
+**Arithmetic.** V4.1's CPU multiplies f32 activations everywhere, so the chain does the
+same arithmetic in another order. On the fixtures every configuration gives the CPU's
+tokens, and every logits row is within 1e-6 of the largest logit: 9.3e-7 at worst on
+Lavapipe, 1.1e-6 on a Radeon 780M (RADV) and 1.0e-6 on an Intel Iris Xe (Mesa's Dozen,
+four configurations).
+
+**The default**: `COLI_VK_CHAIN_UNMEASURED`, so the chain is off on an integrated GPU
+(`COLI_VK_CHAIN=1` turns it on, `2` for prompts only) and on a discrete GPU follows the
+rule above. No DeepSeek checkpoint was run on the chain: none is on the 780M box, and
+V4.1 Flash is 510 GB. Speed is not measured; the tests prove the tokens on the tiny
+fixtures, on Lavapipe, the 780M and the Iris Xe:
+
+```
+[VK] deepseek_v41: dense chain off (an integrated GPU with the expert tier: not measured; COLI_VK_CHAIN=0 off, 1 on, 2 prompts only)
+```
+
 ### Adding an engine to the chain
 
 The recipe qwen36_chain.h and qwen38_chain.h follow, for the engines still on the
@@ -915,7 +973,8 @@ What each remaining architecture needs on top of today's shaders:
 
 | Engine | Attention / mixer | New pieces |
 |---|---|---|
-| deepseek_v41, kimi_k3 (MLA layers) | MLA: q_a/kv_a, the latent norms, q_b, RoPE on the rope dims, a latent + rope cache | the [MLA ops](#multi-head-latent-attention-on-the-chain-vkc_mla) take any geometry (q_lora or none, NoPE, the scale and cos/sin table from the engine, a gate on the values for Kimi K3); colibri and glm53 run them ([above](#glm-52-and-glm-53-flash-on-the-chain)). DeepSeek V4.1's attention has sinks and its own sparse selection: those are not in the ops yet |
+| kimi_k3 (MLA layers) | MLA: q_a/kv_a, the latent norms, q_b, RoPE on the rope dims, a latent + rope cache | the [MLA ops](#multi-head-latent-attention-on-the-chain-vkc_mla) take any geometry (q_lora or none, NoPE, the scale and cos/sin table from the engine, a gate on the values for Kimi K3); colibri and glm53 run them ([above](#glm-52-and-glm-53-flash-on-the-chain)) |
+| deepseek_v41 | MQA over a window ring and compressed rows, a sink, an indexer with candidate blocks | on the chain ([above](#deepseek-v41-flash-and-deepseek-v4-on-the-chain)), with the [DeepSeek ops](#deepseek-v41-flash-and-deepseek-v4s-attention-vkc_dsv4) |
 | deepseek_v4 | MLA with compressed (CSA) and hierarchical (HCA) KV, mHC | the manifold hyper-connections are `vkc_mhc` (GLM-5.3's, the same arithmetic) and the clamped SwiGLU too; the compressors' rolling windows are rings like the conv's, snapshotted the same way; the CPU rounds activations to E4M3 before its fp8 matmuls, so the chain needs that rounding as an element-wise op to keep the same arithmetic |
 | kimi_k3 (KDA layers) | Kimi Delta Attention: a gated delta rule whose decay is a vector over the key channels | `vkc_kda_conv` and `vkc_kda_rec` (GLM-5.3's KDA, `delta_attention.h`'s step); Kimi K3 builds its decay and output gate its own way (a full g_proj, not a low-rank one), which the recurrence's prologue and epilogue would take as options |
 | mimo | sliding-window attention (and full layers) | `chain_attn.comp` with a window (positions from `max(0, pos - W + 1)`: one more push constant), the cache optionally a ring of W rows (the host mirror then indexes `t % W`) |
