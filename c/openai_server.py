@@ -6008,12 +6008,14 @@ class _DeadlineReader:
 
 class APIHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    # TCP_NODELAY on every connection. A response is the header block and the
-    # body in two writes; with Nagle on, the body waits for the client's delayed
-    # ACK of the headers on a kept-alive connection, about 40 ms per request
-    # (measured: 44 ms median for a /v1/systemone round trip on loopback, 1 ms
-    # without). That is most of a decision's time on a fast engine.
-    disable_nagle_algorithm = True
+    # TCP_NODELAY on every connection, set in setup(). A response is the header
+    # block and the body in two writes; with Nagle on, the body waits for the
+    # client's delayed ACK of the headers on a kept-alive connection, about 40 ms
+    # per request (measured: 44 ms median for a /v1/systemone round trip on
+    # loopback, 1 ms without). That is most of a decision's time on a fast engine.
+    # Not through disable_nagle_algorithm: macOS refuses the option with EINVAL on
+    # a socket the client has already reset, and a hangup is not a server error.
+    disable_nagle_algorithm = False
     timeout = 30   # per socket OPERATION. On its own this does not stop a slowloris:
                    # it restarts on every byte received, so a drip renews it forever.
                    # READ_DEADLINE below is the cumulative bound that actually does.
@@ -6023,6 +6025,10 @@ class APIHandler(BaseHTTPRequestHandler):
     _body_read = False    # request body fully consumed, so nothing is left to drain
 
     def setup(self):
+        try:
+            self.request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, True)
+        except OSError:
+            pass   # the client already hung up: the request fails as a hangup, below
         super().setup()
         # Keep the socket-backed reader; handle_one_request re-wraps it with a
         # fresh deadline per request rather than wrapping a wrapper each time.
