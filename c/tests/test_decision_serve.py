@@ -348,8 +348,10 @@ class DecisionRegistryAndLauncher(unittest.TestCase):
 
     def test_coli_describes_it_and_refuses_to_chat(self):
         import subprocess
-        if not (FIXTURE / "rl_agent_config.json").exists():
-            self.skipTest("laya_tiny missing")
+        # the weights generated and the engine built: coli plan reads the weights' header,
+        # and a fresh checkout has laya_tiny's configs and no weights
+        if not ((FIXTURE / "model.safetensors").exists() and BINARY.exists()):
+            self.skipTest("laya_tiny's weights or the laya engine missing (make laya-tiny-check)")
         def coli(*args):
             return subprocess.run([sys.executable, str(HERE / "coli"), *args], capture_output=True,
                                   text=True, timeout=120, cwd=str(HERE))
