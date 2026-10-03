@@ -544,6 +544,9 @@ typedef struct {
     double t_disk, t_expert, t_attn;
     int idot, direct;
     uint8_t **ehit;              /* [layer][expert] routed this turn, for HITS */
+#ifdef COLI_VULKAN
+    void *vkchain;               /* the dense chain's device state (mimo_chain.h), NULL until it runs */
+#endif
 } Model;
 
 static void expert_table_init(Model *m) {
@@ -1109,6 +1112,10 @@ static void embed_rows(Model *m, const int *ids, int n, float *h) {
  * image-pad position of the WHOLE prompt (the first at `first_pad`). */
 typedef struct { const float *rows; int n_rows; } ImageRows;
 
+#ifdef COLI_VULKAN
+#include "mimo_chain.h"   /* COLI_VK_CHAIN: every layer's dense chain on the device */
+#endif
+
 /* One block of n tokens at m->pos. logits: NULL, or [n, V] (all rows) when
  * all_rows, else [V] for the last row. */
 static void forward(Model *m, const int *ids, int n, float *logits, int all_rows,
@@ -1133,24 +1140,35 @@ static void forward(Model *m, const int *ids, int n, float *logits, int all_rows
     static int traced;
     if (!traced && getenv("MIMO_TRACE")) { trace = fopen(getenv("MIMO_TRACE"), "wb"); }
     if (trace) fwrite(h, sizeof(float), (size_t)n * H, trace);
-    for (int li = 0; li < c->n_layers; li++) {
+    /* The rows the CPU computes: all of them, or with the dense chain on (COLI_VK_CHAIN,
+     * mimo_chain.h) the ones it did not (a lost device), from where the host's caches end. */
+    int done = 0;
+#ifdef COLI_VULKAN
+    if (g_vk_chain && !trace) {
+        done = mc_forward(m, h, n, m->pos, logits, all_rows);
+        if (done < n) mc_cpu_step(m, m->pos + done);
+    }
+#endif
+    float *hc = h + (size_t)done * H, *lc = logits && all_rows ? logits + (size_t)done * c->vocab : logits;
+    int nc = n - done, pc = m->pos + done;
+    for (int li = 0; li < c->n_layers && nc > 0; li++) {
         Layer *l = &m->L[li];
-        for (int t = 0; t < n; t++) rmsnorm(xn + (size_t)t * H, h + (size_t)t * H, l->ln1, H, c->eps);
-        attention(m, li, xn, n, m->pos, tmp);
-        for (size_t i = 0; i < (size_t)n * H; i++) h[i] += tmp[i];
-        if (trace) fwrite(h, sizeof(float), (size_t)n * H, trace);
-        for (int t = 0; t < n; t++) rmsnorm(xn + (size_t)t * H, h + (size_t)t * H, l->ln2, H, c->eps);
-        if (c->moe[li]) moe(m, li, xn, n, tmp);
-        else dense_mlp(m, l, xn, n, tmp);
-        for (size_t i = 0; i < (size_t)n * H; i++) h[i] += tmp[i];
-        if (trace) fwrite(h, sizeof(float), (size_t)n * H, trace);
+        for (int t = 0; t < nc; t++) rmsnorm(xn + (size_t)t * H, hc + (size_t)t * H, l->ln1, H, c->eps);
+        attention(m, li, xn, nc, pc, tmp);
+        for (size_t i = 0; i < (size_t)nc * H; i++) hc[i] += tmp[i];
+        if (trace) fwrite(hc, sizeof(float), (size_t)nc * H, trace);
+        for (int t = 0; t < nc; t++) rmsnorm(xn + (size_t)t * H, hc + (size_t)t * H, l->ln2, H, c->eps);
+        if (c->moe[li]) moe(m, li, xn, nc, tmp);
+        else dense_mlp(m, l, xn, nc, tmp);
+        for (size_t i = 0; i < (size_t)nc * H; i++) hc[i] += tmp[i];
+        if (trace) fwrite(hc, sizeof(float), (size_t)nc * H, trace);
     }
     if (trace) { fclose(trace); trace = NULL; }
     traced = 1;
-    if (logits) {
-        int from = all_rows ? 0 : n - 1, rows = n - from;
-        for (int t = from; t < n; t++) rmsnorm(xn + (size_t)(t - from) * H, h + (size_t)t * H, m->norm, H, c->eps);
-        dw_matmul(logits, xn, rows, &m->head);
+    if (lc && nc > 0) {
+        int from = all_rows ? 0 : nc - 1, rows = nc - from;
+        for (int t = from; t < nc; t++) rmsnorm(xn + (size_t)(t - from) * H, hc + (size_t)t * H, m->norm, H, c->eps);
+        dw_matmul(lc, xn, rows, &m->head);
     }
     kv_prefix_record(&m->kvp, ids, m->pos, n);
     m->pos += n;
@@ -1234,8 +1252,9 @@ static Vision *g_vision;
 #ifdef COLI_VULKAN
 /* The dense matrices go up first, at start-up, the trunk before the tower, so
  * the experts take only what they leave; one that does not fit stays on the
- * CPU. Returns how many went up. */
-static int vk_dense_upload(Model *m) {
+ * CPU. Returns how many went up. The dense chain alone (the per-matrix path off)
+ * takes the trunk and leaves the tower on the CPU (vision 0). */
+static int vk_dense_upload(Model *m, int vision) {
     int n = 0;
     for (int li = 0; li < m->c.n_layers; li++) {
         Layer *l = &m->L[li];
@@ -1243,7 +1262,7 @@ static int vk_dense_upload(Model *m) {
         if (!m->c.moe[li]) n += dw_upload(&l->gate) + dw_upload(&l->up) + dw_upload(&l->down);
     }
     n += dw_upload(&m->head);
-    if (g_vision) {
+    if (g_vision && vision) {
         Vision *v = g_vision;
         n += dw_upload(&v->embed) + dw_upload(&v->fc1) + dw_upload(&v->fc2);
         for (int i = 0; i < v->depth; i++)
@@ -1265,14 +1284,14 @@ static size_t dw_bytes(const DW *d) {
     }
     return 0;
 }
-static size_t vk_dense_bytes(const Model *m) {
+static size_t vk_dense_bytes(const Model *m, int vision) {
     size_t b = dw_bytes(&m->head);
     for (int li = 0; li < m->c.n_layers; li++) {
         const Layer *l = &m->L[li];
         b += dw_bytes(&l->qkv) + dw_bytes(&l->o);
         if (!m->c.moe[li]) b += dw_bytes(&l->gate) + dw_bytes(&l->up) + dw_bytes(&l->down);
     }
-    if (g_vision) {
+    if (g_vision && vision) {
         const Vision *v = g_vision;
         b += dw_bytes(&v->embed) + dw_bytes(&v->fc1) + dw_bytes(&v->fc2);
         for (int i = 0; i < v->depth; i++)
@@ -1314,7 +1333,7 @@ static void vk_tier_start(Model *m) {
                     .gate_up = f, .down = f, .act = VKT_ACT_SWIGLU,
                     .max_rows = MIMO_VK_ROWS * c->topk,
                     .ram_reserve = (size_t)(m->e_bytes + 8192) * (size_t)cap * (size_t)nmoe,
-                    .dense_bytes = coli_vk_dense() ? vk_dense_bytes(m) : 0,
+                    .dense_bytes = coli_vk_dense() ? vk_dense_bytes(m, 1) : g_vk_chain ? vk_dense_bytes(m, 0) : 0,
                     .in_ram = vk_in_ram, .ram_ctx = m};
     atexit(coli_vk_shutdown);   /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
     if (vkt_init(&vc, NULL)) atexit(vkt_shutdown);
@@ -1442,6 +1461,9 @@ static int pin_state_load(Model *m, const PinState *st) {
         memcpy(l->V, st->V[li], st->vd[li] * sizeof(float));
         memcpy(l->ring_pos, st->ring_pos[li], (size_t)l->rows * sizeof(int));
     }
+#ifdef COLI_VULKAN
+    mc_rings_rewritten(m);   /* the dense chain's copies of the rings go up again */
+#endif
     return 1;
 }
 
@@ -1738,6 +1760,9 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *dir) {
         serve_hits(m);
         serve_emap(m);
         vkt_report("turn", m->hits, m->miss);   /* the Vulkan tier's line, when it runs */
+#ifdef COLI_VULKAN
+        mc_report(m, "turn");
+#endif
         coli_serve_command_dispose(&command);
     }
     free(ids); free(logits); free(pending);
@@ -1752,6 +1777,7 @@ static void vk_report(const Model *m) {
     if (!g_vk_ready) return;
     fprintf(stderr, "[VK] mimo: %llu matmuls on the GPU\n", coli_vk_matmul_calls());
     vkt_report("run", m->hits, m->miss);
+    mc_report((Model *)m, "run");
 #else
     (void)m;
 #endif
@@ -1818,11 +1844,31 @@ int main(int argc, char **argv) {
         const char *mx = getenv("MIMO_VK_EXPERTS");
         int tier = vkt_wanted() && any_moe && !(mx && *mx && atoi(mx) <= 0);   /* MIMO_VK_EXPERTS=0: experts on the CPU */
         g_vk_ready = coli_vk_init_env_tier("mimo", tier);
+        /* COLI_VK_CHAIN: every layer's dense chain on the device (mimo_chain.h), decided
+         * before the tier so the tier's budget leaves the trunk room. Not measured on a
+         * MiMo checkpoint: an integrated GPU keeps it opt-in (docs/vulkan.md). */
+        if (g_vk_ready) {
+            g_vk_chain = coli_vk_chain_decide(NULL, tier, COLI_VK_CHAIN_OFF);
+            const char *e = getenv("COLI_VK_CHAIN");
+            char why[160];
+            if (e && *e) snprintf(why, sizeof why, "COLI_VK_CHAIN=%s", e);
+            else if (coli_vk_device_integrated())
+                snprintf(why, sizeof why, "an integrated GPU: not measured on a MiMo checkpoint; COLI_VK_CHAIN=1 on, 2 prompts only");
+            else if (coli_vk_device_shares_ram()) snprintf(why, sizeof why, "a CPU device; COLI_VK_CHAIN=1 turns it on");
+            else snprintf(why, sizeof why, "a discrete GPU%s", tier ? ", beside the expert tier" : "");
+            fprintf(stderr, "[VK] mimo: dense chain %s (%s)\n", g_vk_chain == COLI_VK_CHAIN_ON ? "on"
+                    : g_vk_chain == COLI_VK_CHAIN_PREFILL ? "on for prompts" : "off", why);
+            if (g_vk_chain && !vkc_init()) g_vk_chain = 0;
+        }
         if (g_vk_ready && tier) vk_tier_start(m);
         if (g_vk_ready && !vkt_ready() && !coli_vk_dense()) coli_vk_dense_decide("mimo", 0, 1);   /* no tier after all */
+        if (g_vk_chain) {   /* the chain's teardown before the device's (the tier registered the device's) */
+            if (!tier) atexit(coli_vk_shutdown);
+            atexit(vkc_shutdown);
+        }
     }
-    if (g_vk_ready && coli_vk_dense()) {   /* COLI_VK_DENSE=0: the trunk stays on the CPU */
-        int up = vk_dense_upload(m);
+    if (g_vk_ready && (coli_vk_dense() || g_vk_chain)) {   /* COLI_VK_DENSE=0: the trunk stays on the CPU */
+        int up = vk_dense_upload(m, coli_vk_dense());
         size_t used = 0, count = 0;
         coli_vk_mem_info(&used, &count);
         fprintf(stderr, "[VK] mimo: %d dense matrices on the GPU (%.2f GB)\n", up, used / 1e9);
