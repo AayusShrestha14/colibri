@@ -196,13 +196,21 @@ class DecisionHead:
     model_id: str
     # (geometry, display_scale): the backbone sizes the head ships on
     scales: tuple = ()
+    # The context a checkpoint with this head gets when nothing asks for another:
+    # the head's own input budget (Clef's encode_record max_length). 0 = the family's.
+    default_context: int = 0
+    # COLI_DENSE_BITS the gateway sets when the planner's RAM budget holds the
+    # trunk at that width (docs/clef.md: int8 moves Clef's probabilities by up to
+    # 0.22, f16 by 0.012). 0 = the engine's own default.
+    precise_dense_bits: int = 0
 
 
 DECISION_HEADS = (
     DecisionHead("clef", "qwen36", ("joint_head_config.json", "joint_head.safetensors"),
                  "Clef", "clef",
                  scales=(((("num_hidden_layers", 64), ("hidden_size", 5120),
-                           ("intermediate_size", 17408)), "27B"),)),
+                           ("intermediate_size", 17408)), "27B"),),
+                 default_context=16384, precise_dense_bits=16),
 )
 
 
@@ -212,6 +220,15 @@ def decision_head_of(resolved):
         if head.id == resolved.decision_head:
             return head
     return None
+
+
+def default_context(resolved):
+    """The context a resolved checkpoint runs at when none is asked for: its
+    decision head's own budget (Clef: 16384), else the family's default."""
+    head = decision_head_of(resolved)
+    if head and head.default_context:
+        return head.default_context
+    return resolved.descriptor.limits.default_context
 
 
 def checkpoint_decides(resolved):

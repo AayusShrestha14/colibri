@@ -47,10 +47,14 @@
 
 /* Effective ceiling: Q36_MAXT if set and sane, the conservative default
  * otherwise; never above the hard limit. */
+/* A Clef checkpoint raises the default to its own input budget, 16384 (clef_head.h):
+ * the KV rows are allocated as a request needs them, so the ceiling costs nothing
+ * until a record that long arrives (2 GiB of f32 rows on the 27B at 16384). */
+static int g_q36_default_ctx = QWEN36_DEFAULT_MAX_CTX;
 static int qwen36_max_ctx(void) {
     const char *e = getenv("Q36_MAXT");
-    int v = (e && *e) ? atoi(e) : QWEN36_DEFAULT_MAX_CTX;
-    if (v < 1) v = QWEN36_DEFAULT_MAX_CTX;
+    int v = (e && *e) ? atoi(e) : g_q36_default_ctx;
+    if (v < 1) v = g_q36_default_ctx;
     return v > QWEN36_ATTN_MAX_CTX ? QWEN36_ATTN_MAX_CTX : v;
 }
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
@@ -4822,6 +4826,7 @@ static void q36_clef_load(Model *m, const char *snap){
         if (g_clef_max_len < 1) { fprintf(stderr, "[clef] COLI_CLEF_MAX_LEN must be positive\n"); exit(1); }
     }
     g_clef = 1;
+    if (g_clef_max_len > g_q36_default_ctx) g_q36_default_ctx = g_clef_max_len;
     fprintf(stderr, "[clef] decision head: %d routing + %d decoder layers, width %d, %d heads; "
             "a record reads up to %d tokens (the engine's context is %d)\n",
             h->routing_layers, h->layers, h->width, h->heads, g_clef_max_len, qwen36_max_ctx());
@@ -4839,8 +4844,9 @@ static int q36_clef_decide(Model *m, const DecideRecord *rec, DecideAnswer *answ
     if (in.n > max_ctx) {
         int n = in.n;
         clef_input_free(&in);
-        return decide_fail(err, cap, "record: %d tokens do not fit this engine's context of %d "
-                           "(Q36_MAXT; Clef itself reads up to %d)", n, max_ctx, g_clef_max_len);
+        return decide_fail(err, cap, "record: %d tokens do not fit this engine's context of %d, "
+                           "set by Q36_MAXT (Clef itself reads up to %d; unset, the context is that)",
+                           n, max_ctx, g_clef_max_len);
     }
     float *hidden = (float *)malloc((size_t)in.n * c->hidden * sizeof(float));
     double **logits = (double **)calloc((size_t)in.n_q, sizeof(double *));

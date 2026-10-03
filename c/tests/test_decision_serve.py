@@ -633,6 +633,21 @@ class ClefTinyEndToEnd(unittest.TestCase):
         self.assertEqual(second["answers"], first["answers"])
         self.check("model_card_systemone", second)
 
+    def test_the_gateway_keeps_clefs_trunk_in_f16_when_the_budget_holds_it(self):
+        """int8 moves Clef's probabilities by up to 0.22 on the real checkpoint, f16 by
+        0.012 (docs/clef.md): the gateway picks f16 when the planner's RAM budget
+        holds it, int8 otherwise, and an operator's own COLI_DENSE_BITS wins."""
+        env = {}
+        openai_server.decision_head_env(env, str(CLEF_CONTAINER))
+        self.assertEqual(env.get("COLI_DENSE_BITS"), "16")
+        env = {"RAM_GB": "0.001"}
+        self.assertIn("int8", openai_server.decision_head_env(env, str(CLEF_CONTAINER)))
+        self.assertNotIn("COLI_DENSE_BITS", env)
+        env = {"COLI_DENSE_BITS": "4"}
+        self.assertIsNone(openai_server.decision_head_env(env, str(CLEF_CONTAINER)))
+        self.assertEqual(env, {"COLI_DENSE_BITS": "4"})
+        self.assertIsNone(openai_server.decision_head_env({}, str(HERE / "laya_tiny")))
+
     def test_a_schema_past_the_budget_is_a_422(self):
         """COLI_CLEF_MAX_LEN is the reference's max_length: past it the schema alone
         does not fit and the request is the caller's 422, not a 500."""

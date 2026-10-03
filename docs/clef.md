@@ -73,8 +73,30 @@ Each step follows the checkpoint's own `joint_schema_model.py` (revision
 | head | `JointSchemaHead.forward` | `clef_head_forward`: LayerNorm over the hidden states, span means for the instructions and the options, lexical option vectors from the LM head's rows (read at the container's precision, not the int8 copy), two evidence routing layers (options attending to the whole sequence), the option summary per question, four decoder layers over the fields, then `prior + sigmoid(gate) * (scale * cosine + residual)` |
 | answer | `systemone` | a softmax per question; the gateway shapes the Jev reply (`choice`, `score` as the expected level, `noul` as P(true)) |
 
-The head runs in f32 (512 MB). The backbone runs as Qwen3.8-27B does here:
-int8 by default (`COLI_DENSE_BITS=4` for int4).
+The head runs in f32 (512 MB). The backbone runs at one of three widths,
+`COLI_DENSE_BITS`:
+
+| width | RAM (measured RSS) | accuracy vs the reference | speed |
+|---|---|---|---|
+| f16 (`16`): the container's own values | 55.4 GB | max \|dp\| 0.012 | 47.4 s per request |
+| int8 (`8`) | 29 GB | max \|dp\| 0.22 | 20.4 s |
+| int4 (`4`) | 19 GB | max \|dp\| 0.22 | 30.2 s |
+
+**Which one runs.** If you set `COLI_DENSE_BITS`, that one. Otherwise `coli
+serve`, `coli web` and `coli chat` ask the planner (`coli plan` shows the same
+numbers): when its RAM budget holds the trunk at its stored size plus the
+runtime and the KV state of 16384 tokens, Clef runs in f16, the width that
+answers like the release; when it does not, int8, and the gateway says which on
+start-up:
+
+```
+[clef] dense trunk in int8: f16 would need 58.9 GiB, the budget is 53.3 GiB (COLI_DENSE_BITS=16 to force it)
+```
+
+The planner's margins are its usual ones: on the 61 GB test box f16 ran at
+55.4 GB, but the planner keeps it to int8 there. A box with about 72 GB free
+gets f16 by default. The engine started by hand (`SERVE=1 ./qwen36`) stays at
+int8 unless told otherwise.
 
 ## Checked against the reference
 
@@ -94,17 +116,19 @@ int8 by default (`COLI_DENSE_BITS=4` for int4).
   20-intent choice, nine questions in one record) against the release's code
   in bf16, its own precision:
 
-| engine backbone | input ids | decisions | max \|dp\| |
-|---|---|---|---|
-| int8 (default) | 15/15 identical | 39/39 | 0.22 |
-| int4 (`COLI_DENSE_BITS=4`) | 15/15 identical | 39/39 | 0.22 |
+| engine backbone | input ids | decisions | max \|dp\| | requests under 0.01 |
+|---|---|---|---|---|
+| f16 (`COLI_DENSE_BITS=16`) | 15/15 identical | 39/39 | 0.012 | 14/15 |
+| int8 | 15/15 identical | 39/39 | 0.22 | 8/15 |
+| int4 (`COLI_DENSE_BITS=4`) | 15/15 identical | 39/39 | 0.22 | 9/15 |
 
-  The two largest differences, 0.22 and 0.21 in int8, are a code-review
-  verdict where the reference puts 0.955 on "request changes" and the
-  nine-question invoice record; both keep the reference's decision, and 8 of
-  the 15 requests stay under 0.01. A reference in f32 has not been run (the 27B in f32
-  does not fit the 61 GB of the box), so how much of the gap is the engine's
-  int8 and how much the reference's bf16 is not separated.
+  The gap is the int8 trunk, not the rendering or the head: with the same
+  rendering, the same head code and the container's f16 weights the largest
+  difference falls from 0.22 to 0.012 (the nine-question invoice record), and
+  the code-review verdict that moved by 0.22 in int8 moves by 0.0008. What
+  is left at f16 is the reference computing in bf16 where the engine computes
+  in f32. On the tiny fixture, where both sides run f32, f16 weights give
+  max |dp| 2.5e-6 and int8 5.0e-2.
 
 ## Speed
 
@@ -112,23 +136,24 @@ Measured on the same box, 8 threads, every request from a cold state:
 
 | | per request |
 |---|---|
-| engine, int8, median over the 15 requests (150 to 779 tokens) | 20.4 s |
+| engine, f16, median over the 15 requests (150 to 779 tokens) | 47.4 s |
+| engine, int8, the same requests | 20.4 s |
 | engine, int4, the same requests | 30.2 s |
 | reference, bf16, transformers 5.17 on the CPU, 28 of 64 layers read from disk | 10.8 s |
-| `coli serve`, the request above (300 tokens), at the client | 20.6 s, of which 1.4 ms gateway |
+| `coli serve`, int8, the request above (300 tokens), at the client | 20.6 s, of which 1.4 ms gateway |
 
-The time is the backbone's prefill, about 15 tokens per second here; the
-reference's bf16 matrix kernels are faster on this CPU than qwen36's int8
-prefill, and int4 is slower still because the prefill is compute-bound. The
-engine's own time is in the `x-colibri-engine-ms` header.
+The time is the backbone's prefill; the reference's bf16 matrix kernels are
+faster on this CPU than qwen36's int8 prefill, int4 is slower because the
+prefill is compute-bound, and f16 multiplies in f32. The engine's own time is
+in the `x-colibri-engine-ms` header.
 
 ## Knobs
 
 | variable | default | meaning |
 |---|---|---|
+| `COLI_DENSE_BITS` | f16 if the planner's budget holds it, else int8 (see above) | `16`, `8` or `4`; `COLI_DENSE_INT4` as for Qwen3.8-27B ([qwen36.md](qwen36.md#the-dense-27b)) |
 | `COLI_CLEF_MAX_LEN` | 16384 | the reference's `max_length`: the state is cut to fit it, a schema longer than it is a 422 |
-| `Q36_MAXT` | 8192 | the engine's context; a record longer than it is a 422 that names it, so raise it to 16384 for Clef's full budget |
-| `COLI_DENSE_BITS`, `COLI_DENSE_INT4` | int8 | as for Qwen3.8-27B ([qwen36.md](qwen36.md#the-dense-27b)) |
+| `Q36_MAXT` | 16384 for a Clef checkpoint (8192 for the others) | the engine's context. The KV rows are allocated as a record needs them, 2 GiB at 16384 on the 27B, and `coli plan` prices them at 16384. A lower `Q36_MAXT` refuses a longer record with a 422 that names it |
 
 ## Limits
 

@@ -795,8 +795,12 @@ def cuda_binary(engine=None):
     return False
 
 def resource_request(a, env):
-    family=resolve_model(a.model).descriptor if getattr(a,"model",None) else family_by_id("glm")
-    ctx=a.ctx or int(env.get(family.limits.context_env,family.limits.default_context))
+    from family_registry import default_context
+    resolved=resolve_model(a.model) if getattr(a,"model",None) else None
+    family=resolved.descriptor if resolved else family_by_id("glm")
+    # a Clef checkpoint plans for its own 16384 (family_registry.default_context)
+    fallback=default_context(resolved) if resolved else family.limits.default_context
+    ctx=a.ctx or int(env.get(family.limits.context_env,fallback))
     if ctx<1 or ctx>family.limits.max_context:
         raise ValueError(f"--ctx must be between 1 and {family.limits.max_context} "
                          f"for {family.display_name}")

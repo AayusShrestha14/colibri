@@ -4761,6 +4761,49 @@ def cap_for_arch(arch, cap, env=None, model=None):
     return family_by_id(arch).limits.implicit_cap
 
 
+def decision_head_env(env, model):
+    """The dense trunk's width for a checkpoint with a decision head (Clef), when
+    the operator set none: the head's precise width (f16) if the planner's RAM
+    budget holds the trunk at that size, the engine's int8 otherwise. Measured on
+    Clef against its reference in bf16 (docs/clef.md): int8 moves a probability
+    by up to 0.22, f16 by 0.012, at 2.3x the time. Returns the line it printed,
+    or None when it had nothing to decide."""
+    if env.get("COLI_DENSE_BITS"):
+        return None
+    from family_registry import decision_head_of, default_context
+    try:
+        resolved = resolve_model(model)
+    except Exception:                   # not a checkpoint this can read: nothing to decide
+        return None
+    head = decision_head_of(resolved)
+    if not head or not head.precise_dense_bits:
+        return None
+    try:
+        from resource_plan import build_plan
+        limits = resolved.descriptor.limits
+        context = int(env.get(limits.context_env) or default_context(resolved))
+        ram = env.get("RAM_GB", "0")
+        plan = build_plan(model, ram_gb=0 if ram in ("", "auto") else float(ram), context=context,
+                          gpu_indices=[])
+    except Exception as error:          # the engine's own default stands
+        line = f"[{head.id}] dense trunk left at the engine's default (no plan: {error})"
+        print(line, file=sys.stderr)
+        return line
+    tier = plan["tiers"]["ram"]
+    need = (tier["dense_bytes"] + tier["runtime_bytes"] + tier["sequence_state_bytes"]
+            + tier["fixed_state_bytes"])
+    gib = 1 << 30
+    if need <= tier["budget_bytes"]:
+        env["COLI_DENSE_BITS"] = str(head.precise_dense_bits)
+        line = (f"[{head.id}] dense trunk in f16: {need / gib:.1f} GiB fit the {tier['budget_bytes'] / gib:.1f} "
+                f"GiB budget (COLI_DENSE_BITS=8 for int8, faster and less exact)")
+    else:
+        line = (f"[{head.id}] dense trunk in int8: f16 would need {need / gib:.1f} GiB, the budget is "
+                f"{tier['budget_bytes'] / gib:.1f} GiB (COLI_DENSE_BITS=16 to force it)")
+    print(line, file=sys.stderr)
+    return line
+
+
 def tune_child_env(env, arch):
     """Apply the engine-local defaults that a direct server launch otherwise misses.
 
@@ -5118,6 +5161,7 @@ class Engine:
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
         tune_child_env(child_env, arch)
+        decision_head_env(child_env, model)
         resolved_cap = cap_for_arch(arch, cap, child_env, model=model)
         child_env.pop("COLI_PROFILE_CAP", None)
         child_env.pop("COLI_PLAN_CAP", None)
