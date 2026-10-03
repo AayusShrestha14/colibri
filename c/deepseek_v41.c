@@ -723,6 +723,21 @@ static void engram_table_open(EngramTable *t, shards *S, int layer, int head_dim
     snprintf(name, sizeof(name), "layers.%d.engram.embed.scale", layer);
     st_tensor *s = st_find(S, name);
     if (!w || !s) { fprintf(stderr, "[engram] layer %d has no table\n", layer); exit(1); }
+    /* SEC: engram_row() reads row `id` at id * head_dim bytes into the table and at
+     * id * head_dim/32 into its scales. head_dim comes from the sidecar and the two
+     * sizes from the shards, and nothing held them together: a head_dim of 0 divided
+     * by zero below, one off a multiple of 32 left the tail of every cached row
+     * unwritten, and a scale tensor shorter than the table was read past its end. */
+    if (head_dim <= 0 || head_dim % 32) {
+        fprintf(stderr, "[engram] head_dim %d is not a positive multiple of 32\n", head_dim);
+        exit(1);
+    }
+    if (w->nbytes % head_dim || s->nbytes != w->nbytes / head_dim * (head_dim / 32)) {
+        fprintf(stderr, "[engram] layer %d: a table of %lld bytes and %lld scale bytes are "
+                        "not whole rows of %d bytes with one scale per 32\n", layer,
+                (long long)w->nbytes, (long long)s->nbytes, head_dim);
+        exit(1);
+    }
     t->fd_w = w->fd; t->off_w = w->off;
     t->fd_s = s->fd; t->off_s = s->off;
     t->rows = w->nbytes / head_dim;
@@ -740,6 +755,16 @@ static void engram_table_open(EngramTable *t, shards *S, int layer, int head_dim
  * miss the row and its scales are one pread each, 264 bytes for the released table. */
 static const float *engram_row(EngramTable *t, int64_t id, int head_dim) {
     int groups = head_dim / 32;
+    /* SEC: `id` is a hash bucket plus an offset, both from the sidecar; the row count
+     * is the shard's. An id past either end read whatever the file holds there, and
+     * -1 -- the empty-slot key -- "hit" an empty slot and returned a row never read.
+     * Checked before the probe for that reason. */
+    if (id < 0 || id >= t->rows) {
+        fprintf(stderr, "[engram] row %lld is outside the table (%lld rows): "
+                        "dsv41_engram.json does not describe this checkpoint\n",
+                (long long)id, (long long)t->rows);
+        exit(1);
+    }
     int slot = (int)((uint64_t)(id * 0x9E3779B97F4A7C15ull) >> 40) & t->mask;
     int victim = slot;
     for (int probe = 0; probe < 4; probe++) {
