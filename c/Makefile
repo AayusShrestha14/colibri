@@ -529,6 +529,7 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41 test_st_f16_bf16_simd_sse41 test_qwen38_tier_engine \
 	test_e8x4g64_loader test_qwenimage_vae test_vk_tier \
 	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract
+TEST_EXCLUDE += test_vk_chain
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
@@ -709,6 +710,12 @@ VK_OBJ    = backend_vulkan.o vk_tier.o
 VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/attention_absorb.spv shaders/rmsnorm.spv \
             shaders/qmatmul_gemm.spv shaders/qmatmul_coop.spv shaders/expert_act.spv \
             shaders/expert_act_v4.spv
+# vk_chain.o: a layer's dense chain recorded into one submission (vk_chain.h), and
+# its shaders; an engine that does not call it links nothing from it.
+VK_OBJ   += vk_chain.o
+VK_SPV   += shaders/chain_norm.spv shaders/chain_rope.spv shaders/chain_attn.spv shaders/chain_dnconv.spv \
+            shaders/chain_dnrec.spv shaders/chain_ew.spv shaders/chain_qsa.spv shaders/chain_ple.spv \
+            shaders/chain_gemv.spv
 endif
 
 # Optional AMD XDNA2 (Ryzen AI NPU) lane, Windows. Same opt-in shape as VK=1:
@@ -844,6 +851,8 @@ backend_vulkan.o: backend_vulkan.c .build-config
 	$(CC) $(CFLAGS) -c backend_vulkan.c -o $@
 vk_tier.o: vk_tier.c .build-config
 	$(CC) $(CFLAGS) -c vk_tier.c -o $@
+vk_chain.o: vk_chain.c .build-config
+	$(CC) $(CFLAGS) -c vk_chain.c -o $@
 shaders/%.spv: shaders/%.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@
@@ -1957,6 +1966,16 @@ tests/test_vk_tier$(EXE): tests/test_vk_tier.c $(VK_OBJ) $(VK_SPV)
 .PHONY: vk-tier-check
 vk-tier-check: tests/test_vk_tier$(EXE)
 	./tests/test_vk_tier$(EXE) shaders/qmatmul.spv
+
+# The dense chain's ops (vk_chain.c, shaders/chain_*.comp) against CPU references, on
+# a Vulkan device (CI: Lavapipe); like test_vk_tier it needs VK=1 and stays out of
+# `check`.
+tests/test_vk_chain$(EXE): tests/test_vk_chain.c $(VK_OBJ) $(VK_SPV)
+	@[ "$(VK)" = 1 ] || { echo "tests/test_vk_chain needs VK=1" >&2; exit 1; }
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+.PHONY: vk-chain-check
+vk-chain-check: tests/test_vk_chain$(EXE)
+	./tests/test_vk_chain$(EXE) shaders/qmatmul.spv
 
 tests/test_rans$(EXE): tests/test_rans.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)

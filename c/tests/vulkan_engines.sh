@@ -6,6 +6,7 @@
 #   bash tests/vulkan_engines.sh mimo-qwenimage | kimi | kimi-mimo-sanitize | deepseek | deepseek-sanitize
 #   bash tests/vulkan_engines.sh glm | glm-sanitize   # GLM-5.2 (colibri) and GLM-5.3 Flash (glm53)
 #   bash tests/vulkan_engines.sh shader    # the qmatmul formats, the expert batch and the tier, no engine
+#   bash tests/vulkan_engines.sh qwen-chain | qwen-chain-sanitize   # the dense chain (COLI_VK_CHAIN=1)
 #
 # Needs libvulkan-dev, glslc and mesa-vulkan-drivers, plus the Python packages of
 # the family's tiny fixtures (see the vulkan-engines job in .github/workflows/ci.yml).
@@ -1152,6 +1153,193 @@ family_glm_sanitize() {
   make clean >/dev/null 2>&1 || true
 }
 
+# The dense chain (vk_chain.c, COLI_VK_CHAIN=1): every layer recorded into one
+# submission, the residual stream, the KV mirrors and the recurrent state on the device.
+# Gates, per configuration: the CPU run's tokens (and its oracle, where the CPU passes
+# it); the last logits within 1e-4 of the largest one where both runs multiply f32
+# activations (tol 1); a "[VK] <engine> chain: N forwards" line with N > 0. Beside them:
+# the chain's ops against CPU references (tests/test_vk_chain), qwen38's oracle targets
+# with the chain on, the prefix-reuse contract, and serve sessions (pins, the prompt
+# cache, the prefill read-out, MTP drafts) frame for frame against the CPU.
+chain_count() {
+  local n
+  n=$(sed -n "s/^\[VK\] $1 chain: \([0-9][0-9]*\) forwards.*/\1/p" "$2" | tail -1)
+  echo "${n:-0}"
+}
+logits_close() {  # <cpu.f32> <vk.f32>: max |diff| within 1e-4 of the largest |logit|
+  $PY - "$1" "$2" <<'PY'
+import array, sys
+a = array.array("f", open(sys.argv[1], "rb").read()); b = array.array("f", open(sys.argv[2], "rb").read())
+d = max(abs(x - y) for x, y in zip(a, b)) if a and len(a) == len(b) else float("inf")
+m = max(abs(x) for x in a) if a else 0.0
+print(f"max |logit diff| {d:.2e} of {m:.2e}")
+sys.exit(0 if d <= 1e-4 * m else 1)
+PY
+}
+chain_gate() {  # <engine> <tag> <tol 0|1> <env...> -- <argv...>   (CPUENV: the CPU arm's own settings)
+  local eng=$1 tag=$2 tol=$3; shift 3
+  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  rm -f chain.usage cpu.f32 vk.f32
+  local rc_cpu=0
+  env "${envs[@]}" ${CPUENV:-} DUMP=cpu.f32 ./"$eng" "$@" > cpu.log 2>&1 || rc_cpu=$?
+  env "${envs[@]}" DUMP=vk.f32 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=${CHAINMODE:-1} \
+    ./"$eng" "$@" > vk.log 2>&1 || { [ $rc_cpu != 0 ] || { cat vk.log; fail "$tag: the chain misses the oracle the CPU passes"; }; }
+  same_tokens cpu.log vk.log "$tag"
+  [ "$(chain_count "$eng" vk.log)" -gt 0 ] || { cat vk.log; fail "$tag: the chain never ran"; }
+  local lg=""
+  if [ "$tol" = 1 ]; then lg=$(logits_close cpu.f32 vk.f32) || { echo "$lg"; fail "$tag: logits"; }; lg=", $lg"; fi
+  echo "OK $tag: tokens = CPU$lg, $(chain_count "$eng" vk.log) chain forwards"
+}
+
+# lost_gate <engine> <tag> <frame> <env...> -- <argv...>: the device "lost" at the given
+# chain frame (COLI_VK_CHAIN_FAULT); the engine rebuilds the recurrent state on the CPU
+# from the prefix record and continues there: the CPU run's tokens all the same.
+lost_gate() {
+  local eng=$1 tag=$2 k=$3; shift 3
+  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  rm -f chain.usage
+  env "${envs[@]}" ./"$eng" "$@" > cpu.log 2>&1 || true
+  env "${envs[@]}" COLI_VK_CHAIN_FAULT=$k COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 \
+    ./"$eng" "$@" > vk.log 2>&1 || true
+  same_tokens cpu.log vk.log "$tag"
+  grep -q "rebuilding the state of [1-9]" vk.log || { cat vk.log; fail "$tag: no state was rebuilt"; }
+  echo "OK $tag: tokens = CPU, $(grep -o 'rebuilding the state of [0-9]* positions' vk.log)"
+}
+
+family_qwen_chain() {
+  make qwen36 qwen38 tests/test_vk_chain VK=1
+  ./tests/test_vk_chain shaders/qmatmul.spv | tee vk_chain.log
+  tail -1 vk_chain.log | grep -qx PASS || fail "the chain's ops"
+  $PY tools/make_qwen36_tiny.py --out qwen36_tiny --ref-mode full --emit-ref qwen36_tiny/ref_full.json
+  $PY tools/make_qwen36_tiny.py --geometry qwen3-coder-30b --out qwen3_coder_tiny --ref-mode full --emit-ref qwen3_coder_tiny/ref_full.json
+  $PY tools/make_qwen36_tiny.py --geometry qwen38-27b-dense --out qwen38_27b_tiny --ref-mode full --emit-ref qwen38_27b_tiny/ref_full.json
+  $PY tools/make_qwen36_tiny.py --geometry qwen38-2p4t --seed 3 --out qwen38_2p4t_tiny --ref-mode full --emit-ref qwen38_2p4t_tiny/ref_full.json
+  local fx cap caps
+  # qwen36: the hybrid, Qwen3-Coder (attention only, no gate, no shared expert), the
+  # 27B dense geometry (no routed experts: no host step at all) and the 2.4T one
+  for fx in qwen36_tiny qwen3_coder_tiny qwen38_27b_tiny qwen38_2p4t_tiny; do
+    $PY tools/convert_qwen36.py --model $fx --out ${fx}_c --ebits 8
+    caps="1 8"; [ $fx = qwen38_2p4t_tiny ] && caps=8
+    for cap in $caps; do
+      chain_gate qwen36 "chain qwen36 $fx f32 cap=$cap" 1 COLI_DENSE_I8=0 SNAP=${fx}_c -- $cap 8 $fx/ref_full.json
+    done
+    # int8 dense rows (fmt 1): the CPU arm with f32 activations (COLI_DENSE_IDOT=0), as the device
+    CPUENV=COLI_DENSE_IDOT=0 chain_gate qwen36 "chain qwen36 $fx int8" 1 SNAP=${fx}_c -- 8 8 $fx/ref_full.json
+  done
+  # the expert containers the tier reads, the tier off, prefill in chunks of 3 rows,
+  # the tiled GEMM inside the chain from S = 2
+  $PY tools/make_qwen36_tiny.py --out qwen36_tiny64 --ref-mode full --inter 64 --emit-ref qwen36_tiny64/ref_full.json
+  $PY tools/convert_qwen36.py --model qwen36_tiny64 --out qwen36_tiny64_c --ebits 4 --gs 64
+  $PY tools/convert_qwen36.py --model qwen36_tiny64 --out qwen36_tiny64_d8 --ebits 4 --gs 64 --down-bits 8
+  $PY tools/convert_qwen36.py --model qwen36_tiny --out qwen36_tiny_i4r --ebits 4
+  chain_gate qwen36 "chain qwen36 int4-g64 planar" 1 QWEN_EXPERT_ACT=f32 COLI_DENSE_I8=0 SNAP=qwen36_tiny64_c -- 8 4 qwen36_tiny64/ref_full.json
+  chain_gate qwen36 "chain qwen36 int4-g64 int8 activations" 0 COLI_DENSE_I8=0 SNAP=qwen36_tiny64_c -- 1 4 qwen36_tiny64/ref_full.json
+  chain_gate qwen36 "chain qwen36 mixed int4/int8" 1 COLI_DENSE_I8=0 SNAP=qwen36_tiny64_d8 -- 8 4 qwen36_tiny64/ref_full.json
+  chain_gate qwen36 "chain qwen36 int4 per row" 1 COLI_DENSE_I8=0 SNAP=qwen36_tiny_i4r -- 8 4 qwen36_tiny/ref_full.json
+  chain_gate qwen36 "chain qwen36 tier off" 1 COLI_VK_TIER=0 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
+  chain_gate qwen36 "chain qwen36 prefill in chunks of 3" 1 COLI_VK_CHAIN_ROWS=3 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
+  chain_gate qwen36 "chain qwen36 tiled GEMM" 1 COLI_VK_GEMM_MIN_S=2 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
+  chain_gate qwen36 "chain qwen36 the per-row GEMV" 1 COLI_VK_CHAIN_GEMV=0 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
+  # an image: the M-RoPE positions reach the chain as the host's cos/sin table,
+  # token-exact against transformers, on the CLI and through the IMAGE frame
+  $PY tools/make_qwen36_vl_tiny.py --out qwen38_27b_vl_tiny
+  $PY tools/convert_qwen36.py --model qwen38_27b_vl_tiny --out qwen38_27b_vl_tiny_c --ebits 8
+  chain_gate qwen36 "chain qwen36 vision" 1 COLI_DENSE_I8=0 SNAP=qwen38_27b_vl_tiny_c -- 8 8 qwen38_27b_vl_tiny/ref.json
+  QWEN36_VL_TINY=qwen38_27b_vl_tiny_c QWEN36_VL_REF=qwen38_27b_vl_tiny/ref.json COLI_VULKAN=1 COLI_VK_CHAIN=1 \
+    COLI_USAGE=$PWD/chain.usage $PY -m unittest tests.test_qwen36_vision_serve
+  # the device lost mid-decode: the state rebuilt on the CPU, the run finishes there
+  lost_gate qwen36 "chain qwen36 device lost" 40 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
+  # the prefix-reuse contract with the state on the device, and a serve session
+  QWEN36_TINY=$PWD/qwen36_tiny_c COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_USAGE=$PWD/chain.usage $PY tests/test_qwen36_prefix_serve.py
+  $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0
+  # COLI_VK_CHAIN=2, prompts on the device and decode on the CPU: the state crosses
+  # between them at every turn's first decode step and next prompt
+  CHAINMODE=2 chain_gate qwen36 "chain qwen36 prompts only" 1 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
+  COLI_VK_CHAIN=2 $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0
+
+  # qwen38: every resident format, prefill batching, every expert form, MTP
+  $PY tools/make_qwen38_tiny.py --out qwen38_tiny
+  $PY tools/make_qwen38_tiny.py --out qwen38_tiny_fp8 --fp8-experts
+  $PY tools/make_qwen38_tiny.py --out qwen38_tiny_int4 --fp8-experts --int4-experts --expert-gain 3
+  local trunk batch bf16 fx ref f
+  for batch in 0 1; do for bf16 in 0 1; do
+    chain_gate qwen38 "chain qwen38 bf16=$bf16 batch=$batch" 1 OMP_NUM_THREADS=2 Q38_PREFILL_BATCH=$batch Q38_NATIVE_BF16=$bf16 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
+  done; done
+  # the int8 trunk (fmt 1): the CPU's integer kernel rounds activations, so tokens only
+  chain_gate qwen38 "chain qwen38 int8 trunk" 0 OMP_NUM_THREADS=2 Q38_TRUNK_MIN_KB=0 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
+  for fx in qwen38_tiny_fp8 qwen38_tiny_int4; do
+    ref=$fx/ref.json; [ $fx = qwen38_tiny_int4 ] && ref=$fx/ref_int4.json
+    for batch in 0 1; do chain_gate qwen38 "chain qwen38 $fx batch=$batch" 1 OMP_NUM_THREADS=2 Q38_PREFILL_BATCH=$batch SNAP=$fx -- 2 8 $ref; done
+  done
+  chain_gate qwen38 "chain qwen38 tier off" 1 OMP_NUM_THREADS=2 COLI_VK_TIER=0 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
+  chain_gate qwen38 "chain qwen38 prefill in chunks of 3" 1 OMP_NUM_THREADS=2 COLI_VK_CHAIN_ROWS=3 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
+  $PY tools/make_qwen38_tiny.py --out qwen38_tiny_mtp --mtp
+  $PY tools/make_edge_tiny_tokenizer.py --vocab-size 64 ./qwen38_tiny_mtp   # serve speaks text
+  $PY tools/make_qwen38_tiny.py --out qwen38_tiny_fp8_mtp --fp8-experts --mtp
+  $PY tools/make_qwen38_tiny.py --out qwen38_tiny_int4_mtp --fp8-experts --int4-experts --expert-gain 3 --mtp
+  # MTP verify (S = 2) with the device's snapshot and rollback: drafts as they come,
+  # every draft rejected (a rollback per token), every one accepted, alternating
+  for fx in qwen38_tiny_mtp qwen38_tiny_fp8_mtp qwen38_tiny_int4_mtp; do for f in "" reject accept mixed; do
+    chain_gate qwen38 "chain qwen38 MTP $fx ${f:-drafting}" 1 OMP_NUM_THREADS=2 Q38_MTP=1 Q38_MTP_FORCE=$f SNAP=$fx -- 2 8 $fx/ref.json
+  done; done
+  # the device lost mid-decode, once between steps and once inside an MTP verify
+  lost_gate qwen38 "chain qwen38 device lost" 20 OMP_NUM_THREADS=2 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
+  lost_gate qwen38 "chain qwen38 device lost in a verify" 45 OMP_NUM_THREADS=2 Q38_MTP=1 Q38_MTP_FORCE=mixed SNAP=qwen38_tiny_mtp -- 2 8 qwen38_tiny_mtp/ref.json
+  # the oracle targets with the chain on (COLI_VK_TIER_BALANCE=0: the int4 target wants
+  # the same last logits from every expert path, and the balancer moves experts between
+  # the device and the CPU by measured times); the MTP harness, whose prompt-cache and pin
+  # checks compare a warm session's draft logits bit for bit with a fresh one's, with the
+  # tier off: the tier's residency differs between two sessions, with or without the chain
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 \
+    make qwen38-tiny-check qwen38-tiny-fp8-check qwen38-tiny-int4-check VK=1
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER=0 make qwen38-tiny-mtp-check VK=1
+  $PY tests/vulkan_chain_serve.py ./qwen38 qwen38_tiny_mtp OMP_NUM_THREADS=2 Q38_MTP=1
+  $PY tests/vulkan_chain_serve.py ./qwen38 qwen38_tiny_mtp OMP_NUM_THREADS=2
+  CHAINMODE=2 chain_gate qwen38 "chain qwen38 prompts only, MTP" 1 OMP_NUM_THREADS=2 Q38_MTP=1 Q38_MTP_FORCE=mixed SNAP=qwen38_tiny_mtp -- 2 8 qwen38_tiny_mtp/ref.json
+  COLI_VK_CHAIN=2 $PY tests/vulkan_chain_serve.py ./qwen38 qwen38_tiny_mtp OMP_NUM_THREADS=2 Q38_MTP=1
+}
+
+# The chain under ASan and UBSan: memory safety is the gate (a sanitized build
+# vectorizes differently, so tokens are not compared); each run must have run the chain.
+family_qwen_chain_sanitize() {
+  make clean >/dev/null 2>&1 || true
+  make qwen36 qwen38 tests/test_vk_chain VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
+  ./tests/test_vk_chain shaders/qmatmul.spv > san.log 2>&1 || true
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log || ! tail -1 san.log | grep -qx PASS; then cat san.log; fail "asan: the chain's ops"; fi
+  echo "OK asan: the chain's ops"
+  $PY tools/make_qwen36_tiny.py --out qwen36_tiny --ref-mode full --emit-ref qwen36_tiny/ref_full.json
+  $PY tools/convert_qwen36.py --model qwen36_tiny --out qwen36_tiny_c --ebits 8
+  $PY tools/make_qwen36_tiny.py --geometry qwen38-27b-dense --out qwen38_27b_tiny --ref-mode full --emit-ref qwen38_27b_tiny/ref_full.json
+  $PY tools/convert_qwen36.py --model qwen38_27b_tiny --out qwen38_27b_tiny_c --ebits 8
+  $PY tools/make_qwen36_tiny.py --out qwen36_tiny64 --ref-mode full --inter 64 --emit-ref qwen36_tiny64/ref_full.json
+  $PY tools/convert_qwen36.py --model qwen36_tiny64 --out qwen36_tiny64_c --ebits 4 --gs 64
+  $PY tools/make_qwen38_tiny.py --out qwen38_tiny
+  $PY tools/make_qwen38_tiny.py --out qwen38_tiny_int4_mtp --fp8-experts --int4-experts --expert-gain 3 --mtp
+  $PY tools/make_qwen38_tiny.py --out qwen38_tiny_mtp --mtp
+  $PY tools/make_edge_tiny_tokenizer.py --vocab-size 64 ./qwen38_tiny_mtp   # serve speaks text
+  csan() {  # <engine> <tag> <env and argv...>
+    local eng=$1 tag=$2; shift 2
+    rm -f chain.usage
+    env OMP_NUM_THREADS=2 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 "$@" > san.log 2>&1 || true
+    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    [ "$(chain_count "$eng" san.log)" -gt 0 ] || { cat san.log; fail "$tag: the chain never ran"; }
+    echo "OK $tag: sanitizers clean, $(chain_count "$eng" san.log) chain forwards"
+  }
+  csan qwen36 "asan chain qwen36 int8 experts" COLI_DENSE_I8=0 SNAP=qwen36_tiny_c ./qwen36 1 8 qwen36_tiny/ref_full.json
+  csan qwen36 "asan chain qwen36 int8 dense, chunks of 3" COLI_VK_CHAIN_ROWS=3 SNAP=qwen36_tiny_c ./qwen36 8 8 qwen36_tiny/ref_full.json
+  csan qwen36 "asan chain qwen36 int4-g64 planar" COLI_DENSE_I8=0 SNAP=qwen36_tiny64_c ./qwen36 8 4 qwen36_tiny64/ref_full.json
+  csan qwen36 "asan chain qwen36 dense model" COLI_DENSE_I8=0 SNAP=qwen38_27b_tiny_c ./qwen36 8 8 qwen38_27b_tiny/ref_full.json
+  csan qwen38 "asan chain qwen38 batch=0" Q38_PREFILL_BATCH=0 SNAP=qwen38_tiny ./qwen38 4 8 qwen38_tiny/ref.json
+  csan qwen38 "asan chain qwen38 int8 trunk, chunks of 3" Q38_TRUNK_MIN_KB=0 COLI_VK_CHAIN_ROWS=3 SNAP=qwen38_tiny ./qwen38 4 8 qwen38_tiny/ref.json
+  csan qwen38 "asan chain qwen38 MTP reject" Q38_MTP=1 Q38_MTP_FORCE=reject SNAP=qwen38_tiny_int4_mtp ./qwen38 2 8 qwen38_tiny_int4_mtp/ref.json
+  csan qwen38 "asan chain qwen38 MTP mixed" Q38_MTP=1 Q38_MTP_FORCE=mixed SNAP=qwen38_tiny_int4_mtp ./qwen38 2 8 qwen38_tiny_int4_mtp/ref.json
+  $PY tests/vulkan_chain_serve.py ./qwen38 qwen38_tiny_mtp Q38_MTP=1 > san.log 2>&1 || { cat san.log; fail "asan chain qwen38 serve"; }
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan chain qwen38 serve: sanitizer diagnostic"; fi
+  echo "OK asan chain qwen38 serve: $(tail -1 san.log)"
+  make clean >/dev/null 2>&1 || true
+}
+
 case "${1:-}" in
   shader)         shader_formats ;;
   qwen)           family_qwen ;;
@@ -1165,5 +1353,7 @@ case "${1:-}" in
   kimi-mimo-sanitize) family_kimi_mimo_sanitize ;;
   glm)            family_glm ;;
   glm-sanitize)   family_glm_sanitize ;;
-  *) echo "usage: $0 shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize" >&2; exit 2 ;;
+  qwen-chain)     family_qwen_chain ;;
+  qwen-chain-sanitize) family_qwen_chain_sanitize ;;
+  *) echo "usage: $0 shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize" >&2; exit 2 ;;
 esac
