@@ -1129,7 +1129,7 @@ jobs:
         run: |
           pip install -r c/tools/requirements-jev-sdk.txt
           cd c/tools/jev-sdk && npm ci
-      - name: Both SDKs against a language model (tiny MiMo) and a decision engine (tiny Laya)
+      - name: Both SDKs against a language model (tiny MiMo) and the decision engines (tiny Laya, tiny GLiNER2.5-Decide)
         run: make -C c jev-sdk-check
 
   qwenimage-tiny-check:
