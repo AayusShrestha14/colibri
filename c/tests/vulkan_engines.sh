@@ -29,6 +29,11 @@ PY=${PY:-python3}
 
 fail() { echo "FAIL: $*"; exit 1; }
 
+# Every sanitized run below sets ASAN_OPTIONS with detect_stack_use_after_return=0:
+# ASan's fake stack frames are only 32-byte aligned, and on an AVX-512 runner
+# (-march=native) GCC keeps 64-byte aligned locals there and stores them with
+# vmovdqa64, which faults (c/Makefile, ASAN_ENV, has the details).
+
 # vk_count <engine> <log>: N from the last "[VK] <engine>: N matmuls on the GPU" line
 vk_count() {
   local n
@@ -85,7 +90,12 @@ tier_failed() {
 dense_where() {
   local eng=$1 log=$2 tag=$3 where; shift 3
   if grep -qa "^\[VK\] $eng: device ready, dense matrices on the device" "$log"; then
-    need_gpu "$eng" "$log" "$tag"; where=device
+    # inkling places none when the host keeps them by design (bf16 weights under the
+    # AVX512-BF16 dot, which rounds the activations as the shader does not): its
+    # placement line then says "0 resident matrices go to the GPU", and the count is
+    # not required, as in family_inkling_olmoe's own bf16 check.
+    grep -qa "^\[VK\] $eng: 0 resident matrices go to the GPU" "$log" || need_gpu "$eng" "$log" "$tag"
+    where=device
   else
     [ "$(vk_count "$eng" "$log")" = 0 ] || { cat "$log"; fail "$tag: dense matmuls ran on the device with the trunk on the CPU"; }
     where=CPU
@@ -263,7 +273,7 @@ family_qwen_sanitize() {
   san() {  # <engine> <tag> <env and argv...>
     local eng=$1 tag=$2; shift 2
     rm -f tier.usage
-    env ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2 \
+    env ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2 \
       COLI_USAGE=tier.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 "$@" > san.log 2>&1 || true
     if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
     [ "$(tier_count "$eng" san.log)" -gt 0 ] || { cat san.log; fail "$tag: no routed expert ran on the device"; }
@@ -470,7 +480,7 @@ family_inkling_olmoe_sanitize() {
   san_io() {  # <engine> <tag> <env and argv...>; KEEP=1 keeps the history of the run before
     local eng=$1 tag=$2; shift 2
     [ "${KEEP:-0}" = 1 ] || rm -f tier.usage
-    env ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2 \
+    env ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2 \
       COLI_USAGE=tier.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 "$@" > san.log 2>&1 || true
     if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
     [ "$(tier_count "$eng" san.log)" -gt 0 ] || { cat san.log; fail "$tag: no routed expert ran on the device"; }
@@ -507,7 +517,7 @@ import os, subprocess, sys, threading
 eng = sys.argv[1]
 snap, argv = ("tiny_inkling", ["8"]) if eng == "inkling" else ("olmoe_tiny_c", ["4", "8"])
 env = dict(os.environ, SNAP=snap, SERVE="1", PIN="tier.usage", COLI_USAGE="tier.usage", COLI_VULKAN="1",
-           COLI_VK_TIER_SYNC="1", OMP_NUM_THREADS="2", ASAN_OPTIONS="detect_leaks=0",
+           COLI_VK_TIER_SYNC="1", OMP_NUM_THREADS="2", ASAN_OPTIONS="detect_leaks=0:detect_stack_use_after_return=0",
            UBSAN_OPTIONS="print_stacktrace=1")
 for run in range(2):
     p = subprocess.Popen(["./" + eng] + argv, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -818,7 +828,7 @@ PY
   san() {  # <engine> <tag> <env and argv...>
     local eng=$1 tag=$2; shift 2
     rm -f tier.usage deepseek_v4_tiny_t/.coli_usage deepseek_v4_tiny_e8/.coli_usage
-    env ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2 \
+    env ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2 \
       COLI_USAGE=tier.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 "$@" > san.log 2>&1 || true
     if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
     [ "$(tier_count "$eng" san.log)" -gt 0 ] || { cat san.log; fail "$tag: no routed expert ran on the device"; }
@@ -836,7 +846,7 @@ PY
   san deepseek_v4 "asan deepseek_v4 trunk on the device" COLI_VK_DENSE=1 ./deepseek_v4 ./deepseek_v4_tiny_t "$p" --raw-prompt --max-tokens 4
   # the warm start: a run that leaves its history, then one that starts from it
   ./deepseek_v4 ./deepseek_v4_tiny_e8 "$p" --raw-prompt --max-tokens 4 > /dev/null 2>&1 || true
-  env ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 \
+  env ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 \
     ./deepseek_v4 ./deepseek_v4_tiny_e8 "$p" --raw-prompt --max-tokens 4 > san.log 2>&1 || true
   if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan deepseek_v4 warm start: sanitizer diagnostic"; fi
   grep -q '^\[VK\] tier deepseek_v4: warm start' san.log || { cat san.log; fail "asan deepseek_v4 warm start: no warm start"; }
@@ -930,7 +940,7 @@ family_kimi_mimo_sanitize() {
   $PY tools/make_mimo_tiny.py --output ./mimo_tiny --force --vision
   ksan() {  # <engine> <tag> <env and argv...>
     local eng=$1 tag=$2; shift 2
-    env ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2 \
+    env ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2 \
       COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 "$@" > san.log 2>&1 || true
     if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
     [ "$(tier_count "$eng" san.log)" -gt 0 ] || { cat san.log; fail "$tag: no routed expert ran on the device"; }
@@ -1117,7 +1127,7 @@ family_glm_sanitize() {
       if [ "$snap" = - ]; then env COLI_USAGE=g53.usage "${a[@]}" > /dev/null 2>&1 || true
       else env STATS=$snap/.coli_usage "${a[@]}" > /dev/null 2>&1 || true; fi
     fi
-    env ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 COLI_USAGE=g53.usage \
+    env ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1 COLI_USAGE=g53.usage \
       COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 "$@" > san.log 2>&1 || true
     rm -f g53.usage; [ "$snap" = - ] || rm -f "$snap/.coli_usage"
     if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi

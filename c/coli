@@ -3,6 +3,9 @@
 colibri — tiny engine, immense model.
 Run GLM-5.2 (744B) locally on CPU with roughly 15-26 GB of RAM.
 
+  coli setup                one step: find the hardware, pick a model, build or fetch
+                            the engine, download, then start the dashboard
+  coli start / status / logs  start, inspect, or read the log of what setup configured
   coli chat                 interactive chat (loads the model once)
   coli serve                OpenAI-compatible HTTP API (persistent engine)
   coli run "prompt"         one-shot generation
@@ -2975,6 +2978,14 @@ def cmd_stop(a):
     real processes: the pidfile first, then /proc by cmdline/environ — only
     the requested port's tagged engine and matching `coli serve` wrapper."""
     banner("stop")
+    if a.port is None:
+        # Default 8000, or the port `coli setup` configured: the same server
+        # `coli start` launched is the one `coli stop` stops.
+        try:
+            from setup_flow import configured_port
+            a.port=configured_port(8000)
+        except Exception:
+            a.port=8000
     targets={}  # pid -> descrizione
     pf=serve_pidfile(a.port)
     try:
@@ -3400,7 +3411,9 @@ def main():
     pworker.add_argument("--layers",default="all",help="topology label, e.g. 0-37")
     pworker.add_argument("--ebits",type=int,default=8); pworker.add_argument("--dbits",type=int,default=8)
     pst=sub.add_parser("stop", parents=[common], help="shut down a running coli serve and its engine")
-    pst.add_argument("--port",type=int,default=8000); pst.add_argument("--dry-run",action="store_true")
+    pst.add_argument("--port",type=int,default=None,
+                     help="port of the server to stop (default 8000, or the one `coli setup` configured)")
+    pst.add_argument("--dry-run",action="store_true")
     pw=sub.add_parser("web", parents=[common], help="serve + open the dashboard in a browser")
     for arg,kw in (("--host",dict(default="127.0.0.1")),("--port",dict(type=int,default=8000)),
                    ("--model-id",dict(default=os.environ.get("COLI_MODEL_ID"))),
@@ -3414,6 +3427,46 @@ def main():
                        help="additional Host header accepted by the DNS-rebinding guard; repeat as needed"))):
         pw.add_argument(arg,**kw)
     pw.add_argument("--no-browser",action="store_true",help="don't auto-open the browser")
+    # One-step setup (setup_flow.py). No `common` parent: --model here names a
+    # catalog entry, not a model directory, and nothing below loads an engine.
+    pset=sub.add_parser("setup",help="one step: detect hardware, pick a model, build or fetch "
+                        "the engine, download with resume, then start the dashboard")
+    pset.add_argument("--yes","-y",action="store_true",
+                      help="non-interactive: take the recommendation and every default")
+    pset.add_argument("--model",dest="pick",default=None,metavar="ID",
+                      help="catalog model to install (see --list); default: the recommendation")
+    pset.add_argument("--model-dir",default=None,metavar="DIR",
+                      help="use a model already on disk instead of downloading one")
+    pset.add_argument("--dir",default=None,metavar="DIR",
+                      help="folder for downloaded models (default ~/colibri-models)")
+    pset.add_argument("--backend",choices=("auto","cpu","vulkan","cuda"),default=None,
+                      help="engine build: auto (default) picks CUDA, then Vulkan, then the CPU")
+    pset.add_argument("--no-gpu",action="store_true",help="same as --backend cpu")
+    pset.add_argument("--host",default=None,help="address to serve on (default 127.0.0.1)")
+    pset.add_argument("--port",type=int,default=None,help="port to serve on (default 8000)")
+    pset.add_argument("--no-start",action="store_true",help="set up, but do not start the server")
+    pset.add_argument("--background",action="store_true",
+                      help="start the server in the background (log in the setup folder)")
+    pset.add_argument("--no-browser",action="store_true",help="do not open the browser")
+    pset.add_argument("--reconfigure",action="store_true",
+                      help="choose again even if a setup is already complete")
+    pset.add_argument("--list",action="store_true",help="list the catalog against this machine and exit")
+    pset.add_argument("--all",action="store_true",help="also show the models that do not fit")
+    pset.add_argument("--via-windows",choices=("auto","yes","no"),default="auto",
+                      help="WSL only: download through Windows' curl.exe (auto: when it measures faster)")
+    pset.add_argument("--no-verify",action="store_true",help="skip the checksum of downloaded files")
+    pset.add_argument("--json",action="store_true",
+                      help="machine-readable result; implies --yes and a background start")
+    pstart=sub.add_parser("start",help="start what `coli setup` configured")
+    pstart.add_argument("--background",action="store_true",help="run in the background")
+    pstart.add_argument("--no-browser",action="store_true",help="do not open the browser")
+    pstart.add_argument("--json",action="store_true",help="background start, JSON status out")
+    pstatus=sub.add_parser("status",help="what is set up, whether it runs, its URLs and speed")
+    pstatus.add_argument("--json",action="store_true")
+    plogs=sub.add_parser("logs",help="the last lines of the background server (or install) log")
+    plogs.add_argument("-n","--lines",type=int,default=100)
+    plogs.add_argument("--install",action="store_true",help="the install log instead of the server's")
+    sub.add_parser("mcp",help="Model Context Protocol server on stdio, for AI coding assistants")
     pb=sub.add_parser("bench", parents=[common]); pb.add_argument("tasks", nargs="*")
     pb.add_argument("--limit",type=int,default=40)
     if sys.platform == "win32":
@@ -3441,6 +3494,14 @@ def main():
              "doctor":cmd_doctor,"tune":cmd_tune,
              "run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"stop":cmd_stop,"bench":cmd_bench,
              "convert":cmd_convert,"web":cmd_web}.get(a.cmd)
+    if a.cmd in ("setup","start","status","logs"):
+        import setup_flow
+        flow={"setup":setup_flow.cmd_setup,"start":setup_flow.cmd_start,
+              "status":setup_flow.cmd_status,"logs":setup_flow.cmd_logs}[a.cmd]
+        sys.exit(setup_flow.run(flow,a))
+    if a.cmd=="mcp":
+        import mcp_server
+        sys.exit(mcp_server.main())
     if a.cmd=="cluster":
         if a.cluster_cmd=="coordinator": handler=cmd_cluster_coordinator
         elif a.cluster_cmd=="worker": handler=cmd_cluster_worker

@@ -4,10 +4,22 @@ A start-to-finish, reproducible path from a fresh Windows 11 machine to GLM-5.2 
 
 ---
 
+## The one-step way
+
+Download the repository (**Code**, then **Download ZIP**, or `git clone`), unzip
+it and double-click **`START-HERE.bat`**. It checks for Python (and offers to
+install it with winget), finds your hardware, recommends a model that fits,
+gets the engine (built with MSYS2 when it is installed, with Vulkan when your
+GPU can use it; otherwise the prebuilt CPU engine from the release), downloads
+the model with resume and opens the dashboard. Running it again starts colibri
+directly. The same from a terminal: `py -3 c\coli setup`. See
+[quickstart.md](quickstart.md#the-one-step-way).
+
 ## If you downloaded a release archive, start here
 
 The archive contains **`coli.cmd`**: that is the program to run. Double-click it
-for the quick start, or from cmd/PowerShell:
+for the quick start (it offers `coli.cmd setup`, the one-step path above), or
+from cmd/PowerShell:
 
 ```
 coli.cmd chat   --model D:\models\glm52_i4

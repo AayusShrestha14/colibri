@@ -368,6 +368,31 @@ n=64 の GLM-5.2 ではまだ捕捉されていません。
 必要なものは 2 つです: **プログラム**（数百 KB）と **モデル**（372 GB）。
 全プラットフォーム向けの手順は [クイックスタートガイド](docs/quickstart.md) にあります。
 
+### ワンステップで始める
+
+**Windows:** リポジトリをダウンロードし（**Code** から **Download ZIP**、または
+`git clone`）、展開して **`START-HERE.bat`** をダブルクリックします。
+**Linux と macOS:**
+
+```bash
+git clone https://github.com/JustVugg/colibri && cd colibri
+./start-here.sh
+```
+
+RAM・ディスク・GPU を検出し、このマシンに収まるモデルを推奨し（Enter でそのまま
+選択）、GPU が使える場合は Vulkan または CUDA でエンジンをビルドし（またはビルド済み
+のものを取得し）、モデルを再開可能な形でダウンロードし（いつ中断しても、もう一度
+実行すれば続きから再開します）、ブラウザでダッシュボードを開きます。他のアプリ向けに
+OpenAI と Anthropic のベース URL も表示します。次回からは実行するだけで colibri が
+すぐに起動し、`c/coli stop` で停止します。各ステップの内容:
+[quickstart.md](docs/quickstart.md#the-one-step-way)。
+
+AI コーディングアシスタントを使っていますか？ [docs/AI_SETUP.md](docs/AI_SETUP.md) に従って colibri をセットアップするよう頼んでください。
+Model Context Protocol に対応したアシスタントは `coli mcp` を使えます
+（[MCP_SERVER.md](docs/MCP_SERVER.md)）。
+
+以下は手動での手順です。
+
 ### 1. colibri を入手する
 
 **ビルド済みリリースをダウンロード** — Linux、macOS、Windows に対応し、コンパイラは不要です。
