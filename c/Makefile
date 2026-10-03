@@ -2649,7 +2649,11 @@ bench-omp-grain: tests/bench_omp_grain.c
 # that a test run does not need.
 ASAN_CFLAGS  = -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined
 ASAN_LDFLAGS = -fsanitize=address,undefined
-ASAN_ENV     = ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
+# detect_stack_use_after_return=0: ASan's fake stack frames are only 32-byte aligned,
+# and on an AVX-512 host (-march=native) GCC keeps 64-byte aligned locals there and
+# stores them with vmovdqa64, which faults (inkling's matmul_w on a Zen 4 runner).
+# Every other check stays on; this file's sanitizer runs and the CI's use the same.
+ASAN_ENV     = ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
 
 # `make clean` first is not optional: tools/clean.py had to be fixed to remove
 # Unix test binaries at all (it globbed only *.exe), and without that step this
