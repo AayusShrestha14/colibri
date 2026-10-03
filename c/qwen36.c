@@ -144,7 +144,9 @@ enum { U_W=0, U_L=1, U_M=2, U_N=3, U_P=4, U_O=5 };
  * punctuation and U_M never comes out. The ranges below are the original
  * approximation, kept for every other checkpoint so their ids do not move. */
 static int g_tok_exact = 0;
+#ifndef QWEN36_NO_MAIN
 static int g_clef = 0;        /* a Clef decision head is loaded (DECIDE answered) */
+#endif
 static int uclass(unsigned cp){
     if (g_tok_exact) {
         if (is_S(cp)) return U_W;
