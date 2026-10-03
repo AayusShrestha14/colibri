@@ -1303,6 +1303,20 @@ laya-tiny-generate:
 laya-tiny-check: laya-tiny-generate laya$(EXE)
 	LAYA_TINY_REQUIRED=1 $(PYTHON) -m unittest -v tests.test_laya_tiny tests.test_decision_serve
 
+# Tiny Clef checkpoint (Cloudflare/clef's layout at toy widths) + the answers of
+# Clef's own joint_schema_model.py on it. The generator is numpy and
+# deterministic, the converter is the one users run (torch + safetensors);
+# clef_tiny/ref.json is committed and comes from tools/make_clef_ref.py
+# (maintainer-run, transformers 5.10.2, fixture SHA-256 pinned). The second
+# module is the same fixture through `coli serve`: POST /v1/systemone and a chat.
+.PHONY: clef-tiny-generate clef-tiny-check
+clef-tiny-generate:
+	$(PYTHON) tools/make_clef_tiny.py --output ./clef_tiny
+	$(PYTHON) tools/convert_qwen36.py --model ./clef_tiny --out ./clef_tiny_c --ebits 8 --no-readme >/dev/null
+
+clef-tiny-check: clef-tiny-generate qwen36$(EXE)
+	CLEF_TINY_REQUIRED=1 $(PYTHON) -m unittest -v tests.test_clef_tiny tests.test_decision_serve
+
 # TypeSafe's own SDKs (Python and TypeScript), unmodified, against `coli serve`
 # on a language model (tiny MiMo) and a decision engine (tiny Laya): switching
 # from Jev is a base-URL change. Needs the pinned SDKs first:
