@@ -839,6 +839,68 @@ def run_image_doctor(model, engine_path, available_memory=None):
             "checks": checks, "plan": None, "image_plan": plan}
 
 
+def run_decision_doctor(model, engine_path, available_memory=None):
+    """doctor for a decision model (Laya): no root config.json, no experts and
+    no KV state. What can be wrong is a missing file of the checkpoint, an
+    engine that is not built, or weights that do not fit in RAM as f32."""
+    import json
+    import struct
+    model = Path(model).expanduser().resolve()
+    checks = []
+    readable = model.is_dir() and os.access(model, os.R_OK)
+    checks.append(_check("model.path", "pass" if readable else "fail",
+                         "model directory is readable" if readable else
+                         "model directory is missing or not readable", path=str(model)))
+    try:
+        resolved = resolve_model(model)
+        checks.append(_check("model.family", "pass",
+                             f"{resolved.descriptor.display_name} decision model is registered",
+                             family_id=resolved.descriptor.id, model_type=resolved.model_type,
+                             descriptor=public_metadata(resolved.descriptor)))
+        tokenizer_file = resolved.descriptor.tokenizer_file
+    except (FamilyConfigError, UnknownFamilyError) as error:
+        checks.append(_check("model.family", "fail", str(error)))
+        tokenizer_file = "tokenizer/tokenizer.json"
+    for name in (tokenizer_file, "tokenizer/tokenizer_config.json", "encoder/config.json"):
+        present = (model / name).is_file()
+        checks.append(_check("model.files", "pass" if present else "fail",
+                             f"{name} found" if present else f"{name} is missing"))
+    engine = Path(engine_path)
+    engine_ok = engine.is_file() and (sys.platform == "win32" or os.access(engine, os.X_OK))
+    checks.append(_check("engine.binary", "pass" if engine_ok else "fail",
+                         "engine executable is ready" if engine_ok else "engine is not built",
+                         path=str(engine)))
+    try:
+        with open(model / "model.safetensors", "rb") as handle:
+            size = struct.unpack("<Q", handle.read(8))[0]
+            if size > 64 << 20:
+                raise ValueError("model.safetensors: implausible header size")
+            header = json.loads(handle.read(size))
+        params = 0
+        for name, entry in header.items():
+            if name != "__metadata__" and isinstance(entry, dict):
+                count = 1
+                for dim in entry.get("shape", []):
+                    count *= int(dim)
+                params += count
+        needed = params * 4
+        available_memory = memory_available() if available_memory is None else available_memory
+        if not available_memory:
+            status, summary = "warn", "available RAM could not be measured"
+        elif needed < available_memory:
+            status, summary = "pass", f"{needed / 1e9:.1f} GB of f32 weights fit in RAM"
+        else:
+            status, summary = "fail", f"{needed / 1e9:.1f} GB of f32 weights do not fit in RAM"
+        checks.append(_check("memory.ram", status, summary, available_bytes=available_memory,
+                             weight_bytes=needed, params=params))
+    except (OSError, ValueError, struct.error) as error:
+        checks.append(_check("model.weights", "fail", f"model.safetensors: {error}"))
+    statuses = {item["status"] for item in checks}
+    status = "error" if "fail" in statuses else "warning" if "warn" in statuses else "ok"
+    return {"schema_version": 1, "status": status, "model": str(model), "mode": "standard",
+            "checks": checks, "plan": None}
+
+
 def format_doctor(report):
     icons = {"pass": "ok", "warn": "warn", "fail": "fail", "skip": "skip"}
     # model is null in the JSON when none was given (#724); say that rather than "None"
