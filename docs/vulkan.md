@@ -877,10 +877,15 @@ configuration gives the CPU's tokens, and every logits row is within 2e-6 of the
 logit (Lavapipe: 1.9e-6 at worst, colibri's int4-g64 experts on the tier, 6.3e-7 and
 below everywhere else).
 
-**The default** is off on an integrated GPU (`COLI_VK_CHAIN=1` turns it on, `2` for
-prompts only) and on a discrete GPU follows the rule above. No GLM checkpoint was run:
-the 780M box has none, and both models are hundreds of GB. Speed is not measured; the
-tests prove the tokens on the tiny fixtures.
+**The default**: both engines pass `COLI_VK_CHAIN_UNMEASURED`, so the chain is off on
+an integrated GPU (`COLI_VK_CHAIN=1` turns it on, `2` for prompts only) and on a
+discrete GPU follows the rule above. No GLM checkpoint was run: the 780M box has none,
+and both models are hundreds of GB. Speed is not measured; the tests prove the tokens on
+the tiny fixtures, on Lavapipe and on the 780M:
+
+```
+[VK] colibri: dense chain off (an integrated GPU with the expert tier: not measured; COLI_VK_CHAIN=0 off, 1 on, 2 prompts only)
+```
 
 ### Adding an engine to the chain
 

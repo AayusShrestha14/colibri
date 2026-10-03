@@ -1346,8 +1346,10 @@ family_qwen_chain_sanitize() {
 # (colibri: the generated tokens, the teacher-forced predictions and the oracle's
 # mismatches; glm53: teacher_forcing and greedy), every logits row within 1e-4 of the
 # largest |logit| (tol 1; DUMP= writes them), and a "[VK] <engine> chain: N forwards"
-# line with N > 0. LOST=1: COLI_VK_CHAIN_FAULT is set, and the run must say the device
-# was lost (and, for glm53 with REBUILD=1, rebuild the KDA state of some positions).
+# line with N > 0. FAULT_BACK=k: the device is lost k frames before the end of the same
+# run without a fault (COLI_VK_CHAIN_FAULT counted from that run's frames, so the loss
+# lands in the same forward on every device, whatever frames its setup took), and the
+# run must say so (and, for glm53 with REBUILD=1, rebuild the KDA state of some positions).
 mla_toks() {  # <engine> <log>
   if [ "$1" = colibri ]; then grep -aE '^GLM C engine|^PREFILL|^\[ORACLE\] mismatch' "$2" | sed 's/ | [0-9.]* pos\/s//'
   else grep -aE '^teacher_forcing|^greedy' "$2"; fi
@@ -1357,12 +1359,20 @@ mla_gate() {
   local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
   rm -f chain.usage cpu.f32 vk.f32
   env "${envs[@]}" COLI_USAGE=chain.usage USAGE_SAVE=0 DUMP=cpu.f32 ./"$eng" "$@" > cpu.log 2>&1 || true
+  if [ -n "${FAULT_BACK:-}" ]; then
+    rm -f chain.usage
+    env "${envs[@]}" COLI_USAGE=chain.usage USAGE_SAVE=0 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 \
+      ./"$eng" "$@" > vk.log 2>&1 || true
+    local frames; frames=$(sed -n "s/^\[VK\] $eng chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p" vk.log | tail -1)
+    [ -n "$frames" ] && [ "$frames" -gt "$FAULT_BACK" ] || { cat vk.log; fail "$tag: no fault-free run to count frames from"; }
+    envs+=("COLI_VK_CHAIN_FAULT=$((frames - FAULT_BACK + 1))")
+  fi
   rm -f chain.usage
   env "${envs[@]}" COLI_USAGE=chain.usage USAGE_SAVE=0 DUMP=vk.f32 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 \
     COLI_VK_CHAIN=${CHAINMODE:-1} ./"$eng" "$@" > vk.log 2>&1 || true
   mla_toks "$eng" cpu.log > cpu.tok; mla_toks "$eng" vk.log > vk.tok
   { [ -s cpu.tok ] && cmp -s cpu.tok vk.tok; } || { cat cpu.tok vk.tok; tail -20 vk.log; fail "$tag: the chain's tokens differ from the CPU"; }
-  if [ "${LOST:-0}" = 1 ]; then
+  if [ -n "${FAULT_BACK:-}" ]; then
     grep -q "$eng chain: the device was lost" vk.log || { cat vk.log; fail "$tag: no loss was handled"; }
     if [ "${REBUILD:-0}" = 1 ]; then grep -q "rebuilding the state of [1-9]" vk.log || { cat vk.log; fail "$tag: no state was rebuilt"; }; fi
   else
@@ -1438,10 +1448,11 @@ family_glm_chain() {
   mla_gate colibri "chain colibri tiled GEMM from 2 rows" 1 SNAP=glm_tiny REF=ref_glm.json TF=1 COLI_VK_GEMM_MIN_S=2 -- 64 16 16
   mla_gate colibri "chain colibri the per-row GEMV" 1 SNAP=glm_tiny REF=ref_glm.json COLI_VK_CHAIN_GEMV=0 -- 64 16 16
   CHAINMODE=2 mla_gate colibri "chain colibri prompts only, drafts" 1 SNAP=glm_tiny REF=ref_glm.json DRAFT=3 -- 64 16 16
-  # the device lost: mid-decode, in the prompt, between MTP drafts
-  LOST=1 mla_gate colibri "chain colibri device lost mid-decode" 1 SNAP=glm_tiny REF=ref_glm.json COLI_VK_CHAIN_FAULT=30 -- 64 16 16
-  LOST=1 mla_gate colibri "chain colibri device lost in the prompt" 1 SNAP=glm_tiny REF=ref_glm.json COLI_VK_CHAIN_FAULT=3 -- 64 16 16
-  LOST=1 mla_gate colibri "chain colibri device lost with MTP" 1 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json COLI_VK_CHAIN_FAULT=40 -- 64 16 16
+  # the device lost: mid-decode, in the prompt (the teacher-forced pass is one forward),
+  # between MTP drafts
+  FAULT_BACK=12 mla_gate colibri "chain colibri device lost mid-decode" 1 SNAP=glm_tiny REF=ref_glm.json -- 64 16 16
+  FAULT_BACK=3 mla_gate colibri "chain colibri device lost in the prompt" 1 SNAP=glm_tiny REF=ref_glm.json TF=1 -- 64 16 16
+  FAULT_BACK=12 mla_gate colibri "chain colibri device lost with MTP" 1 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json -- 64 16 16
   # serve sessions frame for frame: pins, the prompt cache, the prefill read-out, two KV slots
   CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0
   CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 DSA_TOPK=4 DRAFT=3
@@ -1463,8 +1474,8 @@ family_glm_chain() {
   mla_gate glm53 "chain glm53 swiglu_limit 0" 1 GLM53_BITS=32 -- --model glm53_lim0 --ids $ids --greedy 4
   grep -qa 'tier glm53: swiglu_limit is 0' vk.log || { cat vk.log; fail "chain glm53 swiglu_limit 0: the tier did not decline"; }
   CHAINMODE=2 mla_gate glm53 "chain glm53 prompts only" 1 GLM53_BITS=32 GLM53_PREFILL_CHUNK=16 -- --model glm53_stream-i4 --ids $ids --greedy 6
-  LOST=1 REBUILD=1 mla_gate glm53 "chain glm53 device lost, the KDA state rebuilt" 1 GLM53_BITS=32 GLM53_PREFILL_CHUNK=16 COLI_VK_CHAIN_FAULT=20 -- --model glm53_stream-i4 --ids $ids --greedy 6
-  LOST=1 REBUILD=1 mla_gate glm53 "chain glm53 device lost after an image" 1 GLM53_BITS=32 COLI_VK_CHAIN_FAULT=6 -- --model glm53_mm_tiny --ids 103,117,268,268,268,268,120,121 --patches glm53_mm_tiny/patches.f32 --grid 4x4 --greedy 4
+  FAULT_BACK=7 REBUILD=1 mla_gate glm53 "chain glm53 device lost, the KDA state rebuilt" 1 GLM53_BITS=32 GLM53_PREFILL_CHUNK=16 -- --model glm53_stream-i4 --ids $ids --greedy 6
+  FAULT_BACK=5 REBUILD=1 mla_gate glm53 "chain glm53 device lost after an image" 1 GLM53_BITS=32 -- --model glm53_mm_tiny --ids 103,117,268,268,268,268,120,121 --patches glm53_mm_tiny/patches.f32 --grid 4x4 --greedy 4
   CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=32
   CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=4 COLI_VK_CHAIN_ROWS=3
   CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=32 KV_SLOTS=2

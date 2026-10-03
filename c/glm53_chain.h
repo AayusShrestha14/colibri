@@ -1,7 +1,8 @@
 /* glm53_chain.h -- GLM-5.3 Flash's layers as a dense chain on the Vulkan device
  * (vk_chain.h). Included once by glm53.c in a COLI_VULKAN build, after run_layers, the
  * CPU forward it stands in for; COLI_VK_CHAIN decides (coli_vk_chain_decide, this
- * engine's integrated GPU default off: not measured on a GLM-5.3 checkpoint).
+ * engine's integrated GPU default COLI_VK_CHAIN_UNMEASURED: off, not measured on a
+ * GLM-5.3 checkpoint).
  *
  * The residual is hc_mult streams per position (mHC). What runs where, per layer, for
  * one block of rows (decode: one row):
@@ -542,20 +543,12 @@ static void g53c_start(GModel *m) {
     if (!g_vk_ready) return;
     const Cfg *c = &m->c;
     int tier_on = vkt_wanted() && m->streaming && c->n_experts > 0 && c->swiglu_limit > 0.f;
-    int on = coli_vk_chain_decide(NULL, tier_on, COLI_VK_CHAIN_OFF);
-    const char *e = getenv("COLI_VK_CHAIN");
-    char why[160];
-    if (e && *e) snprintf(why, sizeof why, "COLI_VK_CHAIN=%s", e);
-    else if (coli_vk_device_integrated())
-        snprintf(why, sizeof why, "an integrated GPU: not measured on a GLM-5.3 checkpoint; COLI_VK_CHAIN=1 on, 2 prompts only");
-    else if (coli_vk_device_shares_ram()) snprintf(why, sizeof why, "a CPU device; COLI_VK_CHAIN=1 turns it on");
-    else snprintf(why, sizeof why, "a discrete GPU%s", tier_on ? ", beside the expert tier" : "");
+    int on = coli_vk_chain_decide("glm53", tier_on, COLI_VK_CHAIN_UNMEASURED);
     const char *no = NULL;
     if (on && !(g_g53c_inited = vkc_init())) no = "the chain's pipelines did not come up";
     if (on && !no && !(vkc_mla_ready() && vkc_kda_ready() && vkc_mhc_ready()))
         no = "the MLA, KDA or mHC shaders are missing";
-    fprintf(stderr, "[VK] glm53: dense chain %s (%s%s%s)\n",
-            on && !no ? (on == COLI_VK_CHAIN_PREFILL ? "on for prompts" : "on") : "off", why, no ? "; " : "", no ? no : "");
+    if (no) fprintf(stderr, "[VK] glm53: %s: the dense chain stays off\n", no);
     if (!on || no) return;
     if (!g53c_setup(m)) return;
     g_vk_chain = on;

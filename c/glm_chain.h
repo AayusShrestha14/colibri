@@ -1,7 +1,7 @@
 /* glm_chain.h -- GLM-5.2's layers as a dense chain on the Vulkan device (vk_chain.h).
  * Included once by colibri.c in a COLI_VULKAN build, after the CPU layer forward it
  * stands in for; COLI_VK_CHAIN decides (coli_vk_chain_decide, this engine's integrated
- * GPU default off: not measured on a GLM checkpoint).
+ * GPU default COLI_VK_CHAIN_UNMEASURED: off, not measured on a GLM checkpoint).
  *
  * What runs where, per layer, for one block of rows (decode: one row):
  *   device, frame A1: the routed MoE output of the layer before joins the residual
@@ -415,14 +415,7 @@ static void glmc_report_atexit(void) { glmc_report(g_glmc_model); }
 static void glmc_start(Model *m) {
     if (!g_vulkan) return;
     int tier_on = vkt_wanted() && g_vk_experts != 0 && m->c.n_experts > 0;
-    int on = coli_vk_chain_decide(NULL, tier_on, COLI_VK_CHAIN_OFF);
-    const char *e = getenv("COLI_VK_CHAIN");
-    char why[160];
-    if (e && *e) snprintf(why, sizeof why, "COLI_VK_CHAIN=%s", e);
-    else if (coli_vk_device_integrated())
-        snprintf(why, sizeof why, "an integrated GPU: not measured on a GLM checkpoint; COLI_VK_CHAIN=1 on, 2 prompts only");
-    else if (coli_vk_device_shares_ram()) snprintf(why, sizeof why, "a CPU device; COLI_VK_CHAIN=1 turns it on");
-    else snprintf(why, sizeof why, "a discrete GPU%s", tier_on ? ", beside the expert tier" : "");
+    int on = coli_vk_chain_decide("colibri", tier_on, COLI_VK_CHAIN_UNMEASURED);
     const char *no = NULL;
 #ifdef COLI_CUDA
     if (on && g_cuda_enabled) no = "the CUDA backend is on and keeps the trunk";
@@ -431,8 +424,7 @@ static void glmc_start(Model *m) {
     if (on && !no && g_pilot) no = "PILOT prefetch reads the residual on the host";
     if (on && !no && !(g_glmc_inited = vkc_init())) no = "the chain's pipelines did not come up";
     if (on && !no && !vkc_mla_ready()) no = "the MLA shaders are missing (chain_mla, chain_hgemv, chain_dsa)";
-    fprintf(stderr, "[VK] colibri: dense chain %s (%s%s%s)\n",
-            on && !no ? (on == COLI_VK_CHAIN_PREFILL ? "on for prompts" : "on") : "off", why, no ? "; " : "", no ? no : "");
+    if (no) fprintf(stderr, "[VK] colibri: %s: the dense chain stays off\n", no);
     if (!on || no) return;
     if (!glmc_setup(m)) return;
     g_vk_chain = on;
