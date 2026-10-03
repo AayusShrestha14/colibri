@@ -1409,7 +1409,7 @@ family_qwen_chain() {
   QWEN36_VL_TINY=qwen38_27b_vl_tiny_c QWEN36_VL_REF=qwen38_27b_vl_tiny/ref.json COLI_VULKAN=1 COLI_VK_CHAIN=1 \
     COLI_USAGE=$PWD/chain.usage $PY -m unittest tests.test_qwen36_vision_serve
   # the device lost mid-decode: the state rebuilt on the CPU, the run finishes there
-  lost_gate qwen36 "chain qwen36 device lost" 40 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
+  lost_late qwen36 "chain qwen36 device lost" 20 rebuild COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
   # the prefix-reuse contract with the state on the device, and a serve session
   QWEN36_TINY=$PWD/qwen36_tiny_c COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_USAGE=$PWD/chain.usage $PY tests/test_qwen36_prefix_serve.py
   $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0
@@ -1444,8 +1444,8 @@ family_qwen_chain() {
     chain_gate qwen38 "chain qwen38 MTP $fx ${f:-drafting}" 1 OMP_NUM_THREADS=2 Q38_MTP=1 Q38_MTP_FORCE=$f SNAP=$fx -- 2 8 $fx/ref.json
   done; done
   # the device lost mid-decode, once between steps and once inside an MTP verify
-  lost_gate qwen38 "chain qwen38 device lost" 20 OMP_NUM_THREADS=2 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
-  lost_gate qwen38 "chain qwen38 device lost in a verify" 45 OMP_NUM_THREADS=2 Q38_MTP=1 Q38_MTP_FORCE=mixed SNAP=qwen38_tiny_mtp -- 2 8 qwen38_tiny_mtp/ref.json
+  lost_late qwen38 "chain qwen38 device lost" 10 rebuild OMP_NUM_THREADS=2 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
+  lost_late qwen38 "chain qwen38 device lost in a verify" 15 rebuild OMP_NUM_THREADS=2 Q38_MTP=1 Q38_MTP_FORCE=mixed SNAP=qwen38_tiny_mtp -- 2 8 qwen38_tiny_mtp/ref.json
   # the oracle targets with the chain on (COLI_VK_TIER_BALANCE=0: the int4 target wants
   # the same last logits from every expert path, and the balancer moves experts between
   # the device and the CPU by measured times); the MTP harness, whose prompt-cache and pin
