@@ -894,7 +894,7 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
         s = &lc->slots[lc->n++];
         slot_ensure_allocated(m, s);
     } else {
-        /* LRU eviction — skip pinned, in-flight (eid==-1) and busy slots */
+        /* LRU eviction: skip pinned, in-flight (eid==-1) and busy slots */
         int lru = -1;
         for (int i = 0; i < lc->n; i++) {
             if (lc->slots[i].pinned || lc->slots[i].eid < 0 || lc->slots[i].busy) continue;
@@ -1433,7 +1433,7 @@ static void pilot_realload(Model *m, int layer, int eid) {
         s = &lc->slots[lc->n++];
         slot_ensure_allocated(m, s);
     } else {
-        /* LRU eviction — skip pinned, in-flight (eid==-1) and busy slots */
+        /* LRU eviction: skip pinned, in-flight (eid==-1) and busy slots */
         int lru = -1;
         for (int i = 0; i < lc->n; i++) {
             if (lc->slots[i].pinned || lc->slots[i].eid < 0 || lc->slots[i].busy) continue;

@@ -36,9 +36,12 @@
  * COLI_VK_CHAIN_FAULT=n (vk_chain.c) fakes the loss at the n-th frame, for tests. */
 #include "vk_chain.h"
 
-/* COLI_VK_CHAIN unset on an integrated GPU with the expert tier (coli_vk_chain_decide) */
+/* COLI_VK_CHAIN unset on an integrated GPU with the expert tier (coli_vk_chain_decide):
+ * on. Measured on a Radeon 780M with OLMoE-1B-7B (docs/vulkan.md, "OLMoE and Inkling"):
+ * against the tier alone the chain decodes 17.3 tok/s to 12.8 and prefills 512 tokens
+ * in 5.5 s to 6.4 (the CPU alone decodes 23.1 tok/s: its f32 trunk) */
 #ifndef OLMOE_CHAIN_IGPU
-#define OLMOE_CHAIN_IGPU COLI_VK_CHAIN_UNMEASURED
+#define OLMOE_CHAIN_IGPU COLI_VK_CHAIN_ON
 #endif
 
 typedef struct {

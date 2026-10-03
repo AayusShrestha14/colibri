@@ -1233,8 +1233,10 @@ int coli_vk_dense(void) { return g_dense_on; }
  *   38.7 s, and lost decode, 3.2 against 3.8 tok/s: the device's GEMV at the GPU's
  *   800 MHz floor is slower than the CPU's int8 one on a 4.3 GB trunk; prompts only
  *   still lost 5% of decode, the trunk's device copy taking from the tier's budget).
+ *   olmoe ON (OLMoE-1B-7B: the chain decoded 17.3 against 12.8 tok/s and prefilled 512
+ *   tokens in 5.5 against 6.4 s; the CPU alone decodes 23.1 tok/s, its trunk being f32).
  *   An engine that has no measurement there passes COLI_VK_CHAIN_UNMEASURED: off, and
- *   the line says it was not measured.
+ *   the line says it was not measured (inkling: no checkpoint of it runs on the box).
  *   Unset, a CPU device (Lavapipe): off.
  * Printed as a [VK] line with an engine name (NULL: silent). */
 int coli_vk_chain_decide(const char *engine, int tier_on, int igpu) {
