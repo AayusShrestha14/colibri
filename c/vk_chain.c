@@ -451,7 +451,7 @@ int vkc_submit(int wait) {
     }
     vkResetFences(K.dev, 1, &f->fence);
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &f->cmd};
-    VkResult r = vkQueueSubmit(K.queue, 1, &si, f->fence);
+    VkResult r = (VkResult)coli_vk_queue_submit(K.queue, &si, f->fence);   /* the backend's lock, staged uploads */
     if (r != VK_SUCCESS) { lose("queue submit", r); return 0; }
     f->inflight = 1;
     K.st.frames++;

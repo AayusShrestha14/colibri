@@ -206,6 +206,12 @@ static int upload(const uint8_t *g, const uint8_t *u, const uint8_t *d,
         }
         convert(f, I, O, codes[k], sc[k], rows, stride, scales);
     }
+    /* staged uploads: the three host images go to device memory now (nothing to do on
+     * mapped memory) */
+    if (!coli_vk_tensor_commit(t, 3)) {
+        for (int k = 0; k < 3; k++) { coli_vk_tensor_free(t[k]); t[k] = NULL; }
+        return 0;
+    }
     return 1;
 }
 
