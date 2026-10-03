@@ -1227,7 +1227,8 @@ int coli_vk_dense(void) { return g_dense_on; }
  *   COLI_VK_CHAIN set and non-empty: 0 off, 2 prefill only, any other number on.
  *   Unset, a discrete GPU: on.
  *   Unset, an integrated GPU: `igpu` when the engine runs the expert tier (tier_on),
- *   else off. `igpu` is what the engine measured on one (a Radeon 780M, docs/vulkan.md,
+ *   else off; an engine never timed on one passes COLI_VK_CHAIN_UNMEASURED, which is
+ *   off and says so. `igpu` is what the engine measured on one (a Radeon 780M, docs/vulkan.md,
  *   "The dense chain"): qwen36 passes ON (its chain won decode, 9.9 against 8.0 tok/s,
  *   and prefill, 9.5 against 12.2 s); qwen38 OFF (its chain won prefill, 30.1 against
  *   38.7 s, and lost decode, 3.2 against 3.8 tok/s: the device's GEMV at the GPU's
@@ -1244,12 +1245,13 @@ int coli_vk_chain_decide(const char *engine, int tier_on, int igpu) {
         on = v == 0 ? COLI_VK_CHAIN_OFF : v == 2 ? COLI_VK_CHAIN_PREFILL : COLI_VK_CHAIN_ON;
         snprintf(why, sizeof why, "COLI_VK_CHAIN=%s", e);
     } else if (coli_vk_device_integrated()) {
-        on = tier_on ? igpu : COLI_VK_CHAIN_OFF;
+        int measured = igpu != COLI_VK_CHAIN_UNMEASURED;
+        on = tier_on && measured ? igpu : COLI_VK_CHAIN_OFF;
         snprintf(why, sizeof why, "an integrated GPU%s: %s; COLI_VK_CHAIN=0 off, 1 on, 2 prompts only",
                  tier_on ? " with the expert tier" : " without the expert tier",
                  on == COLI_VK_CHAIN_ON ? "measured faster on decode and prefill"
                  : on == COLI_VK_CHAIN_PREFILL ? "measured faster on prefill, slower on decode"
-                 : tier_on ? "measured slower on decode" : "not measured");
+                 : tier_on && measured ? "measured slower on decode" : "not measured");
     } else if (coli_vk_device_shares_ram()) {
         on = COLI_VK_CHAIN_OFF;
         snprintf(why, sizeof why, "a CPU device; COLI_VK_CHAIN=1 turns it on");
