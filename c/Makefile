@@ -1915,6 +1915,9 @@ tests/test_k3_chat_tools$(EXE): tests/test_k3_chat_tools.c kimi_k3.c $(VK_OBJ)
 tests/test_olmoe_matmul_q$(EXE): tests/test_olmoe_matmul_q.c olmoe.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
+tests/test_olmoe_moe_by_expert$(EXE): tests/test_olmoe_moe_by_expert.c olmoe.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_olmoe_serve_framing$(EXE): tests/test_olmoe_serve_framing.c olmoe.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
