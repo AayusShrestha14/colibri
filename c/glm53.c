@@ -362,6 +362,14 @@ static void load_cfg(Cfg *c, const char *snap) {
         c->hc_mult < 1 || c->hc_mult > 8) {
         fprintf(stderr, "config.json: dimension out of range\n"); exit(1);
     }
+    /* L'esperto condiviso e' largo moe_inter * n_shared, e il FFN gli da' i
+     * buffer del piu' largo fra denso e routed (ffn_layer_ex, glm53_chain.h). */
+    if (c->n_shared < 1 || (int64_t)c->moe_inter * c->n_shared >
+                           (c->dense_inter > c->moe_inter ? c->dense_inter : c->moe_inter)) {
+        fprintf(stderr, "config.json: n_shared_experts=%d does not fit the FFN buffers\n",
+                c->n_shared);
+        exit(1);
+    }
     /* qk_rope must be zero: a rotary GLM-5.3 would need position handling this
      * engine deliberately does not have, and silently ignoring the rotation
      * would produce a model that answers fluently and wrongly. */
@@ -882,7 +890,12 @@ static void absorb_kvb(GModel *m, GLayer *l, const char *name) {
     l->kvb_v = quantize_loaded(vv, H * V, L);
 }
 
-static Mat load_mat(GModel *m, const char *fmt, ...) {
+/* rows x columns e' la forma con cui il forward usa la matrice, contata dalla
+ * config: mm() scrive w->rows valori per token e ne legge w->columns. Presa
+ * dall'header senza confronto, una riga in piu' scriveva oltre il buffer
+ * d'uscita e una colonna in piu' leggeva oltre quello d'ingresso. A differenza
+ * di load_f32 la forma deve tornare esatta: piu' colonne spostano ogni riga. */
+static Mat load_mat(GModel *m, int64_t rows, int64_t columns, const char *fmt, ...) {
     char name[512];
     va_list args; va_start(args, fmt); vsnprintf(name, sizeof(name), fmt, args); va_end(args);
     st_tensor *t = st_find(&m->S, name);
@@ -922,8 +935,14 @@ static Mat load_mat(GModel *m, const char *fmt, ...) {
                             "the shape is not stored in the file and cannot be inferred\n", name);
             exit(1);
         }
-        mat.rows = (int)t->shape[0];
-        mat.columns = (int)(values / t->shape[0]);
+        if (t->shape[0] != rows || values != rows * columns) {
+            fprintf(stderr, "%s: %lld rows and %lld values, the config needs %lld x %lld\n",
+                    name, (long long)t->shape[0], (long long)values,
+                    (long long)rows, (long long)columns);
+            exit(1);
+        }
+        mat.rows = (int)rows;
+        mat.columns = (int)columns;
         if (mat.columns % 64) {
             fprintf(stderr, "%s: %d columns are not multiples of 64\n", name, mat.columns);
             exit(1);
@@ -938,11 +957,17 @@ static Mat load_mat(GModel *m, const char *fmt, ...) {
     }
 
     if (t->rank != 2) { fprintf(stderr, "%s: rank %d, expected 2\n", name, t->rank); exit(1); }
+    if (t->shape[0] != rows || t->shape[1] != columns) {
+        fprintf(stderr, "%s: %lld x %lld, the config needs %lld x %lld\n", name,
+                (long long)t->shape[0], (long long)t->shape[1],
+                (long long)rows, (long long)columns);
+        exit(1);
+    }
     float *buffer = malloc((size_t)t->numel * sizeof(float));
     if (!buffer) { fprintf(stderr, "OOM on %s\n", name); exit(1); }
     st_read_f32_cap(&m->S, name, buffer, t->numel, 1);
-    mat.rows = (int)t->shape[0];
-    mat.columns = (int)t->shape[1];
+    mat.rows = (int)rows;
+    mat.columns = (int)columns;
 
     mat = quantize_loaded(buffer, mat.rows, mat.columns);
     return mat;
@@ -2275,10 +2300,12 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
     snprintf(probe, sizeof(probe), "%sembed_tokens.weight", m->prefix);
     if (!st_find(&m->S, probe)) snprintf(m->prefix, sizeof(m->prefix), "model.");
     const char *P = m->prefix;
-    /* Le misure con cui il forward legge i vettori f32 (vedi load_f32). Le
-     * matrici mHC sono [(2+hc)*hc, hc*hidden], come in hyper_connections.h. */
+    /* Le misure con cui il forward legge i vettori f32 (vedi load_f32) e le
+     * forme delle matrici (vedi load_mat). Le matrici mHC sono
+     * [(2+hc)*hc, hc*hidden], come in hyper_connections.h. */
     const Cfg *c = &m->c;
     const int64_t D = c->hidden, hc = c->hc_mult, hc_mix = (2 + hc) * hc;
+    const int64_t H = c->n_heads, IH = c->index_nh, shared = (int64_t)c->moe_inter * c->n_shared;
 
     if (layer_end < 0 || layer_end > m->c.n_layers) layer_end = m->c.n_layers;
     if (layer_begin < 0) layer_begin = 0;
@@ -2298,7 +2325,7 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
      * layer non la carica proprio: non ha logit da produrre. */
     if (load_io) {
         if (st_find(&m->S, "lm_head.weight")) {
-            m->head = load_mat(m, "lm_head.weight");
+            m->head = load_mat(m, c->vocab, D, "lm_head.weight");
         } else {
             memset(&m->head, 0, sizeof(m->head));
             m->head.f = m->embed;
@@ -2335,10 +2362,10 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
         l->hc_ffn_base = load_f32(m, hc_mix, "%slayers.%d.hc_ffn_base", P, i);
         l->hc_ffn_scale = load_f32(m, 3, "%slayers.%d.hc_ffn_scale", P, i);
         if (m->c.is_full[i]) {
-            l->qa = load_mat(m, "%slayers.%d.self_attn.q_a_proj.weight", P, i);
+            l->qa = load_mat(m, c->q_lora, D, "%slayers.%d.self_attn.q_a_proj.weight", P, i);
             l->qa_ln = load_f32(m, c->q_lora, "%slayers.%d.self_attn.q_a_layernorm.weight", P, i);
-            l->qb = load_mat(m, "%slayers.%d.self_attn.q_b_proj.weight", P, i);
-            l->kva = load_mat(m, "%slayers.%d.self_attn.kv_a_proj_with_mqa.weight", P, i);
+            l->qb = load_mat(m, H * c->qk_nope, c->q_lora, "%slayers.%d.self_attn.q_b_proj.weight", P, i);
+            l->kva = load_mat(m, c->kv_lora, D, "%slayers.%d.self_attn.kv_a_proj_with_mqa.weight", P, i);
             l->kva_ln = load_f32(m, c->kv_lora, "%slayers.%d.self_attn.kv_a_layernorm.weight", P, i);
             {
                 char kvb_name[512];
@@ -2346,27 +2373,27 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
                          "%slayers.%d.self_attn.kv_b_proj.weight", P, i);
                 absorb_kvb(m, l, kvb_name);
             }
-            l->o = load_mat(m, "%slayers.%d.self_attn.o_proj.weight", P, i);
-            l->iwq = load_mat(m, "%slayers.%d.self_attn.indexer.wq_b.weight", P, i);
-            l->iwk = load_mat(m, "%slayers.%d.self_attn.indexer.wk.weight", P, i);
-            l->iwp = load_mat(m, "%slayers.%d.self_attn.indexer.weights_proj.weight", P, i);
+            l->o = load_mat(m, D, H * c->v_head, "%slayers.%d.self_attn.o_proj.weight", P, i);
+            l->iwq = load_mat(m, IH * c->index_hd, c->q_lora, "%slayers.%d.self_attn.indexer.wq_b.weight", P, i);
+            l->iwk = load_mat(m, c->index_hd, D, "%slayers.%d.self_attn.indexer.wk.weight", P, i);
+            l->iwp = load_mat(m, IH, D, "%slayers.%d.self_attn.indexer.weights_proj.weight", P, i);
             l->ik_nw = load_f32(m, c->index_hd, "%slayers.%d.self_attn.indexer.k_norm.weight", P, i);
             l->ik_nb = load_f32(m, c->index_hd, "%slayers.%d.self_attn.indexer.k_norm.bias", P, i);
             if (m->c.index_kpool > 1) {
                 l->ikpa = load_f32(m, (int64_t)c->index_kpool * c->index_hd,
                                    "%slayers.%d.self_attn.indexer.index_kpool_compress_ape", P, i);
-                l->ikpg = load_mat(m, "%slayers.%d.self_attn.indexer.index_kpool_compress_gate", P, i);
+                l->ikpg = load_mat(m, c->index_hd, D, "%slayers.%d.self_attn.indexer.index_kpool_compress_gate", P, i);
             }
         } else {
-            l->kq = load_mat(m, "%slayers.%d.self_attn.q_proj.weight", P, i);
-            l->kk = load_mat(m, "%slayers.%d.self_attn.k_proj.weight", P, i);
-            l->kv = load_mat(m, "%slayers.%d.self_attn.v_proj.weight", P, i);
-            l->ko = load_mat(m, "%slayers.%d.self_attn.o_proj.weight", P, i);
-            l->kga = load_mat(m, "%slayers.%d.self_attn.g_a_proj.weight", P, i);
-            l->kgb = load_mat(m, "%slayers.%d.self_attn.g_b_proj.weight", P, i);
-            l->kfa = load_mat(m, "%slayers.%d.self_attn.f_a_proj.weight", P, i);
-            l->kfb = load_mat(m, "%slayers.%d.self_attn.f_b_proj.weight", P, i);
-            l->kb = load_mat(m, "%slayers.%d.self_attn.b_proj.weight", P, i);
+            l->kq = load_mat(m, c->kda_proj, D, "%slayers.%d.self_attn.q_proj.weight", P, i);
+            l->kk = load_mat(m, c->kda_proj, D, "%slayers.%d.self_attn.k_proj.weight", P, i);
+            l->kv = load_mat(m, c->kda_proj, D, "%slayers.%d.self_attn.v_proj.weight", P, i);
+            l->ko = load_mat(m, D, c->kda_proj, "%slayers.%d.self_attn.o_proj.weight", P, i);
+            l->kga = load_mat(m, c->kda_hd, D, "%slayers.%d.self_attn.g_a_proj.weight", P, i);
+            l->kgb = load_mat(m, c->kda_proj, c->kda_hd, "%slayers.%d.self_attn.g_b_proj.weight", P, i);
+            l->kfa = load_mat(m, c->kda_hd, D, "%slayers.%d.self_attn.f_a_proj.weight", P, i);
+            l->kfb = load_mat(m, c->kda_proj, c->kda_hd, "%slayers.%d.self_attn.f_b_proj.weight", P, i);
+            l->kb = load_mat(m, c->kda_heads, D, "%slayers.%d.self_attn.b_proj.weight", P, i);
             l->dt = load_f32(m, c->kda_proj, "%slayers.%d.self_attn.dt_bias", P, i);
             l->alog = load_f32(m, c->kda_heads, "%slayers.%d.self_attn.A_log", P, i);
             l->onorm = load_f32(m, c->kda_hd, "%slayers.%d.self_attn.o_norm.weight", P, i);
@@ -2386,17 +2413,17 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
             }
         }
         if (i < m->c.first_dense) {
-            l->dg = load_mat(m, "%slayers.%d.mlp.gate_proj.weight", P, i);
-            l->du = load_mat(m, "%slayers.%d.mlp.up_proj.weight", P, i);
-            l->dd = load_mat(m, "%slayers.%d.mlp.down_proj.weight", P, i);
+            l->dg = load_mat(m, c->dense_inter, D, "%slayers.%d.mlp.gate_proj.weight", P, i);
+            l->du = load_mat(m, c->dense_inter, D, "%slayers.%d.mlp.up_proj.weight", P, i);
+            l->dd = load_mat(m, D, c->dense_inter, "%slayers.%d.mlp.down_proj.weight", P, i);
         } else {
             l->router = load_f32(m, c->n_experts * D, "%slayers.%d.mlp.gate.weight", P, i);
             l->rbias = st_find(&m->S, (snprintf(probe, sizeof(probe),
                         "%slayers.%d.mlp.gate.e_score_correction_bias", P, i), probe))
                        ? load_f32(m, c->n_experts, "%s", probe) : NULL;
-            l->rg = load_mat(m, "%slayers.%d.mlp.shared_experts.gate_proj.weight", P, i);
-            l->ru = load_mat(m, "%slayers.%d.mlp.shared_experts.up_proj.weight", P, i);
-            l->rd = load_mat(m, "%slayers.%d.mlp.shared_experts.down_proj.weight", P, i);
+            l->rg = load_mat(m, shared, D, "%slayers.%d.mlp.shared_experts.gate_proj.weight", P, i);
+            l->ru = load_mat(m, shared, D, "%slayers.%d.mlp.shared_experts.up_proj.weight", P, i);
+            l->rd = load_mat(m, D, shared, "%slayers.%d.mlp.shared_experts.down_proj.weight", P, i);
             /* Gli esperti quantizzati restano su disco: sono il 97% dei byte
              * e nessuna macchina li tiene in RAM. Un checkpoint f32, come le
              * fixture degli oracoli, e' piccolo e si carica tutto. */
@@ -2405,9 +2432,9 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
                 l->eu = malloc((size_t)m->c.n_experts * sizeof(Mat));
                 l->ed = malloc((size_t)m->c.n_experts * sizeof(Mat));
                 for (int e = 0; e < m->c.n_experts; e++) {
-                    l->eg[e] = load_mat(m, "%slayers.%d.mlp.experts.%d.gate_proj.weight", P, i, e);
-                    l->eu[e] = load_mat(m, "%slayers.%d.mlp.experts.%d.up_proj.weight", P, i, e);
-                    l->ed[e] = load_mat(m, "%slayers.%d.mlp.experts.%d.down_proj.weight", P, i, e);
+                    l->eg[e] = load_mat(m, c->moe_inter, D, "%slayers.%d.mlp.experts.%d.gate_proj.weight", P, i, e);
+                    l->eu[e] = load_mat(m, c->moe_inter, D, "%slayers.%d.mlp.experts.%d.up_proj.weight", P, i, e);
+                    l->ed[e] = load_mat(m, D, c->moe_inter, "%slayers.%d.mlp.experts.%d.down_proj.weight", P, i, e);
                 }
             }
         }
