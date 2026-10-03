@@ -719,6 +719,8 @@ VK_SPV   += shaders/chain_norm.spv shaders/chain_rope.spv shaders/chain_attn.spv
 # the MLA ops (vk_chain.h): attention core, RoPE and LayerNorm rows, per-head weight
 # blocks, the DSA indexer's selection
 VK_SPV   += shaders/chain_mla.spv shaders/chain_hgemv.spv shaders/chain_dsa.spv
+# Kimi Delta Attention and manifold-constrained hyper-connections (vk_chain.h)
+VK_SPV   += shaders/chain_kda.spv shaders/chain_mhc.spv
 endif
 
 # Optional AMD XDNA2 (Ryzen AI NPU) lane, Windows. Same opt-in shape as VK=1:

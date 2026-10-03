@@ -885,6 +885,15 @@ records what reads the projections (a DSA indexer reads the normalized q latent 
 leaves in its scratch). Limits: K up to 1024, R up to 128, Q up to 1024 where kv_b's key
 rows are read transposed, an indexer of up to 64 heads and 4096 query floats.
 
+GLM-5.3 Flash adds three more things, as ops of their own in `vk_chain.h`, which the
+DeepSeek V4 and Kimi K3 chains can take as they are:
+
+| Op | Shader | What it does |
+|---|---|---|
+| `vkc_dsa_pool_keys`, `vkc_dsa_pool_select` | `chain_dsa` (modes 1, 2) | the k-pooled indexer (`sparse_index.h`): a pool's key, the per-channel softmax mixture of its members' keys under their gate logits plus a position bias, computed once when a step completes the pool; each row's top pools in rank order (score, then the lower pool), their positions, the incomplete tail, -1 in the unused slots |
+| `vkc_kda_conv`, `vkc_kda_rec` | `chain_kda` | Kimi Delta Attention (`delta_attention.h`): the short convolution with its window, the gated delta rule with a decay per key row and the state on the device, GLM-5.3's output RMSNorm and sigmoid gate; the l2 sums and the norm's sum in the CPU's order |
+| `vkc_mhc` | `chain_mhc` | manifold-constrained hyper-connections (`hyper_connections.h`): the mix logits' split with Sinkhorn, the collapse, the write back, the plain mean of the last collapse; and a clamped SwiGLU |
+
 `make vk-chain-check VK=1` runs them against double-precision references of colibri.c's
 absorbed attention: every weight format both ways through the per-head blocks, RoPE in
 both styles in place and into a cache row, LayerNorm with and without a bias, and the
@@ -894,7 +903,10 @@ context from a nonzero start, GLM-5.2's head shape, a latent of 1024). Measured 
 Lavapipe and on an Intel Iris Xe (Mesa's Dozen): the layer's output within 5e-7 of its
 largest value and the new cache rows within 7e-7 (the test's bound is 2e-5). The
 indexer's selection is checked bit for bit, ties included, on scores that are exact in
-float on both sides.
+float on both sides. The k-pooled selection is checked slot for slot against `sparse_index.h` the same
+way, the KDA layer against `delta_attention.h` over two submissions (the state and the
+window carried between them, inputs small enough that the l2 eps counts), the mHC ops
+against `hyper_connections.h`; each within 3e-7 on Lavapipe and on the Iris Xe.
 
 ## Adding an engine to the tier
 

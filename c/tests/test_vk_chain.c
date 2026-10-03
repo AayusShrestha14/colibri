@@ -25,14 +25,25 @@
  *            lists with skipped entries, a gate, prefill rows, a long context from
  *            kv_start, latents up to 1024)
  *   dsa      the indexer's top-k selection bit for bit, ties included
+ *   kpool    the k-pooled indexer (GLM-5.3): pooled keys, the pools' rank order and
+ *            the tail, slot for slot against sparse_index.h
+ *   kda      GLM-5.3's KDA layer around delta_attention.h's step: the convolution
+ *            and its window, the recurrence and its state over two submissions, the
+ *            decay, beta, output norm and gate
+ *   mhc      hyper_connections.h's split, collapse and write back, the mean, and the
+ *            clamped SwiGLU
  *
  *   make vk-chain-check VK=1   (VK_ICD_FILENAMES=.../lvp_icd.json for Lavapipe) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <float.h>
 #include "../backend_vulkan.h"
 #include "../vk_chain.h"
+#include "../delta_attention.h"      /* the KDA step the KDA ops follow */
+#include "../hyper_connections.h"    /* the mHC arithmetic */
+#include "../sparse_index.h"         /* GLM-5.3's k-pooled indexer */
 
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -790,6 +801,181 @@ static void test_dsa(int S, int pos_base, int IH, int ID, int topk, int force, i
     free(q); free(k); free(w); free(ref);
 }
 
+/* ---- KDA, mHC, k-pooling ----------------------------------------------------------------- */
+/* glm53.c's KDA layer around delta_attention.h's step, S rows over two calls (the state
+ * and the window carried on the device between them) */
+static void test_kda(int H, int KD, int CK, float xs) {   /* xs: the inputs' scale (small: the l2 eps counts) */
+    int VD = KD, P = H * KD, C = 3 * P, S = 5;
+    float lb = -5.f, neps = 1e-6f, eps = 1e-5f;
+    float *qkv = fvec((size_t)S * C, xs), *f = fvec((size_t)S * P, 1.f), *b = fvec((size_t)S * H, 2.f), *g = fvec((size_t)S * P, 2.f);
+    float *taps = fvec((size_t)C * CK, 0.7f), *win = fvec((size_t)C * CK, 1.f), *state = fvec((size_t)H * KD * VD, 0.3f);
+    float *prm = malloc((size_t)(H + P + VD) * 4);
+    for (int i = 0; i < H; i++) prm[i] = frnd() * 0.5f;
+    for (int i = 0; i < P; i++) prm[H + i] = frnd() * 0.5f;
+    for (int i = 0; i < VD; i++) prm[H + P + i] = 0.5f + (rnd() % 100) / 100.f;
+    /* reference: glm53.c's kda_layer row by row */
+    float *rs = malloc((size_t)H * KD * VD * 4), *rw = malloc((size_t)C * CK * 4), *ref = malloc((size_t)S * P * 4);
+    memcpy(rs, state, (size_t)H * KD * VD * 4); memcpy(rw, win, (size_t)C * CK * 4);
+    float *scratch = malloc((size_t)coli_kda_scratch_floats(H, KD, VD) * 4), *core = malloc((size_t)P * 4);
+    float *dk = malloc((size_t)P * 4), *bt = malloc((size_t)H * 4);
+    for (int s = 0; s < S; s++) {
+        for (int h = 0; h < H; h++) for (int d = 0; d < KD; d++) {
+            int i = h * KD + d; float sv = expf(prm[h]) * (f[s * P + i] + prm[H + i]);
+            float sg = sv >= 0 ? 1.f / (1.f + expf(-sv)) : expf(sv) / (1.f + expf(sv));
+            dk[i] = lb * sg;
+        }
+        for (int h = 0; h < H; h++) { float v = b[s * H + h]; bt[h] = v >= 0 ? 1.f / (1.f + expf(-v)) : expf(v) / (1.f + expf(v)); }
+        coli_kda_step(core, rs, rw, qkv + (size_t)s * C, taps, dk, bt, H, KD, VD, CK, neps, scratch);
+        for (int h = 0; h < H; h++) {
+            float sq = 0; for (int d = 0; d < VD; d++) sq += core[h * VD + d] * core[h * VD + d];
+            float inv = 1.f / sqrtf(sq / VD + eps);
+            for (int d = 0; d < VD; d++) {
+                float gv = g[s * P + h * VD + d], sg = gv >= 0 ? 1.f / (1.f + expf(-gv)) : expf(gv) / (1.f + expf(gv));
+                ref[s * P + h * VD + d] = core[h * VD + d] * inv * prm[H + P + d] * sg;
+            }
+        }
+    }
+    /* the device: q, k, v in three blocks [3][S][P] (in_part = S*P) */
+    float *blk = malloc((size_t)3 * S * P * 4);
+    for (int s = 0; s < S; s++) for (int part = 0; part < 3; part++)
+        memcpy(blk + (size_t)part * S * P + (size_t)s * P, qkv + (size_t)s * C + (size_t)part * P, (size_t)P * 4);
+    VkcBuf *ib = up(blk, (size_t)3 * S * P), *tb = up(taps, (size_t)C * CK), *wb = up(win, (size_t)C * CK), *sb = up(state, (size_t)H * KD * VD);
+    VkcBuf *fb = up(f, (size_t)S * P), *bb = up(b, (size_t)S * H), *gb = up(g, (size_t)S * P), *pb = up(prm, (size_t)H + P + VD);
+    VkcBuf *mb = vkc_buf((size_t)S * C * 4, VKC_DEV), *yb = vkc_buf((size_t)S * P * 4, VKC_DEV);
+    int ok = 1, s0 = 0;
+    for (int part = 0; part < 2 && ok; part++) {
+        int n = part ? S - 3 : 3;
+        VkcKdaConv cp = {n, C, CK, P, s0 * P, P, S * P, 0, C, 0, 0};
+        VkcKdaRec rp = {n, H, VD, P, 0, C, s0 * P, P, s0 * H, H, s0 * P, P, s0 * P, P, 0, 0, lb, neps, eps};
+        ok = vkc_begin() && vkc_kda_conv(ib, tb, wb, mb, &cp) && vkc_kda_rec(KD, mb, fb, bb, gb, pb, sb, yb, &rp) && vkc_submit(part);
+        s0 += n;
+    }
+    float *y = down(yb, 0, (size_t)S * P), *st2 = down(sb, 0, (size_t)H * KD * VD), *w2 = down(wb, 0, (size_t)C * CK);
+    double e = relerr(y, ref, (size_t)S * P, 1e-3), es = relerr(st2, rs, (size_t)H * KD * VD, 1e-3), ew = relerr(w2, rw, (size_t)C * CK, 1e-3);
+    CHECK(ok && e < 1e-5 && es < 1e-5 && ew == 0 && !bad(y, (size_t)S * P), "kda H %d KD %d K %d: ok %d out %.2e state %.2e window %.2e",
+          H, KD, CK, ok, e, es, ew);
+    if (getenv("VKC_TEST_VERBOSE")) printf("kda H %d KD %d: out %.2e state %.2e\n", H, KD, e, es);
+    vkc_free(ib); vkc_free(tb); vkc_free(wb); vkc_free(sb); vkc_free(fb); vkc_free(bb); vkc_free(gb); vkc_free(pb); vkc_free(mb); vkc_free(yb);
+    free(qkv); free(f); free(b); free(g); free(taps); free(win); free(state); free(prm); free(rs); free(rw); free(ref);
+    free(scratch); free(core); free(dk); free(bt); free(blk); free(y); free(st2); free(w2);
+}
+
+/* hyper_connections.h's pre and post against the split, collapse and write back, the
+ * mean, and the clamped SwiGLU */
+static void test_mhc(int H, int D, int iters) {
+    int S = 3, HD = H * D, nm = (2 + H) * H;
+    float eps = 1e-5f, hce = 1e-6f, lim = 1.5f;
+    float *x = fvec((size_t)S * HD, 1.f), *fn = fvec((size_t)nm * HD, 0.05f), *br = fvec((size_t)S * D, 1.f);
+    float *prm = malloc((size_t)(3 + nm) * 4);
+    for (int i = 0; i < 3; i++) prm[i] = 0.5f + (rnd() % 100) / 100.f;
+    for (int i = 0; i < nm; i++) prm[3 + i] = frnd() * 0.5f;
+    float *rpre = malloc((size_t)S * D * 4), *rpost = malloc((size_t)S * H * 4), *rcomb = malloc((size_t)S * H * H * 4);
+    float *rout = malloc((size_t)S * HD * 4), *rmean = malloc((size_t)S * D * 4);
+    for (int s = 0; s < S; s++) {
+        coli_hc_pre(rpre + s * D, rpost + s * H, rcomb + s * H * H, x + s * HD, fn, prm, prm + 3, H, D, iters, eps, hce);
+        coli_hc_post(rout + s * HD, br + s * D, x + s * HD, rpost + s * H, rcomb + s * H * H, H, D);
+        for (int d = 0; d < D; d++) { float sm = 0; for (int i = 0; i < H; i++) sm += x[s * HD + i * D + d]; rmean[s * D + d] = sm / H; }
+    }
+    ColiVkTensor *t = NULL;
+    if (!coli_vk_tensor_ensure(&t, fn, NULL, 10, HD, nm, 0)) { CHECK(0, "mhc: upload"); return; }
+    VkcBuf *xb = up(x, (size_t)S * HD), *bb = up(br, (size_t)S * D), *pb = up(prm, 3 + (size_t)nm);
+    VkcBuf *mb = vkc_buf((size_t)S * nm * 4, VKC_DEV), *hb = vkc_buf((size_t)S * (2 * H + H * H) * 4, VKC_DEV);
+    VkcBuf *cb = vkc_buf((size_t)S * D * 4, VKC_DEV), *ob = vkc_buf((size_t)S * HD * 4, VKC_DEV), *eb = vkc_buf((size_t)S * D * 4, VKC_DEV);
+    int hrow = 2 * H + H * H;
+    VkcMhc sp = {S, H, D, iters, 0, HD, 0, nm, 0, hrow, 0, D, 0, 0, eps, hce, 0.f};
+    VkcMhc po = {S, H, D, iters, 0, HD, 0, D, 0, hrow, 0, HD, 0, 0, eps, hce, 0.f};
+    int ok = vkc_begin() && vkc_matmul(t, xb, 0, mb, 0, S) && vkc_mhc(VKC_MHC_SPLIT, xb, mb, hb, pb, NULL, &sp) &&
+             vkc_mhc(VKC_MHC_COLLAPSE, xb, NULL, hb, NULL, cb, &sp) && vkc_mhc(VKC_MHC_POST, xb, bb, hb, NULL, ob, &po) &&
+             vkc_mhc(VKC_MHC_MEAN, xb, NULL, NULL, NULL, eb, &sp) && vkc_submit(1);
+    float *hp = down(hb, 0, (size_t)S * hrow), *col = down(cb, 0, (size_t)S * D), *out = down(ob, 0, (size_t)S * HD), *mean = down(eb, 0, (size_t)S * D);
+    /* pre, post and comb from coli_hc_split_sinkhorn on the CPU's own mixes */
+    float *rp = malloc((size_t)S * hrow * 4), *mixs = malloc((size_t)nm * 4);
+    for (int s = 0; s < S; s++) {
+        float ms = 0; for (int i = 0; i < HD; i++) ms += x[s * HD + i] * x[s * HD + i];
+        float ir = 1.f / sqrtf(ms / HD + eps);
+        for (int r = 0; r < nm; r++) { float a = 0; for (int i = 0; i < HD; i++) a += fn[(size_t)r * HD + i] * x[s * HD + i]; mixs[r] = a * ir; }
+        coli_hc_split_sinkhorn(rp + s * hrow, rp + s * hrow + H, rp + s * hrow + 2 * H, mixs, prm, prm + 3, H, iters, hce);
+    }
+    double epre = 0;
+    for (int s = 0; s < S; s++) for (int i = 0; i < hrow; i++) { double d = fabs(hp[s * hrow + i] - rp[s * hrow + i]); if (d > epre) epre = d; }
+    free(rp); free(mixs);
+    double ep = 0, ec = relerr(col, rpre, (size_t)S * D, 1e-3), eo = relerr(out, rout, (size_t)S * HD, 1e-3), em = relerr(mean, rmean, (size_t)S * D, 1e-3);
+    for (int s = 0; s < S; s++) {
+        for (int i = 0; i < H; i++) { double d = fabs(hp[s * hrow + H + i] - rpost[s * H + i]); if (d > ep) ep = d; }
+        for (int i = 0; i < H * H; i++) { double d = fabs(hp[s * hrow + 2 * H + i] - rcomb[s * H * H + i]); if (d > ep) ep = d; }
+    }
+    CHECK(ok && ep < 2e-5 && epre < 5e-7 && ec < 2e-5 && eo < 2e-5 && em < 1e-6,
+          "mhc H %d D %d iters %d: ok %d split %.2e post/comb %.2e collapse %.2e write back %.2e mean %.2e",
+          H, D, iters, ok, epre, ep, ec, eo, em);
+    if (getenv("VKC_TEST_VERBOSE")) printf("mhc H %d D %d: split %.2e post/comb %.2e collapse %.2e write back %.2e mean %.2e\n", H, D, epre, ep, ec, eo, em);
+    /* the clamped SwiGLU, on values both sides of the limit */
+    int n = 333;
+    float *ga = fvec(n, 3.f), *ua = fvec(n, 3.f), *rr = malloc((size_t)n * 4);
+    for (int i = 0; i < n; i++) { float gg = ga[i] > lim ? lim : ga[i], uu = ua[i] < -lim ? -lim : (ua[i] > lim ? lim : ua[i]); rr[i] = gg / (1.f + expf(-gg)) * uu; }
+    VkcBuf *gab = up(ga, n), *uab = up(ua, n), *yb = vkc_buf((size_t)n * 4, VKC_DEV);
+    VkcMhc sw = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, n, 0.f, 0.f, lim};
+    ok = vkc_begin() && vkc_mhc(VKC_SWIGLU_CLAMP, gab, uab, NULL, NULL, yb, &sw) && vkc_submit(1);
+    float *yy = down(yb, 0, n);
+    double es = relerr(yy, rr, n, 1e-3);
+    CHECK(ok && es < 1e-6, "swiglu clamp: ok %d err %.2e", ok, es);
+    vkc_free(xb); vkc_free(bb); vkc_free(pb); vkc_free(mb); vkc_free(hb); vkc_free(cb); vkc_free(ob); vkc_free(eb);
+    vkc_free(gab); vkc_free(uab); vkc_free(yb); coli_vk_tensor_free(t);
+    free(x); free(fn); free(br); free(prm); free(rpre); free(rpost); free(rcomb); free(rout); free(rmean);
+    free(hp); free(col); free(out); free(mean); free(ga); free(ua); free(rr); free(yy);
+}
+
+/* k-pooling against sparse_index.h. Equal gates and no bias make each pooled key the
+ * exact mean of its members, so with quarter-step values and power-of-two scales the
+ * scores are exact on both sides and the selection must be the CPU's slot for slot;
+ * a second pass with random gates and bias checks the pooled keys to rounding. */
+static void test_kpool(int S, int pos_base, int IH, int ID, int pool, int topk, int tail) {
+    int T = pos_base + S, width = coli_sparse_index_width(topk, pool, tail), selrow = width + 1;
+    int npool = T / pool, scrow = npool + 1;
+    float *keys = malloc((size_t)T * ID * 4), *gates = calloc((size_t)T * ID, 4), *ape = calloc((size_t)pool * ID, 4);
+    float *q = malloc((size_t)S * IH * ID * 4), *hw = malloc((size_t)S * IH * 4);
+    for (int i = 0; i < T * ID; i++) keys[i] = ((int)(rnd() % 17) - 8) * 0.25f;
+    for (int i = 0; i < S * IH * ID; i++) q[i] = ((int)(rnd() % 17) - 8) * 0.25f;
+    for (int i = 0; i < S * IH; i++) hw[i] = ((int)(rnd() % 9) - 4) * 0.5f * sqrtf((float)IH);
+    for (int t = 0; t < T; t += 7) for (int i = 0; i < ID; i++) keys[t * ID + i] = keys[(t % 3) * ID + i];   /* equal pools: ties */
+    unsigned char *valid = malloc((size_t)T); memset(valid, 1, (size_t)T);
+    int *ref = malloc((size_t)S * width * sizeof(int));
+    float *hwd = malloc((size_t)S * IH * 4);
+    for (int i = 0; i < S * IH; i++) hwd[i] = hw[i] / sqrtf((float)IH);
+    coli_sparse_index_select_range(ref, q, keys, gates, hwd, ape, valid, T, IH, ID, pool, topk, tail, pos_base, T);
+    VkcBuf *kb = up(keys, (size_t)T * ID), *gb = up(gates, (size_t)T * ID), *ab = up(ape, (size_t)pool * ID);
+    VkcBuf *qb = up(q, (size_t)S * IH * ID), *wb = up(hw, (size_t)S * IH), *pk = vkc_buf((size_t)(npool + 1) * ID * 4, VKC_DEV);
+    VkcBuf *scb = vkc_buf((size_t)S * scrow * 4, VKC_DEV), *sb = vkc_buf((size_t)S * selrow * 4, VKC_DOWN);
+    VkcDsaPool kp = {npool, pool, 0, ID, 0, ID, 0, 0, 0, ID};
+    VkcDsaPick sp = {S, pos_base, IH, ID, topk, pool, 0, IH * ID, 0, IH, 0, tail, scrow, selrow, sqrtf((float)IH), 1.f / sqrtf((float)ID)};
+    int ok = vkc_begin() && vkc_dsa_pool_keys(kb, gb, ab, pk, &kp) && vkc_dsa_pool_select(qb, wb, pk, scb, sb, &sp) && vkc_submit(1);
+    const int *got = (const int *)vkc_ptr(sb);
+    int same = ok;
+    for (int s = 0; same && s < S; s++) {
+        same = got[s * selrow] == width;
+        for (int i = 0; same && i < width; i++) same = got[s * selrow + 1 + i] == ref[s * width + i];
+        if (!same && getenv("DSA_DEBUG")) { for (int i = 0; i < width; i++) printf(" %d/%d", got[s * selrow + 1 + i], ref[s * width + i]); printf("\n"); }
+    }
+    CHECK(same, "kpool S %d pos %d IH %d ID %d pool %d topk %d tail %d: ok %d, the selection differs", S, pos_base, IH, ID, pool, topk, tail, ok);
+    /* the pooled keys with real gates and bias, against sparse_index.h's arithmetic */
+    for (int i = 0; i < T * ID; i++) gates[i] = frnd() * 2.f;
+    for (int i = 0; i < pool * ID; i++) ape[i] = frnd() * 0.5f;
+    float *rk = malloc((size_t)npool * ID * 4);
+    for (int p = 0; p < npool; p++) for (int d = 0; d < ID; d++) {
+        float mx = -FLT_MAX, tot = 0, mix = 0;
+        for (int j = 0; j < pool; j++) { float l = gates[(p * pool + j) * ID + d] + ape[j * ID + d]; if (l > mx) mx = l; }
+        for (int j = 0; j < pool; j++) tot += expf(gates[(p * pool + j) * ID + d] + ape[j * ID + d] - mx);
+        for (int j = 0; j < pool; j++) mix += expf(gates[(p * pool + j) * ID + d] + ape[j * ID + d] - mx) / tot * keys[(p * pool + j) * ID + d];
+        rk[p * ID + d] = mix;
+    }
+    ok = vkc_begin() && vkc_write(gb, 0, gates, (size_t)T * ID * 4) && vkc_write(ab, 0, ape, (size_t)pool * ID * 4) &&
+         vkc_dsa_pool_keys(kb, gb, ab, pk, &kp) && vkc_submit(1);
+    float *gk = down(pk, 0, (size_t)npool * ID);
+    double e = relerr(gk, rk, (size_t)npool * ID, 1e-3);
+    CHECK(ok && e < 2e-6, "kpool keys pool %d ID %d: ok %d err %.2e", pool, ID, ok, e);
+    vkc_free(kb); vkc_free(gb); vkc_free(ab); vkc_free(qb); vkc_free(wb); vkc_free(pk); vkc_free(scb); vkc_free(sb);
+    free(keys); free(gates); free(ape); free(q); free(hw); free(valid); free(ref); free(hwd); free(rk); free(gk);
+}
+
 /* ---- frames: many ops, frames in flight, ordering ---------------------------------------- */
 static void test_frames(void) {
     int n = 1000;
@@ -895,6 +1081,17 @@ int main(int argc, char **argv) {
         test_dsa(3, 5, 2, 16, 64, 1, 0); test_dsa(2, 700, 3, 64, 100, 0, 0); test_dsa(1, 9, 64, 64, 4, 0, 0);
         test_dsa(2, 900, 2, 16, 50, 0, 1);
         printf("dsa done\n");
+        test_kpool(3, 20, 4, 16, 2, 8, 1); test_kpool(2, 9, 1, 16, 4, 8, 1); test_kpool(4, 300, 4, 64, 4, 64, 1);
+        test_kpool(1, 2, 4, 16, 2, 4, 0); test_kpool(2, 30, 16, 16, 2, 6, 1);
+        printf("kpool done\n");
+    }
+    if (!vkc_kda_ready() || !vkc_mhc_ready()) { fails++; printf("FAIL: the KDA or mHC shaders did not load\n"); }
+    else {
+        test_kda(3, 16, 4, 1.f); test_kda(2, 32, 4, 1.f); test_kda(4, 128, 3, 1.f); test_kda(1, 64, 2, 1.f);
+        test_kda(2, 16, 4, 0.002f);
+        printf("kda done\n");
+        test_mhc(2, 64, 3); test_mhc(4, 96, 20); test_mhc(3, 40, 1);
+        printf("mhc done\n");
     }
     VkcStats st; vkc_stats(&st);
     printf("chain: %llu frames, %llu ops, %llu matmuls (%llu GEMM), %llu barriers\n", st.frames, st.ops, st.matmuls, st.gemms, st.barriers);
