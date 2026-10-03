@@ -810,7 +810,9 @@ What the numbers say:
 GPU the chain is on. On an integrated GPU with the expert tier on, each engine passes
 what it measured here: qwen36 on, qwen38 off (decode, a chat's steady state, is slower
 in both modes; `COLI_VK_CHAIN=2` is the choice for long prompts). Without the tier, and
-on a CPU device such as Lavapipe, it is off. The startup line says which and why:
+on a CPU device such as Lavapipe, it is off. An engine not timed on an integrated GPU
+passes `COLI_VK_CHAIN_UNMEASURED`: off there, and the line says "not measured". The
+startup line says which and why:
 
 ```
 [VK] qwen36: dense chain on (an integrated GPU with the expert tier: measured faster on decode and prefill; COLI_VK_CHAIN=0 off, 1 on, 2 prompts only)
@@ -889,7 +891,7 @@ on for a discrete GPU (the common rule), off on an integrated GPU (`COLI_VK_CHAI
 turns it on) and on a CPU device:
 
 ```
-[VK] mimo: dense chain off (an integrated GPU: not measured on a MiMo checkpoint; COLI_VK_CHAIN=1 on, 2 prompts only)
+[VK] mimo: dense chain off (an integrated GPU with the expert tier: not measured; COLI_VK_CHAIN=0 off, 1 on, 2 prompts only)
 ```
 
 ### Adding an engine to the chain

@@ -1849,16 +1849,7 @@ int main(int argc, char **argv) {
          * before the tier so the tier's budget leaves the trunk room. Not measured on a
          * MiMo checkpoint: an integrated GPU keeps it opt-in (docs/vulkan.md). */
         if (g_vk_ready) {
-            g_vk_chain = coli_vk_chain_decide(NULL, tier, COLI_VK_CHAIN_OFF);
-            const char *e = getenv("COLI_VK_CHAIN");
-            char why[160];
-            if (e && *e) snprintf(why, sizeof why, "COLI_VK_CHAIN=%s", e);
-            else if (coli_vk_device_integrated())
-                snprintf(why, sizeof why, "an integrated GPU: not measured on a MiMo checkpoint; COLI_VK_CHAIN=1 on, 2 prompts only");
-            else if (coli_vk_device_shares_ram()) snprintf(why, sizeof why, "a CPU device; COLI_VK_CHAIN=1 turns it on");
-            else snprintf(why, sizeof why, "a discrete GPU%s", tier ? ", beside the expert tier" : "");
-            fprintf(stderr, "[VK] mimo: dense chain %s (%s)\n", g_vk_chain == COLI_VK_CHAIN_ON ? "on"
-                    : g_vk_chain == COLI_VK_CHAIN_PREFILL ? "on for prompts" : "off", why);
+            g_vk_chain = coli_vk_chain_decide("mimo", tier, COLI_VK_CHAIN_UNMEASURED);
             if (g_vk_chain && !vkc_init()) g_vk_chain = 0;
         }
         if (g_vk_ready && tier) vk_tier_start(m);
