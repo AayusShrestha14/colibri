@@ -138,6 +138,14 @@ def _engine_error(fields, message):
     engine's context. Report it the way every OpenAI-compatible server does, so clients that
     know how to compact a conversation actually get the chance to (previously the engine
     silently truncated the prompt instead, which is #401)."""
+    if fields and fields[0] == "DECIDE_INVALID":
+        # A decision engine refusing the record: the caller's mistake, named by the
+        # field the engine points at ("questions.q: only 3 of its 30 option markers
+        # fit ..."), answered as every other /v1/systemone validation error is.
+        reason = " ".join(fields[1:]) or "The decision engine refused the request."
+        head = reason.split(":", 1)[0] if ":" in reason else ""
+        param = head if head and " " not in head else "questions"
+        return APIError(422, reason, param, "invalid_question")
     if fields and fields[0] == "CONTEXT_EXCEEDED":
         # Two spellings of the same frame. colibri and deepseek_v4 write the
         # original `CONTEXT_EXCEEDED <used> <limit>`; qwen36 and qwen38 write
@@ -4644,7 +4652,7 @@ def _engine_extension_args(engine_k):
 
     That is this helper's decision for THESE endpoints, not a property of the request
     builder. `gbytes_before_ext` is a per-call-site parameter, and the other caller that
-    sends an extension key -- /v1/brio -- does not pass it and keeps the header it has
+    sends an extension key -- /v1/systemone's scoring -- does not pass it and keeps the header it has
     always sent; changing that endpoint's wire is not this change's to make."""
     if not engine_k:
         return {}
@@ -4897,6 +4905,110 @@ def _write_all(stream, data, frame):
         written += sent
 
 
+# ---------------------------------------------------------------- decision engines
+#
+# A decision engine (Laya; docs/systemone.md, "Decision engines") does not generate: it
+# reads a state and typed questions and returns a probability per option. The
+# gateway hands it the request as one DECIDE record and shapes the DECISION it
+# gets back into the /v1/systemone reply, the same reply an LLM gives there.
+
+MAX_DECISION_BYTES = 16 << 20
+
+
+def decision_text(value):
+    """A state, an instruction or a criterion as the text a decision model reads.
+
+    A string is kept exactly as sent; anything else is JSON, written the way the
+    reference packages write the same value (`json.dumps(value, ensure_ascii=False)`,
+    laya's serialize_state and render_criterion), so the model reads the bytes it
+    was trained on. None stays None: the engine knows the model's own default."""
+    if value is None or isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False)
+
+
+def decision_state_type(value):
+    """What the caller sent as the state, by JSON type: a model may read a list (a
+    conversation, newest turn last) differently from a document."""
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, bool):
+        return "boolean"
+    return "number"
+
+
+def systemone_decision_record(body):
+    """The DECIDE record for a /v1/systemone request that passed validation.
+
+    Each question keeps its options in the caller's order: a choice's labels with
+    their descriptions, a score's levels (level 0 first), a noul's false then true
+    with the optional criteria. Instructions left out get the same default text the
+    LLM path asks with."""
+    defaults = {"noul": "Is this true?", "choice": "Which of the following applies?",
+                "score": "Rate this on the scale below."}
+    questions = []
+    for qid, question in body["questions"].items():
+        kind = question["type"]
+        criteria = question.get("criteria")
+        instructions = question.get("instructions")
+        if instructions is None or (isinstance(instructions, str) and not instructions.strip()):
+            instructions = defaults[kind]
+        if kind == "choice":
+            options = [{"label": label,
+                        "text": None if text is None or text == "" else decision_text(text)}
+                       for label, text in criteria.items()]
+        elif kind == "score":
+            options = [{"label": str(i), "text": decision_text(text)}
+                       for i, text in enumerate(criteria)]
+        else:
+            given = {str(key).lower(): text for key, text in (criteria or {}).items()}
+            options = [{"label": side,
+                        "text": None if given.get(side) in (None, "") else decision_text(given[side])}
+                       for side in ("false", "true")]
+        questions.append({"id": qid, "type": kind, "instructions": decision_text(instructions),
+                          "options": options})
+    state = body["state"]
+    return {"state": decision_text(state), "state_type": decision_state_type(state),
+            "questions": questions}
+
+
+def _decision_texts(record):
+    yield record["state"]
+    for question in record["questions"]:
+        yield question["id"]
+        yield question["instructions"]
+        for option in question["options"]:
+            yield option["label"]
+            yield option["text"]
+
+
+def decision_payload(record):
+    """The DECIDE payload bytes: UTF-8 JSON. A NUL would end a C string early and a
+    lone surrogate has no UTF-8 form, so both are the caller's 422."""
+    if any(text and "\0" in text for text in _decision_texts(record)):
+        raise APIError(422, "NUL characters are not supported in a decision request.", "state",
+                       "invalid_value")
+    try:
+        return json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise APIError(422, f"The request carries text that is not valid Unicode ({error.reason}).",
+                       "state", "invalid_value") from error
+
+
+def engine_decides(engine):
+    """The engine announced decide=1: /v1/systemone goes to it as a DECIDE record."""
+    return getattr(engine, "decides", False) is True
+
+
+def engine_chats(engine):
+    """False only for an engine that said chat=0: it has no generating endpoint."""
+    return getattr(engine, "chats", True) is not False
+
+
 class _Pending:
     """One in-flight engine request: the queue its frames are delivered on, whether it asked
     for the per-token numeric channel, and any fault the dispatcher has recorded against it.
@@ -4946,7 +5058,7 @@ class Engine:
         # whole of its contract: a DATA tail on every generated token, and an ECHO frame
         # for EVERY prompt position (" nan 0" at position 0) unless a pin photo covers the
         # prefix -- which means never resuming a read-out from a live prefix. colibri.c
-        # (glm) and mimo.c do; the engines that score /v1/brio options but resume
+        # (glm) and mimo.c do; the engines that score /v1/systemone options but resume
         # read-outs from a live prefix would answer `echo` with a hole. Token-id intake
         # is glm's alone: serve_codec.h, which mimo reads its frames with, has no `ids=`.
         self.supports_logprobs_echo = arch in ("glm", "mimo")
@@ -4994,6 +5106,11 @@ class Engine:
         # True/False when the engine said whether it loaded a vision tower; None when
         # it said nothing (an engine that predates CAPS, or a family without a tower).
         self.vision = {"1": True, "0": False}.get(self.caps.get("vision"))
+        # A decision engine says decide=1: /v1/systemone then sends it the record
+        # (DECIDE) instead of scoring options through the logprob channel. chat=0
+        # means it has nothing else: the generating endpoints answer 400.
+        self.decides = self.caps.get("decide") == "1"
+        self.chats = self.caps.get("chat") != "0"
         self.dispatcher = threading.Thread(target=self._dispatch_stdout,
                                            name="colibri-stdout", daemon=True)
         self.dispatcher.start()
@@ -5221,6 +5338,19 @@ class Engine:
                         "lp": record["lp"] if record else None,
                         "topk": record["topk"] if record else [],
                     }))
+                elif kind == "DECISION" and len(fields) == 3:
+                    # A decision engine's answer to DECIDE: one JSON payload, then DONE.
+                    request_id = fields[1]
+                    size = int(fields[2])
+                    if not 0 <= size <= MAX_DECISION_BYTES:
+                        raise RuntimeError("invalid engine DECISION size")
+                    data = self._read_exact(size)
+                    if self._read_exact(1) != b"\n":
+                        raise RuntimeError("invalid engine DECISION terminator")
+                    with self.pending_lock:
+                        entry = self.pending.get(request_id)
+                    if entry is not None and entry.failed is None:
+                        entry.events.put(("decision", data))
                 elif kind == "ACCEPT" and len(fields) >= 3:
                     # #597: the engine validated the submission (fits context) before prefill.
                     # Keep it pending — DATA/DONE still follow — and let generate() commit the
@@ -5293,6 +5423,63 @@ class Engine:
             if not self.closed:
                 self.dispatcher_error = error
                 self._fail_pending(error)
+
+    def decide(self, record, cache_slot=0, cancelled=None):
+        """One DECIDE round trip: the record out, the engine's DECISION back.
+
+        Returns (decision, stats): the parsed DECISION payload and the DONE line's
+        statistics. A record the engine refuses raises the APIError its ERROR names
+        (422 for DECIDE_INVALID); anything else the engine reports is a RuntimeError.
+        No CANCEL is sent: a decision is one forward pass, and the admission is held
+        until the engine's terminal frame either way."""
+        if not self.decides:
+            raise APIError(400, "This engine does not decide.", "model", "unsupported_endpoint")
+        if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
+            raise APIError(400, "Invalid cache slot.", "cache_slot")
+        payload = decision_payload(record)
+        pending = _Pending(False)
+        with self.pending_lock:
+            if self.closed:
+                raise RuntimeError("colibri engine is shutting down")
+            if self.dispatcher_error is not None:
+                raise RuntimeError("colibri engine dispatcher stopped") from self.dispatcher_error
+            if self.process.poll() is not None:
+                raise RuntimeError("colibri engine is not running")
+            request_id = str(self.next_request_id)
+            self.next_request_id += 1
+            self.pending[request_id] = pending
+        try:
+            with self.write_lock:
+                if self.process.poll() is not None:
+                    raise RuntimeError("colibri engine is not running")
+                try:
+                    _write_all(self.process.stdin,
+                               f"DECIDE {request_id} {cache_slot} {len(payload)}\n".encode()
+                               + payload + b"\n", "DECIDE")
+                    self.process.stdin.flush()
+                except OSError as error:
+                    raise RuntimeError(f"failed to write DECIDE to the engine ({error})") from error
+        except Exception:
+            with self.pending_lock:
+                self.pending.pop(request_id, None)
+            raise
+        decision = None
+        while True:
+            kind, value = pending.events.get()
+            if kind == "decision":
+                decision = value
+            elif kind == "done":
+                if decision is None:
+                    raise RuntimeError("the engine finished a DECIDE without a DECISION")
+                try:
+                    parsed = json.loads(decision.decode("utf-8"))
+                except (UnicodeDecodeError, ValueError) as error:
+                    raise RuntimeError(f"the engine sent an unreadable DECISION ({error})") from error
+                return parsed, value
+            elif kind == "accept":
+                continue
+            else:
+                raise value
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
                  cancelled=None, grammar=None, stopped=None, on_accept=None, audio=None,
@@ -5581,10 +5768,25 @@ def is_image_engine(engine):
 
 # The endpoints that only make sense for a chat model, refused with a pointer
 # when the model draws images instead.
-TEXT_ENDPOINTS = ("/v1/chat/completions", "/v1/completions", "/v1/messages", "/v1/brio",
-                  "/v1/systemone")
+TEXT_ENDPOINTS = ("/v1/chat/completions", "/v1/completions", "/v1/messages", "/v1/systemone")
+# The endpoints that generate or score text with a language model, refused with a
+# pointer to /v1/systemone when the model is a decision engine (chat=0).
+GENERATING_ENDPOINTS = ("/v1/chat/completions", "/v1/completions", "/v1/messages")
 IMAGE_OPTION_KEYS = ("default_width", "default_height", "default_steps", "min_side",
                      "max_side", "multiple")
+
+
+def cors_origin_list(given):
+    """The allowed browser origins from --cors-origin values. None keeps the
+    defaults. A value written `+origin` adds to the list instead of replacing
+    it: only `+` values extend the defaults, and plain values replace them as
+    they always have, with any `+` values added after."""
+    if given is None:
+        return DEFAULT_CORS_ORIGINS
+    plain = [origin for origin in given if not origin.startswith("+")]
+    added = [origin[1:] for origin in given if origin.startswith("+") and origin[1:]]
+    base = list(DEFAULT_CORS_ORIGINS) if not plain else plain
+    return tuple(dict.fromkeys(base + added))
 
 
 def _positive_env(name, default):
@@ -5636,6 +5838,12 @@ class APIServer(ThreadingHTTPServer):
         self.allowed_hosts = tuple(
             h.strip().lower() for h in allowed_hosts if h and h.strip())
         self.created = int(time.time())
+        # Hashes of the states /v1/systemone scored lately: a state seen again is
+        # worth a photo, one seen once is probably a feed (systemone's pin rule).
+        self._states_seen = collections.OrderedDict()
+        self._states_lock = threading.Lock()
+        # slot -> (fixed prefix, its tokens) photographed by /v1/systemone
+        self.pinned_prefixes = {}
         self._conn_lock = threading.Lock()
         self._conn_live = 0
         self._conn_by_ip = {}
@@ -5647,11 +5855,43 @@ class APIServer(ThreadingHTTPServer):
         without trial and error."""
         entry = model_object(self.model_id, self.created)
         entry["input_modalities"] = self.input_modalities()
+        entry["capabilities"] = self.capabilities()
         if is_image_engine(self.engine):
             info = getattr(self.engine, "info", None) or {}
-            entry["capabilities"] = ["image_generation"]
             entry["image"] = {key: info.get(key) for key in IMAGE_OPTION_KEYS}
         return entry
+
+    def state_seen(self, state, capacity=256):
+        """True if `state` was scored before (and remember it either way)."""
+        key = hashlib.sha1(state.encode("utf-8", "replace")).digest()
+        with self._states_lock:
+            seen = key in self._states_seen
+            self._states_seen[key] = True
+            self._states_seen.move_to_end(key)
+            while len(self._states_seen) > capacity:
+                self._states_seen.popitem(last=False)
+        return seen
+
+    def capabilities(self):
+        """What the served model does, for /v1/models and /health: an image model
+        draws (image_generation); every text engine answers POST /v1/systemone
+        (systemone), and a decision engine does only that (decision)."""
+        if is_image_engine(self.engine):
+            return ["image_generation"]
+        if engine_decides(self.engine) and not engine_chats(self.engine):
+            return ["systemone", "decision"]
+        return ["chat", "systemone"]
+
+    def jev_model_card(self):
+        """The served model as Jev's GET /v1/models lists it. colibri does not know a
+        model's release date; it gives the day this server started."""
+        try:
+            name = family_by_id(ARCH).display_name
+        except Exception:
+            name = self.model_id
+        return {"name": self.model_id,
+                "description": f"{name}, served by colibri; POST /v1/systemone answers typed questions.",
+                "release_date": time.strftime("%Y-%m-%d", time.gmtime(self.created))}
 
     def input_modalities(self):
         """What a request to this server may carry: text, plus image when BOTH the
@@ -5768,6 +6008,14 @@ class _DeadlineReader:
 
 class APIHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    # TCP_NODELAY on every connection, set in setup(). A response is the header
+    # block and the body in two writes; with Nagle on, the body waits for the
+    # client's delayed ACK of the headers on a kept-alive connection, about 40 ms
+    # per request (measured: 44 ms median for a /v1/systemone round trip on
+    # loopback, 1 ms without). That is most of a decision's time on a fast engine.
+    # Not through disable_nagle_algorithm: macOS refuses the option with EINVAL on
+    # a socket the client has already reset, and a hangup is not a server error.
+    disable_nagle_algorithm = False
     timeout = 30   # per socket OPERATION. On its own this does not stop a slowloris:
                    # it restarts on every byte received, so a drip renews it forever.
                    # READ_DEADLINE below is the cumulative bound that actually does.
@@ -5777,6 +6025,10 @@ class APIHandler(BaseHTTPRequestHandler):
     _body_read = False    # request body fully consumed, so nothing is left to drain
 
     def setup(self):
+        try:
+            self.request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, True)
+        except OSError:
+            pass   # the client already hung up: the request fails as a hangup, below
         super().setup()
         # Keep the socket-backed reader; handle_one_request re-wraps it with a
         # fresh deadline per request rather than wrapping a wrapper each time.
@@ -5880,6 +6132,8 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         if request_id:
             self.send_header("x-request-id", request_id)
+            # what the TypeSafe SDKs read as `request_id` (an error carries it too)
+            self.send_header("x-typesafe-request-id", request_id)
         for name, value in (headers or {}).items():
             self.send_header(name, value)
         self.send_cors_headers()
@@ -5892,9 +6146,11 @@ class APIHandler(BaseHTTPRequestHandler):
             return
         self.send_header("Access-Control-Allow-Origin", "*" if "*" in self.server.cors_origins else origin)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, x-api-key, anthropic-version")
+        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, x-api-key, anthropic-version, "
+                         "X-TypeSafe-SDK, X-TypeSafe-Runtime, X-TypeSafe-Retry-Count")
         self.send_header("Access-Control-Expose-Headers",
-                         "x-request-id, x-colibri-queue-wait-ms, Retry-After")
+                         "x-request-id, x-typesafe-request-id, x-colibri-queue-wait-ms, "
+                         "x-colibri-elapsed-ms, x-colibri-engine-ms, Retry-After")
         self.send_header("Access-Control-Max-Age", "600")
         if "*" not in self.server.cors_origins:
             self.send_header("Vary", "Origin")
@@ -6056,8 +6312,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     if tiers: payload["tiers"] = tiers
                     hwinfo = getattr(self.server.engine, "hwinfo", None) if self.server.engine else None
                     if hwinfo: payload["hwinfo"] = hwinfo
+                    payload["capabilities"] = self.server.capabilities()
                     if is_image_engine(self.server.engine):
-                        payload["capabilities"] = ["image_generation"]
                         payload["image"] = dict(getattr(self.server.engine, "info", None) or {})
                 self.send_json(200, payload, request_id)
                 return
@@ -6089,7 +6345,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 return
             self.require_auth()
             if path == "/v1/models":
-                self.send_json(200, {"object": "list", "data": [self.server.model_entry()]},
+                # `data` is OpenAI's list; `models` is Jev's (name, description,
+                # release_date), which the TypeSafe SDKs' models.list() reads.
+                self.send_json(200, {"object": "list", "data": [self.server.model_entry()],
+                                     "models": [self.server.jev_model_card()]},
                                request_id)
             elif path.startswith("/v1/models/") and unquote(path[11:]) == self.server.model_id:
                 self.send_json(200, self.server.model_entry(), request_id)
@@ -6126,14 +6385,17 @@ class APIHandler(BaseHTTPRequestHandler):
                 raise APIError(400, f"`{self.server.model_id}` is an image generation model and "
                                     "does not chat: POST /v1/images/generations instead.",
                                "model", "unsupported_endpoint")
+            if not engine_chats(self.server.engine) and path in GENERATING_ENDPOINTS:
+                raise APIError(400, f"`{self.server.model_id}` is a decision model: it answers typed "
+                                    "questions with calibrated probabilities and does not generate "
+                                    "text. POST /v1/systemone instead.",
+                               "model", "unsupported_endpoint")
             if path == "/v1/images/generations":
                 self.image_generation(body, request_id)
             elif path == "/v1/chat/completions":
                 self.chat_completion(body, request_id)
             elif path == "/v1/completions":
                 self.completion(body, request_id)
-            elif path == "/v1/brio":
-                self.brio(body, request_id)
             elif path == "/v1/systemone":
                 self.systemone(body, request_id)
             elif path == "/v1/messages":
@@ -6155,156 +6417,49 @@ class APIHandler(BaseHTTPRequestHandler):
                 pass
 
 
-    # ---------------------------------------------------------------- modalita brio
+    # ---------------------------------------------------------------- il canale di scoring
     #
-    # Il modello non genera: si legge il logprob di ogni opzione ammessa e si
-    # normalizza sulle sole opzioni. Torna una distribuzione, non una stringa.
+    # Il percorso di POST /v1/systemone su un modello linguistico. Il modello non
+    # genera: si legge il logprob di ogni opzione ammessa e si normalizza sulle
+    # sole opzioni. Torna una distribuzione, non una stringa. (Un motore di
+    # decisione, decide=1, risponde da se' con DECIDE: _systemone_decide.)
     #
     # PERCHE' IL CICLO STA QUI E NON NEL CLIENT. Servono tre cose facili da
     # sbagliare: fotografare il prefisso condiviso (pin) cosi ogni opzione paga
-    # solo i propri token; NON mettere l'elenco delle opzioni nel prompt (su
-    # qwen36 erano 48 token su 123, meta del risparmio); e normalizzare per
-    # lunghezza, perche' sommare i logprob penalizza le opzioni da piu token --
-    # misurato, la somma diceva "merge" dove la generazione greedy dello stesso
-    # modello diceva "request changes". Un client che rifacesse questo ciclo
-    # sbaglierebbe una di queste tre, e il risultato resterebbe plausibile.
+    # solo i propri token; leggere l'opzione come continuazione della risposta e
+    # non come coda di un elenco; e normalizzare, perche' somma e media dei
+    # logprob danno risposte diverse quando le opzioni hanno lunghezze diverse.
+    # Un client che rifacesse questo ciclo sbaglierebbe una di queste tre, e il
+    # risultato resterebbe plausibile.
     #
-    # COSA TORNA. Non solo il vincitore: la probabilita di OGNI opzione e
-    # l'entropia. E' la differenza con la generazione, che una risposta la da
-    # sempre e con la stessa faccia: qui "non lo so" e' un numero.
-    # TRE FORME, UN ENDPOINT. `options` e' la domanda singola. `questions` e'
-    # un elenco di domande sullo stesso stato, ognuna con le sue opzioni: lo
-    # stato viene fotografato una volta e ogni domanda paga solo se stessa,
-    # che e' dove sta il 5,7x misurato. `schema` e' un oggetto campo -> valori
-    # ammessi: il server scrive lo scheletro JSON, casella per casella, e per
-    # ognuna legge il logprob di ciascun valore. Il JSON non puo' uscire
-    # malformato perche' non lo scrive il modello. Prima queste due forme
-    # esistevano solo come script di misura: chi integrava doveva riscriverle.
-    @staticmethod
-    def _brio_options(options, where, limit=64):
-        if not isinstance(options, list) or not options:
-            raise APIError(400, f"`{where}` must be a non-empty array of strings.", where)
-        if len(options) > limit:
-            raise APIError(400, f"`{where}` accepts at most {limit} entries.", where)
-        seen = set()
-        for option in options:
-            if not isinstance(option, str) or not option.strip():
-                raise APIError(400, f"Every entry of `{where}` must be a non-empty string.", where)
-            if option in seen:
-                raise APIError(400, f"Duplicate option in `{where}`: {option!r}.", where)
-            seen.add(option)
-        if len(options) < 2:
-            raise APIError(400, f"`{where}` needs at least two options to choose between.", where)
-        return options
+    # Lo stato viene fotografato una volta e ogni domanda paga solo se stessa:
+    # e' la forma in cui il canale rende (5,7x misurato contro la chat).
+    # (Fino alla 1.12.1 questo ciclo aveva anche un endpoint suo, POST /v1/brio,
+    # con le forme options/questions/schema. /v1/systemone e' ora l'unica API.)
+    def _score_questions(self, state, questions, normalize="sum", pin_state=True,
+                         fixed=None, cache_slot=None):
+        """Score every question's options against `state` through the engine's
+        logprob channel. `questions` is a list of (question text, options).
 
-    def brio(self, body, request_id, send=True):
-        # `send=False` returns the result instead of writing it: /v1/systemone
-        # builds a `questions` request and re-shapes the answer. `_max_options`
-        # is that caller's word too (Jev allows 255 labels); clamped.
-        option_limit = min(int(body.get("_max_options", 64) or 64), 255)
-        forms = [k for k in ("options", "questions", "schema") if body.get(k) is not None]
-        if len(forms) != 1:
-            raise APIError(400, "Provide exactly one of `options`, `questions` or `schema`.",
-                           forms[0] if forms else "options")
-        form = forms[0]
-        question = body.get("question")
-        if question is not None and not isinstance(question, str):
-            raise APIError(400, "`question` must be a string.", "question")
-        options = questions = schema = None
-        if form == "options":
-            options = self._brio_options(body["options"], "options")
-        elif form == "questions":
-            raw = body["questions"]
-            if not isinstance(raw, list) or not raw:
-                raise APIError(400, "`questions` must be a non-empty array.", "questions")
-            if len(raw) > 64:
-                raise APIError(400, "`questions` accepts at most 64 entries.", "questions")
-            questions = []
-            for i, entry in enumerate(raw):
-                if not isinstance(entry, dict):
-                    raise APIError(400, f"`questions[{i}]` must be an object.", "questions")
-                text = entry.get("question")
-                if not isinstance(text, str) or not text.strip():
-                    raise APIError(400, f"`questions[{i}].question` must be a non-empty string.",
-                                   "questions")
-                per = entry.get("normalize", body.get("normalize", "sum"))
-                if per not in ("mean", "sum"):
-                    raise APIError(400, "`normalize` must be \"mean\" or \"sum\".", "normalize")
-                questions.append((text, self._brio_options(entry.get("options"),
-                                                           f"questions[{i}].options",
-                                                           option_limit), per))
-        else:
-            raw = body["schema"]
-            if not isinstance(raw, dict) or not raw:
-                raise APIError(400, "`schema` must be a non-empty object of field: [values].",
-                               "schema")
-            if len(raw) > 64:
-                raise APIError(400, "`schema` accepts at most 64 fields.", "schema")
-            schema = []
-            for field, values in raw.items():
-                if not isinstance(field, str) or not field.strip():
-                    raise APIError(400, "Every `schema` field name must be a non-empty string.",
-                                   "schema")
-                if any(ch in field for ch in '"\\\n'):
-                    raise APIError(400, f"`schema` field {field!r} cannot contain quotes, "
-                                        "backslashes or newlines.", "schema")
-                schema.append((field, self._brio_options(values, f"schema.{field}")))
-            task = body.get("task")
-            if task is not None and not isinstance(task, str):
-                raise APIError(400, "`task` must be a string.", "task")
-        state = body.get("state")
-        messages = body.get("messages")
-        if state is not None and not isinstance(state, str):
-            raise APIError(400, "`state` must be a string.", "state")
-        if state is None and isinstance(messages, list):
-            # La conversazione in corso FA da stato: e' quello che la TUI manda
-            # quando si scrive /brio a meta chat.
-            parts = []
-            for message_index, message in enumerate(messages):
-                if not isinstance(message, dict):
-                    raise APIError(400, "Every message must be an object.", "messages")
-                content = message.get("content")
-                if isinstance(content, list):
-                    text_parts = []
-                    for part_index, piece in enumerate(content):
-                        if not isinstance(piece, dict):
-                            continue
-                        text = piece.get("text", "")
-                        if not isinstance(text, str):
-                            raise APIError(400, "Text content parts require a string `text` field.",
-                                           f"messages.{message_index}.content.{part_index}.text")
-                        text_parts.append(text)
-                    content = "".join(text_parts)
-                if content:
-                    parts.append(f"{message.get('role', 'user')}: {content}")
-            state = "\n".join(parts)
-        if not state and not question and form == "options":
-            raise APIError(400, "Provide `state`, `messages` or `question`.", "state")
-        if not state and form != "options":
-            raise APIError(400, f"`{form}` needs a `state` (or `messages`) to decide on.", "state")
-        # "sum" (the joint log-probability of the option as a continuation)
-        # is the default: "mean" compares per-token averages, which silently
-        # favors multi-token options whenever the menu mixes token counts —
-        # e.g. DENY (2 tokens) beating ALLOW (1) on every safe change in a
-        # 30-case benchmark. "mean" stays available for menus whose options
-        # tokenize to the same length, and warns when they do not.
-        normalize = body.get("normalize", "sum")
-        if normalize not in ("mean", "sum"):
-            raise APIError(400, "`normalize` must be \"mean\" or \"sum\".", "normalize")
+        Returns (answers, usage, headers): per question the options sorted by
+        probability, each with `p`, `logprob`, `mean_logprob` and `tokens`, and
+        the normalised entropy; `prompt_tokens` (the longest prompt) and
+        `read_tokens` (the option tokens read); the timing headers.
+
+        `fixed` is a text read before the state and photographed once per slot
+        (/v1/systemone's `prefix`); `pin_state` False skips the photo of the
+        state. The slot defaults to the one derived from the part that does not
+        change: the fixed text when there is one, else the state."""
         # Lo slot si sceglie dallo STATO, non dalla domanda: mille domande
         # diverse sullo stesso contesto devono cadere sullo stesso slot, o la
         # fotografia del prefisso condiviso non le serve a niente. E' la stessa
         # regola di conversation_cache_slot per la chat, con la chiave presa
         # dalla parte che non cambia.
-        cache_slot = body.get("cache_slot")
         if cache_slot is None:
             cache_slot = conversation_cache_slot(
-                [{"role": "system", "content": state or ""}], self.server.kv_slots)
-        if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) \
-                or not 0 <= cache_slot < self.server.kv_slots:
-            raise APIError(400, "Invalid cache slot.", "cache_slot")
-
-        state_prefix = f"Context:\n{state}\n\n" if state else ""
+                [{"role": "system", "content": fixed or state or ""}], self.server.kv_slots)
+        fixed_prefix = f"{fixed}\n\n" if fixed else ""
+        state_prefix = fixed_prefix + (f"Context:\n{state}\n\n" if state else "")
         started = time.time()
         read_total = 0
         prompt_max = 0
@@ -6336,8 +6491,13 @@ class APIHandler(BaseHTTPRequestHandler):
                 """Fotografa `prefix`, poi un giro per opzione: ognuna paga solo
                 i propri token. Torna (scored, entropia, token del prefisso)."""
                 nonlocal read_total, prompt_max
-                n_prefix, _ = score(prefix, True)
+                n_prefix, fresh = score(prefix, True)
                 prompt_max = max(prompt_max, n_prefix)
+                known = self.server.pinned_prefixes.get(cache_slot)
+                if known and known[0] == fixed_prefix and len(fresh) > n_prefix - known[1]:
+                    # The engine read the fixed prefix again: its photo was
+                    # evicted. Forget it, so the next request takes it anew.
+                    self.server.pinned_prefixes.pop(cache_slot, None)
                 scored = []
                 for option in choices:
                     # Il cliente se n'e andato: smettere subito invece di
@@ -6362,7 +6522,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     if len(token_counts) > 1:
                         counts = ", ".join(f"{entry['option']}={entry['tokens']}"
                                            for entry in scored)
-                        print(f"[brio] WARNING: normalize=mean with unequal option "
+                        print(f"[systemone] WARNING: normalize=mean with unequal option "
                               f"token counts ({counts}) — per-token averages favor "
                               f"multi-token options; consider normalize=sum",
                               file=sys.stderr)
@@ -6378,84 +6538,45 @@ class APIHandler(BaseHTTPRequestHandler):
                 return scored, round(entropy, 6), n_prefix
 
             # Lo stato da solo, fotografato per primo: e' il livello che tutte
-            # le domande (o tutte le caselle) condividono. Con un livello solo
-            # la domanda si rilegge una volta per opzione; con due, 176 token
-            # invece di 496 su quattro item (misurato).
-            #
-            # Vale anche per la forma `options`: dentro una singola richiesta lo
-            # stato si legge comunque una volta (lo snapshot dello stato viene
-            # ripristinato quando `choose` fotografa il prefisso completo), ma
-            # il punto di ritorno sullo stato condiviso serve TRA richieste. La
-            # pagina web manda una domanda per richiesta sullo stesso documento;
-            # senza questa fotografia ogni domanda rifarebbe il prefill di tutto
-            # il documento, buttando via il "read once" che e' il senso della
-            # modalita. Con essa, ogni domanda successiva paga solo i propri
-            # token. Il costo e' uno snapshot in piu' su una richiesta one-shot,
-            # riusato o sfrattato.
-            if state_prefix:
+            # le domande condividono. Con un livello solo la domanda si rilegge
+            # una volta per opzione; con due, 176 token invece di 496 su quattro
+            # item (misurato). Il punto di ritorno sullo stato serve anche TRA
+            # richieste: la pagina web manda una domanda per richiesta sullo
+            # stesso documento, e senza la fotografia ognuna rifarebbe il
+            # prefill di tutto il documento. Quando la fotografia non puo'
+            # pagare (uno stato visto una volta sola) systemone la spegne.
+            # The fixed prefix is photographed once per slot, not per request:
+            # sending it again would read it again (an identical prompt is not a
+            # strict prefix of itself, so no photo can resume it), which is the
+            # cost the prefix exists to save. If the photo is evicted, the next
+            # question shows it (it reads the prefix fresh) and it is retaken.
+            if fixed_prefix and self.server.pinned_prefixes.get(cache_slot, ("",))[0] != fixed_prefix:
+                n_fixed, _ = score(fixed_prefix, True)
+                prompt_max = max(prompt_max, n_fixed)
+                self.server.pinned_prefixes[cache_slot] = (fixed_prefix, n_fixed)
+            if state_prefix and state_prefix != fixed_prefix and pin_state:
                 n_state, _ = score(state_prefix, True)
                 prompt_max = max(prompt_max, n_state)
 
-            if form == "options":
-                prefix = state_prefix
-                if question:
-                    prefix += f"Question: {question}\n"
-                prefix += "Answer:"
-                scored, entropy, _ = choose(prefix, options, normalize)
-                result = {"object": "brio.choice", "answer": scored[0]["option"],
-                          "entropy": entropy, "normalize": normalize, "choices": scored}
-
-            elif form == "questions":
-                answers = []
-                for text, choices, norm in questions:
-                    prefix = state_prefix + f"Question: {text}\nAnswer:"
-                    scored, entropy, _ = choose(prefix, choices, norm)
-                    answers.append({"question": text, "answer": scored[0]["option"],
-                                    "entropy": entropy, "normalize": norm,
-                                    "choices": scored})
-                result = {"object": "brio.answers", "answers": answers}
-
-            else:
-                # Lo scheletro JSON e' DATO: parentesi, virgolette e nomi dei
-                # campi li scriviamo noi, il modello sceglie solo il valore. Ogni
-                # casella si fotografa con dentro le scelte gia fatte, cosi il
-                # campo dopo vede quelli prima, come nella generazione.
-                head = state_prefix + (f"Task: {task}\n" if task else "")
-                filled, fields = {}, []
-                for field, values in schema:
-                    skeleton = "{" + "".join(
-                        f'"{k}": {json.dumps(v)}, ' for k, v in filled.items())
-                    prefix = head + skeleton + f'"{field}": "'
-                    scored, entropy, _ = choose(prefix, values, normalize)
-                    filled[field] = scored[0]["option"]
-                    fields.append({"field": field, "value": scored[0]["option"],
-                                   "p": scored[0]["p"], "entropy": entropy,
-                                   "choices": scored})
-                result = {"object": "brio.schema", "json": filled, "fields": fields,
-                          "normalize": normalize}
-
-        result.update({
-            "id": "brio-" + uuid.uuid4().hex,
-            "created": int(time.time()),
-            "model": self.server.model_id,
-            "usage": {"prompt_tokens": prompt_max, "completion_tokens": 0,
-                      "read_tokens": read_total,
-                      "total_tokens": prompt_max + read_total},
-        })
+            answers = []
+            for text, choices in questions:
+                prefix = state_prefix + f"Question: {text}\nAnswer:"
+                scored, entropy, _ = choose(prefix, choices, normalize)
+                answers.append({"question": text, "answer": scored[0]["option"],
+                                "entropy": entropy, "choices": scored})
         headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000)),
                    "x-colibri-elapsed-ms": str(round((time.time() - started) * 1000))}
-        if not send:
-            result["_headers"] = headers
-            return result
-        self.send_json(200, result, request_id, headers)
+        return answers, {"prompt_tokens": prompt_max, "read_tokens": read_total}, headers
 
     # ------------------------------------------------------------ Jev-compatible
     #
     # POST /v1/systemone speaks the request and the reply of TypeSafe's Jev
     # API (docs.typesafe.ai/api): a client written for it points at colibri
-    # and changes the base URL, nothing else. The three primitives map onto
-    # the `questions` form of /v1/brio, the same channel: the state is
-    # photographed once and every question pays only its own tokens.
+    # and changes the base URL, nothing else. It is colibri's one decision
+    # API. On a language model the three primitives become closed questions
+    # on the scoring channel above (_score_questions): the state is
+    # photographed once and every question pays only its own tokens. A
+    # decision engine gets the request as it is (DECIDE, _systemone_decide).
     #
     #   noul   -> one yes/no question. `noul` is the probability of yes. The
     #             optional criteria (what true and false mean) go into the
@@ -6464,14 +6585,15 @@ class APIHandler(BaseHTTPRequestHandler):
     #             go into the question text, because a label alone ("billing")
     #             does not say what it means. `confidence` follows their
     #             documented formula, (n * peak - 1) / (n - 1).
-    #   score  -> the levels of `criteria` are the options "1".."n"; `score`
-    #             is the expected value under the distribution, `legend` the
-    #             levels by number, `confidence` as for choice.
+    #   score  -> the levels of `criteria` are the options "1".."n" for the
+    #             model; the reply numbers them from 0 as Jev does. `score` is
+    #             the expected level, `legend` the levels as sent,
+    #             `confidence` as for choice.
     #
     # What differs, stated rather than hidden: `model` echoes the served
     # model, not "jev-latest"; `usage.output_tokens` counts the option tokens
     # READ, since this engine generates nothing; validation errors are 422 as
-    # theirs are, with this server's error envelope. docs/brio.md has the
+    # theirs are, with this server's error envelope. docs/systemone.md has the
     # mapping table.
     _SYSTEMONE_MAX_QUESTIONS = 64
 
@@ -6489,16 +6611,24 @@ class APIHandler(BaseHTTPRequestHandler):
     @staticmethod
     def _systemone_confidence(probabilities):
         """(n * peak - 1) / (n - 1): 1 when all the mass is on one label, 0 when flat."""
-        values = list(probabilities)
+        values = [float(v) for v in probabilities]
         n = len(values)
         if n < 2:
             return 1.0
         return round(max(0.0, (n * max(values) - 1.0) / (n - 1)), 6)
 
+    @staticmethod
+    def _systemone_legend(value, index):
+        """A score level as the reply's `legend` gives it back: the criterion the
+        caller sent (text, object or array), or `level <n>` for one sent as null."""
+        return value if isinstance(value, (str, dict, list)) else f"level {index}"
+
     def systemone(self, body, request_id):
-        state = self._systemone_text(body.get("state"), "state")
-        if state is None:
+        if body.get("state") is None:
             raise APIError(422, "`state` is required: the content the questions are about.", "state")
+        # Text, an object or an array; an empty text is a state with nothing in it,
+        # which the Jev schema allows, and the questions are asked without context.
+        state = self._systemone_text(body.get("state"), "state")
         raw = body.get("questions")
         if not isinstance(raw, dict) or not raw:
             raise APIError(422, "`questions` must be a non-empty object of id: question.", "questions")
@@ -6541,44 +6671,164 @@ class APIHandler(BaseHTTPRequestHandler):
                     labels.append(label)
                     text = self._systemone_text(description, f"{where}.criteria.{label}")
                     lines.append(f"- {label}: {text}" if text else f"- {label}")
-                if len(labels) < 2:
-                    raise APIError(422, f"`{where}.criteria` needs at least two labels.", f"{where}.criteria")
                 text = (instructions or "Which of the following applies?") + "\nOptions:\n" + "\n".join(lines)
                 plan.append((qid, "choice", text + "\nAnswer with one of the options.", labels, None))
             elif kind == "score":
-                if not isinstance(criteria, list) or not 2 <= len(criteria) <= 10:
-                    raise APIError(422, f"`{where}.criteria` must be an array of 2 to 10 level descriptions.",
+                # Jev numbers the levels from zero, in the order given (its OpenAPI
+                # schema: "Each description's position determines its score,
+                # starting at zero"). The model reads them as 1..n, the numbering a
+                # rubric is usually written in, and the reply maps them back.
+                if not isinstance(criteria, list) or not 1 <= len(criteria) <= 255:
+                    raise APIError(422, f"`{where}.criteria` must be an array of 1 to 255 level descriptions.",
                                    f"{where}.criteria")
-                levels = [self._systemone_text(c, f"{where}.criteria[{i}]") or f"level {i + 1}"
+                levels = [self._systemone_text(c, f"{where}.criteria[{i}]") or f"level {i}"
                           for i, c in enumerate(criteria)]
                 text = (instructions or "Rate this on the scale below.") + "\nScale:\n" + \
                     "\n".join(f"{i + 1}: {d}" for i, d in enumerate(levels))
                 plan.append((qid, "score", text + "\nAnswer with the number.",
-                             [str(i + 1) for i in range(len(levels))], levels))
+                             [str(i + 1) for i in range(len(levels))],
+                             [self._systemone_legend(c, i) for i, c in enumerate(criteria)]))
             else:
                 raise APIError(422, f"`{where}.type` must be \"noul\", \"choice\" or \"score\".", f"{where}.type")
-        inner = {"state": state, "_max_options": 255,
-                 "questions": [{"question": text, "options": options} for _, _, text, options, _ in plan]}
-        result = self.brio(inner, request_id, send=False)
+        options = self._systemone_options(body)
+        if engine_decides(self.server.engine):
+            if options["prefix"]:
+                raise APIError(422, "`prefix` is a language-model option (a fixed text photographed "
+                                    "before a changing state); a decision engine reads the whole "
+                                    "request in one pass: put that text in `state` or `instructions`.",
+                               "prefix")
+            self._systemone_decide(body, plan, request_id, options["cache_slot"])
+            return
+        # A question with one option has its answer already: nothing to score.
+        asked = [entry for entry in plan if len(entry[3]) > 1]
+        scored, usage, headers = [], {"prompt_tokens": 0, "read_tokens": 0}, None
+        if asked:
+            # Photograph the state when it can pay: within this request (two or
+            # more questions read it), or because it came back from an earlier
+            # one. A state that changes on every call (a game, a feed) is read
+            # straight through instead. `pin_state` says it explicitly.
+            pin_state = options["pin_state"]
+            seen = self.server.state_seen(state or "")
+            if pin_state is None:
+                pin_state = len(asked) > 1 or seen
+            scored, usage, headers = self._score_questions(
+                state or "", [(text, choices) for _, _, text, choices, _ in asked],
+                normalize=options["normalize"], pin_state=pin_state,
+                fixed=options["prefix"], cache_slot=options["cache_slot"])
+        scored = iter(scored)
         answers = {}
-        for (qid, kind, _, options, levels), got in zip(plan, result["answers"]):
-            p = {c["option"]: c["p"] for c in got["choices"]}
+        for qid, kind, _, choices, levels in plan:
+            if len(choices) > 1:
+                got = next(scored)
+                p = {c["option"]: c["p"] for c in got["choices"]}
+            else:
+                p = {choices[0]: 1.0}
             if kind == "noul":
-                answers[qid] = {"type": "noul", "noul": round(p.get("yes", 0.0), 6)}
+                answers[qid] = {"type": "noul", "noul": round(float(p.get("yes", 0.0)), 6)}
             elif kind == "choice":
-                answers[qid] = {"type": "choice", "choice": got["answer"],
-                                "probabilities": {o: round(p[o], 6) for o in options},
+                answers[qid] = {"type": "choice", "choice": max(choices, key=lambda o: p[o]),
+                                "probabilities": {o: round(float(p[o]), 6) for o in choices},
                                 "confidence": self._systemone_confidence(p.values())}
             else:
+                values = [float(p[o]) for o in choices]
                 answers[qid] = {"type": "score",
-                                "score": round(sum(int(k) * v for k, v in p.items()), 6),
-                                "legend": {str(i + 1): d for i, d in enumerate(levels)},
-                                "probabilities": {o: round(p[o], 6) for o in options},
-                                "confidence": self._systemone_confidence(p.values())}
-        reply = {"model": self.server.model_id, "answers": answers,
-                 "usage": {"input_tokens": result["usage"]["prompt_tokens"],
-                           "output_tokens": result["usage"]["read_tokens"]}}
-        self.send_json(200, reply, request_id, result.get("_headers"))
+                                "score": round(sum(i * v for i, v in enumerate(values)), 6),
+                                "legend": {str(i): legend for i, legend in enumerate(levels)},
+                                "probabilities": {str(i): round(v, 6) for i, v in enumerate(values)},
+                                "confidence": self._systemone_confidence(values)}
+        self.send_json(200, self._systemone_reply(answers, request_id, usage["prompt_tokens"],
+                                                  usage["read_tokens"]),
+                       request_id, headers)
+
+    def _systemone_options(self, body):
+        """colibri's optional fields on /v1/systemone, none of which a Jev client
+        sends (docs/systemone.md lists them):
+
+          normalize   "sum" (default) or "mean": how a language model's option
+                      log-probabilities become one score per option
+          pin_state   true / false: photograph the state for the next request;
+                      omitted, the server decides (see systemone)
+          prefix      a fixed text read before the state and always photographed
+          cache_slot  the KV slot, as on the chat endpoints
+
+        On a decision engine normalize and pin_state have nothing to act on and
+        are ignored; prefix is refused."""
+        normalize = body.get("normalize", "sum")
+        if normalize not in ("sum", "mean"):
+            raise APIError(422, "`normalize` must be \"sum\" or \"mean\".", "normalize")
+        pin_state = body.get("pin_state")
+        if pin_state is not None and not isinstance(pin_state, bool):
+            raise APIError(422, "`pin_state` must be true or false.", "pin_state")
+        prefix = body.get("prefix")
+        if prefix is not None and (not isinstance(prefix, str) or not prefix.strip()):
+            raise APIError(422, "`prefix` must be a non-empty string.", "prefix")
+        cache_slot = body.get("cache_slot")
+        if cache_slot is not None and (isinstance(cache_slot, bool) or not isinstance(cache_slot, int)
+                                       or not 0 <= cache_slot < self.server.kv_slots):
+            raise APIError(422, f"`cache_slot` must be an integer from 0 to {self.server.kv_slots - 1}.",
+                           "cache_slot")
+        return {"normalize": normalize, "pin_state": pin_state, "prefix": prefix,
+                "cache_slot": cache_slot}
+
+    def _systemone_reply(self, answers, request_id, input_tokens, output_tokens):
+        """The reply both paths send, in the Jev shape: `model` is the served
+        model, `provider` says who answered, and `usage.cost` is what this server
+        charges, nothing."""
+        return {"id": request_id, "model": self.server.model_id, "provider": "colibri",
+                "answers": answers,
+                "usage": {"input_tokens": int(input_tokens), "output_tokens": int(output_tokens),
+                          "cost": 0}}
+
+    def _systemone_decide(self, body, plan, request_id, cache_slot=None):
+        """The native path: the request as one DECIDE record, the engine's
+        probabilities back, shaped exactly like the LLM path's reply. No prompt is
+        rendered and no option is scored on its own: one round trip, one forward."""
+        record = systemone_decision_record(body)
+        if cache_slot is None:
+            cache_slot = conversation_cache_slot([{"role": "system", "content": record["state"]}],
+                                                 self.server.kv_slots)
+        started = time.time()
+        with self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission:
+            queue_wait, cache_slot = admission
+            call = time.monotonic()
+            try:
+                decision, _stats = self.server.engine.decide(record, cache_slot,
+                                                             self.client_disconnected)
+            finally:
+                self.server.scheduler.observe_timing("engine_call_seconds", time.monotonic() - call)
+        got = decision.get("answers") if isinstance(decision, dict) else None
+        if not isinstance(got, list) or len(got) != len(plan):
+            raise APIError(502, "The decision engine answered a different number of questions.",
+                           None, "engine_error", "server_error")
+        answers = {}
+        for (qid, kind, _, _, levels), question, answer in zip(plan, record["questions"], got):
+            probs = answer.get("probs") if isinstance(answer, dict) else None
+            n = len(question["options"])
+            if (answer.get("id") != qid or not isinstance(probs, list) or len(probs) != n or
+                    not all(isinstance(p, (int, float)) and math.isfinite(p) for p in probs)):
+                raise APIError(502, f"The decision engine sent no usable probabilities for `{qid}`.",
+                               None, "engine_error", "server_error")
+            best = max(range(n), key=lambda i: (probs[i], -i))
+            if kind == "noul":
+                answers[qid] = {"type": "noul", "noul": round(float(probs[1]), 6)}
+            elif kind == "choice":
+                labels = [option["label"] for option in question["options"]]
+                answers[qid] = {"type": "choice", "choice": labels[best],
+                                "probabilities": {label: round(float(p), 6) for label, p in zip(labels, probs)},
+                                "confidence": self._systemone_confidence(probs)}
+            else:
+                answers[qid] = {"type": "score",
+                                "score": round(sum(i * float(p) for i, p in enumerate(probs)), 6),
+                                "legend": {str(i): legend for i, legend in enumerate(levels)},
+                                "probabilities": {str(i): round(float(p), 6) for i, p in enumerate(probs)},
+                                "confidence": self._systemone_confidence(probs)}
+        reply = self._systemone_reply(answers, request_id, decision.get("input_tokens") or 0, 0)
+        headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000)),
+                   "x-colibri-elapsed-ms": str(round((time.time() - started) * 1000))}
+        engine_ms = decision.get("engine_ms")
+        if isinstance(engine_ms, (int, float)) and math.isfinite(engine_ms):
+            headers["x-colibri-engine-ms"] = str(round(engine_ms, 1))
+        self.send_json(200, reply, request_id, headers)
 
     # ------------------------------------------------------------- images
     #
@@ -6589,6 +6839,10 @@ class APIHandler(BaseHTTPRequestHandler):
     def image_generation(self, body, request_id):
         engine = self.server.engine
         if not is_image_engine(engine):
+            if not engine_chats(engine):
+                raise APIError(400, f"`{self.server.model_id}` does not generate images: it is a "
+                                    "decision model (POST /v1/systemone).",
+                               "model", "unsupported_endpoint")
             raise APIError(400, f"`{self.server.model_id}` does not generate images: it is a "
                                 "chat model (POST /v1/chat/completions).",
                            "model", "unsupported_endpoint")
@@ -6769,8 +7023,21 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_json(error.status, self.error_body(error), request_id, error.headers)
 
     def error_body(self, error):
-        """Anthropic clients parse a different error envelope; the OpenAI one is unchanged."""
-        if urlsplit(self.path).path != "/v1/messages":
+        """Anthropic clients parse a different error envelope; the OpenAI one is unchanged.
+        A /v1/systemone validation error also carries Jev's `detail` list (FastAPI's
+        form: loc, msg, type), which a client written for Jev may read."""
+        path = urlsplit(self.path).path
+        if path == "/v1/systemone" and error.status == 422:
+            body = error_object(error)
+            loc = ["body"]
+            for part in re.split(r"\.(?![^\[]*\])", error.param or ""):
+                match = re.fullmatch(r"(.*?)((?:\[\d+\])*)", part)
+                if match.group(1):
+                    loc.append(match.group(1))
+                loc.extend(int(i) for i in re.findall(r"\[(\d+)\]", match.group(2)))
+            body["detail"] = [{"loc": loc, "msg": error.message, "type": "value_error"}]
+            return body
+        if path != "/v1/messages":
             return error_object(error)
         return {"type": "error", "error": {"type": error.error_type, "message": error.message}}
 
@@ -7625,7 +7892,7 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
     if allowed_hosts and "*" in allowed_hosts:
         print("WARNING: --allowed-host '*' accepts ANY Host header "
               "(DNS-rebinding guard disabled)", file=sys.stderr)
-    origins = DEFAULT_CORS_ORIGINS if cors_origins is None else tuple(cors_origins)
+    origins = cors_origin_list(cors_origins)
     # Bind before starting the 744B engine. A stale/occupied port must fail in
     # milliseconds rather than loading hundreds of GB and leaking a child.
     server = APIServer((host, port), None, model_id, api_key, max_tokens, origins,
@@ -7706,7 +7973,8 @@ def main():
     parser.add_argument("--model-id", default=os.environ.get("COLI_MODEL_ID"))
     parser.add_argument("--api-key", default=os.environ.get("COLI_API_KEY"))
     parser.add_argument("--cors-origin", action="append", default=None,
-                        help="allowed browser origin; repeat as needed (use '*' for any origin)")
+                        help="allowed browser origin; repeat as needed (use '*' for any origin). "
+                             "Plain values replace the default list; +ORIGIN adds to it")
     # Absent = not explicitly set: mirrors coli's --cap (see cap_for_arch and issue
     # #379 -- glm arch resolves platform-aware, non-glm gets the legacy 8). An
     # explicit value, 0 included, reaches the engine verbatim.

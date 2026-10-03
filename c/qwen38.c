@@ -1680,7 +1680,7 @@ static void serve_hits(Model *m){
 /* The generation budget a request gets. max_tokens is a CEILING, not a
  * target (#260/#382, the rule GLM and DeepSeek V4 already apply): the prompt
  * must fit with room for one token (none for a read-only logprobs request,
- * docs/brio.md), and the budget is then clamped to what the context can hold.
+ * docs/systemone.md), and the budget is then clamped to what the context can hold.
  * Returns the budget, or -1 when the PROMPT does not fit. Refusing when
  * prompt + budget exceeded the context (#1641) turned the gateway's default
  * output budget -- 8192 here, the whole default context -- into a 400 on
