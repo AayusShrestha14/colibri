@@ -65,6 +65,7 @@ shader_formats() {
   ./tests/test_vk_tier shaders/qmatmul.spv | tee vk_tier.log
   tail -1 vk_tier.log | grep -qx PASS || fail "routed-expert tier"
   ./tests/test_glm53_vk_f32
+  COLI_VK_GEMM_MIN_S=0 ./tests/test_glm53_vk_f32
 }
 
 # tier_count <engine> <log>: N from the last "[VK] tier <engine> run: device N of M" line;
@@ -1837,9 +1838,15 @@ family_glm_chain() {
   CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=4 COLI_VK_CHAIN_ROWS=3
   CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=32 KV_SLOTS=2
   COLI_VK_CHAIN=2 CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=32
-  # a pin restored over rows another branch rewrote: the KDA state goes up from the pin,
-  # the MLA rows' watermark comes down
-  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_USAGE=$PWD/chain.usage $PY tests/glm53_pin_branch_harness.py --binary ./glm53 --fixture glm53_mm_tiny
+  # A pin restored over rows another branch rewrote: the KDA state goes up from the
+  # pin, the MLA rows' watermark comes down. This check compares printed logprobs
+  # exactly, so keep the per-row GEMV for every prompt length (as for MiMo's exact
+  # prefix check). A cold prompt and a short resumed tail can otherwise straddle
+  # the GEMM threshold, including at the now-device-resident f32 lm_head, and differ
+  # in the last printed digit from reduction order alone. The gates above exercise
+  # the default GEMM/GEMV policy against CPU tokens and the numerical tolerance.
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_GEMM_MIN_S=0 COLI_USAGE=$PWD/chain.usage \
+    $PY tests/glm53_pin_branch_harness.py --binary ./glm53 --fixture glm53_mm_tiny
   unset OMP_NUM_THREADS CAP_RAISE
 }
 

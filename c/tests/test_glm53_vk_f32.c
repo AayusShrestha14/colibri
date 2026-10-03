@@ -40,6 +40,23 @@ int main(void) {
             }
         }
     }
+    /* Exact prefix/pin checks fix the kernel to GEMV: a cold prompt and its
+     * resumed suffix must then have identical arithmetic at every batch size.
+     * Default GEMM/GEMV selection is checked numerically above instead. */
+    const char *gemm_min = getenv("COLI_VK_GEMM_MIN_S");
+    if (gemm_min && !strcmp(gemm_min, "0")) {
+        float single[S * O];
+        for (int t = 0; t < S; t++) mv(single + t * O, &w, x + t * I);
+        if (memcmp(single, gpu, sizeof(single))) {
+            fputs("FAIL: f32 GEMV rows differ between a full batch and individual rows\n", stderr);
+            failed = 1;
+        }
+        mm(gpu, &w, x + (S - 5) * I, 5);
+        if (memcmp(single + (S - 5) * O, gpu, 5 * O * sizeof(float))) {
+            fputs("FAIL: f32 GEMV resumed suffix differs from the full batch\n", stderr);
+            failed = 1;
+        }
+    }
     /* Nonresident weights still belong to the CPU and take no dense budget. */
     w.resident = 0;
     unsigned long long before = coli_vk_matmul_calls();
