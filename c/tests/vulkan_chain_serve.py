@@ -13,7 +13,13 @@ does, prints logprobs whose rounding is larger in absolute terms).
 
 usage: vulkan_chain_serve.py <engine> <snapshot> [KEY=VALUE ...]   (extra environment)
 COLI_VK_CHAIN in the caller's environment picks the chain's mode (default 1; 2 runs
-prompts on the device and decode on the CPU, the state moving between them)
+prompts on the device and decode on the CPU, the state moving between them).
+CHAIN_SERVE_DIALECT picks the SUBMIT header: unset, ids r0, r1, ... and the options
+straight after top_p (what the qwen engines have always been sent); "numeric", ids 1,
+2, ... (glm53); "colibri", numeric ids and the grammar-bytes field (0) before the
+options (colibri's multiplexed serve). CHAIN_SERVE_SLOTS=n sends request i to KV slot
+i % n (the engine needs KV_SLOTS=n): the turns move between sessions, and with them
+whatever state the chain keeps on the device.
 """
 import os
 import subprocess
@@ -48,7 +54,11 @@ def session(engine, snap, extra, chain):
              (base + b"QRSk", 4, "")]
     out = []
     for i, (prompt, max_tok, ext) in enumerate(turns):
-        hdr = f"SUBMIT r{i} 0 {len(prompt)} {max_tok} 0 1" + (f" {ext}" if ext else "") + "\n"
+        dialect = os.environ.get("CHAIN_SERVE_DIALECT", "")
+        rid = f"{i + 1}" if dialect in ("numeric", "colibri") else f"r{i}"
+        slot = i % int(os.environ.get("CHAIN_SERVE_SLOTS", "1"))
+        hdr = (f"SUBMIT {rid} {slot} {len(prompt)} {max_tok} 0 1" + (" 0" if dialect == "colibri" else "") +
+               (f" {ext}" if ext else "") + "\n")
         p.stdin.write(hdr.encode() + prompt + b"\n")
         p.stdin.flush()
         while True:
