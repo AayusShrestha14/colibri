@@ -330,6 +330,10 @@ static int glmc_forward(Model *m, float *xh, int S, int pos_base) {
         return 0;
     }
     vkc_gemm_rows(-1);
+    /* the final rows wait here until every chunk is through: a lost device leaves xh the
+     * forward's input, for the CPU to run again */
+    float *outs = malloc((size_t)S * D * sizeof(float));
+    if (!outs) return 0;
     float *inv = R ? malloc((size_t)(R / 2) * sizeof(float)) : NULL;
     for (int j = 0; j < R / 2; j++) inv[j] = powf(c->theta, -2.0f * j / R);   /* rope_interleave's frequencies */
     for (int c0 = 0; c0 < S; c0 += rows) {
@@ -378,14 +382,15 @@ static int glmc_forward(Model *m, float *xh, int S, int pos_base) {
         ok = ok && vkc_copy(ch->xd, 0, ch->x, 0, (size_t)n * D) && vkc_submit(1);
         if (!ok) goto lost;
         glmc_pull_kv(ch, m, pulled, L, pb, n);
-        memcpy(xh + (size_t)c0 * D, vkc_ptr(ch->xd), (size_t)n * D * sizeof(float));
+        memcpy(outs + (size_t)c0 * D, vkc_ptr(ch->xd), (size_t)n * D * sizeof(float));
         for (int i = 0; i < L; i++) ch->kv_valid[i] = pb + n;
     }
-    free(inv);
+    memcpy(xh, outs, (size_t)S * D * sizeof(float));
+    free(inv); free(outs);
     ch->forwards++;
     return 1;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
-    free(inv);
+    free(inv); free(outs);
     if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost(); }
     g_vk_chain = 0; ch->failed = 1;
     fprintf(stderr, "[VK] colibri chain: the device was lost; the CPU runs this forward again and from here on "
