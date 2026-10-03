@@ -102,8 +102,12 @@ typedef struct {
  * meccanismo che fa stare GLM-5.2 nei 15 GB. dequant-on-use nel matmul. */
 /* pinned=1 means this slot is strongly preferred to keep (hot expert); it will
  * not be evicted during normal LRU eviction, but may be displaced under extreme
- * cache pressure when all slots are pinned or in-flight. */
-typedef struct { int eid; int pinned; int8_t *g, *u, *d; float *gs, *us, *ds; uint64_t used; } Slot;
+ * cache pressure when all slots are pinned or in-flight.
+ * busy counts the computations reading the slot, from expert_get to expert_put
+ * (under g_pilot_mx): neither eviction takes a busy slot. Without it the PILOT
+ * worker could pick the slot the forward pass was multiplying with as its LRU
+ * victim and read another expert into it mid-matmul (at cap 1 the only slot). */
+typedef struct { int eid; int pinned; int busy; int8_t *g, *u, *d; float *gs, *us, *ds; uint64_t used; } Slot;
 typedef struct {
     Slot *slots;
     int *slot_by_expert;                  /* expert id -> resident slot, -1 if absent */
@@ -874,7 +878,7 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
         hit = slot_indexed(m, layer, eid);
     }
     if (hit) {
-        m->hits++; hit->used = ++m->clock; *out = hit;
+        m->hits++; hit->used = ++m->clock; hit->busy++; *out = hit;
         if (m->last_access) m->last_access[layer * m->c.n_experts + eid] = m->clock;
         pthread_mutex_unlock(&g_pilot_mx);
         return;
@@ -886,17 +890,17 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
         s = &lc->slots[lc->n++];
         slot_ensure_allocated(m, s);
     } else {
-        /* LRU eviction — skip pinned and in-flight (eid==-1) slots */
+        /* LRU eviction — skip pinned, in-flight (eid==-1) and busy slots */
         int lru = -1;
         for (int i = 0; i < lc->n; i++) {
-            if (lc->slots[i].pinned || lc->slots[i].eid < 0) continue;
+            if (lc->slots[i].pinned || lc->slots[i].eid < 0 || lc->slots[i].busy) continue;
             if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
         }
         if (lru < 0) {
-            /* All slots are pinned or in-flight; find oldest non-in-flight slot
-             * (may be pinned, but never select one currently being loaded). */
+            /* All slots are pinned, in-flight or busy; find oldest non-in-flight slot
+             * (may be pinned, but never select one currently being loaded or read). */
             for (int i = 0; i < lc->n; i++) {
-                if (lc->slots[i].eid < 0) continue; /* never evict in-flight */
+                if (lc->slots[i].eid < 0 || lc->slots[i].busy) continue; /* never evict in-flight */
                 if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
             }
         }
@@ -912,7 +916,7 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
             sleep_ms(1);
             pthread_mutex_lock(&g_pilot_mx);
             for (int i = 0; i < lc->n; i++) {
-                if (lc->slots[i].eid < 0) continue;
+                if (lc->slots[i].eid < 0 || lc->slots[i].busy) continue;
                 if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
             }
         }
@@ -929,9 +933,16 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     cache_publish(m, layer, s, eid);
     s->pinned = m->is_pinned[layer * c->n_experts + eid];
     s->used = ++m->clock;
+    s->busy++;
     if (m->last_access) m->last_access[layer * c->n_experts + eid] = m->clock;
     *out = s;
     pthread_cond_broadcast(&g_pilot_cv);
+    pthread_mutex_unlock(&g_pilot_mx);
+}
+/* The computation that expert_get handed the slot to is done reading it. */
+static void expert_put(Slot *s) {
+    pthread_mutex_lock(&g_pilot_mx);
+    s->busy--;
     pthread_mutex_unlock(&g_pilot_mx);
 }
 
@@ -1172,6 +1183,7 @@ static void moe_vk_cpu(Model *m, int layer, const float *x, int n, const int *ib
         moe_expert_row(m, e, x + (int64_t)(i / K) * D, g, u, ctb + (int64_t)i * D);
         pthread_mutex_lock(&g_pilot_mx);
         if (e->eid == ib[i]) { VktExpertSrc vs = olmoe_vk_src(e); vkt_note(layer, ib[i], &vs); }
+        e->busy--;   /* expert_put, under the lock already held */
         pthread_mutex_unlock(&g_pilot_mx);
     }
 }
@@ -1235,6 +1247,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         for (int kk = 0; kk < K; kk++) {
             Slot *e; expert_get(m, layer, idx[kk], &e);
             moe_expert_row(m, e, xs, g, u, hh);
+            expert_put(e);
             float w = val[kk];
             float *os = out + (int64_t)s*D;
             for (int d = 0; d < D; d++) os[d] += w * hh[d];
@@ -1386,16 +1399,16 @@ static void pilot_realload(Model *m, int layer, int eid) {
         s = &lc->slots[lc->n++];
         slot_ensure_allocated(m, s);
     } else {
-        /* LRU eviction — skip pinned and in-flight (eid==-1) slots */
+        /* LRU eviction — skip pinned, in-flight (eid==-1) and busy slots */
         int lru = -1;
         for (int i = 0; i < lc->n; i++) {
-            if (lc->slots[i].pinned || lc->slots[i].eid < 0) continue;
+            if (lc->slots[i].pinned || lc->slots[i].eid < 0 || lc->slots[i].busy) continue;
             if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
         }
         if (lru < 0) {
             m->is_queued[layer * c->n_experts + eid] = 0;
             pthread_mutex_unlock(&g_pilot_mx);
-            return; /* all pinned/in-flight, skip */
+            return; /* all pinned/in-flight/busy, skip */
         }
 
         /* LFRU eviction guard: don't displace a warm resident expert with a speculation */
