@@ -832,6 +832,9 @@ typedef struct {
     float *vis_rows; int vis_rows_n;
     int *vis_map, vis_map_len;
     int *mpos, mpos_len, rope_delta;
+#ifdef COLI_VULKAN
+    void *vkchain;             /* the dense chain's device state (qwen36_chain.h), NULL until it runs */
+#endif
 } Model;
 
 static pthread_mutex_t g_pilot_mx = PTHREAD_MUTEX_INITIALIZER;
@@ -1339,29 +1342,42 @@ static void vk_q4_planar_to_fmt4(const QW *w, uint8_t *dst) {
     }
 }
 static unsigned g_vk_placed[3];   /* uploads by format: int8 rows, int4, f32 */
+/* w's device copy, uploaded on the first call (the int4 copy repacked); NULL when it
+ * cannot be (vk_off then keeps the matrix on the CPU). The dense chain reads the same
+ * tensor, so the per-matrix path and the chain never hold a matrix twice. */
+static ColiVkTensor *vk_qw_tensor(const QW *w) {
+    if (w->vk_off) return NULL;
+    QW *mw = (QW *)w;   /* vk is a cache in a matrix the forward pass treats as read-only */
+    ColiVkTensor **t = (ColiVkTensor **)&mw->vk;
+    if (*t) return *t;
+    int I = w->I, O = w->O;
+    int fmt = w->q4 ? 4 : w->q ? 1 : 10, gs = w->q4 ? 64 : 0;
+    const void *wq = w->q4 ? (const void *)w->q4 : w->q ? (const void *)w->q : (const void *)w->w;
+    const float *sc = w->q4 ? w->sg : w->q ? w->sc : NULL;   /* fmt 10: no scales */
+    if (!wq) return NULL;
+    int ok;
+    if (w->q4) {
+        uint8_t *packed = malloc((size_t)O * (I / 2));
+        if (packed) vk_q4_planar_to_fmt4(w, packed);
+        ok = packed && coli_vk_tensor_ensure(t, packed, sc, fmt, I, O, gs);
+        free(packed);
+    } else ok = coli_vk_tensor_ensure(t, wq, sc, fmt, I, O, gs);
+    if (!ok) { mw->vk_off = 1; return NULL; }
+    g_vk_placed[fmt == 1 ? 0 : fmt == 4 ? 1 : 2]++;
+    return *t;
+}
 static int vk_dense_matmul(float *y, const float *x, const QW *w, int S, int I, int O) {
 #ifdef _OPENMP
     if (omp_in_parallel()) return 0;
 #endif
     if (w->vk_off || w->I != I || w->O != O || S < 1 || S > 65535) return 0;
-    QW *mw = (QW *)w;   /* vk is a cache in a matrix the forward pass treats as read-only */
-    ColiVkTensor **t = (ColiVkTensor **)&mw->vk;
     int fmt = w->q4 ? 4 : w->q ? 1 : 10, gs = w->q4 ? 64 : 0;
     const void *wq = w->q4 ? (const void *)w->q4 : w->q ? (const void *)w->q : (const void *)w->w;
     const float *sc = w->q4 ? w->sg : w->q ? w->sc : NULL;   /* fmt 10: no scales */
     if (!wq) return 0;
-    if (!*t) {
-        int ok;
-        if (w->q4) {
-            uint8_t *packed = malloc((size_t)O * (I / 2));
-            if (packed) vk_q4_planar_to_fmt4(w, packed);
-            ok = packed && coli_vk_tensor_ensure(t, packed, sc, fmt, I, O, gs);
-            free(packed);
-        } else ok = coli_vk_tensor_ensure(t, wq, sc, fmt, I, O, gs);
-        if (!ok) { mw->vk_off = 1; return 0; }
-        g_vk_placed[fmt == 1 ? 0 : fmt == 4 ? 1 : 2]++;
-    }
-    return coli_vk_matmul(t, y, x, wq, sc, fmt, S, I, O, gs);
+    ColiVkTensor *t = vk_qw_tensor(w);
+    if (!t) return 0;
+    return coli_vk_matmul(&t, y, x, wq, sc, fmt, S, I, O, gs);
 }
 /* One line at the end of a run or a serve turn: how many matmuls the device
  * really answered, so a test can tell a used path from an initialised one. */
@@ -2919,8 +2935,8 @@ static void moe_vk_i8_cpu(Model *m, int layer, const float *x, int S, const int 
     }
 }
 static void moe_vk_run(Model *m, Layer *l, int layer, const float *x, int S, float *out,
-                       const int *idx, const float *val) {
-    Cfg *c = &m->c; int D = c->hidden, K = c->topk, I = c->inter, SI = c->shared_inter;
+                       const int *idx, const float *val, int routed_only) {
+    Cfg *c = &m->c; int D = c->hidden, K = c->topk, I = c->inter, SI = routed_only ? 0 : c->shared_inter;
     int xf = xf_mode(m), B = S < QWEN_VK_ROWS ? S : QWEN_VK_ROWS;
     float *ctb = falloc((int64_t)B * K * D), *shb = SI > 0 ? falloc((int64_t)B * D) : NULL;
     float *g = falloc(I > SI ? I : SI), *u = falloc(I > SI ? I : SI), *hh = falloc(D);
@@ -2956,10 +2972,17 @@ static void moe_vk_run(Model *m, Layer *l, int layer, const float *x, int S, flo
     free(ctb); free(shb); free(g); free(u); free(hh); free(taken); free(want); free(dev);
 }
 
-static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
+/* moe_ex: logits_in (the router's raw rows, S x E) when the caller already has them,
+ * else NULL and the router runs here; routed_only = 1 leaves the shared expert out,
+ * so `out` gets the routed experts' rank-order sum alone (the Vulkan dense chain runs
+ * the router and the shared expert on the device and adds them there). moe() is
+ * moe_ex(..., NULL, 0): the same operations in the same order as before. */
+static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
+                   const float *logits_in, int routed_only) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
     if (E == 0) {
         memset(out, 0, (int64_t)S*D*sizeof(float));
+        if (routed_only) return;
         float *g = falloc(c->shared_inter), *u = falloc(c->shared_inter), *hh = falloc(D);
         qwen_shared_experts_cpu(m, l, x, S, out, g, u, hh);
         free(g); free(u); free(hh);
@@ -2968,7 +2991,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     }
     float *logits = falloc((int64_t)S*E);
     double _tr = tm_now();
-    matmul_d(logits, x, &l->gate, S, D, E);
+    if (logits_in) memcpy(logits, logits_in, (size_t)S*E*sizeof(float));
+    else matmul_d(logits, x, &l->gate, S, D, E);
     tm_add(S, 4, tm_now()-_tr);
     if (c->has_bias && l->gate_bias) {
         for (int s = 0; s < S; s++) { float *pr = logits + (int64_t)s*E; for (int e = 0; e < E; e++) pr[e] += l->gate_bias[e]; }
@@ -3152,13 +3176,16 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         }
     }
     if (use_xf) { moe_xf_run(m, layer, x, S, out, xidx, xval); free(xidx); free(xval); }
-    if (use_vk) { moe_vk_run(m, l, layer, x, S, out, xidx, xval); free(xidx); free(xval); }
+    if (use_vk) { moe_vk_run(m, l, layer, x, S, out, xidx, xval, routed_only); free(xidx); free(xval); }
     /* The CUDA tier keeps its per-token shared block above because it overlaps
      * resident GPU experts, and the Vulkan tier computes it inside moe_vk_run while
      * its batch runs.  CPU prefill instead traverses each shared matrix once per
      * bounded chunk. */
-    if (!use_qt && !use_vk) qwen_shared_experts_cpu(m,l,x,S,out,sh,shu,shd);
+    if (!use_qt && !use_vk && !routed_only) qwen_shared_experts_cpu(m,l,x,S,out,sh,shu,shd);
     free(logits); free(g); free(u); free(hh); free(sh); free(shu); free(shd);
+}
+static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
+    moe_ex(m, l, layer, x, S, out, NULL, 0);
 }
 
 /* Gated DeltaNet (linear_attention) forward — recurrent gated-delta-rule.
@@ -3547,6 +3574,10 @@ static const char *g_echo_id = NULL;
 static void serve_echo(const char *id, int pos, int token, const float *lo, int V, int k);
 #endif
 
+#ifdef COLI_VULKAN
+#include "qwen36_chain.h"  /* COLI_VK_CHAIN: every layer's dense chain on the device */
+#endif
+
 static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
     if (m->resident_mode && m->first_step) m->resident_collecting = 1;
@@ -3576,6 +3607,23 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         else
             memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
     }
+#ifdef COLI_VULKAN
+    /* COLI_VK_CHAIN: the layers, the final norm and lm_head on the device; x comes
+     * back only when the prefill read-out below needs every row */
+    float *chain_logit = NULL;
+    if (g_vk_chain) {
+        int echo = 0;
+#ifndef QWEN36_NO_MAIN
+        echo = g_echo_k > 0 && g_echo_id && S > 1;
+#endif
+        chain_logit = falloc(c->vocab);
+        if (!q36c_forward(m, x, S, pos_base, lf, echo, chain_logit)) {
+            free(chain_logit); chain_logit = NULL;
+            q36c_cpu_step(m, pos_base);
+        }
+    }
+    if (!chain_logit)
+#endif
     layers_forward_range(m, x, S, pos_base, 0, c->n_layers, 1, lf);
     /* Recorded HERE, where the tokens actually entered the state, rather than
      * derived from the caller's bookkeeping: the invariant that fed[0..len-1]
@@ -3610,9 +3658,19 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     }
 #endif
     float *last = falloc(D);
+    float *logit;
+#ifdef COLI_VULKAN
+    if (chain_logit) logit = chain_logit;   /* the chain ran the final norm and lm_head */
+    else
+#endif
+    {
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
-    float *logit = falloc(c->vocab);
+    logit = falloc(c->vocab);
+    }
     double _th = tm_now();
+#ifdef COLI_VULKAN
+    if (!chain_logit)
+#endif
     if (!qt_lmhead_matmul(logit, last, D, c->vocab))
         matmul_d(logit, last, &m->lm_head, 1, D, c->vocab);
     if (tm_on()) { tm_add(S, 5, tm_now()-_th); if (S==1) g_tm_dec_tokens++; else g_tm_pre_tokens += S; }
@@ -3759,6 +3817,9 @@ static void pin_drop(void){
 
 static Q36PinState *q36_pin_state_save(Model *m, Q36PinState *reuse){
     Cfg *c = &m->c;
+#ifdef COLI_VULKAN
+    q36c_sync_host(m);   /* the dense chain keeps the newest state on the device */
+#endif
     size_t nr = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim;
     size_t nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
     Q36PinState *st = reuse;
@@ -3819,6 +3880,9 @@ static int pin_restore(Model *m, const int *ids, int n){
                 if (m->DN_rec[i]  && st->rec[i])  memcpy(m->DN_rec[i],  st->rec[i],  nr * sizeof(float));
                 if (m->DN_conv[i] && st->conv[i]) memcpy(m->DN_conv[i], st->conv[i], nc * sizeof(float));
             }
+#ifdef COLI_VULKAN
+            q36c_host_wrote(m, 0);   /* the device's copy goes up again before the next chain step */
+#endif
             m->kv_len = k->len;
             kv_prefix_clear(&m->kvp);
             kv_prefix_record(&m->kvp, k->ids, 0, k->len);
@@ -3843,6 +3907,9 @@ static void reset_recurrent(Model *m){
         if (m->DN_rec[i])  memset(m->DN_rec[i],  0, (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim * sizeof(float));
         if (m->DN_conv[i]) memset(m->DN_conv[i], 0, (size_t)c->dn_conv_dim * (c->dn_convk - 1) * sizeof(float));
     }
+#ifdef COLI_VULKAN
+    q36c_host_wrote(m, 1);   /* zeros: the dense chain fills its copy with zeros */
+#endif
 }
 
 /* Allocate (once) or reuse the KV cache across requests. Grows only when a
@@ -4395,6 +4462,7 @@ static void serve_one(Model *m, ServeReq *q){
     fflush(stdout);
 #ifdef COLI_VULKAN
     vk_report();   /* stderr: the wire protocol on stdout is untouched */
+    q36c_report(m);
     vk_tier_turn(m, "turn");
 #endif
 }
@@ -4511,7 +4579,7 @@ static size_t vk_qw_bytes(const QW *w) {
          : w->w  ? (size_t)w->O * w->I * sizeof(float) : 0;
 }
 static size_t vk_dense_bytes(Model *m) {
-    if (!g_vk_dense) return 0;
+    if (!g_vk_dense && !g_vk_chain) return 0;
     size_t b = vk_qw_bytes(&m->lm_head);
     for (int i = 0; i < m->c.n_layers; i++) {
         Layer *L = &m->L[i];
@@ -4563,9 +4631,9 @@ static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int
     else snprintf(g_vk_usage, sizeof g_vk_usage, "%s/.coli_usage", snap);
     int64_t h = rt_load(g_vk_usage);
     if (h > 0) fprintf(stderr, "[USAGE] expert history: %lld selections (%s)\n", (long long)h, g_vk_usage);
+    atexit(coli_vk_shutdown);   /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
     if (!vkt_init(&vc, rt_counts_all())) { rt_destroy(); return; }
     m->vk_hist = 1;
-    atexit(coli_vk_shutdown);   /* runs after the tier's teardown: the device goes before the drivers unload */
     atexit(vkt_shutdown);
     int all = c->n_layers * c->n_experts;
     int *pl = malloc((size_t)all * sizeof(int)), *pe = malloc((size_t)all * sizeof(int));
@@ -4694,6 +4762,12 @@ int main(int argc, char **argv) {
      * No device (or COLI_VULKAN unset) leaves g_vk_ready 0, the CPU path. */
     g_vk_ready = coli_vk_init_env_tier("qwen36", vkt_wanted() && m.c.n_experts > 0 && !qq_active());
     g_vk_dense = coli_vk_dense();   /* COLI_VK_DENSE; unset, off on a device sharing the CPU's RAM with the tier on */
+    /* COLI_VK_CHAIN: every layer's dense chain on the device (qwen36_chain.h); the
+     * CUDA expert tier and a qpack container keep it off, as they keep the tier off */
+    /* measured on a Radeon 780M: decode and prefill both faster (docs/vulkan.md) */
+    if (g_vk_ready && !qq_active())
+        g_vk_chain = coli_vk_chain_decide("qwen36", vkt_wanted() && m.c.n_experts > 0, COLI_VK_CHAIN_ON);
+    if (g_vk_chain && !vkc_init()) g_vk_chain = 0;
 #endif
     if (ref_image && ref_image->t == J_OBJ) {
         jval *gh = json_get(ref_image, "grid_h"), *gw = json_get(ref_image, "grid_w");
@@ -4879,6 +4953,12 @@ int main(int argc, char **argv) {
 #ifdef COLI_VULKAN
     vk_tier_start(&m, snap, cap, expert_is_int4, expert_mixed);   /* COLI_VULKAN=1: hot routed experts on the device */
     if (g_vk_ready && !vkt_ready() && !g_vk_dense) g_vk_dense = coli_vk_dense_decide("qwen36", 0, 1);   /* no tier after all */
+    if (g_vk_chain && qt_ready()) {   /* the CUDA tier keeps its priority */
+        fprintf(stderr, "[VK] qwen36: dense chain off, the CUDA expert tier is on\n");
+        g_vk_chain = 0;
+    }
+    if (g_vk_chain && g_pilot) fprintf(stderr, "[VK] qwen36: PILOT prefetch reads the residual on the host: the dense chain stays off\n");
+    if (g_vk_chain) atexit(vkc_shutdown);   /* registered after the tier's: runs before the device goes */
 #endif
 
     /* coli serve mode: speak the gateway wire protocol instead of argv
@@ -4902,6 +4982,7 @@ int main(int argc, char **argv) {
         printf("Speed: %.2f tok/s (%.1fs for %d tokens) | PEAK RSS: %.2f GB\n", scored/dt, dt, scored, rss_gb());
 #ifdef COLI_VULKAN
         vk_report();
+        q36c_report(&m);
         vk_tier_turn(&m, "run");
 #endif
         free(buf); free(arena); return 0;
@@ -4988,6 +5069,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Speed: %.2f tok/s (%.1fs for %d tokens)\n", n_new/dt, dt, n_new);
 #ifdef COLI_VULKAN
     vk_report();
+    q36c_report(&m);
     vk_tier_turn(&m, "run");
 #endif
     free(buf); free(arena);

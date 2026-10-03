@@ -8,7 +8,8 @@
  * thread makes them resident at a quiescent point (no batch in flight), where it
  * also frees evicted experts. So the slot table, the counters and every Vulkan
  * call but the pool's allocation are single-threaded; the lock guards the queue,
- * the done list and the room-made signal only. */
+ * the done list, the room-made signal and the count of victims not freed yet
+ * only. */
 #ifdef COLI_VULKAN
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,11 +46,13 @@ static struct {
     VSlot *s;
     uint32_t tick, decay_at;          /* tokens seen (rows of the forward's first layer) */
     int last_layer, first_layer, promos, promo_cap;
+    int begin;                         /* vkt_begin_forward: the next issue starts a forward */
     /* uploader */
     pthread_t th; int th_on, stop;
     pthread_mutex_t mx; pthread_cond_t cv, cv_room, cv_done;
     int busy;                          /* the uploader is between taking an entry and push_done */
     int sync;                          /* COLI_VK_TIER_SYNC=1: quiescent points wait for the uploader */
+    int evict_pending;                 /* victims chosen and not freed yet (a batch is in flight) */
     VQ q[VKT_QCAP]; int qh, qn;
     VDone *done; int ndone, cdone;
     unsigned long room_gen;
@@ -63,6 +66,7 @@ static struct {
     int *grp; int *touched;              /* expert -> group of this step, and the groups' experts */
     ColiVkExpert **bex; int *brows; int *bfirst; int cb;
     const float **bx, **by; int *rowsrc; int cbx;
+    float *bw;                           /* the rows' route weights (vkt_issue_w), beside bx */
     int max_dev_rows;
     double t_issued;
     /* the balance: the share of a step's resident experts the device takes, moved by
@@ -243,6 +247,11 @@ static void *uploader(void *arg) {
     for (;;) {
         pthread_mutex_lock(&T.mx);
         while (!T.qn && !T.stop) pthread_cond_wait(&T.cv, &T.mx);
+        /* COLI_VK_TIER_SYNC=1: a victim chosen while a batch is in flight is freed at that
+         * batch's join, before the join waits for the uploads staged so far: wait for
+         * that free here, so the promotion that displaced it finds its room. Uploading
+         * first would meet the full pool, and a refusal is final in this mode. */
+        while (T.sync && T.evict_pending && !T.stop) pthread_cond_wait(&T.cv_room, &T.mx);
         if (T.stop) { pthread_mutex_unlock(&T.mx); return NULL; }
         VQ e = T.q[T.qh]; T.qh = (T.qh + 1) % VKT_QCAP; T.qn--; T.busy = 1;
         pthread_mutex_unlock(&T.mx);
@@ -258,7 +267,9 @@ static void *uploader(void *arg) {
          * minute (the engine stopped stepping), the pool is full for real. */
         for (int frees = 0, waited = 0; !ok; ) {
             ok = upload(g, u, d, gs, us, ds, t);
-            if (ok || frees >= 3 || waited >= 600 || T.sync) break;   /* sync: the engine waits on us, not we on it */
+            /* sync: every free decided so far came first (above), and the engine now waits
+             * on us, not we on it: the pool is full for real */
+            if (ok || frees >= 3 || waited >= 600 || T.sync) break;
             pthread_mutex_lock(&T.mx);
             unsigned long gen = T.room_gen;
             while (T.room_gen == gen && !T.stop && waited < 600) {
@@ -280,15 +291,19 @@ static void *uploader(void *arg) {
 /* ---- quiescent points: nothing in flight ---------------------------------------- */
 static void quiesce(void) {
     if (T.inflight) return;
-    int freed = 0;
+    int freed = 0, had = T.nevict;
     for (int i = 0; i < T.nevict; i++) {
         VSlot *v = &T.s[T.evict[i]];
         if (v->ex) { coli_vk_xb_expert_free(v->ex); v->ex = NULL; freed = 1; }
         v->state = VS_NONE;
     }
     T.nevict = 0;
-    if (freed) {
-        pthread_mutex_lock(&T.mx); T.room_gen++; pthread_cond_broadcast(&T.cv_room); pthread_mutex_unlock(&T.mx);
+    if (had) {   /* room made: an upload may be waiting for it */
+        pthread_mutex_lock(&T.mx);
+        if (freed) T.room_gen++;
+        T.evict_pending = 0;
+        pthread_cond_broadcast(&T.cv_room);
+        pthread_mutex_unlock(&T.mx);
     }
     /* finished uploads become resident; COLI_VK_TIER_SYNC=1 waits for every staged one
      * first, so what is resident depends on the routing alone, not on thread timing
@@ -398,13 +413,26 @@ void vkt_note(int layer, int eid, const VktExpertSrc *src) {
             T.evict = n; T.cevict = nc;
         }
         T.evict[T.nevict++] = victim;
-        quiesce();   /* nothing in flight: free it right away */
+        pthread_mutex_lock(&T.mx); T.evict_pending = T.nevict; pthread_mutex_unlock(&T.mx);
+        quiesce();   /* nothing in flight: free it right away; else at the join */
     }
     v->state = VS_QUEUED; T.queued++; T.promos++;
     pthread_mutex_lock(&T.mx);
     T.q[(T.qh + T.qn) % VKT_QCAP] = (VQ){layer, eid, buf}; T.qn++;
     pthread_cond_signal(&T.cv);
     pthread_mutex_unlock(&T.mx);
+}
+
+/* vkt_note's decision without its copy: the same tests, in the same order. */
+int vkt_wants(int layer, int eid) {
+    if (!T.on || layer < 0 || layer >= T.c.layers || eid < 0 || eid >= T.c.experts) return 0;
+    VSlot *v = slot(layer, eid);
+    if (v->state != VS_NONE || T.promos >= T.promo_cap) return 0;
+    if (T.resident + T.queued >= T.max_resident && (!v->heat || peek_victim(score(v)) < 0)) return 0;
+    pthread_mutex_lock(&T.mx);
+    int qfull = T.qn >= VKT_QCAP;
+    pthread_mutex_unlock(&T.mx);
+    return !qfull;
 }
 
 /* ---- warm start ------------------------------------------------------------------ */
@@ -478,19 +506,20 @@ static int grow_rows(int need) {
     int nc = grow_to(need, &T.cbx);
     const float **a = realloc(T.bx, (size_t)nc * sizeof(*a)); if (a) T.bx = a;
     const float **b = realloc(T.by, (size_t)nc * sizeof(*b)); if (b) T.by = b;
-    if (!a || !b) return 0;
+    float *c = realloc(T.bw, (size_t)nc * sizeof(*c)); if (c) T.bw = c;
+    if (!a || !b || !c) return 0;
     T.cbx = nc;
     return 1;
 }
 
-int vkt_issue(int layer, const float *x, int S, int K, const int *idx, uint8_t *taken) {
+static int issue(int layer, const float *x, int S, int K, const int *idx, const float *w, uint8_t *taken) {
     if (S > 0 && K > 0) memset(taken, 0, (size_t)S * K);
     if (!T.on || T.inflight || layer < 0 || layer >= T.c.layers || S < 1 || K < 1) return 0;
     if (!coli_vk_xb_ready()) {
         if (T.on) { fprintf(stderr, "[VK] tier %s: the device stopped answering, the experts stay on the CPU\n", T.engine); T.on = 0; }
         return 0;
     }
-    if (layer < T.last_layer) { T.first_layer = layer; new_forward(); }
+    if (layer < T.last_layer || T.begin) { T.begin = 0; T.first_layer = layer; new_forward(); }
     if (layer == T.first_layer) {   /* COLI_VK_TIER_RATE promotions per token of the forward */
         T.tick += (uint32_t)S;
         long cap = (long)T.promo_cap + (long)T.rate * S;
@@ -566,10 +595,11 @@ int vkt_issue(int layer, const float *x, int S, int K, const int *idx, uint8_t *
         if (g < 0) continue;
         int j = T.bfirst[g] + T.brows[g]++;
         T.bx[j] = x + (size_t)(i / K) * H;
+        T.bw[j] = w ? w[i] : 1.0f;
         T.map[i] = j;
     }
     for (int g = 0; g < ng; g++) T.grp[T.touched[g]] = -1;
-    if (!coli_vk_xb_issue(T.bex, T.brows, ng, T.bx)) {
+    if (!coli_vk_xb_issue_w(T.bex, T.brows, ng, T.bx, w ? T.bw : NULL)) {
         for (int i = 0; i < n; i++) T.map[i] = -1;
         return 0;
     }
@@ -577,6 +607,12 @@ int vkt_issue(int layer, const float *x, int S, int K, const int *idx, uint8_t *
     T.inflight = 1; T.S = S; T.K = K; T.steps++; T.served += (unsigned long long)total;
     T.t_issued = vkt_now_ms();
     return total;
+}
+int vkt_issue(int layer, const float *x, int S, int K, const int *idx, uint8_t *taken) {
+    return issue(layer, x, S, K, idx, NULL, taken);
+}
+int vkt_issue_w(int layer, const float *x, int S, int K, const int *idx, const float *w, uint8_t *taken) {
+    return issue(layer, x, S, K, idx, w, taken);
 }
 
 int vkt_join(const float **rows) {
@@ -608,6 +644,7 @@ int vkt_join(const float **rows) {
     return 1;
 }
 
+void vkt_begin_forward(void) { if (T.on) T.begin = 1; }
 int vkt_resident(int layer, int eid) {
     return T.on && layer >= 0 && layer < T.c.layers && eid >= 0 && eid < T.c.experts &&
            slot(layer, eid)->state == VS_RESIDENT;
@@ -651,7 +688,8 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
                 eng, T.c.gate_up.kind, T.c.down.kind, T.c.gate_up.gs, T.c.down.gs);
         return 0;
     }
-    int act = T.c.act == VKT_ACT_SITU ? COLI_VK_ACT_SITU : COLI_VK_ACT_SWIGLU;
+    int act = T.c.act == VKT_ACT_SITU ? COLI_VK_ACT_SITU
+            : T.c.act == VKT_ACT_SWIGLU_V4 ? COLI_VK_ACT_SWIGLU_V4 : COLI_VK_ACT_SWIGLU;
     if (!coli_vk_xb_init(T.c.hidden, T.c.inter, act, T.c.act_limit, T.c.act_a, T.c.act_b)) {
         fprintf(stderr, "[VK] tier %s: no expert batch on this device (shaders?), the experts stay on the CPU\n", eng);
         return 0;
@@ -703,6 +741,7 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
                 eng, human(want, hb, sizeof hb), human((double)T.exp_bytes, he, sizeof he));
         return 0;
     }
+    if (T.c.max_experts > 0 && fit > T.c.max_experts) fit = T.c.max_experts;   /* the engine's count cap */
     T.max_resident = (int)fit;
     T.budget = (size_t)want;
     /* Every expert fits in one block's worth: the pool's limit (and so its one block)
@@ -792,7 +831,7 @@ void vkt_shutdown(void) {
     }
     pthread_mutex_destroy(&T.mx); pthread_cond_destroy(&T.cv); pthread_cond_destroy(&T.cv_room); pthread_cond_destroy(&T.cv_done);
     free(T.s); free(T.grp); free(T.map); free(T.touched); free(T.bex); free(T.brows); free(T.bfirst);
-    free(T.bx); free(T.by); free(T.evict); free(T.done);
+    free(T.bx); free(T.by); free(T.bw); free(T.evict); free(T.done);
     memset(&T, 0, sizeof T);
 }
 #endif /* COLI_VULKAN */

@@ -400,6 +400,31 @@ Ti servono due cose: **il programma** (poche centinaia di KB) e **il modello**
 (372 GB). Guida passo passo per tutte le piattaforme nella
 [Quick Start](docs/quickstart.md).
 
+### In un solo passo
+
+**Windows:** scarica il repository (**Code**, poi **Download ZIP**, oppure
+`git clone`), scompattalo e fai doppio clic su **`START-HERE.bat`**.
+**Linux e macOS:**
+
+```bash
+git clone https://github.com/JustVugg/colibri && cd colibri
+./start-here.sh
+```
+
+Rileva RAM, disco e GPU, consiglia un modello adatto a questa macchina (Invio
+lo accetta), compila il motore con Vulkan o CUDA quando la tua GPU può usarli
+(oppure scarica quello già compilato), scarica il modello con ripresa
+(interrompilo quando vuoi, rilancialo per continuare) e apre la dashboard nel
+browser. Stampa anche gli URL base OpenAI e Anthropic per le altre app.
+Rilancialo più tardi e colibri parte subito; `c/coli stop` lo ferma. Cosa fa
+ogni passo: [quickstart.md](docs/quickstart.md#the-one-step-way).
+
+Usi un assistente di programmazione AI? Chiedigli di installare colibri seguendo [docs/AI_SETUP.md](docs/AI_SETUP.md).
+Gli assistenti che parlano il Model Context Protocol possono usare `coli mcp`
+([MCP_SERVER.md](docs/MCP_SERVER.md)).
+
+Segue il percorso manuale.
+
 ### 1. Procurati colibri
 
 **Scarica una release già compilata** — Linux, macOS e Windows, nessun
@@ -499,8 +524,8 @@ altre nove famiglie di modelli linguistici, e un motore genera immagini. Ognuna 
 >
 > **Vulkan opzionale** significa una build `VK=1`. Avviato con `COLI_VULKAN=1`, il
 > motore mette le sue matrici residenti su qualsiasi GPU con un driver Vulkan 1.2
-> (GLM-5.2 ha lì un percorso di decode completo, Kimi K3 un suo livello di expert,
-> `K3_VK`), e la CI verifica quei motori contro i token della CPU su un driver
+> (GLM-5.2 ha lì un percorso di decode completo), e la CI verifica quei motori
+> contro i token della CPU su un driver
 > software ([vulkan.md](docs/vulkan.md#the-other-engines)). Corretto non vuol dire
 > ancora più veloce. Sulla prima GPU reale misurata per questi motori, una Radeon
 > 780M integrata (Ryzen 7 PRO 8700GE, stessi binari, page cache fredda), oggi è più
@@ -558,8 +583,9 @@ possono attivare i checkpoint dello stato ricorrente (`COLI_K3_CKPT=N` slot in R
 o parcheggiati su disco con `COLI_K3_CKPT_DIR`): un prompt modificato o di
 follow-up ripristina il checkpoint più profondo ancora disponibile e rifà il
 prefill solo della coda, invece di ripercorrere l'intera conversazione attraverso i
-layer SSM. Sugli host Vulkan `K3_VK_UP=auto` dimensiona il caricamento del livello
-degli expert in base alla banda misurata. I percorsi KDA e MLA del motore sono
+layer SSM. Sugli host Vulkan (`COLI_VULKAN=1`) i suoi expert instradati entrano nel
+livello di expert condiviso, riempito dalla storia degli expert e aggiornato man mano
+che il routing cambia. I percorsi KDA e MLA del motore sono
 validati token-esatti in CI contro l'implementazione del vendor.
 
 Inkling distribuisce expert int4 ma **pesi densi bf16** (49,4 GB residenti); su un

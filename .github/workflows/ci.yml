@@ -168,13 +168,43 @@ jobs:
           # the routed-expert tier of qwen36 and qwen38 under ASan and UBSan
           - family: qwen-sanitize
             req: c/tools/requirements-qwen38-tiny.txt
+          # the dense chain (COLI_VK_CHAIN=1) of qwen36 and qwen38, and the same under
+          # ASan and UBSan
+          - family: qwen-chain
+            req: c/tools/requirements-qwen38-tiny.txt
+          - family: qwen-chain-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
           - family: inkling-olmoe
+            req: c/tools/oracle-requirements.txt
+          # the routed-expert tier of inkling and olmoe under ASan and UBSan
+          - family: inkling-olmoe-sanitize
             req: c/tools/oracle-requirements.txt
           - family: mimo-qwenimage
             req: c/tools/requirements-qwenimage-tiny.txt
           - family: deepseek
             req: c/tools/requirements-deepseek-v4-tiny.txt
             extra: sympy pillow   # the V4.1 fixture's reference and its vision tower
+          # the routed-expert tier of deepseek_v41 and deepseek_v4 under ASan and UBSan
+          - family: deepseek-sanitize
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          # Kimi K3's routed experts on the shared tier, and its and MiMo's tier under
+          # ASan and UBSan (MiMo's tier runs in mimo-qwenimage)
+          - family: kimi
+            req: c/tools/requirements-kimi-k3-tiny.txt
+          - family: kimi-mimo-sanitize
+            req: c/tools/requirements-mimo-tiny.txt
+          # MiMo-V2.6's dense chain (COLI_VK_CHAIN=1), and the same under ASan and UBSan
+          - family: mimo-chain
+            req: c/tools/requirements-mimo-tiny.txt
+          - family: mimo-chain-sanitize
+            req: c/tools/requirements-mimo-tiny.txt
+          # GLM-5.2 (colibri) and GLM-5.3 Flash (glm53) on the routed-expert tier, and
+          # the same under ASan and UBSan
+          - family: glm
+            req: c/tools/requirements-glm53-tiny.txt
+          - family: glm-sanitize
+            req: c/tools/requirements-glm53-tiny.txt
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -633,7 +663,7 @@ jobs:
           make clean >/dev/null 2>&1 || true
           make qwen36 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
           for fx in qwen36_tiny qwen38_2p4t_tiny; do
-            ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
+            ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1 \
               COLI_DENSE_I8=0 SNAP=${fx}_c PILOT=1 WIDE=2 \
               ./qwen36 1 8 $fx/ref_full.json > san.log 2>&1 || true
             if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then
@@ -644,7 +674,7 @@ jobs:
           # Same sanitized binary on hostile weights: an all-NaN router row and an
           # oversized e_score_correction_bias must degrade or be refused, never
           # reach the heap.
-          ASAN_OPTIONS=detect_leaks=0 QWEN36_TINY_C=qwen36_tiny_c \
+          ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 QWEN36_TINY_C=qwen36_tiny_c \
             QWEN36_TINY_REF=qwen36_tiny/ref_full.json \
             python3 -m unittest -v tests.test_qwen36_hostile_weights
       - name: KV prefix reuse is token-identical (serve, several turns)
@@ -1044,11 +1074,11 @@ jobs:
         run: |
           cd c
           make -B qwen38 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
-          ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
+          ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1 \
             OMP_NUM_THREADS=2 SNAP=./qwen38_tiny \
             ./qwen38 1 8 ./qwen38_tiny/ref.json > qwen38-san.log 2>&1
           # the int4-g64 sidecar's load and matmul, evicting at cap 1
-          ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
+          ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1 \
             Q38_EXPERT_INT4=1 OMP_NUM_THREADS=2 SNAP=./qwen38_tiny_int4 \
             ./qwen38 1 8 ./qwen38_tiny_int4/ref_int4.json > qwen38-san-int4.log 2>&1
           if grep -qE "ERROR: AddressSanitizer|runtime error:" qwen38-san.log qwen38-san-int4.log; then
@@ -1058,7 +1088,7 @@ jobs:
           grep -q "Matching tokens: 8/8" qwen38-san.log
           grep -q "Matching tokens: 8/8" qwen38-san-int4.log
           # the MTP head, the S=2 verify and the rollback on every fixture kind
-          ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+          ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
             python3 tests/qwen38_mtp_harness.py --engine ./qwen38 --bf16 ./qwen38_tiny_mtp \
             --fp8 ./qwen38_tiny_fp8_mtp --int4 ./qwen38_tiny_int4_mtp
       - name: Refuse config and tensor-shape disagreement
@@ -1159,7 +1189,7 @@ jobs:
         run: |
           cd c
           make -B qwenimage EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
-          export ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2
+          export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2
           COLI_IMG_BITS=16 COLI_IMG_ACT8=0 ./qwenimage --model qwenimage_tiny --ref qwenimage_tiny/ref > qwenimage-san.log 2>&1 || true
           QWENIMAGE_TINY=qwenimage_tiny python3 -m unittest tests.test_qwenimage_engine_serve >> qwenimage-san.log 2>&1 || true
           if grep -qE "ERROR: AddressSanitizer|runtime error:" qwenimage-san.log; then

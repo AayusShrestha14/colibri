@@ -382,6 +382,31 @@ You need two things: **the program** (a few hundred KB) and **the model**
 (372 GB). Step-by-step for every platform in the
 [Quick Start guide](docs/quickstart.md).
 
+### The one-step way
+
+**Windows:** download the repository (**Code**, then **Download ZIP**, or
+`git clone`), unzip it and double-click **`START-HERE.bat`**.
+**Linux and macOS:**
+
+```bash
+git clone https://github.com/JustVugg/colibri && cd colibri
+./start-here.sh
+```
+
+It finds your RAM, disk and GPU, recommends a model that fits this machine
+(Enter takes it), builds the engine with Vulkan or CUDA when your GPU can use
+it (or fetches the prebuilt one), downloads the model with resume (interrupt
+it any time, run it again to continue), and opens the dashboard in your
+browser. It also prints the OpenAI and Anthropic base URLs for other apps.
+Run it again later and colibri starts straight away; `c/coli stop` stops it.
+What each step does: [quickstart.md](docs/quickstart.md#the-one-step-way).
+
+Use an AI coding assistant? Ask it to set up colibri following [docs/AI_SETUP.md](docs/AI_SETUP.md).
+Assistants that speak the Model Context Protocol can use `coli mcp`
+([MCP_SERVER.md](docs/MCP_SERVER.md)).
+
+The manual path follows.
+
 ### 1. Get colibri
 
 **Download a prebuilt release** — Linux, macOS and Windows, no compiler needed.
@@ -480,7 +505,7 @@ or from `model_index.json` for the image model):
 >
 > **Vulkan opt-in** means a `VK=1` build. Run with `COLI_VULKAN=1`, the engine
 > puts its resident matrices on any GPU with a Vulkan 1.2 driver (GLM-5.2 has a
-> full decode path there, Kimi K3 its own expert tier, `K3_VK`), and CI checks
+> full decode path there), and CI checks
 > those engines against the CPU's tokens on a software driver
 > ([vulkan.md](docs/vulkan.md#the-other-engines)). Correct is not yet faster. On
 > the first real GPU measured for these engines, an integrated Radeon 780M (Ryzen 7
@@ -534,7 +559,8 @@ Long agent sessions can opt into recurrent-state checkpoints (`COLI_K3_CKPT=N`
 slots in RAM, or parked on disk with `COLI_K3_CKPT_DIR`): an edited or follow-up
 prompt restores the deepest surviving checkpoint and re-prefills only the tail,
 instead of replaying the whole conversation through the SSM layers. On Vulkan
-hosts `K3_VK_UP=auto` sizes the expert tier upload from measured bandwidth. The
+hosts (`COLI_VULKAN=1`) its routed experts join the shared expert tier, filled from
+the expert history and evicting as the routing moves. The
 engine's KDA and MLA paths are validated token-exact in CI against the vendor
 implementation.
 

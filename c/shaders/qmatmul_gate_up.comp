@@ -15,6 +15,9 @@
 //   0  SwiGLU silu(g) * u; with limit > 0 the gate is clamped from above at limit
 //      and up to [-limit, limit] first (swiglu_limit; 0 = unclamped)
 //   1  SiTU-GLU a*tanh(g/a)*sigmoid(g) * b*tanh(u/b) (Kimi K3: a = 4, b = 25)
+//   2  DeepSeek V4: gate and up rounded to bf16 first, then act 0's clamps and
+//      g * sigmoid(g) * u as its CPU computes it (act_v4 below); the route weight,
+//      bf16 and E4M3 rounding that follow run in expert_act_v4.comp
 #extension GL_KHR_shader_subgroup_arithmetic : require
 layout(local_size_x = 256) in;
 
@@ -54,6 +57,20 @@ float e4m3(uint w, int l) {
     uint e = (b >> 3) & 0xfu, m = b & 7u;
     float v = e == 0u ? float(m) * 0.001953125 : ldexp(1.0 + float(m) * 0.125, int(e) - 7);
     return (b & 0x80u) != 0u ? -v : v;
+}
+
+// act 2: round to bf16, nearest even (the CPU's coli_bf16_round), and DeepSeek V4's
+// SwiGLU in its CPU form (coli_v4_swiglu after coli_bf16_round_array of gate and up)
+float bf16r(float v) {
+    uint b = floatBitsToUint(v);
+    if ((b & 0x7f800000u) != 0x7f800000u) b += 0x7fffu + ((b >> 16) & 1u);
+    return uintBitsToFloat(b & 0xffff0000u);
+}
+float act_v4(float g, float u, float limit) {
+    g = bf16r(g); u = bf16r(u);
+    if (limit > 0.0) { g = min(g, limit); u = max(-limit, min(u, limit)); }
+    float s = g >= 0.0 ? 1.0 / (1.0 + exp(-g)) : exp(g) / (1.0 + exp(g));
+    return g * s * u;
 }
 
 void main() {
@@ -164,6 +181,8 @@ void main() {
         float h;
         if (p.act == 1) {
             h = p.a * tanh(gt / p.a) * (1.0 / (1.0 + exp(-gt))) * (p.b * tanh(ut / p.b));
+        } else if (p.act == 2) {
+            h = act_v4(gt, ut, p.limit);
         } else {
             if (p.limit > 0.0) {
                 if (gt > p.limit) gt = p.limit;

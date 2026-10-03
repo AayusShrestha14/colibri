@@ -95,6 +95,14 @@ c/glm_tiny_i4/
 c/glm_tiny_mix/
 c/glm_tiny_fmt6/
 c/glm_tiny_fmt4/
+# tests/vulkan_engines.sh glm: the FP8 oracle and its int4/int3 conversions, GLM-5.3's tiny pair
+c/glm_fp8/
+c/glm_tiny_i4r/
+c/glm_tiny_i3/
+c/glm_tiny_d3/
+c/glm53_tiny/
+c/glm53_stream-i4/
+c/glm53_stream-deq/
 c/glm_bench_medium/
 c/bench/
 

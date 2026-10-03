@@ -75,6 +75,8 @@
 #include "serve_poll.h"
 #ifdef COLI_VULKAN
 #include "backend_vulkan.h"
+#include "vk_tier.h"
+#include "route_trace.h"   /* the tier's expert history (.coli_usage), kept while it is on */
 /* 1 once COLI_VULKAN=1 opened a device, after the weights load (a VK=1 build). */
 static int g_vk_ready = 0;
 #endif
@@ -2289,7 +2291,8 @@ static void expert_ffn_rows(Model *m, const uint8_t *w1, const uint8_t *s1,
  * streams -- but it is still 35 MB of matrices, and reading them once for a block
  * of positions rather than once per position is the same saving mv8_rows makes in
  * attention. */
-static void shared_ffn_rows(Model *m, Layer *l, const float *x, int rows, float *out) {
+/* The shared expert's output rows into `down` ... */
+static void shared_ffn_down(Model *m, Layer *l, const float *x, int rows, float *down) {
     Cfg *c = &m->c;
     int inter = c->moe_inter, dim = c->dim;
     float *gate = xmalloc((size_t)rows * inter * sizeof(float), "shared gate");
@@ -2297,10 +2300,16 @@ static void shared_ffn_rows(Model *m, Layer *l, const float *x, int rows, float 
     mv8_rows(gate, inter, &l->sh_w1, x, dim, rows);
     mv8_rows(up,   inter, &l->sh_w3, x, dim, rows);
     swiglu_into(c, gate, up, (int64_t)rows * inter);
-    float *down = xmalloc((size_t)rows * dim * sizeof(float), "shared down");
     mv8_rows(down, dim, &l->sh_w2, gate, inter, rows);
+    free(up); free(gate);
+}
+/* ... and added to `out` */
+static void shared_ffn_rows(Model *m, Layer *l, const float *x, int rows, float *out) {
+    int dim = m->c.dim;
+    float *down = xmalloc((size_t)rows * dim * sizeof(float), "shared down");
+    shared_ffn_down(m, l, x, rows, down);
     for (int64_t i = 0; i < (int64_t)rows * dim; i++) out[i] += down[i];
-    free(down); free(up); free(gate);
+    free(down);
 }
 
 /* model.py Gate + MoE. The bias steers the choice of experts and nothing else: the
@@ -2344,6 +2353,110 @@ static void moe_gate(Model *m, Layer *l, int E, int topk, float *scores,
  * stay a plausible working set for the cache. */
 #define MOE_ROW_CHUNK 32
 
+#ifdef COLI_VULKAN
+/* ---- the Vulkan routed-expert tier (vk_tier.c) ---------------------------------
+ * One block of positions of a backbone layer with the tier on. The block's resident
+ * experts go to the device as one batch (vkt_issue) while the CPU computes the other
+ * draws expert-major, as moe_run_at does, and the shared expert into a buffer of its
+ * own; then every rank of every position joins the output in rank order, the
+ * device's rows and the CPU's alike (w x row, then the add), and the shared expert
+ * after them, as moe_run_at adds them. So the order of the sum never depends on
+ * which experts were resident. Every expert the CPU computed passes its slot to the
+ * tier (vkt_note), which may promote it. The DSpark stages ("mtp") have expert
+ * sets and caches of their own and stay on the CPU. */
+static char g_vk_usage[2100];   /* the tier's history (vk_tier_start); empty = none */
+static void vk_tier_save(void) { if (g_vk_usage[0]) rt_save(g_vk_usage, 1); }
+
+static VktExpertSrc vk_slot_src(const Slot *s) {
+    return (VktExpertSrc){s->w1, s->w3, s->w2, s->s1, s->s3, s->s2};
+}
+
+/* The draws want[d] of a block on the CPU into contrib[d] = w x expert(x): moe_run_at's
+ * expert-major union over those draws only. */
+static void moe_vk_cpu(Model *m, LCache *cache, int layer, int topk, const float *xc, int rows,
+                       const int *chosen, const float *weights, const uint8_t *want, float *contrib) {
+    Cfg *c = &m->c;
+    int dim = c->dim, draws = rows * topk;
+    int uniq[MOE_ROW_CHUNK * MOE_TOPK_MAX], head[MOE_ROW_CHUNK * MOE_TOPK_MAX];
+    int tail[MOE_ROW_CHUNK * MOE_TOPK_MAX], count[MOE_ROW_CHUNK * MOE_TOPK_MAX];
+    int next[MOE_ROW_CHUNK * MOE_TOPK_MAX];
+    int n_uniq = 0;
+    for (int d = 0; d < draws; d++) {
+        if (!want[d]) continue;
+        int eid = chosen[d], at = -1;
+        for (int u = 0; u < n_uniq; u++) if (uniq[u] == eid) { at = u; break; }
+        next[d] = -1;
+        if (at < 0) { at = n_uniq++; uniq[at] = eid; head[at] = d; count[at] = 0; }
+        else next[tail[at]] = d;
+        tail[at] = d;
+        count[at]++;
+    }
+    if (!n_uniq) return;
+    float *gathered = xmalloc((size_t)rows * dim * sizeof(float), "expert inputs");
+    float *down = xmalloc((size_t)rows * dim * sizeof(float), "expert outputs");
+    int step = cache->cap < MOE_ROW_CHUNK ? cache->cap : MOE_ROW_CHUNK;
+    for (int u0 = 0; u0 < n_uniq; u0 += step) {
+        int ne = n_uniq - u0 < step ? n_uniq - u0 : step;
+        Slot *slot[MOE_ROW_CHUNK];
+        expert_slots_at(m, cache, "layers", layer, uniq + u0, ne, slot);
+        for (int u = 0; u < ne; u++) {
+            int cnt = count[u0 + u], at = 0;
+            for (int d = head[u0 + u]; d >= 0; d = next[d], at++)
+                memcpy(gathered + (size_t)at * dim, xc + (size_t)(d / topk) * dim, (size_t)dim * sizeof(float));
+            expert_ffn_rows(m, slot[u]->w1, slot[u]->s1, slot[u]->w3, slot[u]->s3,
+                            slot[u]->w2, slot[u]->s2, gathered, cnt, down);
+            at = 0;
+            for (int d = head[u0 + u]; d >= 0; d = next[d], at++) {
+                float w = weights[d];
+                float *dst = contrib + (size_t)d * dim;
+                const float *src = down + (size_t)at * dim;
+                for (int i = 0; i < dim; i++) dst[i] = w * src[i];
+            }
+            m->hits += (uint64_t)(cnt - 1);
+            VktExpertSrc src = vk_slot_src(slot[u]);
+            vkt_note(layer, uniq[u0 + u], &src);
+        }
+    }
+    free(down); free(gathered);
+}
+
+static void moe_vk_block(Model *m, Layer *l, LCache *cache, int layer, int topk, const float *xc,
+                         int rows, float *outc, const int *chosen, const float *weights) {
+    int dim = m->c.dim, draws = rows * topk;
+    uint8_t taken[MOE_ROW_CHUNK * MOE_TOPK_MAX], want[MOE_ROW_CHUNK * MOE_TOPK_MAX];
+    const float *dev[MOE_ROW_CHUNK * MOE_TOPK_MAX];
+    for (int r = 0; r < rows; r++) rt_count(layer, chosen + r * topk, topk);
+    int ndev = vkt_issue(layer, xc, rows, topk, chosen, taken);
+    for (int d = 0; d < draws; d++) { want[d] = !taken[d]; if (taken[d]) ehit_mark(m, layer, chosen[d]); }
+    float *contrib = xmalloc((size_t)draws * dim * sizeof(float), "expert contributions");
+    float *shared = xmalloc((size_t)rows * dim * sizeof(float), "shared expert");
+    moe_vk_cpu(m, cache, layer, topk, xc, rows, chosen, weights, want, contrib);
+    shared_ffn_down(m, l, xc, rows, shared);
+    if (ndev && !vkt_join(dev)) {   /* the batch failed (the tier stops): those draws here */
+        moe_vk_cpu(m, cache, layer, topk, xc, rows, chosen, weights, taken, contrib);
+        memset(taken, 0, (size_t)draws);
+    }
+    for (int r = 0; r < rows; r++) {
+        float *o = outc + (size_t)r * dim;
+        memset(o, 0, (size_t)dim * sizeof(float));
+        for (int k = 0; k < topk; k++) {
+            int d = r * topk + k;
+            if (taken[d]) {
+                float w = weights[d];
+                const float *src = dev[d];
+                for (int i = 0; i < dim; i++) o[i] += w * src[i];
+            } else {
+                const float *cvec = contrib + (size_t)d * dim;
+                for (int i = 0; i < dim; i++) o[i] += cvec[i];
+            }
+        }
+        const float *sh = shared + (size_t)r * dim;
+        for (int i = 0; i < dim; i++) o[i] += sh[i];
+    }
+    free(shared); free(contrib);
+}
+#endif
+
 /* The MoE for a block of positions, expert-major.
  *
  * Position-major is the obvious reading and it is what this did: route a
@@ -2380,6 +2493,12 @@ static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int 
             moe_gate(m, l, E, topk, scores + (size_t)r * E,
                      chosen + r * topk, weights + r * topk);
         free(scores);
+#ifdef COLI_VULKAN
+        if (vkt_ready() && !strcmp(kind, "layers")) {
+            moe_vk_block(m, l, cache, layer, topk, xc, rows, outc, chosen, weights);
+            continue;
+        }
+#endif
 
         int draws = rows * topk;
         if (cache->cap < topk) {
@@ -3606,6 +3725,9 @@ static void serve_emap(Model *m) {
             int resident = 0;
             for (int k = 0; k < cache->n; k++) if (cache->slot[k].eid == e) { resident = 1; break; }
             int byte = resident << 6;    /* tier in bits 6-7; no usage counter here, heat 0 */
+#ifdef COLI_VULKAN
+            if (vkt_resident(i, e)) byte = 2 << 6;   /* on the Vulkan device */
+#endif
             hex[w++] = "0123456789abcdef"[byte >> 4];
             hex[w++] = "0123456789abcdef"[byte & 15];
         }
@@ -4009,6 +4131,9 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
         serve_line("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %llu\n", wall, n_prompt, emitted,
                    m->t_disk - disk0, 0.0, m->t_expert - expert0, m->t_attn - attn0,
                    m->t_engram - engram0, (unsigned long long)(m->forwards - forwards0));
+#ifdef COLI_VULKAN
+        if (vkt_ready()) { vkt_report("turn", turn_hits, turn_miss); vk_tier_save(); }
+#endif
         serve_hits(m);
         serve_emap(m);
         coli_serve_command_dispose(&command);
@@ -4040,6 +4165,93 @@ static void vk_report(void) {
                     "(fp8 as fmt 12, bf16 as fmt 11)\n", tensors, bytes / 1048576.0);
 #endif
 }
+
+#ifdef COLI_VULKAN
+/* ---- the Vulkan routed-expert tier: start ----------------------------------------
+ * After the weights and the device. The experts sit in the slots as the checkpoint
+ * stores them, fp4 with a ue8m0 scale per 32 inputs (MXFP4_E8M0, fmt 7 on the
+ * device); the activation is the clamped SwiGLU. The history (.coli_usage, beside
+ * the container or COLI_USAGE) is kept only while the tier is on; it gives the warm
+ * start, read straight from the container in parallel. */
+static size_t vk_w8_bytes(const W8 *w) {   /* as the device holds it: fmt 12, an f32 per 32 inputs */
+    return w->q ? (size_t)w->O * w->I + (size_t)w->O * ((w->I + FP8_TILE - 1) / FP8_TILE) * 4 : 0;
+}
+static size_t vk_wb_bytes(const WB *w) { return w->w ? (size_t)w->O * w->I * 2 : 0; }
+/* The trunk the dense hook would put on the device, for the tier's budget. */
+static size_t vk_dense_bytes(Model *m) {
+    if (!coli_vk_dense()) return 0;
+    size_t b = vk_wb_bytes(&m->head);
+    for (int i = 0; i < m->c.n_layers; i++) {
+        Layer *L = &m->L[i];
+        const W8 *w8[] = {&L->wq_a, &L->wq_b, &L->wkv, &L->wo_a, &L->wo_b, &L->idx_wq_b,
+                          &L->sh_w1, &L->sh_w3, &L->sh_w2, &L->eng_wkv};
+        const WB *wb[] = {&L->comp_wkv, &L->comp_wgate, &L->idx_wk, &L->idx_wproj, &L->gate_w};
+        for (size_t k = 0; k < sizeof w8 / sizeof *w8; k++) b += vk_w8_bytes(w8[k]);
+        for (size_t k = 0; k < sizeof wb / sizeof *wb; k++) b += vk_wb_bytes(wb[k]);
+    }
+    return b;
+}
+/* Is the expert in this layer's slots now (the tier's balance asks)? */
+static int vk_in_ram(void *ctx, int layer, int e) {
+    Model *m = ctx;
+    if (layer < 0 || layer >= m->c.n_layers) return 0;
+    LCache *cache = &m->cache[layer];
+    for (int i = 0; i < cache->n; i++) if (cache->slot[i].eid == e) return 1;
+    return 0;
+}
+static void vk_tier_start(Model *m, const char *snap, int cap) {
+    Cfg *c = &m->c;
+    if (!g_vk_ready || c->n_routed < 1 || !vkt_wanted()) return;
+    VktFmt f = {VKT_SRC_MXFP4_E8M0, 32};
+    size_t expert = 0;
+    for (int part = 0; part < V41_EXPERT_TENSORS; part++) expert += (size_t)expert_part_bytes(c, part);
+    VktConfig vc = {.engine = "deepseek_v41", .layers = c->n_layers, .experts = c->n_routed,
+                    .hidden = c->dim, .inter = c->moe_inter, .topk = c->n_activated,
+                    .gate_up = f, .down = f, .act = VKT_ACT_SWIGLU, .act_limit = c->swiglu_limit,
+                    .max_rows = MOE_ROW_CHUNK * c->n_activated,
+                    .ram_reserve = expert * (size_t)cap * (size_t)c->n_layers,
+                    .dense_bytes = vk_dense_bytes(m), .in_ram = vk_in_ram, .ram_ctx = m};
+    rt_init("deepseek_v41", c->n_layers, c->n_routed);
+    rt_drop_row(c->n_layers);   /* no MTP row: the DSpark stages stay on the CPU */
+    const char *up = getenv("COLI_USAGE");
+    if (up && *up) snprintf(g_vk_usage, sizeof g_vk_usage, "%s", up);
+    else snprintf(g_vk_usage, sizeof g_vk_usage, "%s/.coli_usage", snap);
+    int64_t h = rt_load(g_vk_usage);
+    if (h > 0) fprintf(stderr, "[USAGE] expert history: %lld selections (%s)\n", (long long)h, g_vk_usage);
+    /* The device goes before the drivers unload, after the tier's teardown (atexit runs
+     * last-registered first), and whether or not the tier starts: vkt_init makes the
+     * expert batch's pipelines before it can refuse (no room), and a driver still
+     * compiling them at exit crashed one run in sixteen on Mesa's Dozen. */
+    atexit(coli_vk_shutdown);
+    if (!vkt_init(&vc, rt_counts_all())) { rt_destroy(); g_vk_usage[0] = 0; return; }
+    atexit(vkt_shutdown);
+    int all = c->n_layers * c->n_routed;
+    int *pl = malloc((size_t)all * sizeof(int)), *pe = malloc((size_t)all * sizeof(int));
+    const char *warm = getenv("COLI_VK_TIER_WARM");   /* 0: no warm start, the tier fills as experts pass by */
+    int n = pl && pe && !(warm && *warm == '0') ? vkt_plan(pl, pe, all) : 0;
+    if (n > 0) {
+        double t0 = now_s();
+        static const char *const part[V41_EXPERT_TENSORS] = {"w1.weight", "w1.scale", "w3.weight", "w3.scale", "w2.weight", "w2.scale"};
+        #pragma omp parallel for schedule(dynamic, 4)
+        for (int i = 0; i < n; i++) {
+            uint8_t *buf = malloc(expert), *at = buf, *p[V41_EXPERT_TENSORS];
+            if (!buf) continue;
+            for (int k = 0; k < V41_EXPERT_TENSORS; k++) {
+                char name[160];
+                snprintf(name, sizeof name, "layers.%d.ffn.experts.%d.%s", pl[i], pe[i], part[k]);
+                st_read_raw_cap(&m->S, name, at, expert_part_bytes(c, k), 0);
+                p[k] = at; at += expert_part_bytes(c, k);
+            }
+            VktExpertSrc src = {p[0], p[2], p[4], p[1], p[3], p[5]};
+            vkt_put(pl[i], pe[i], &src);
+            free(buf);
+        }
+        vkt_put_done();
+        fprintf(stderr, "[VK] tier deepseek_v41: warm start, %d experts from the history in %.1fs\n", n, now_s() - t0);
+    }
+    free(pl); free(pe);
+}
+#endif
 
 int main(int argc, char **argv) {
     /* Size the team to PHYSICAL cores before anything else touches the model.
@@ -4074,7 +4286,10 @@ int main(int argc, char **argv) {
     /* After the weights, as in glm53: the device is an option, never a requirement.
      * The matrices go up on their first multiply (see vk_mul), from this thread. */
     g_vk_thread = pthread_self();
-    g_vk_ready = coli_vk_init_env("deepseek_v41");
+    g_vk_ready = coli_vk_init_env_tier("deepseek_v41", vkt_wanted() && c->n_routed > 0);
+    vk_tier_start(&m, snap, cap);
+    if (g_vk_ready && !vkt_ready() && !coli_vk_dense())
+        coli_vk_dense_decide("deepseek_v41", 0, 1);   /* no tier after all: the trunk to the device */
 #endif
 
     if (getenv("SERVE") && atoi(getenv("SERVE"))) {
@@ -4086,6 +4301,10 @@ int main(int argc, char **argv) {
         srand(seed ? (unsigned)strtoul(seed, NULL, 10) : (unsigned)time(NULL));
         serve_loop(&m, &tokenizer, snap);
         vk_report();
+#ifdef COLI_VULKAN
+        vkt_report("run", m.hits, m.miss);
+        vk_tier_save();
+#endif
         return 0;
     }
     if (!ref_path) {
@@ -4268,6 +4487,10 @@ int main(int argc, char **argv) {
         spec_failed = 1;
     }
     vk_report();
+#ifdef COLI_VULKAN
+    vkt_report("run", m.hits, m.miss);
+    vk_tier_save();
+#endif
     free(confidence); free(draft);
     free(logits); free(prompt); free(expected); json_free(root); free(arena); free(text);
     return (matched == n_expected && !vision_failed && !spec_failed) ? 0 : 1;

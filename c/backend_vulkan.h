@@ -171,6 +171,13 @@ size_t coli_vk_tensor_scale_count(int fmt, int I, int O, int gs);
  * Threading: engine thread only, except where noted. */
 #define COLI_VK_ACT_SWIGLU 0
 #define COLI_VK_ACT_SITU   1
+/* DeepSeek V4's expert, with the roundings its CPU kernel makes: gate and up rounded
+ * to bf16, the clamped SwiGLU, times the row's route weight (coli_vk_xb_issue_w) and
+ * rounded to bf16, then quantized to E4M3 and back with one power-of-two scale per
+ * 128 inputs before down (expert_act_v4.spv beside the main shader). The rows given
+ * are already E4M3-rounded by the caller, as the CPU kernel rounds x; down's output
+ * comes back in f32 for the caller's own bf16 rounding. */
+#define COLI_VK_ACT_SWIGLU_V4 2
 typedef struct ColiVkExpert ColiVkExpert;
 int  coli_vk_xb_init(int D, int I, int act, float limit, float a, float b);   /* again: same D, I, new act */
 int  coli_vk_xb_ready(void);
@@ -185,6 +192,10 @@ void coli_vk_xb_expert_free(ColiVkExpert *e);
  * sum(rows) pointers to D floats, expert by expert. 0 = nothing was submitted (the
  * caller computes those experts itself). One batch in flight at a time. */
 int  coli_vk_xb_issue(ColiVkExpert *const *ex, const int *rows, int count, const float *const *xrows);
+/* The same with one weight per input row (same order as xrows, NULL = 1), which
+ * COLI_VK_ACT_SWIGLU_V4 applies before down; the other activations ignore it. */
+int  coli_vk_xb_issue_w(ColiVkExpert *const *ex, const int *rows, int count, const float *const *xrows,
+                        const float *wrows);
 /* Wait for it: yrows[j] points at the D outputs of input row j (same order), valid
  * until the next issue; *device_ms is its device time when timestamps exist (else 0).
  * 0 = the batch failed (device lost): the caller computes those rows itself. */
@@ -229,6 +240,35 @@ int coli_vk_dense(void);   /* the last decision; 1 before any */
 const char *coli_vk_shader_path(char *buf, size_t n);
 /* How many coli_vk_matmul calls ran on the device: a check that a path is really used. */
 unsigned long long coli_vk_matmul_calls(void);
+
+/* ---- the dense chain (vk_chain.h) ----------------------------------------------
+ * Whether an engine runs its layers' dense chain on the device (COLI_VK_CHAIN): set,
+ * 0 off, 2 prompts only, else on; unset, on for a discrete GPU, `igpu` (the engine's
+ * measured choice) on an integrated GPU with the expert tier on, off otherwise. With an
+ * engine name the decision is printed as a [VK] line. */
+#define COLI_VK_CHAIN_OFF     0
+#define COLI_VK_CHAIN_ON      1
+#define COLI_VK_CHAIN_PREFILL 2   /* forwards of more than two rows only */
+#define COLI_VK_CHAIN_UNMEASURED 3 /* as `igpu`: not measured on an integrated GPU, so off there */
+int coli_vk_chain_decide(const char *engine, int tier_on, int igpu);
+/* The device as the chain sees it: Vulkan handles as void * (VkInstance,
+ * VkPhysicalDevice, VkDevice, VkQueue), the memory types the backend picked, the
+ * shader directory's qmatmul.spv and the fp32 GEMM's tiles. 0 before coli_vk_init. */
+typedef struct {
+    void *instance, *phys, *device, *queue;
+    uint32_t qfam, memtype_host, memtype_cached, memtype_dev;
+    size_t ssbo_align, ssbo_range;
+    const char *spv_path;
+    int gemm_tiles, gemm_tile[4][6];      /* bm, bn, bk, tm, tn, pf */
+    int gemm_min_s, gemm_min_so;
+    int has_prio, integrated, shares_ram;
+} ColiVkCore;
+int  coli_vk_core(ColiVkCore *out);
+/* A resident tensor's buffers (VkBuffer as void *) and layout; 0 for a COLI_VK_DEV2 one. */
+typedef struct { void *wbuf, *sbuf; int fmt, I, O, rowWords, gs; } ColiVkTensorInfo;
+int  coli_vk_tensor_info(const ColiVkTensor *t, ColiVkTensorInfo *out);
+/* The chain's fence wait failed: the device is lost, the backend stops. */
+void coli_vk_mark_lost(void);
 
 #ifdef __cplusplus
 }
