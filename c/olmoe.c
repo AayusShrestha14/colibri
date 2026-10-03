@@ -36,6 +36,9 @@
 #include <sys/resource.h>
 #include <unistd.h>
 #endif
+#if defined(__GLIBC__)
+#include <malloc.h>   /* malloc_trim: kv_room_fit gives the slots it frees back to the system */
+#endif
 #include "cli_args.h"
 #include "st.h"
 #ifdef _OPENMP
@@ -132,6 +135,10 @@ typedef struct {
      * plain double: a per-turn delta of it is what the PROF line reports. */
     uint64_t disk_ns;
     float **K, **V; int kv_len, max_t;
+    /* The bytes the expert cache and the KV share when the cache was sized from
+     * the automatic budget (0: an explicit cap, nothing shared), and the
+     * positions the KV's pages already reach (see kv_room_fit). */
+    int64_t room_bytes; int kv_room_t;
     /* What the cached keys and values were built from, so a serve turn that
      * resends the transcript prefills only the new tail. Recorded where the
      * tokens are fed (see kv_prefix.h), never derived from a counter. */
@@ -543,6 +550,13 @@ static float *load_t(Model *m, const char *name) {
     return p;
 }
 
+/* One slot holds one expert: three int8 matrices plus their row scales, the
+ * same arithmetic the Segment adapter uses to turn a memory limit into a cap. */
+static int64_t slot_bytes(const Cfg *c) {
+    return (int64_t)c->hidden * c->inter * 3 +
+           (int64_t)(c->inter * 2 + c->hidden) * (int64_t)sizeof(float);
+}
+
 static void model_init_range(Model *m, const char *snap, int cap, int bits,
                              int layer_begin, int layer_end,
                              int load_boundaries, int init_telemetry) {
@@ -598,21 +612,17 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
          * same fraction and the same reason as the sibling engines: overshoot
          * means an OOM kill mid-generation, which is worse than a small cache. */
         double budget = ram_arg > 0.0 ? ram_arg : resident + avail * 0.88;
-        /* The KV cache is allocated later, at the first request, so project it:
-         * two tensors per layer of n_heads * max_t * head_dim floats. CTX caps
-         * at 4096 because attention()'s score buffer does. */
-        int max_t = getenv("CTX") ? atoi(getenv("CTX")) : 4096;
-        if (max_t < 1 || max_t > 4096) max_t = 4096;
-        double kv_gb = 2.0 * (double)c->n_layers * c->n_heads * max_t *
-                       c->head_dim * sizeof(float) / 1e9;
-        /* One slot holds one expert: three int8 matrices plus their row scales,
-         * the same arithmetic the Segment adapter uses to turn a memory limit
-         * into a cap. */
-        double slot_gb = ((double)c->hidden * c->inter * 3.0 +
-                          (double)(c->inter * 2 + c->hidden) * sizeof(float)) / 1e9;
+        /* The KV is not set aside here. Its pages are faulted in as positions
+         * are written, so the cache and the KV share this room: kv_room_fit()
+         * takes a layer's slots back as the KV reaches their bytes. Setting
+         * aside the KV of the whole context (CTX, 1.07 GB at 4096 positions on
+         * OLMoE-1B-7B) cost the cache that much even for a request that writes
+         * a few hundred positions. */
+        double slot_gb = (double)slot_bytes(c) / 1e9;
         int layers = layer_end - layer_begin;
         if (layers < 1) layers = 1;
-        double room = budget - resident - kv_gb - 0.5;   /* 0.5 GB: activations */
+        double room = budget - resident - 0.5;   /* 0.5 GB: activations */
+        m->room_bytes = room > 0.0 ? (int64_t)(room * 1e9) : 0;
         int derived = room > 0.0 && slot_gb > 0.0
                     ? (int)(room / slot_gb / (double)layers) : 0;
         if (derived < 1) {
@@ -625,11 +635,11 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         }
         if (derived > c->n_experts) derived = c->n_experts;
         fprintf(stderr, "[cache] %d slots/layer of %d experts: %.1f GB budget "
-                        "(%s), %.1f GB dense resident, %.1f GB projected KV, "
-                        "%.0f MB per expert\n",
+                        "(%s), %.1f GB dense resident, %.0f MB per expert; "
+                        "the KV takes slots back as the context grows\n",
                 derived, c->n_experts, budget,
                 ram_arg > 0.0 ? "RAM_GB" : "88% of what the OS still offers",
-                resident, kv_gb, slot_gb * 1000.0);
+                resident, slot_gb * 1000.0);
         cap = derived;
     }
     m->cache = calloc(c->n_layers, sizeof(LCache));
@@ -948,6 +958,72 @@ static void expert_put(Slot *s) {
     pthread_mutex_lock(&g_pilot_mx);
     s->busy--;
     pthread_mutex_unlock(&g_pilot_mx);
+}
+
+/* The bytes the KV's pages reach once `positions` are written: K and V of
+ * every layer hold n_heads rows of max_t * head_dim floats, each written from
+ * its start, and a row's first B bytes touch at most B / 4096 + 2 pages. */
+static int64_t kv_room_bytes(const Model *m, int positions) {
+    const Cfg *c = &m->c;
+    int64_t rows = 2 * (int64_t)c->n_layers * c->n_heads;
+    return rows * ((int64_t)positions * c->head_dim * (int64_t)sizeof(float) + 2 * 4096);
+}
+
+/* The expert cache and the KV share one room (room_bytes, set by the automatic
+ * budget in model_init_range). Before a forward writes positions the KV has
+ * not reached yet, every layer's cap comes down to what the room still holds,
+ * never below one slot, and each layer frees its least recently used slots
+ * down to it (a pinned one only when nothing else is left). Which experts sit
+ * in RAM changes, the logits do not. Called from step(), between forwards: no
+ * slot is busy, and a PILOT read in flight is waited for as in expert_get. */
+static void kv_room_fit(Model *m, int positions) {
+    if (m->room_bytes <= 0 || positions <= m->kv_room_t) return;
+    m->kv_room_t = positions;
+    Cfg *c = &m->c;
+    int64_t left = m->room_bytes - kv_room_bytes(m, positions);
+    int64_t fit = left > 0 ? left / slot_bytes(c) / c->n_layers : 0;
+    int cap = fit < 1 ? 1 : fit > c->n_experts ? c->n_experts : (int)fit;
+    int shrunk = 0;
+    pthread_mutex_lock(&g_pilot_mx);
+    for (int l = 0; l < c->n_layers; l++) {
+        LCache *lc = &m->cache[l];
+        if (!lc->slots || cap >= lc->cap) continue;
+        lc->cap = cap; shrunk = 1;
+        while (lc->n > cap) {
+            int v = -1;
+            for (int i = 0; i < lc->n; i++) {
+                Slot *s = &lc->slots[i];
+                if (s->eid < 0 || s->busy) continue;
+                if (v < 0 || s->pinned < lc->slots[v].pinned ||
+                    (s->pinned == lc->slots[v].pinned && s->used < lc->slots[v].used)) v = i;
+            }
+            Slot *last = &lc->slots[lc->n - 1];
+            if (v < 0 || (v != lc->n - 1 && (last->eid < 0 || last->busy))) {
+                /* the slot to free or the one to move into its place is being
+                 * read into: wait for that read to publish */
+                pthread_mutex_unlock(&g_pilot_mx);
+                sleep_ms(1);
+                pthread_mutex_lock(&g_pilot_mx);
+                continue;
+            }
+            Slot *s = &lc->slots[v];
+            cache_unindex(m, l, s);
+            free(s->g); free(s->gs);   /* the two blocks slot_ensure_allocated made */
+            if (s != last) {
+                *s = *last;
+                if (lc->slot_by_expert && s->eid >= 0 && s->eid < c->n_experts)
+                    lc->slot_by_expert[s->eid] = v;
+            }
+            memset(last, 0, sizeof *last);
+            lc->n--;
+        }
+    }
+    pthread_mutex_unlock(&g_pilot_mx);
+    if (!shrunk) return;
+#if defined(__GLIBC__)
+    malloc_trim(0);   /* glibc keeps freed blocks in its heap unless asked */
+#endif
+    fprintf(stderr, "[cache] the KV reaches %d positions: %d slots/layer\n", positions, cap);
 }
 
 /* ---------- IMPROVEMENT 2: pin top-N hot experts per layer ---------- */
@@ -1343,6 +1419,7 @@ static void olmoe_echo(const char *id, int pos, int token, const float *lo, int 
 
 static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
+    kv_room_fit(m, pos_base + S);   /* before the positions' pages are written */
     if (g_pilot && m->token_count > 0) {
         /* Flush stale prefetch requests: clear is_queued so pilot_realload
          * will skip any entries still sitting in pilot_q for the previous
