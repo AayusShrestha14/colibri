@@ -664,6 +664,43 @@ uint64_t coli_v4_expert_store_record_bytes(ColiExpertStore *store);
 int coli_v4_expert_store_read_private(ColiExpertStore *store, ColiExpertKey key,
                                       unsigned char *buffer, ColiExpertView *view);
 extern int (*coli_v4_expert_store_device_tier)(int layer, int expert);
+
+/* The dense chain (deepseek_v4_chain.h, COLI_VK_CHAIN): a layer's attention state as its
+ * units keep it, so the chain can mirror it on the device and write back what a forward
+ * changed, as the CPU would have left it. The views point into the live state.
+ *   attention  the window ring [window][head_dim] (position % window), the compressed
+ *              rows [capacity][head_dim] and their count, the compressor and the
+ *              indexer (NULL on a layer without them, or before the layer first ran:
+ *              coli_v4_window_attention_prepare makes them);
+ *   compressor its ring: kv and score rows [rows][projection] (rows = ratio, twice that
+ *              with the overlap of ratio 4; projection = head_dim, twice that likewise);
+ *   indexer    its keys [capacity][head_dim] and their count, and its compressor.
+ * reserve makes room for `rows` rows (the contents kept, the count untouched); set_count
+ * sets the count (at most the capacity). */
+typedef struct {
+    float *kv, *compressed;
+    int window, head_dim, ratio, compressed_count, compressed_capacity;
+    ColiDeepSeekV4CompressorState *compressor;
+    ColiDeepSeekV4Indexer *indexer;
+} ColiV4AttentionView;
+int coli_v4_attention_view(ColiDeepSeekV4WindowAttentionState *state, ColiV4AttentionView *view);
+int coli_v4_attention_reserve(ColiDeepSeekV4WindowAttentionState *state, int rows);
+int coli_v4_attention_set_count(ColiDeepSeekV4WindowAttentionState *state, int count);
+typedef struct { float *kv, *score; int rows, projection, ratio, head_dim, rotate_fp4; } ColiV4CompressorView;
+int coli_v4_compressor_view(ColiDeepSeekV4CompressorState *state, ColiV4CompressorView *view);
+typedef struct { float *keys; int count, capacity, head_dim; ColiDeepSeekV4CompressorState *compressor; } ColiV4IndexerView;
+int coli_v4_indexer_view(ColiDeepSeekV4Indexer *state, ColiV4IndexerView *view);
+int coli_v4_indexer_reserve(ColiDeepSeekV4Indexer *state, int rows);
+int coli_v4_indexer_set_count(ColiDeepSeekV4Indexer *state, int count);
+/* The MoE of `rows` normalized FFN rows without the shared expert: each row's routed
+ * experts summed in the CPU block's order (the store, the Vulkan tier), the sum left as
+ * it stands before the CPU adds the shared expert and rounds; the chain adds the shared
+ * expert it ran on the device. tokens: the rows' ids (the hash router). 0, or -1 with
+ * the reason in error. */
+int coli_v4_moe_routed(float *routed, const ColiDeepSeekV4LayerWeights *weights,
+                       const ColiDeepSeekV4Config *config, ColiExpertStore *store,
+                       const float *inputs, const int *tokens, int rows,
+                       char *error, size_t error_size);
 #endif
 
 #ifdef __cplusplus
