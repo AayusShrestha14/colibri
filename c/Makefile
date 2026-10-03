@@ -1296,6 +1296,19 @@ laya-tiny-generate:
 laya-tiny-check: laya-tiny-generate laya$(EXE)
 	LAYA_TINY_REQUIRED=1 $(PYTHON) -m unittest -v tests.test_laya_tiny tests.test_decision_serve
 
+# Tiny GLiNER2.5-Decide checkpoint + the gliner2 package's own answers on it,
+# the same arrangement: tools/make_gliner_decide_tiny.py (numpy, deterministic)
+# writes the checkpoint, gliner_decide_tiny/ref.json is committed and comes from
+# the `gliner2` package (tools/make_gliner_decide_ref.py, maintainer-run,
+# fixture SHA-256 pinned). The second module serves the fixture through the
+# gateway: POST /v1/systemone end to end.
+.PHONY: gliner-decide-tiny-generate gliner-decide-tiny-check
+gliner-decide-tiny-generate:
+	$(PYTHON) tools/make_gliner_decide_tiny.py --output ./gliner_decide_tiny
+
+gliner-decide-tiny-check: gliner-decide-tiny-generate gliner_decide$(EXE)
+	GLINER_DECIDE_TINY_REQUIRED=1 $(PYTHON) -m unittest -v tests.test_gliner_decide_tiny tests.test_decision_serve
+
 # TypeSafe's own SDKs (Python and TypeScript), unmodified, against `coli serve`
 # on a language model (tiny MiMo) and a decision engine (tiny Laya): switching
 # from Jev is a base-URL change. Needs the pinned SDKs first:

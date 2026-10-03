@@ -1101,6 +1101,19 @@ jobs:
       - name: Generate the fixture, build laya, compare with the committed reference
         run: make -C c laya-tiny-check
 
+  gliner-decide-tiny-check:
+    name: GLiNER2.5-Decide tiny oracle (vs the gliner2 package) and POST /v1/systemone end to end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install the fixture generator's one dependency
+        run: pip install numpy
+      - name: Generate the fixture, build gliner_decide, compare with the committed reference
+        run: make -C c gliner-decide-tiny-check
+
   jev-sdk-check:
     name: TypeSafe's SDKs (Python, TypeScript) against coli serve, base URL changed only
     runs-on: ubuntu-latest
