@@ -550,6 +550,25 @@ def missing_shared_libraries(engine_path):
                    for line in result.stdout.splitlines() if "not found" in line})
 
 
+def _decision_head_check(model, resolved):
+    """A decision head beside a chat model's shards (Clef): its config must read
+    and fit the backbone, or the engine refuses to start."""
+    from family_registry import decision_head_of
+    head = decision_head_of(resolved)
+    try:
+        config = json.loads((Path(model) / head.files[0]).read_text(encoding="utf-8"))
+        hidden = config.get("hidden_size")
+    except (OSError, ValueError, AttributeError) as error:
+        return _check("model.decision_head", "fail", f"{head.files[0]} is unreadable: {error}")
+    want = resolved.family_config.get("hidden_size")
+    if hidden != want:
+        return _check("model.decision_head", "fail",
+                      f"{head.display_name} head reads hidden size {hidden}, the backbone has {want}")
+    return _check("model.decision_head", "pass",
+                  f"{head.display_name} decision head: POST /v1/systemone answers natively",
+                  head=head.id, hidden_size=hidden)
+
+
 def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
                engine_path, available_memory=None, available_disk=None, gpus=None,
                linkage=None, deep=False, mirror_dir=None, kv_slots=1,
@@ -582,6 +601,8 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
                                  family_id=resolved.descriptor.id,
                                  model_type=resolved.model_type,
                                  descriptor=public_metadata(resolved.descriptor)))
+            if resolved.decision_head:
+                checks.append(_decision_head_check(model, resolved))
         except (FamilyConfigError, UnknownFamilyError) as error:
             checks.append(_check("model.family", "fail", str(error)))
     else:

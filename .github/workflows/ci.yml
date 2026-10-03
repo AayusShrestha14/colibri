@@ -1169,11 +1169,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: Install the pinned SDKs
+      - name: Install the pinned SDKs, and torch for the Clef fixture's converter
         run: |
           pip install -r c/tools/requirements-jev-sdk.txt
+          pip install numpy -r c/tools/oracle-requirements.txt
           cd c/tools/jev-sdk && npm ci
-      - name: Both SDKs against a language model (tiny MiMo) and a decision engine (tiny Laya)
+      - name: Both SDKs against a language model (tiny MiMo), a decision engine (tiny Laya) and Clef
         run: make -C c jev-sdk-check
 
   qwenimage-tiny-check:

@@ -179,6 +179,45 @@ class ResolvedFamily:
     config: dict
     family_config: dict
     model_dir: str
+    # A decision head over a text family's backbone (Cloudflare's Clef: a qwen36
+    # container with joint_head_config.json and joint_head.safetensors). The
+    # engine then answers POST /v1/systemone natively AND chats; the family, its
+    # planner and its limits stay the backbone's. "" for every other checkpoint.
+    decision_head: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionHead:
+    """A decision head a text engine loads beside its backbone (docs/clef.md)."""
+    id: str
+    family: str                  # the engine that runs the backbone and the head
+    files: tuple                 # all of them next to the shards
+    display_name: str
+    model_id: str
+    # (geometry, display_scale): the backbone sizes the head ships on
+    scales: tuple = ()
+
+
+DECISION_HEADS = (
+    DecisionHead("clef", "qwen36", ("joint_head_config.json", "joint_head.safetensors"),
+                 "Clef", "clef",
+                 scales=(((("num_hidden_layers", 64), ("hidden_size", 5120),
+                           ("intermediate_size", 17408)), "27B"),)),
+)
+
+
+def decision_head_of(resolved):
+    """The DecisionHead a resolved checkpoint carries, or None."""
+    for head in DECISION_HEADS:
+        if head.id == resolved.decision_head:
+            return head
+    return None
+
+
+def checkpoint_decides(resolved):
+    """True when the checkpoint answers POST /v1/systemone natively: a decision
+    family (Laya), or a text family with a decision head (Clef)."""
+    return resolved.descriptor.modality == "decision" or bool(resolved.decision_head)
 
 
 def _required_int(config, key, family, minimum=1):
@@ -1874,8 +1913,18 @@ def resolve_model(model_dir):
         family_config = config.get("text_config", config)
         if not isinstance(family_config, dict):
             raise FamilyConfigError(f"{family.id}: text_config is not an object")
+    head = ""
+    for candidate in DECISION_HEADS:
+        present = [name for name in candidate.files if (model / name).is_file()]
+        if candidate.family == family.id and present:
+            if len(present) != len(candidate.files):
+                raise FamilyConfigError(f"{model}: {present[0]} without "
+                                        f"{', '.join(n for n in candidate.files if n not in present)}: "
+                                        f"a {candidate.display_name} decision head needs all of "
+                                        f"{', '.join(candidate.files)}")
+            head = candidate.id
     return ResolvedFamily(family, _normalize_model_type(config.get("model_type")),
-                          config, family_config, str(model))
+                          config, family_config, str(model), head)
 
 
 def default_model_id(resolved):
@@ -1883,6 +1932,9 @@ def default_model_id(resolved):
     one of its own, else the family's."""
     family = resolved.descriptor
     config = resolved.family_config
+    head = decision_head_of(resolved)
+    if head:
+        return head.model_id
     for variant in family.display_variants:
         if variant.model_id and all(config.get(key) == value for key, value in variant.geometry):
             return variant.model_id
@@ -1899,9 +1951,15 @@ def display_for(resolved):
     count.
     """
     family = resolved.descriptor
+    config = resolved.family_config
+    head = decision_head_of(resolved)
+    if head:
+        for geometry, scale in head.scales:
+            if all(config.get(key) == value for key, value in geometry):
+                return head.display_name, scale
+        return head.display_name, ""
     if not family.display_variants:
         return family.display_name, family.display_scale
-    config = resolved.family_config
     for variant in family.display_variants:
         if all(config.get(key) == value for key, value in variant.geometry):
             return variant.display_name, variant.display_scale

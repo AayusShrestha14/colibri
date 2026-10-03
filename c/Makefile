@@ -1318,11 +1318,12 @@ clef-tiny-check: clef-tiny-generate qwen36$(EXE)
 	CLEF_TINY_REQUIRED=1 $(PYTHON) -m unittest -v tests.test_clef_tiny tests.test_decision_serve
 
 # TypeSafe's own SDKs (Python and TypeScript), unmodified, against `coli serve`
-# on a language model (tiny MiMo) and a decision engine (tiny Laya): switching
-# from Jev is a base-URL change. Needs the pinned SDKs first:
+# on a language model (tiny MiMo), a decision engine (tiny Laya) and a chat
+# model with a decision head (tiny Clef on qwen36): switching from Jev is a
+# base-URL change. Needs the pinned SDKs first, and torch for the Clef converter:
 #   pip install -r tools/requirements-jev-sdk.txt && (cd tools/jev-sdk && npm ci)
 .PHONY: jev-sdk-check
-jev-sdk-check: mimo$(EXE) laya$(EXE) mimo-tiny-generate laya-tiny-generate
+jev-sdk-check: mimo$(EXE) laya$(EXE) qwen36$(EXE) mimo-tiny-generate laya-tiny-generate clef-tiny-generate
 	JEV_SDK_REQUIRED=1 $(PYTHON) -m unittest -v tests.test_jev_sdk
 
 # In make check: every format and ragged edges against the naive product, and

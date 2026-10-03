@@ -24,7 +24,7 @@ import v4_dsml                      # vendored DeepSeek V4 DSML reference primit
 import v41_dsml                     # ...and V4.1's, whose tag names differ by a space
 import image_engine                 # the qwenimage serve protocol, PNG and request rules
 from family_registry import (FamilyConfigError, UnknownFamilyError, family_by_id,
-                             family_ids, resolve_model)
+                             display_for, family_ids, resolve_model)
 from family_registry import default_model_id as registry_default_model_id
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -5942,7 +5942,7 @@ class APIServer(ThreadingHTTPServer):
         """The served model as Jev's GET /v1/models lists it. colibri does not know a
         model's release date; it gives the day this server started."""
         try:
-            name = family_by_id(ARCH).display_name
+            name = getattr(self, "display_name", None) or family_by_id(ARCH).display_name
         except Exception:
             name = self.model_id
         return {"name": self.model_id,
@@ -7975,6 +7975,10 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
                 pending_model_id = family.default_model_id
         model_id = pending_model_id
         server.model_id = model_id
+        try:          # what the checkpoint on disk is called (a Clef, a 27B), for the Jev card
+            server.display_name = display_for(resolve_model(model))[0]
+        except Exception:
+            server.display_name = None
         if kv_slots > family.limits.max_kv_slots:
             raise ValueError(f"{family.id} engine supports at most "
                              f"{family.limits.max_kv_slots} KV slot(s)")

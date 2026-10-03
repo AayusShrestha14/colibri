@@ -16,9 +16,15 @@ of scoring options through the logprob channel. Three layers are pinned here:
                       gateway: the probabilities that come back over HTTP are
                       the `laya` package's (laya_tiny/ref.json), and the
                       latency is split into gateway and engine time.
+  ClefTinyEndToEnd    qwen36 with Clef's decision head (clef_tiny_c) behind the
+                      real gateway: CAPS decide=1 decide_record=raw and no
+                      chat=0, /v1/systemone gives Clef's own probabilities
+                      (clef_tiny/ref.json), and the same engine still chats,
+                      with a decision before and after the chat unchanged.
 
-LayaTinyEndToEnd is skipped without the fixture and the binary
-(`make laya-tiny-check` builds both and turns the skip into a failure).
+LayaTinyEndToEnd and ClefTinyEndToEnd are skipped without their fixture and
+binary (`make laya-tiny-check` and `make clef-tiny-check` build them and turn
+the skip into a failure).
 """
 import json
 import math
@@ -43,6 +49,10 @@ from test_openai_server import BlockingStream, FakeProcess  # noqa: E402
 FIXTURE = HERE / "laya_tiny"
 BINARY = HERE / ("laya.exe" if os.name == "nt" else "laya")
 REQUIRED = os.environ.get("LAYA_TINY_REQUIRED") == "1"
+CLEF_REF = HERE / "clef_tiny" / "ref.json"
+CLEF_CONTAINER = HERE / "clef_tiny_c"
+QWEN36 = HERE / ("qwen36.exe" if os.name == "nt" else "qwen36")
+CLEF_REQUIRED = os.environ.get("CLEF_TINY_REQUIRED") == "1"
 
 TICKET = {"from": "user@acme.com", "subject": "Duplicate charge on invoice #4411",
           "body": "Hi, we were billed twice for March. Please refund the duplicate today or we "
@@ -238,6 +248,40 @@ class DecisionGateway(unittest.TestCase):
         self.assertEqual(s["instructions"], "Rate this on the scale below.")
         self.assertEqual(d["instructions"], "Is this true?")
 
+    def test_a_raw_form_engine_gets_the_callers_values(self):
+        """An engine that said decide_record=raw (Clef) renders the request the way
+        its reference does: it gets the caller's values, not the gateway's
+        defaults, and JSON with sorted keys."""
+        engine = FakeDecisionEngine({"q": [0.5, 0.5], "c": [0.2, 0.3, 0.5], "s": [0.5, 0.5],
+                                     "d": [0.5, 0.5]})
+        engine.decide_record = "raw"
+        engine.chats = True
+        self.serve(engine)
+        self.post("/v1/systemone", {"state": {"ticket": 4711, "text": "café", "ok": True},
+                                    "questions": {
+            "q": {"type": "noul", "instructions": {"ask": "money?", "a": 1},
+                  "criteria": {"true": "about a payment", "false": None}},
+            "c": {"type": "choice", "instructions": "",
+                  "criteria": {"b": None, "a": {"z": 1, "y": [2.5]}, "c": ""}},
+            "s": {"type": "score", "criteria": ["low", {"n": 2}]},
+            "d": {"type": "noul"}}})
+        record = self.engine.records[0]
+        self.assertEqual(record["record"], "raw")
+        self.assertEqual(record["state"], '{"ok":true,"text":"café","ticket":4711}')
+        q, c, s, d = record["questions"]
+        self.assertEqual(q["instructions"], '{"a":1,"ask":"money?"}')
+        self.assertEqual(q["options"], [{"label": "false", "text": None},
+                                        {"label": "true", "text": "about a payment"}])
+        self.assertEqual(c["instructions"], "")                         # not replaced
+        self.assertEqual(c["options"], [{"label": "b", "text": None},
+                                        {"label": "a", "text": '{"y":[2.5],"z":1}', "json": True},
+                                        {"label": "c", "text": ""}])
+        self.assertEqual(s["instructions"], None)
+        self.assertEqual(s["options"][1], {"label": "1", "text": '{"n":2}', "json": True})
+        self.assertEqual(d["options"], [{"label": "false"}, {"label": "true"}])   # undescribed
+        with urlopen(self.base + "/v1/models", timeout=10) as response:
+            self.assertEqual(json.loads(response.read())["data"][0]["capabilities"], ["chat", "systemone"])
+
     def test_a_list_state_is_a_conversation(self):
         self.serve(FakeDecisionEngine({"q": [0.5, 0.5]}))
         turns = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
@@ -369,6 +413,32 @@ class DecisionRegistryAndLauncher(unittest.TestCase):
             self.assertIn("POST /v1/systemone", refused.stdout + refused.stderr)
 
 
+    def test_the_registry_knows_a_clef_checkpoint(self):
+        import tempfile
+        from family_registry import (FamilyConfigError, checkpoint_decides, default_model_id,
+                                     display_for, resolve_model)
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        text = {"model_type": "qwen3_5_text", "num_hidden_layers": 64, "hidden_size": 5120,
+                "intermediate_size": 17408}
+        (root / "config.json").write_text(json.dumps({"model_type": "qwen3_5", "text_config": text}),
+                                          encoding="utf-8")
+        stock = resolve_model(root)
+        self.assertEqual((stock.decision_head, display_for(stock)), ("", ("Qwen3.8-27B", "27B")))
+        self.assertFalse(checkpoint_decides(stock))
+        (root / "joint_head_config.json").write_text(json.dumps({"hidden_size": 5120}), encoding="utf-8")
+        with self.assertRaises(FamilyConfigError):          # half a head
+            resolve_model(root)
+        (root / "joint_head.safetensors").write_bytes(b"")
+        clef = resolve_model(root)
+        self.assertEqual((clef.descriptor.id, clef.descriptor.modality), ("qwen36", "text"))
+        self.assertEqual(clef.decision_head, "clef")
+        self.assertTrue(checkpoint_decides(clef))
+        self.assertEqual(display_for(clef), ("Clef", "27B"))
+        self.assertEqual(default_model_id(clef), "clef")
+
+
 def _laya_ready():
     return (FIXTURE / "model.safetensors").exists() and BINARY.exists()
 
@@ -468,6 +538,134 @@ class LayaTinyEndToEnd(unittest.TestCase):
         walls.sort(), engines.sort()
         wall, engine = walls[len(walls) // 2], engines[len(engines) // 2]
         sys.stderr.write(f"\n[laya tiny e2e] /v1/systemone, 4 questions: median {wall:.1f} ms at the "
+                         f"client, {engine:.1f} ms in the engine, {wall - engine:.1f} ms gateway\n")
+        self.assertGreater(wall, engine)
+
+
+def _clef_ready():
+    return CLEF_REF.exists() and (CLEF_CONTAINER / "joint_head.safetensors").exists() and QWEN36.exists()
+
+
+class ClefTinyEndToEnd(unittest.TestCase):
+    """qwen36 with Clef's head behind the real gateway, on the tiny fixture."""
+
+    # the cases the route accepts as Jev requests (it refuses a bare number as a
+    # criterion or an instruction, which the engine-level oracle still covers)
+    CASES = ("model_card_invoice", "model_card_systemone", "ticket_four_questions", "noul_variants",
+             "json_state", "conversation", "special_text", "many_questions", "single_option",
+             "empty_state")
+
+    @classmethod
+    def setUpClass(cls):
+        if not _clef_ready():
+            message = "qwen36, clef_tiny or clef_tiny_c missing: run make clef-tiny-check"
+            if CLEF_REQUIRED:
+                raise AssertionError(message)
+            raise unittest.SkipTest(message)
+        cls.ref = {case["name"]: case for case in
+                   json.loads(CLEF_REF.read_text(encoding="utf-8"))["cases"]}
+
+    def setUp(self):
+        arch = patch.object(openai_server, "ARCH", "qwen36")
+        arch.start()
+        self.addCleanup(arch.stop)
+        engine = Engine(QWEN36, CLEF_CONTAINER, family=family_by_id("qwen36"),
+                        env=dict(os.environ, COLI_DENSE_I8="0", OMP_NUM_THREADS="2",
+                                 COLI_NO_OMP_TUNE="1"))
+        self.engine = engine
+        self.addCleanup(engine.process.stdout.close)
+        self.addCleanup(engine.close)
+        self.server = APIServer(("127.0.0.1", 0), engine, "clef-tiny")
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+
+    def post(self, path, body):
+        request = Request(self.base + path, data=json.dumps(body).encode(),
+                          headers={"Content-Type": "application/json"})
+        with urlopen(request, timeout=300) as response:
+            return json.loads(response.read()), dict(response.headers)
+
+    def check(self, name, out):
+        case = self.ref[name]
+        for want in case["answers"]:
+            got = out["answers"][want["id"]]
+            p = dict(zip(want["option_ids"], want["probs"]))
+            if got["type"] == "noul":
+                self.assertAlmostEqual(got["noul"], p["true"], delta=2e-5, msg=name)
+                continue
+            self.assertEqual(set(got["probabilities"]), set(p), name)
+            for label, value in got["probabilities"].items():
+                self.assertAlmostEqual(value, p[label], delta=2e-5, msg=f"{name}.{want['id']}.{label}")
+            if got["type"] == "choice":
+                self.assertEqual(got["choice"], max(p, key=p.get), name)
+        self.assertEqual(out["usage"], {"input_tokens": len(case["input_ids"]), "output_tokens": 0,
+                                        "cost": 0})
+
+    def test_caps_say_decide_raw_and_chat(self):
+        self.assertTrue(self.engine.decides)
+        self.assertTrue(self.engine.chats)
+        self.assertEqual(self.engine.decide_record, "raw")
+        with urlopen(self.base + "/v1/models", timeout=10) as response:
+            card = json.loads(response.read())
+        self.assertEqual(card["data"][0]["capabilities"], ["chat", "systemone"])
+
+    def test_systemone_answers_with_clefs_probabilities(self):
+        for name in self.CASES:
+            case = self.ref[name]
+            with self.subTest(case=name):
+                out, headers = self.post("/v1/systemone", {"model": "jev-latest", "state": case["state"],
+                                                           "questions": case["questions"]})
+                self.check(name, out)
+                self.assertIn("x-colibri-engine-ms", headers)
+
+    def test_the_same_engine_chats_between_two_decisions(self):
+        case = self.ref["model_card_systemone"]
+        body = {"state": case["state"], "questions": case["questions"]}
+        first, _ = self.post("/v1/systemone", body)
+        chat, _ = self.post("/v1/chat/completions", {"model": "clef-tiny", "max_tokens": 6,
+                                                      "temperature": 0,
+                                                      "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(chat["object"], "chat.completion")
+        self.assertGreater(chat["usage"]["completion_tokens"], 0)
+        second, _ = self.post("/v1/systemone", body)
+        self.assertEqual(second["answers"], first["answers"])
+        self.check("model_card_systemone", second)
+
+    def test_a_schema_past_the_budget_is_a_422(self):
+        """COLI_CLEF_MAX_LEN is the reference's max_length: past it the schema alone
+        does not fit and the request is the caller's 422, not a 500."""
+        self.engine.close()
+        engine = Engine(QWEN36, CLEF_CONTAINER, family=family_by_id("qwen36"),
+                        env=dict(os.environ, COLI_DENSE_I8="0", OMP_NUM_THREADS="2",
+                                 COLI_NO_OMP_TUNE="1", COLI_CLEF_MAX_LEN="600"))
+        self.addCleanup(engine.process.stdout.close)
+        self.addCleanup(engine.close)
+        self.server.engine = engine
+        case = self.ref["schema_too_long"]
+        request = Request(self.base + "/v1/systemone",
+                          data=json.dumps({"state": case["state"], "questions": case["questions"]}).encode(),
+                          headers={"Content-Type": "application/json"})
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(request, timeout=120)
+        self.assertEqual(caught.exception.code, 422)
+        self.assertIn("1389", json.loads(caught.exception.read())["error"]["message"])
+
+    def test_latency_gateway_and_engine(self):
+        """Not a gate: wall time at the client against the engine's own time."""
+        case = self.ref["ticket_four_questions"]
+        body = {"model": "jev-latest", "state": case["state"], "questions": case["questions"]}
+        self.post("/v1/systemone", body)
+        walls, engines = [], []
+        for _ in range(5):
+            started = time.perf_counter()
+            _, headers = self.post("/v1/systemone", body)
+            walls.append((time.perf_counter() - started) * 1e3)
+            engines.append(float(headers["x-colibri-engine-ms"]))
+        walls.sort(), engines.sort()
+        wall, engine = walls[len(walls) // 2], engines[len(engines) // 2]
+        sys.stderr.write(f"\n[clef tiny e2e] /v1/systemone, 4 questions: median {wall:.1f} ms at the "
                          f"client, {engine:.1f} ms in the engine, {wall - engine:.1f} ms gateway\n")
         self.assertGreater(wall, engine)
 
