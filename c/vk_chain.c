@@ -1115,3 +1115,28 @@ int vkc_dsv4_engram(VkcBuf *kv, VkcBuf *prm, VkcBuf *x, const VkcDsEngram *p) {
     VkcBind bd[6] = {B(kv, 0), B(prm, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(x, 1)};
     return dsv4_rec(PK_EW, 6, p, sizeof *p, bd, 6, (uint32_t)p->H, (uint32_t)p->S);
 }
+int vkc_dsv4_round(VkcBuf *x, VkcBuf *y, const VkcDsRound *p) {
+    if (!x || !y || p->kind < VKC_DS_BF16 || p->kind > VKC_DS_HADAMARD || p->nseg < 0 || p->per_row < 1 || p->len < 1)
+        return 0;
+    if ((p->kind == VKC_DS_E4M3 || p->kind == VKC_DS_E2M1) && (p->block < 1 || p->block > 256)) return 0;
+    if (p->kind == VKC_DS_HADAMARD && (p->len > 4096 || (p->len & (p->len - 1)))) return 0;
+    if (p->nseg == 0) return open_frame() && !K.lost;
+    /* the fields, then whether it runs in place (x is read where y is written), then hscale */
+    int w[14];
+    memcpy(w, p, 12 * sizeof(int));
+    w[12] = x == y;
+    memcpy(&w[13], &p->hscale, sizeof(float));
+    uint64_t groups = p->kind == VKC_DS_BF16 ? ((uint64_t)p->nseg * p->len + 255) / 256
+                    : p->kind == VKC_DS_HADAMARD ? (uint64_t)p->nseg
+                    : (uint64_t)p->nseg * ((p->len + p->block - 1) / p->block);
+    uint32_t gx, gy; grid(groups, &gx, &gy);
+    VkcBind bd[6] = {B(x == y ? NULL : x, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(y, 1)};
+    return dsv4_rec(PK_EW, 7, w, sizeof w, bd, 6, gx, gy);
+}
+int vkc_dsv4_swiglu(VkcBuf *a, VkcBuf *b, VkcBuf *y, const VkcDsSwiglu *p) {
+    if (!a || !b || !y || p->n < 0) return 0;
+    if (p->n == 0) return open_frame() && !K.lost;
+    uint32_t gx, gy; grid(((uint64_t)p->n + 255) / 256, &gx, &gy);
+    VkcBind bd[6] = {B(a, 0), B(b, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(y, 1)};
+    return dsv4_rec(PK_EW, 8, p, sizeof *p, bd, 6, gx, gy);
+}

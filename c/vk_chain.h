@@ -341,6 +341,29 @@ typedef struct { int S, width, topk, sc_row, l_off, l_row, base, order; } VkcDsT
 int vkc_dsv4_topk(VkcBuf *sc, VkcBuf *list, const VkcDsTopk *p);
 typedef struct { int S, H, D, kv_off, kv_row, x_off, x_row, qw_off, kw_off; float eps; } VkcDsEngram;
 int vkc_dsv4_engram(VkcBuf *kv, VkcBuf *prm, VkcBuf *x, const VkcDsEngram *p);
+/* DeepSeek V4's roundings, each the engine's C bit for bit (chain_dsv4.comp modes 7, 8):
+ *   vkc_dsv4_round    nseg segments of len floats (segment g at row g / per_row, index
+ *                     g % per_row: x_off + row*x_row + j*x_seg, y likewise) from x into y
+ *                     (y may be x: in place), as `kind`:
+ *                       VKC_DS_BF16      to bf16, nearest even (coli_bf16_round)
+ *                       VKC_DS_E4M3      E4M3 per block of `block` values with one
+ *                                        power-of-two scale (coli_fp8_activation_qdq_ref)
+ *                       VKC_DS_E2M1      E2M1 per block (coli_fp4_activation_qdq_ref)
+ *                       VKC_DS_HADAMARD  the Hadamard transform times hscale (the host's
+ *                                        1 / sqrtf(len)), to bf16 (coli_hadamard_bf16_ref)
+ *                     flags 1: the E4M3 or E2M1 result to bf16 after. Limits: block <= 256;
+ *                     the Hadamard's len a power of two up to 4096.
+ *   vkc_dsv4_swiglu   y[y_off + i] = bf16(g * sigmoid(g) * u), g = bf16(a[a_off + i]) and
+ *                     u = bf16(b[b_off + i]) clamped by lim when lim > 0, i < n (the shared
+ *                     expert's activation between its roundings; coli_v4_swiglu). */
+#define VKC_DS_BF16     0
+#define VKC_DS_E4M3     1
+#define VKC_DS_E2M1     2
+#define VKC_DS_HADAMARD 3
+typedef struct { int kind, nseg, per_row, len, block, flags, x_off, x_row, x_seg, y_off, y_row, y_seg; float hscale; } VkcDsRound;
+int vkc_dsv4_round(VkcBuf *x, VkcBuf *y, const VkcDsRound *p);
+typedef struct { int n, a_off, b_off, y_off; float lim; } VkcDsSwiglu;
+int vkc_dsv4_swiglu(VkcBuf *a, VkcBuf *b, VkcBuf *y, const VkcDsSwiglu *p);
 
 /* counters, for the engines' [VK] lines */
 typedef struct {

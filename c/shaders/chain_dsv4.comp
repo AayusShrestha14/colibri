@@ -1,7 +1,7 @@
 #version 450
 // DeepSeek V4.1 Flash's (and DeepSeek V4's) attention on the dense chain (vk_chain.c,
 // chain_dsv4; vk_chain.h: vkc_dsv4_*). The model is MQA over one KV row per position:
-// a sliding window of raw rows plus compressed rows a DSA indexer picks. Seven modes:
+// a sliding window of raw rows plus compressed rows a DSA indexer picks. Nine modes:
 //
 // mode 0, sparse attention with a sink (sparse_attn.h, coli_sparse_attend): one
 //   workgroup per (head h, row s). The row's list is list[l_off + s*l_row + j], j < cnt:
@@ -46,6 +46,27 @@
 //   s): x = the stream (x_off + s*x_row + c*D), key = kv[s][c*D..], value = kv[s][H*D..];
 //   r = 1/sqrt(mean(x^2) + eps) * 1/sqrt(mean(key^2) + eps), t = sum(x * qw * kw * key)
 //   * r / sqrt(D), g = sigmoid(sign(t) * sqrt(max(|t|, 1e-6))); x += g * value.
+// mode 7, DeepSeek V4's roundings over segments: segment g (row g / per_row, index
+//   j = g % per_row) is len floats at x_off + row*x_row + j*x_seg, written to y at
+//   y_off + row*y_row + j*y_seg (in place when x is y). Each kind as the engine's C:
+//   kind 0, bf16 (coli_bf16_round). One thread per value.
+//   kind 1, E4M3 per block of `block` values (coli_fp8_activation_qdq_ref): amax floored
+//     at 1e-4, the scale 2^e with e the smallest for which amax <= 448 * 2^e, each value
+//     times 2^-e clamped to +-448, rounded to E4M3 (nearest even, steps of 2^-9 below
+//     2^-6) and times 2^e back. One workgroup per (segment, block), block <= 256.
+//   kind 2, E2M1 per block (coli_fp4_activation_qdq_ref): amax floored at 6 * 2^-126, the
+//     scale 2^e smallest for which amax <= 6 * 2^e, each value times 2^-e clamped to +-6
+//     and rounded to the nearest of 0, 0.5, 1, 1.5, 2, 3, 4, 6 (a tie to the smaller,
+//     zero as +0), times 2^e. One workgroup per (segment, block), block <= 256.
+//   kind 3, the Hadamard transform (coli_hadamard_bf16_ref): butterflies of width 1, 2,
+//     4, ... in place in the CPU's order, then each value times hscale (the host's
+//     1 / sqrtf(len)) to bf16. One workgroup per segment, len a power of two <= 4096.
+//   flags 1 (kinds 1 and 2): the result to bf16 after. Every step is exact in f32 or
+//   rounds once as the CPU does, so the result is the CPU's bit for bit.
+// mode 8, DeepSeek V4's SwiGLU between the shared expert's roundings (coli_v4_swiglu):
+//   over n values g = bf16(a[a_off + i]), u = bf16(b[b_off + i]); with lim > 0,
+//   g = min(g, lim) and u = clamp(u, -lim, lim); y[y_off + i] = bf16(g * sigmoid(g) * u),
+//   the sigmoid in the CPU's stable form.
 // Offsets and strides in floats (ints for lists and masks).
 #extension GL_KHR_shader_subgroup_basic : enable
 layout(local_size_x = 256) in;
@@ -394,6 +415,108 @@ void engram() {
     for (int i = tid; i < D; i += 256) y5[xb + i] = y5[xb + i] + g * b0[vb + i];
 }
 
+// ---- mode 7 ------------------------------------------------------------------------
+float pow2(int k) { return uintBitsToFloat(uint(k + 127) << 23); }   // 2^k, -126 <= k <= 127
+// |x| <= 448: the nearest E4M3 value (ties to even), coli_e4m3fn_encode then _decode
+float e4m3r(float x) {
+    float a = abs(x), r;
+    if (a == 0.0) return x;
+    if (a >= 448.0) r = 448.0;
+    else if (a < 0.015625) {                 // below 2^-6: subnormal codes, steps of 2^-9
+        float s = a * 512.0, f = floor(s), fr = s - f;
+        if (fr > 0.5 || (fr == 0.5 && (int(f) & 1) == 1)) f += 1.0;
+        r = f * 0.001953125;
+    } else {                                 // 1.mmm x 2^E, three mantissa bits
+        uint b = floatBitsToUint(a);
+        int E = int((b >> 23) & 0xffu) - 127;
+        uint sg = 0x800000u | (b & 0x7fffffu), q = sg >> 20, rem = sg & 0xfffffu;
+        if (rem > 0x80000u || (rem == 0x80000u && (q & 1u) == 1u)) q++;
+        r = float(q) * pow2(E - 3);
+    }
+    return x < 0.0 ? -r : r;
+}
+// |x| <= 6: the nearest E2M1 value, a tie to the smaller magnitude, zero as +0 (the CPU
+// scans the codes in order and keeps the first of two equal distances)
+float e2m1r(float x) {
+    float a = abs(x), r;
+    if (a <= 0.25) return 0.0;
+    if (a <= 0.75) r = 0.5;
+    else if (a <= 1.25) r = 1.0;
+    else if (a <= 1.75) r = 1.5;
+    else if (a <= 2.5) r = 2.0;
+    else if (a <= 3.5) r = 3.0;
+    else if (a <= 5.0) r = 4.0;
+    else r = 6.0;
+    return x < 0.0 ? -r : r;
+}
+float rd_in(int i) { return p.v[13] != 0 ? y5[i] : b0[i]; }
+void roundings() {
+    int g = int(gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x), tid = int(gl_LocalInvocationID.x);
+    int kind = p.v[1], nseg = p.v[2], per_row = p.v[3], len = p.v[4], blk = p.v[5], flags = p.v[6];
+    if (kind == 0) {
+        int t = g * 256 + tid;
+        if (t >= nseg * len) return;
+        int sg = t / len, i = t - sg * len, row = sg / per_row, j = sg - row * per_row;
+        float v = rd_in(p.v[7] + row * p.v[8] + j * p.v[9] + i);
+        y5[p.v[10] + row * p.v[11] + j * p.v[12] + i] = bf16r(v);
+        return;
+    }
+    if (kind == 3) {                         // one workgroup per segment
+        if (g >= nseg) return;
+        int row = g / per_row, j = g - row * per_row;
+        int xb = p.v[7] + row * p.v[8] + j * p.v[9], yb = p.v[10] + row * p.v[11] + j * p.v[12];
+        for (int i = tid; i < len; i += 256) sm[i] = rd_in(xb + i);
+        barrier();
+        for (int w = 1; w < len; w *= 2) {
+            for (int k = tid; k < len / 2; k += 256) {
+                int base = (k / w) * 2 * w, i = k - (k / w) * w;
+                float l = sm[base + i], r = sm[base + w + i];
+                sm[base + i] = l + r;
+                sm[base + w + i] = l - r;
+            }
+            barrier();
+        }
+        float hs = intBitsToFloat(p.v[14]);
+        for (int i = tid; i < len; i += 256) y5[yb + i] = bf16r(sm[i] * hs);
+        return;
+    }
+    // kinds 1 and 2: one workgroup per (segment, block)
+    int nblk = (len + blk - 1) / blk, sg = g / nblk, bk = g - sg * nblk;
+    if (sg >= nseg) return;
+    int row = sg / per_row, j = sg - row * per_row, i = bk * blk + tid;
+    bool live = tid < blk && i < len;
+    int xa = p.v[7] + row * p.v[8] + j * p.v[9] + i, ya = p.v[10] + row * p.v[11] + j * p.v[12] + i;
+    float v = live ? rd_in(xa) : 0.0;
+    red[tid] = abs(v);
+    barrier();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off) red[tid] = max(red[tid], red[tid + off]);
+        barrier();
+    }
+    // m = (1 + man / 2^23) * 2^E. E4M3: 448 = 1.75 * 2^8, so m <= 448 * 2^e holds from
+    // e = E - 8 when the mantissa is at most 1.75, else from E - 7; E2M1: 6 = 1.5 * 2^2,
+    // from E - 2 when it is at most 1.5, else from E - 1. (The CPU takes the ceiling of
+    // log2 of m / 448 or m / 6, a correctly rounded quotient: the two agree.)
+    float m = kind == 1 ? max(red[0], 1.0e-4) : max(red[0], 6.0 * pow2(-126));
+    uint mb = floatBitsToUint(m), man = mb & 0x7fffffu;
+    int E = int((mb >> 23) & 0xffu) - 127;
+    int e = kind == 1 ? (man <= 0x600000u ? E - 8 : E - 7) : (man <= 0x400000u ? E - 2 : E - 1);
+    e = clamp(e, -126, 126);
+    float r = kind == 1 ? e4m3r(clamp(v * pow2(-e), -448.0, 448.0)) * pow2(e)
+                        : e2m1r(clamp(v * pow2(-e), -6.0, 6.0)) * pow2(e);
+    if ((flags & 1) != 0) r = bf16r(r);
+    if (live) y5[ya] = r;
+}
+
+// ---- mode 8 ------------------------------------------------------------------------
+void swiglu_v4() {
+    int t = int(gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u);
+    if (t >= p.v[1]) return;
+    float g = bf16r(b0[p.v[2] + t]), u = bf16r(b1[p.v[3] + t]), lim = intBitsToFloat(p.v[5]);
+    if (lim > 0.0) { g = min(g, lim); u = max(-lim, min(u, lim)); }
+    y5[p.v[4] + t] = bf16r(g * sig(g) * u);
+}
+
 void main() {
     int m = MODE;
     if (m == 0) attend();
@@ -403,4 +526,6 @@ void main() {
     else if (m == 4) candidates();
     else if (m == 5) topk();
     else if (m == 6) engram();
+    else if (m == 7) roundings();
+    else if (m == 8) swiglu_v4();
 }

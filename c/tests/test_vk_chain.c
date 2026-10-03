@@ -36,6 +36,8 @@
  *            window and compressed rows (V4's bf16 roundings too), interleaved RoPE
  *            both ways, the compressor's ring (V4's overlapping form), the indexer's
  *            scores, candidate blocks and top-k slot for slot, the engram gate
+ *   dsv4 rounding  DeepSeek V4's roundings (deepseek_v4.c): bf16, E4M3 and E2M1 per block,
+ *            the Hadamard transform, bit for bit; its SwiGLU within one bf16 step
  *
  *   make vk-chain-check VK=1   (VK_ICD_FILENAMES=.../lvp_icd.json for Lavapipe) */
 #include <stdio.h>
@@ -1245,6 +1247,179 @@ static void test_ds_engram(int S, int H, int D) {
     free(kv); free(x); free(prm); free(ref); free(got);
 }
 
+/* ---- DeepSeek V4's roundings (chain_dsv4.comp modes 7, 8) ------------------------------
+ * References transcribed from deepseek_v4.c (COLI_V4_UNIT_NATIVE_QUANT, the MATH unit's
+ * coli_v4_swiglu): the device must give their bits. */
+static float ds_e4m3_decode(uint8_t v) {
+    int sign = v >> 7, exponent = (v >> 3) & 15, mantissa = v & 7;
+    if (exponent == 15 && mantissa == 7) return NAN;
+    float n = !exponent ? ldexpf((float)mantissa, -9) : ldexpf(1.0f + (float)mantissa / 8.0f, exponent - 7);
+    return sign ? -n : n;
+}
+static uint8_t ds_e4m3_encode(float value) {
+    if (isnan(value)) return 0x7f;
+    int negative = signbit(value) != 0;
+    float magnitude = fabsf(value);
+    if (!magnitude) return negative ? 0x80 : 0;
+    if (magnitude >= 448.0f) return (uint8_t)((negative ? 0x80 : 0) | 0x7e);
+    uint8_t best;
+    if (magnitude < 0.015625f) {
+        float scaled = magnitude * 512.0f;
+        uint8_t rounded = (uint8_t)scaled;
+        float fraction = scaled - rounded;
+        if (fraction > 0.5f || (fraction == 0.5f && (rounded & 1))) rounded++;
+        best = rounded;
+    } else {
+        uint32_t bits; memcpy(&bits, &magnitude, 4);
+        int exponent = (int)((bits >> 23) & 0xff) - 127;
+        uint32_t significand = 0x800000u | (bits & 0x7fffffu), rounded = significand >> 20, remainder = significand & 0xfffffu;
+        if (remainder > 0x80000u || (remainder == 0x80000u && (rounded & 1u))) rounded++;
+        if (rounded == 16u) { rounded = 8u; exponent++; }
+        best = (uint8_t)((exponent + 7) * 8 + (int)rounded - 8);
+    }
+    return (uint8_t)(best | (negative ? 0x80 : 0));
+}
+static int ds_ceil_log2(float value) { int e; float f = frexpf(value, &e); return f == 0.5f ? e - 1 : e; }
+static void ds_fp8_qdq(float *out, const float *in, size_t n, size_t block) {
+    for (size_t base = 0; base < n; base += block) {
+        size_t count = n - base < block ? n - base : block;
+        float maximum = 0.0f;
+        for (size_t i = 0; i < count; i++) maximum = fmaxf(maximum, fabsf(in[base + i]));
+        maximum = fmaxf(maximum, 1e-4f);
+        int e = ds_ceil_log2(maximum / 448.0f);
+        if (e < -127) e = -127;
+        if (e > 127) e = 127;
+        float scale = ldexpf(1.0f, e);
+        for (size_t i = 0; i < count; i++)
+            out[base + i] = ds_e4m3_decode(ds_e4m3_encode(fmaxf(-448.0f, fminf(448.0f, in[base + i] / scale)))) * scale;
+    }
+}
+static float ds_e2m1_decode(int n) {
+    static const float v[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f, 0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+    return v[n & 15];
+}
+static void ds_fp4_qdq(float *out, const float *in, size_t n, size_t block) {
+    for (size_t base = 0; base < n; base += block) {
+        size_t count = n - base < block ? n - base : block;
+        float maximum = 0.0f;
+        for (size_t i = 0; i < count; i++) maximum = fmaxf(maximum, fabsf(in[base + i]));
+        maximum = fmaxf(maximum, 6.0f * ldexpf(1.0f, -126));
+        int e = ds_ceil_log2(maximum / 6.0f);
+        if (e < -127) e = -127;
+        if (e > 127) e = 127;
+        float scale = ldexpf(1.0f, e);
+        for (size_t i = 0; i < count; i++) {
+            float value = fmaxf(-6.0f, fminf(6.0f, in[base + i] / scale));
+            int best = 0; float distance = fabsf(value - ds_e2m1_decode(0));
+            for (int code = 1; code < 16; code++) {
+                float c = fabsf(value - ds_e2m1_decode(code));
+                if (c < distance) { distance = c; best = code; }
+            }
+            out[base + i] = ds_e2m1_decode(best) * scale;
+        }
+    }
+}
+static void ds_hadamard(float *v, size_t n) {
+    for (size_t w = 1; w < n; w *= 2)
+        for (size_t base = 0; base < n; base += 2 * w)
+            for (size_t i = 0; i < w; i++) { float l = v[base + i], r = v[base + w + i]; v[base + i] = l + r; v[base + w + i] = l - r; }
+    float scale = 1.0f / sqrtf((float)n);
+    for (size_t i = 0; i < n; i++) v[i] = bf16r(v[i] * scale);
+}
+static float ds_sigmoid(float v) { if (v >= 0.0f) { float d = expf(-v); return 1.0f / (1.0f + d); } float g = expf(v); return g / (1.0f + g); }
+
+/* A block's values: random magnitudes over 40 binades, and blocks built on purpose:
+ * all zero, the amax on the scale's boundary (1.75 * 2^E for E4M3, 1.5 * 2^E for E2M1)
+ * and one step above it, exact ties of the target grid (E4M3 mantissa midpoints and
+ * subnormal midpoints; E2M1 midpoints), signed zeros, an amax under E4M3's floor. (The
+ * bf16 rounding after E4M3 or E2M1 is the CPU's step but changes nothing: both grids
+ * are bf16 values.) */
+static void ds_fill(float *v, int n, int kind, int pattern) {
+    float s = ldexpf(1.0f, (int)(rnd() % 30) - 15);
+    for (int i = 0; i < n; i++) v[i] = frnd() * ldexpf(1.0f, (int)(rnd() % 40) - 20);
+    if (pattern == 1) for (int i = 0; i < n; i++) v[i] = 0.0f;
+    if (pattern == 2 || pattern == 3) {
+        float top = (kind == VKC_DS_E2M1 ? 1.5f : 1.75f) * 4.0f * s;
+        if (pattern == 3) { uint32_t u; memcpy(&u, &top, 4); u++; memcpy(&top, &u, 4); }
+        v[0] = top;
+    }
+    if (pattern == 4) {
+        float amax = (kind == VKC_DS_E2M1 ? 6.0f : 448.0f) * s;
+        static const float ties2[7] = {0.25f, 0.75f, 1.25f, 1.75f, 2.5f, 3.5f, 5.0f};
+        v[0] = amax;
+        for (int i = 1; i < n; i++) {
+            float t;
+            if (kind == VKC_DS_E2M1) t = ties2[rnd() % 7];
+            else if (rnd() % 3 == 0) t = (float)(2 * (int)(rnd() % 8) + 1) * ldexpf(1.0f, -10);   /* subnormal midpoints */
+            else t = (1.0f + (float)(2 * (int)(rnd() % 8) + 1) / 16.0f) * ldexpf(1.0f, (int)(rnd() % 14) - 6);
+            v[i] = (rnd() & 1 ? -t : t) * s;
+        }
+        v[n / 2] = -0.0f; if (n > 3) v[3] = 0.0f;
+    }
+    if (pattern == 5) for (int i = 0; i < n; i++) v[i] = frnd() * ldexpf(1.0f, -20 - (int)(rnd() % 4));   /* under the floor */
+}
+/* kind, nseg segments of len (per_row a row, at strides), block, flags; in place or not */
+static void test_ds_round(int kind, int nseg, int per_row, int len, int block, int flags, int inplace) {
+    int rows = (nseg + per_row - 1) / per_row, xseg = len + 3, xrow = per_row * xseg + 5, yseg = len + 1, yrow = per_row * yseg + 2;
+    size_t xn = (size_t)rows * xrow + 7, yn = inplace ? xn : (size_t)rows * yrow + 4;
+    int xo = 7, yo = inplace ? 7 : 4, ys = inplace ? xseg : yseg, yr = inplace ? xrow : yrow;
+    float *x = fvec(xn, 1.f), *ref = malloc(xn > yn ? xn * 4 : yn * 4), *seg = malloc((size_t)len * 4);
+    int bl = kind == VKC_DS_E4M3 || kind == VKC_DS_E2M1 ? block : len, nb = (len + bl - 1) / bl;
+    for (int g = 0; g < nseg; g++) {
+        float *xs = x + xo + (g / per_row) * xrow + (g % per_row) * xseg;
+        for (int b = 0; b < nb; b++) ds_fill(xs + b * bl, len - b * bl < bl ? len - b * bl : bl, kind, (g * nb + b) % 6);
+    }
+    if (inplace) memcpy(ref, x, xn * 4);
+    else for (size_t i = 0; i < yn; i++) ref[i] = -7.0f;     /* what the op must not touch */
+    for (int g = 0; g < nseg; g++) {
+        const float *xs = x + xo + (g / per_row) * xrow + (g % per_row) * xseg;
+        float *ys2 = ref + yo + (g / per_row) * yr + (g % per_row) * ys;
+        memcpy(seg, xs, (size_t)len * 4);
+        if (kind == VKC_DS_BF16) for (int i = 0; i < len; i++) seg[i] = bf16r(seg[i]);
+        else if (kind == VKC_DS_E4M3) ds_fp8_qdq(seg, xs, (size_t)len, (size_t)block);
+        else if (kind == VKC_DS_E2M1) ds_fp4_qdq(seg, xs, (size_t)len, (size_t)block);
+        else ds_hadamard(seg, (size_t)len);
+        if ((flags & 1) && (kind == VKC_DS_E4M3 || kind == VKC_DS_E2M1)) for (int i = 0; i < len; i++) seg[i] = bf16r(seg[i]);
+        memcpy(ys2, seg, (size_t)len * 4);
+    }
+    VkcBuf *xb = up(x, xn), *yb = inplace ? xb : NULL;
+    if (!inplace) { float *init = malloc(yn * 4); for (size_t i = 0; i < yn; i++) init[i] = -7.0f; yb = up(init, yn); free(init); }
+    VkcDsRound p = {kind, nseg, per_row, len, block, flags, xo, xrow, xseg, yo, yr, ys, 1.0f / sqrtf((float)len)};
+    vkc_begin(); int ok = vkc_dsv4_round(xb, yb, &p); vkc_submit(1);
+    float *got = down(yb, 0, yn);
+    size_t diff = 0, first = 0;
+    for (size_t i = 0; i < yn; i++) if (memcmp(&got[i], &ref[i], 4)) { if (!diff) first = i; diff++; }
+    CHECK(ok && !diff, "dsv4 round kind %d nseg %d len %d block %d flags %d inplace %d: %zu of %zu values differ (first at %zu: %a, want %a)",
+          kind, nseg, len, block, flags, inplace, diff, yn, first, (double)got[first], (double)ref[first]);
+    vkc_free(xb); if (!inplace) vkc_free(yb);
+    free(x); free(ref); free(seg); free(got);
+}
+/* The SwiGLU: within one bf16 step of the CPU (the device's exp is not the CPU's expf),
+ * and how many values are the CPU's bits */
+static void test_ds_swiglu(int n, float lim) {
+    float *a = fvec((size_t)n + 3, 14.f), *b = fvec((size_t)n + 5, 14.f), *ref = malloc((size_t)n * 4);
+    for (int i = 0; i < n; i++) {
+        float g = bf16r(a[3 + i]), u = bf16r(b[5 + i]);
+        if (lim > 0.0f) { g = fminf(g, lim); u = fmaxf(-lim, fminf(u, lim)); }
+        ref[i] = bf16r(g * ds_sigmoid(g) * u);
+    }
+    VkcBuf *ab = up(a, (size_t)n + 3), *bb = up(b, (size_t)n + 5), *yb = vkc_buf((size_t)(n + 2) * 4, VKC_DEV);
+    VkcDsSwiglu p = {n, 3, 5, 2, lim};
+    vkc_begin(); int ok = vkc_dsv4_swiglu(ab, bb, yb, &p); vkc_submit(1);
+    float *got = down(yb, 2, (size_t)n);
+    int same = 0, far = 0;
+    for (int i = 0; i < n; i++) {
+        uint32_t u, v; memcpy(&u, &got[i], 4); memcpy(&v, &ref[i], 4);
+        same += u == v;
+        long d = (long)(u >> 16) - (long)(v >> 16);
+        if ((u & 0xffff) || d > 1 || d < -1) far++;
+    }
+    CHECK(ok && !far, "dsv4 swiglu n %d lim %g: %d values further than one bf16 step (or not bf16)", n, lim, far);
+    printf("  dsv4 swiglu n %d lim %g: %d of %d values the CPU's bits, the rest one bf16 step away\n", n, lim, same, n);
+    vkc_free(ab); vkc_free(bb); vkc_free(yb);
+    free(a); free(b); free(ref); free(got);
+}
+
 /* ---- frames: many ops, frames in flight, ordering ---------------------------------------- */
 static void test_frames(void) {
     int n = 1000;
@@ -1373,6 +1548,17 @@ int main(int argc, char **argv) {
         test_ds_index(2, 900, 1, 3, 64, 100, 4, 8, 0); test_ds_index(4, 300, 4, 16, 64, 16, 1, 3, 1); test_ds_index(3, 1, 2, 2, 16, 4, 2, 1, 0);
         test_ds_engram(1, 4, 128); test_ds_engram(3, 2, 300);
         printf("dsv4 done\n");
+        int in;
+        for (in = 0; in < 2; in++) {
+            test_ds_round(VKC_DS_BF16, 6, 2, 50, 0, 0, in); test_ds_round(VKC_DS_BF16, 300, 1, 1000, 0, 0, in);
+            test_ds_round(VKC_DS_E4M3, 6, 2, 300, 128, 0, in); test_ds_round(VKC_DS_E4M3, 9, 3, 448, 64, 1, in);
+            test_ds_round(VKC_DS_E4M3, 40, 1, 4096, 128, 0, in); test_ds_round(VKC_DS_E4M3, 5, 1, 70, 256, 1, in);
+            test_ds_round(VKC_DS_E2M1, 6, 2, 128, 32, 1, in); test_ds_round(VKC_DS_E2M1, 10, 5, 100, 32, 0, in);
+            test_ds_round(VKC_DS_HADAMARD, 6, 2, 128, 0, 0, in); test_ds_round(VKC_DS_HADAMARD, 3, 1, 4096, 0, 0, in);
+            test_ds_round(VKC_DS_HADAMARD, 4, 4, 32, 0, 0, in); test_ds_round(VKC_DS_HADAMARD, 2, 1, 1, 0, 0, in);
+        }
+        test_ds_swiglu(5000, 10.0f); test_ds_swiglu(3000, 0.0f);
+        printf("dsv4 rounding done\n");
     }
     VkcStats st; vkc_stats(&st);
     printf("chain: %llu frames, %llu ops, %llu matmuls (%llu GEMM), %llu barriers\n", st.frames, st.ops, st.matmuls, st.gemms, st.barriers);
