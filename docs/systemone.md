@@ -461,11 +461,14 @@ cannot tell which kind answered.
 | engine | model | doc |
 |---|---|---|
 | `c/laya` | Laya (Convai Innovations): ModernBERT encoder + decision head | [laya.md](laya.md) |
+| `c/qwen36` | Clef (Cloudflare): Qwen3.8-27B, post-trained, + joint schema head; it also chats | [clef.md](clef.md) |
 
-A decision engine serves `POST /v1/systemone` only. Chat, completions and
-messages answer 400 with a pointer to `/v1/systemone`, and
+A decision-only engine (Laya) serves `POST /v1/systemone` only. Chat,
+completions and messages answer 400 with a pointer to `/v1/systemone`, and
 `/v1/models` lists the model with `capabilities: ["systemone", "decision"]`
-(a language model says `["chat", "systemone"]`). The path is one round trip:
+(a language model says `["chat", "systemone"]`). A chat model with a
+decision head (Clef) keeps every endpoint and says `["chat", "systemone"]`;
+only its `/v1/systemone` takes the native path. The path is one round trip:
 the gateway checks the request, sends it to the engine as one record, and
 shapes the answer. Nothing is rendered into a prompt and no option is scored
 on its own. On Laya the gateway's share is about 2 ms per request: 8.1 ms at
@@ -482,6 +485,7 @@ so a new engine writes only its model and one function.
 protocol: `decide=1` (it takes `DECIDE`) and `chat=0` (it generates nothing).
 An engine that also chats leaves `chat` out; the gateway then sends
 `/v1/systemone` to `DECIDE` and the chat endpoints to `SUBMIT` as before.
+`decide_record=raw` asks for the raw form of the record, below.
 
 **Request.** `DECIDE <id> <slot> <bytes>` followed by one JSON record:
 
@@ -509,6 +513,18 @@ An engine that also chats leaves `chat` out; the gateway then sends
   then `true` with the optional criteria. Missing instructions get the same
   default text the language-model path asks with.
 - `slot` is the KV slot, for an engine that keeps state between requests.
+
+**The raw form.** A model whose reference renders the request into a prompt
+itself (Clef) needs what the caller sent, not the gateway's reading of it. An
+engine that says `decide_record=raw` gets the record with `"record": "raw"`
+and the same shape, with three differences: instructions are `null` when the
+caller sent none (no default text); a description is kept as sent, `""`
+included, and a noul side the caller did not describe has no `"text"` key at
+all (`null` when it was described as `null`); and a JSON value (the state,
+instructions, a description) is written with sorted keys and compact
+separators, `json.dumps(value, ensure_ascii=False, separators=(",", ":"),
+sort_keys=True)`, with `"json": true` on an option whose text is one.
+Laya gets the default form, byte for byte as before.
 
 **Answer.** One `DECISION <id> <bytes>` frame, then `DONE`:
 
@@ -539,7 +555,7 @@ package (`tools/make_laya_tiny.py`, `tools/make_laya_ref.py`,
 `tests/test_laya_tiny.py`), and the fixture behind the real gateway
 (`tests/test_decision_serve.py`, `tests/test_jev_sdk.py`).
 
-### The next two
+### The next one
 
 - **GLiNER2.5-Decide** (DeBERTa-v3 encoder, GLiNER2 heads): a second encoder
   engine on the same contract. It needs the DeBERTa-v3 encoder (relative
@@ -547,10 +563,3 @@ package (`tools/make_laya_tiny.py`, `tools/make_laya_ref.py`,
   its heads, its own rendering of a record into its input, and a
   `resolve_model` rule for its checkpoint. `decide_serve.h`, the gateway and
   the SDK tests stay as they are.
-- **Clef** (a joint schema head over Qwen3.8-27B, dense, with vision): the
-  backbone is the qwen36 engine's. It would answer `DECIDE` in that engine's
-  serve loop next to `SUBMIT`, announce `decide=1` without `chat=0` (the same
-  process still chats), run the backbone over the rendered record and apply
-  the head to its final hidden states. The record already carries what a
-  schema head needs (every question with its typed options); a picture in the
-  state would need the record to carry image parts, which today it does not.

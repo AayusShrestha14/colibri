@@ -43,7 +43,9 @@ Two more keys say what kind of engine answers. `decide=1`: the engine takes
 instead of scoring options through the logprob channel. `chat=0`: it has nothing
 else, so the generating endpoints answer 400 with a pointer to `/v1/systemone`.
 A decision engine (laya) says `decide=1 chat=0`; an engine that chats and also
-decides natively would say `decide=1` alone.
+decides natively says `decide=1` alone (qwen36 with Clef's head). `decide_record=raw`
+asks for the record in its raw form, the caller's own values (docs/systemone.md,
+"Decision engines").
 
 ## Requests (server → engine)
 

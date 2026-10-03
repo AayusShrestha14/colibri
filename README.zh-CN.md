@@ -464,6 +464,7 @@ GLM-5.2 是参考模型，但同样的流式方法还能运行另外九个语言
 | **OLMoE**（AI2） | 7B / 1B | 用 `c/tools/convert_olmoe_merged.py` 转换，**int8** 容器，约 7 GB | `make -C c olmoe` | 无 |
 | **Qwen-Image-2.1**（Alibaba） | 图像模型 | [`Qwen/Qwen-Image-2.1`](https://huggingface.co/Qwen/Qwen-Image-2.1)（约 33 GB），官方 diffusers checkpoint，**无需转换**：文本编码器与扩散 transformer 在加载时量化为 int8。`coli chat` 中直接显示图片，`coli serve` 提供 `POST /v1/images/generations`。Qwen Research License：仅限非商业用途 | `make -C c qwenimage` | [qwen-image.md](docs/qwen-image.md) |
 | **Laya**（Convai Innovations） | 决策模型，421M | [`convaiinnovations/laya`](https://huggingface.co/convaiinnovations/laya)（842 MB），官方 checkpoint，**无需转换**：ModernBERT 编码器加决策头，对类型化问题（choice、score、noul）给出校准后的概率，而不是生成文本。由 `coli serve` 在 `POST /v1/systemone` 上提供。Apache-2.0 | `make -C c laya` | [laya.md](docs/laya.md) |
+| **Clef**（Cloudflare） | 决策模型 + 聊天，27B | [`Cloudflare/clef`](https://huggingface.co/Cloudflare/clef)（55 GB），用 `c/tools/convert_qwen36.py` 转换（52 GB，含决策头）：在 Qwen3.8-27B 上继续训练并加上联合模式头，一次前向为每个问题的每个选项打分。`POST /v1/systemone` 原生作答，聊天与 Qwen3.8-27B 相同。Apache-2.0 | `make -C c qwen36` | [clef.md](docs/clef.md) |
 
 Qwen3.6 提供三个预转换容器：**int4-gs64**（推荐：与 per-row 相比，对 int8 基准的余弦相似度
 实测从 0.98777 提升到 0.99313，KL 从 0.109 降到 0.080，即量化误差减少约 44%）、作为 A/B 基线的
