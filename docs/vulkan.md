@@ -1249,6 +1249,21 @@ differs from the main or the tier queue's, the staged tensors' buffers are creat
 main queue in the same command buffer as their reader; a row written again before that
 (a rewound cache) first sends what is pending, so no two pending copies overlap.
 
+**When an upload fails.** A staging buffer that cannot be had at startup leaves the
+mapped path on (with a line saying so). A device-local block or buffer the driver refuses
+is out of memory: that matrix stays on the CPU, the tier takes fewer experts, the KV
+mirror's layer runs its attention on the CPU. A command buffer that would not record or a
+submit refused fails that upload only: the uploader waits for what it had sent, frees the
+tensors and starts the next upload clean; the matrix stays on the CPU, and an expert whose
+commit failed stays on the CPU with the tier's budget intact (it may be promoted again). A
+fence wait that fails means the copy may still run: the device is taken as lost, as for
+every other wait, so the dense matrices, the tier (its batches stop) and the chain (at its
+next frame, rebuilding the state on the CPU) all move to the CPU. `COLI_VK_STAGED_FAULT`
+injects each of these, and `tests/vulkan_engines.sh staged-faults` (with
+`staged-faults-sanitize` under ASan and UBSan) runs qwen36's matrices, its tier awaited and
+with the uploader thread free, its chain, and colibri's KV mirror through every point,
+gated on the CPU's tokens.
+
 **A fresh device-local block is zero-filled** (`vkCmdFillBuffer`) before its first
 tensor. On an RX 580 (RADV, Polaris) the author of #1338, where this approach comes from,
 measured results that differed slightly from run to run when read from a block the GPU had

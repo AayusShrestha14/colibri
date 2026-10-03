@@ -189,6 +189,13 @@ jobs:
             req: c/tools/requirements-qwen38-tiny.txt
           - family: qwen-chain-staged
             req: c/tools/requirements-qwen38-tiny.txt
+          # staged uploads failing at every point they can (COLI_VK_STAGED_FAULT): qwen36's
+          # matrices, tier and chain, colibri's KV mirror; the CPU's tokens, and the same
+          # under ASan and UBSan
+          - family: staged-faults
+            req: c/tools/requirements-qwen38-tiny.txt
+          - family: staged-faults-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
           - family: inkling-olmoe
             req: c/tools/oracle-requirements.txt
           # the routed-expert tier of inkling and olmoe under ASan and UBSan
