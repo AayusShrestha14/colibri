@@ -179,6 +179,12 @@ jobs:
           # the routed-expert tier of inkling and olmoe under ASan and UBSan
           - family: inkling-olmoe-sanitize
             req: c/tools/oracle-requirements.txt
+          # the dense chain (COLI_VK_CHAIN=1) of inkling and olmoe, and the same under
+          # ASan and UBSan
+          - family: inkling-olmoe-chain
+            req: c/tools/oracle-requirements.txt
+          - family: inkling-olmoe-chain-sanitize
+            req: c/tools/oracle-requirements.txt
           - family: mimo-qwenimage
             req: c/tools/requirements-qwenimage-tiny.txt
           - family: deepseek
