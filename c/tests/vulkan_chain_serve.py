@@ -7,7 +7,9 @@ The turns exercise what moves the chain's device state around: a pinned snapshot
 a prompt that diverges and one that starts over, a cache that grows between turns,
 and the prefill read-out (logprobs=k, ECHO frames). Token ids and texts must be the
 CPU's exactly; the logprobs printed with them may differ in their last digits (the
-device sums in another order), so numbers compare within 1e-4.
+device sums in another order), so numbers compare within 1e-4 (CHAIN_SERVE_TOL in the
+environment sets another bound: a fixture whose logits run to the hundreds, as MiMo's
+does, prints logprobs whose rounding is larger in absolute terms).
 
 usage: vulkan_chain_serve.py <engine> <snapshot> [KEY=VALUE ...]   (extra environment)
 COLI_VK_CHAIN in the caller's environment picks the chain's mode (default 1; 2 runs
@@ -78,6 +80,10 @@ def session(engine, snap, extra, chain):
     return out, b"".join(err).decode(errors="replace")
 
 
+TOL = float(os.environ.get("CHAIN_SERVE_TOL", "1e-4"))
+WORST = [0.0]
+
+
 def close(a, b):
     if a == b:
         return True
@@ -88,8 +94,9 @@ def close(a, b):
         if x == y:
             continue
         try:
-            if b"." not in x or abs(float(x) - float(y)) > 1e-4:
+            if b"." not in x or abs(float(x) - float(y)) > TOL:
                 return False
+            WORST[0] = max(WORST[0], abs(float(x) - float(y)))
         except ValueError:
             return False
     return True
@@ -114,8 +121,9 @@ def main():
                 print(f"  cpu: {a[:200]!r}\n  vk : {b[:200]!r}")
                 break
         sys.exit(f"FAIL: the chain's frames differ from the CPU's ({len(cpu)} vs {len(dev)})")
-    print(f"OK serve {os.path.basename(snap)} {' '.join(sys.argv[3:])}: {len(cpu)} frames = CPU, "
-          f"{pins} pin lines, {len(reuse)} turns reusing state, {forwards[-1].split('] ', 1)[1][:60]}")
+    print(f"OK serve {os.path.basename(snap)} {' '.join(sys.argv[3:])}: {len(cpu)} frames = CPU "
+          f"(numbers within {WORST[0]:.1e}), {pins} pin lines, {len(reuse)} turns reusing state, "
+          f"{forwards[-1].split('] ', 1)[1][:60]}")
 
 
 if __name__ == "__main__":

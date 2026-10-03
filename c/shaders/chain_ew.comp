@@ -14,6 +14,7 @@
 //   4 HC_MIX    y[r*D+d] = sum_k sigmoid(a[r*W+k*D+d]) * b[r*W+k*D+d] / fc,  k < C, W = C*D
 //   5 HC_INJ    y[i] = 2 * sigmoid(a[i] / fc)
 //   6 HC_APPLY  y[r*W+k*D+d] += a[r*C+k] * b[r*D+d]                  (i over S*C*D)
+//   7 SCALE     y[i] = a[i] * fc                                     (MiMo's value scale)
 // Offsets in floats: y_off, a_off, b_off, c_off, e_off.
 layout(local_size_x = 256) in;
 
@@ -64,5 +65,7 @@ void main() {
         int W = p.C * p.D;
         int r = i / W, rem = i - r * W, k = rem / p.D, d = rem - k * p.D;
         y[p.y_off + i] += a[p.a_off + r * p.C + k] * b[p.b_off + r * p.D + d];
+    } else if (p.op == 7) {
+        y[p.y_off + i] = a[p.a_off + i] * p.fc;
     }
 }

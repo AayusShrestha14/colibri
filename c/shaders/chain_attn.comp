@@ -13,6 +13,20 @@
 // normalizes first); the two agree to rounding.
 // Cache layout as the engines keep it on the host: K[(kvh*cap + t)*hd + d].
 // Limits: hd <= 256 (two dims per thread).
+//
+// The trailing push constants (all zero for the callers that predate them, who get
+// exactly the arithmetic above):
+//   win    a sliding window: row s sees the positions max(0, pos - win + 1)..pos,
+//          pos = pos_base + s (MiMo's SWA layers); 0 = every position from 0
+//   ring   the cache is a ring of `ring` rows: position t sits in row t % ring;
+//          0 = position t in row t
+//   vd     V's head dim when it differs from K's (the output's per-head stride too);
+//          vk_chain.c passes hd for 0. vd <= 256
+//   kv_pm  1: position-major rows, K[(row*KVH + kvh)*hd + d], V[(row*KVH + kvh)*vd + d]
+//          (MiMo's host layout); 0: the head-major layout above
+//   sink, sink_off   1: one more logit per head, snk[sink_off + h], joins the softmax
+//          denominator and nothing else (MiMo's attention sink): the running max and
+//          sum start from it instead of from nothing
 layout(local_size_x = 128) in;
 
 layout(std430, binding = 0) readonly buffer QB { float q[]; };
@@ -21,6 +35,7 @@ layout(std430, binding = 2) readonly buffer VB { float vc[]; };
 layout(std430, binding = 3) buffer OB { float o[]; };
 layout(std430, binding = 4) readonly buffer GB { float gt[]; };
 layout(std430, binding = 5) readonly buffer LB { int sel[]; };
+layout(std430, binding = 6) readonly buffer SB { float snk[]; };
 
 layout(push_constant) uniform P {
     int S, H, KVH, hd, pos_base, cap;
@@ -30,6 +45,7 @@ layout(push_constant) uniform P {
     int sel_off, sel_row;
     float scale;
     int k_off, v_off;      // where this layer's cache starts in kc / vc
+    int win, ring, vd, kv_pm, sink, sink_off;
 } p;
 
 shared float qs[256];
@@ -43,7 +59,8 @@ void main() {
     int kvh = h / (p.H / p.KVH);
     int qb = p.q_off + s * p.q_row + h * p.q_seg;
     for (int d = tid; d < p.hd; d += 128) qs[d] = q[qb + d];
-    int n = p.pos_base + s + 1;
+    int first = p.win > 0 ? max(0, p.pos_base + s - p.win + 1) : 0;
+    int n = p.pos_base + s + 1 - first;
     bool list = false;
     int lb = 0;
     if (p.sel_row > 0) {
@@ -52,15 +69,16 @@ void main() {
         if (c >= 0) { n = c; list = true; }
     }
     barrier();
-    float m = -3.0e38, l = 0.0, acc0 = 0.0, acc1 = 0.0;
+    float m = p.sink != 0 ? snk[p.sink_off + h] : -3.0e38, l = p.sink != 0 ? 1.0 : 0.0, acc0 = 0.0, acc1 = 0.0;
     int kbase = kvh * p.cap;
     for (int t0 = 0; t0 < n; t0 += 128) {
         int i = t0 + tid;
         float sv = -3.0e38;
         if (i < n) {
-            int t = list ? sel[lb + 1 + i] : i;
-            pt[tid] = t;
-            int kb = p.k_off + (kbase + t) * p.hd;
+            int t = list ? sel[lb + 1 + i] : first + i;
+            int r = p.ring > 0 ? t % p.ring : t;
+            pt[tid] = r;
+            int kb = p.k_off + (p.kv_pm != 0 ? r * p.KVH + kvh : kbase + r) * p.hd;
             float a = 0.0;
             for (int d = 0; d < p.hd; d++) a += qs[d] * kc[kb + d];
             sv = a * p.scale;
@@ -87,20 +105,20 @@ void main() {
         int cnt = min(128, n - t0);
         int d0 = tid, d1 = tid + 128;
         for (int j = 0; j < cnt; j++) {
-            int vb = p.v_off + (kbase + pt[j]) * p.hd;
+            int vb = p.v_off + (p.kv_pm != 0 ? pt[j] * p.KVH + kvh : kbase + pt[j]) * p.vd;
             float w = pe[j];
-            if (d0 < p.hd) acc0 += w * vc[vb + d0];
-            if (d1 < p.hd) acc1 += w * vc[vb + d1];
+            if (d0 < p.vd) acc0 += w * vc[vb + d0];
+            if (d1 < p.vd) acc1 += w * vc[vb + d1];
         }
         m = mn;
         barrier();
     }
     float inv = l > 0.0 ? 1.0 / l : 0.0;
-    int ob = p.o_off + s * p.o_row + h * p.hd;
+    int ob = p.o_off + s * p.o_row + h * p.vd;
     int gb = p.g_off + s * p.g_row + h * p.g_seg;
     for (int k = 0; k < 2; k++) {
         int d = tid + 128 * k;
-        if (d >= p.hd) break;
+        if (d >= p.vd) break;
         float v = (k == 0 ? acc0 : acc1) * inv;
         if (p.has_gate != 0) v *= 1.0 / (1.0 + exp(-gt[gb + d]));
         o[ob + d] = v;
