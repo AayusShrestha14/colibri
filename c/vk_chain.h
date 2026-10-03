@@ -92,6 +92,15 @@ int  vkc_rope(VkcBuf *x, VkcBuf *cs, const VkcRope *p);
 typedef struct { int S, H, KVH, hd, pos_base, cap, q_off, q_row, q_seg, g_off, g_row, g_seg, has_gate,
                  o_off, o_row, sel_off, sel_row; float scale; int k_off, v_off; } VkcAttn;
 int  vkc_attn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf *sel, const VkcAttn *p);
+/* The same core with what MiMo adds (vkc_attn is this with every field below zero):
+ * win a sliding window of that many positions (row s sees max(0, pos - win + 1)..pos);
+ * ring the cache a ring of that many rows (position t in row t % ring); vd V's head dim
+ * (0 = hd; also the output's per-head stride), at most 256; kv_pm position-major rows
+ * (K[(row*KVH + kvh)*hd + d], V[(row*KVH + kvh)*vd + d]) instead of head-major; sink a
+ * sink logit per head at snk[sink_off + h], which joins the softmax denominator only. */
+typedef struct { VkcAttn a; int win, ring, vd, kv_pm, sink, sink_off; } VkcAttnW;
+int  vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf *sel, VkcBuf *snk,
+                const VkcAttnW *p);
 /* chain_dnconv.comp */
 typedef struct { int S, CD, CK, in_off, in_row, out_off, out_row, snap_row, order, w_off, ring_off, snap_off; } VkcDnConv;
 int  vkc_dnconv(VkcBuf *in, VkcBuf *w, VkcBuf *ring, VkcBuf *out, VkcBuf *snap, const VkcDnConv *p);
@@ -107,6 +116,7 @@ int  vkc_dnrec(int KD, VkcBuf *cv, VkcBuf *ab, VkcBuf *z, VkcBuf *st, VkcBuf *pr
 #define VKC_EW_HC_MIX   4
 #define VKC_EW_HC_INJ   5
 #define VKC_EW_HC_APPLY 6
+#define VKC_EW_SCALE    7
 typedef struct { int op, n, D, C, flags, e_row, y_off, a_off, b_off, c_off, e_off; float fc; } VkcEw;
 int  vkc_ew(VkcBuf *y, VkcBuf *a, VkcBuf *b, VkcBuf *c, VkcBuf *e, const VkcEw *p);
 /* chain_qsa.comp (mode 0: nb block keys from b0; mode 1: S rows' selections) */

@@ -810,7 +810,9 @@ What the numbers say:
 GPU the chain is on. On an integrated GPU with the expert tier on, each engine passes
 what it measured here: qwen36 on, qwen38 off (decode, a chat's steady state, is slower
 in both modes; `COLI_VK_CHAIN=2` is the choice for long prompts). Without the tier, and
-on a CPU device such as Lavapipe, it is off. The startup line says which and why:
+on a CPU device such as Lavapipe, it is off. An engine not timed on an integrated GPU
+passes `COLI_VK_CHAIN_UNMEASURED`: off there, and the line says "not measured". The
+startup line says which and why:
 
 ```
 [VK] qwen36: dense chain on (an integrated GPU with the expert tier: measured faster on decode and prefill; COLI_VK_CHAIN=0 off, 1 on, 2 prompts only)
@@ -823,6 +825,74 @@ way); that is the case the chain's default is set for, and nothing above is a
 prediction of it. Not timed either: contexts past 2048 tokens (where Qwen3.8's QSA
 selects blocks instead of attending to all of them), serve sessions, Qwen3-Coder and
 Qwen3.8-27B (no checkpoints on the box); their correctness is the Lavapipe gates'.
+
+### MiMo-V2.6 on the chain
+
+`mimo_chain.h` runs MiMo-V2.6's layers (Flash and Pro) as frames on the device, as
+qwen36's chain does, with what this model has instead of a DeltaNet:
+
+| | mimo |
+|---|---|
+| device, one frame per MoE layer | the previous layer's routed sum joining the residual (the CPU's `h += out`); the input RMSNorm; the fused qkv projection in its dense form (`MIMO_DENSE_BITS`: the release's FP8 with its 128-column block scales, int8 rows or f32); partial RoPE on q and k (rotate-half on the first `rope_dim` dims, from a host table of the CPU's own `cosf`/`sinf`, one per layer kind: the two kinds have their own theta); the value scale (`chain_ew` SCALE); the new K/V rows into the device's cache; attention with the layer's sliding window and its sink logits (`chain_attn.comp` with a window, a ring and a sink); o_proj; the residual add; the post-attention RMSNorm. The dense layer (layer 0 on the release) runs its MLP there too and has no host step |
+| host | `moe()` as the CPU runs it, on the device's normalized rows: the router (sigmoid scores, the correction bias picks, top-k renormalized) and the routed experts (the tier's batch and the CPU's share, joined in each row's routing order). There is no shared expert, so nothing runs beside it |
+| last frame | the final norm and lm_head on the last row, every row for a read-out (`MIMO_LOGITS`, logprobs) |
+
+**The caches.** The host's stay canonical, in the layout the CPU keeps: a
+full-attention layer `[ctx][kvh][hd]` (V `[ctx][kvh][vd]`), a windowed layer a ring of
+`min(window, ctx)` rows with position `p` in row `p % rows`. The device mirrors each
+one in exactly that layout (`chain_attn.comp` reads position-major rows and a ring) behind
+a watermark per layer: positions below it (for a ring, the last `rows` of them) equal
+the host's. A step lowers it to its first position and uploads what the window still
+sees; a CPU step lowers it to its own; a restored photo (`pin_state_load` rewrites the
+host's rings) drops the rings' watermarks to 0, so the next step uploads them again.
+Prefix reuse needs nothing else.
+
+**A windowed layer's attention.** One decode row reads the ring in place: its window
+is exactly the ring's rows. A block of rows cannot (its later rows would overwrite slots
+its earlier rows still see), so it gathers the window's earlier rows from the ring and
+its own new rows into one position-major scratch, as the CPU's `attention()` copies
+them, attends there, and writes its last `rows` rows into the ring. Both visit the
+positions in the same order, so a row gets the same bits either way: with every matrix
+on the per-row GEMV (`COLI_VK_GEMM_MIN_S=0`) and the tier off, the logits of every
+position are the same bytes for a prompt in one block, one token at a time, and in
+blocks of 3, 8 (the fixture's window) and 9 rows.
+
+**A lost device.** MiMo has no recurrent state, and the new K/V rows reach the host's
+caches only when the step's last frame has completed: a device lost in the middle of a
+step loses nothing the host holds, and the CPU runs the step's remaining rows from where
+the caches end. Nothing is rebuilt, and a turn with a picture recovers too. The line is
+`[VK] mimo chain: the device was lost at position P; ...`.
+
+**What stays off the device.** The router's top-k and the routed experts the tier does
+not hold, the embedding gather, the vision tower (on the device only with
+`COLI_VK_DENSE=1`, through the per-matrix path), and runs with `MIMO_TRACE` (the CPU's
+per-layer dump), which the chain declines. MiMo has no MTP head. The chain also
+declines a head dim above 256 or a dense matrix that did not reach the device.
+
+**Correctness, on the tiny fixture** (6 layers: 4 windowed with a window of 8 and a sink
+logit, 2 full, partial RoPE with two thetas, a value scale of 0.707, a dense layer 0, a
+vision tower), on Lavapipe and on the Radeon 780M (`tests/vulkan_engines.sh
+mimo-chain`): Xiaomi's vendor oracle passes with the chain on (greedy and teacher-forced
+in every case, the native FP8/BF16 trunk, prefill in blocks of 3 and of 1, the picture);
+every configuration gives the CPU's tokens and every position's logits within 1e-4 of
+the largest one (measured over 42 configurations at most 2.0e-6 on Lavapipe and 2.7e-6
+on the 780M, both with the picture's tower on the device; 1.7e-6 without it); serve
+sessions give the CPU's frames (logprobs within 2.9e-4 on Lavapipe and 1.8e-4 on the
+780M, on logits that reach 300); the prefix-reuse and photo tests pass bit for bit
+against a cold engine. With `COLI_VULKAN` unset, the tokens and the logits bytes of 36
+configurations (`MIMO_DENSE_BITS` 32, 0 and 8, blocks of 64, 3 and 1, four cases with
+the picture) are the previous build's; with `COLI_VULKAN=1` and `COLI_VK_CHAIN=0` or
+unset, those of 54 (the tier balanced deterministically, `COLI_VK_TIER_BALANCE=0`, since
+its balance moves bits from run to run on either build).
+
+**The default.** The chain's speed on a real MiMo model is not measured: no MiMo
+checkpoint is on the test box (the smallest, Flash, has 309B parameters). The chain is
+on for a discrete GPU (the common rule), off on an integrated GPU (`COLI_VK_CHAIN=1`
+turns it on) and on a CPU device:
+
+```
+[VK] mimo: dense chain off (an integrated GPU with the expert tier: not measured; COLI_VK_CHAIN=0 off, 1 on, 2 prompts only)
+```
 
 ### Adding an engine to the chain
 
@@ -855,7 +925,7 @@ What each remaining architecture needs on top of today's shaders:
 | colibri.c (GLM-5.2), glm53, deepseek_v41, kimi_k3 (MLA layers) | MLA: q_a/kv_a, the latent norms, q_b, RoPE on the rope dims, a latent + rope cache | the absorb core (`attention_absorb.comp`) already reads a device KV mirror with GLM's watermark (`vk_kv_valid`): record it as a chain op with the o-projection fused (the universal layout's eight bindings hold its seven); DSA's index keys and top-k are `chain_qsa.comp`'s selection with blocks of one position, and the absorb shader takes the selection list as `chain_attn.comp` does; GLM's MTP layer stays on the CPU like qwen38's head, or runs in the chain (MLA has no recurrent state: a rejected draft is a lowered watermark) |
 | deepseek_v4 | MLA with compressed (CSA) and hierarchical (HCA) KV, mHC | the manifold hyper-connections are qwen38's stream read/apply with a Sinkhorn normalization (an element-wise op that iterates); the compressors' rolling windows are rings like the conv's, snapshotted the same way; the CPU rounds activations to E4M3 before its fp8 matmuls, so the chain needs that rounding as an element-wise op to keep the same arithmetic |
 | kimi_k3 (KDA layers) | Kimi Delta Attention: a gated delta rule whose decay is a vector over the key channels | `chain_dnrec.comp` with the decay per key row (one `exp(g_k)` per row of the column, loaded beside q and k in shared memory) instead of one per head; the short convolution is `chain_dnconv.comp`; its output gate and norm as the gated norm |
-| mimo | sliding-window attention (and full layers) | `chain_attn.comp` with a window (positions from `max(0, pos - W + 1)`: one more push constant), the cache optionally a ring of W rows (the host mirror then indexes `t % W`) |
+| mimo | sliding-window attention (and full layers) | done: [MiMo-V2.6 on the chain](#mimo-v26-on-the-chain) (`chain_attn.comp` with a window, a ring of W rows, V's own head dim and a sink) |
 | inkling | grouped attention, MoE with a shared expert | qwen36's attention and combine as they are; its per-position heads are matmuls of the residual rows |
 | olmoe | attention with q/k norm, MoE without a shared expert | qwen36's Qwen3-Coder geometry (all attention, no gate, no shared expert) is the same chain |
 
@@ -940,7 +1010,11 @@ in short:
   (measured 2e-7 and below on the fixtures), prefill in chunks, an image, MTP drafts
   rejected, accepted and alternating, a device lost mid-run, the qwen38 oracle targets,
   the prefix-reuse contract and serve sessions frame for frame; `qwen-chain-sanitize`
-  runs the chain under ASan and UBSan.
+  runs the chain under ASan and UBSan. `mimo-chain` does it for MiMo: the vendor
+  oracle with the chain on, the CPU's tokens and every position's logits in every dense
+  form, block size, case and tier setting, the window boundary bit for bit across block
+  sizes, prompts only, a device lost in four places, the prefix-reuse and photo tests
+  and serve sessions; `mimo-chain-sanitize` under ASan and UBSan.
 - int4 weights decode as offset-binary (nibble−8), byte-identical layout to
   the CPU path — no repacking.
 - Khronos validation layers: the backend never enables them, so the loader
