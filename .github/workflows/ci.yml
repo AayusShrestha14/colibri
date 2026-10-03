@@ -200,6 +200,11 @@ jobs:
             req: c/tools/requirements-kimi-k3-tiny.txt
           - family: kimi-mimo-sanitize
             req: c/tools/requirements-mimo-tiny.txt
+          # MiMo-V2.6's dense chain (COLI_VK_CHAIN=1), and the same under ASan and UBSan
+          - family: mimo-chain
+            req: c/tools/requirements-mimo-tiny.txt
+          - family: mimo-chain-sanitize
+            req: c/tools/requirements-mimo-tiny.txt
           # GLM-5.2 (colibri) and GLM-5.3 Flash (glm53) on the routed-expert tier, and
           # the same under ASan and UBSan
           - family: glm

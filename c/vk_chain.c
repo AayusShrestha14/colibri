@@ -690,10 +690,19 @@ int vkc_rope(VkcBuf *x, VkcBuf *cs, const VkcRope *p) {
     return record(K.pipe[P_ROPE], bd, 2, p, sizeof *p, gx, gy, 1);
 }
 int vkc_attn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf *sel, const VkcAttn *p) {
+    VkcAttnW w;
+    memset(&w, 0, sizeof w);
+    w.a = *p;
+    return vkc_attn_w(q, kc, vc, o, gate, sel, NULL, &w);
+}
+int vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf *sel, VkcBuf *snk,
+               const VkcAttnW *p) {
     K.kind = PK_ATTN;
-    if (p->hd > 256 || p->H % p->KVH) return 0;
-    VkcBind bd[6] = {B(q, 0), B(kc, 0), B(vc, 0), B(o, 1), B(gate, 0), B(sel, 0)};
-    return record(K.pipe[P_ATTN], bd, 6, p, sizeof *p, (uint32_t)p->H, (uint32_t)p->S, 1);
+    VkcAttnW w = *p;   /* the shader's push constants: VkcAttn's fields, then these */
+    if (w.vd <= 0) w.vd = w.a.hd;
+    if (w.a.hd > 256 || w.vd > 256 || w.a.H % w.a.KVH || w.win < 0 || w.ring < 0 || (w.sink && !snk)) return 0;
+    VkcBind bd[7] = {B(q, 0), B(kc, 0), B(vc, 0), B(o, 1), B(gate, 0), B(sel, 0), B(snk, 0)};
+    return record(K.pipe[P_ATTN], bd, 7, &w, sizeof w, (uint32_t)w.a.H, (uint32_t)w.a.S, 1);
 }
 int vkc_dnconv(VkcBuf *in, VkcBuf *w, VkcBuf *ring, VkcBuf *out, VkcBuf *snap, const VkcDnConv *p) {
     K.kind = PK_DNCONV;

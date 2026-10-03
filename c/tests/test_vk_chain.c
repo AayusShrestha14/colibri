@@ -11,10 +11,12 @@
  *            weight slice per stream, in place
  *   rope     rotate-half from a host table, heads at a stride
  *   attn     causal GQA with the output gate over a cache at an offset, prefill rows
- *            after earlier ones, and a selection list
+ *            after earlier ones, and a selection list; MiMo's form (vkc_attn_w): a
+ *            sliding window, a ring of rows, position-major rows, V's own head dim and
+ *            a sink logit per head
  *   dnconv   both orders of the sum, the ring carried across calls, the snapshot row
  *   dnrec    KD 8 and 128, silu and sigmoid gates, the state carried, the snapshot
- *   ew       every element-wise op
+ *   ew       every element-wise op (SCALE: MiMo's value scale)
  *   qsa      block keys, and the selection with ties broken as the CPU sorts
  *   ple      the gate and the dilated convolution with its ring and snapshot
  *   frames   vkc_write, vkc_read, a frame left in flight and one ordered after it
@@ -208,6 +210,51 @@ static void test_attn(int S, int pos_base, int hd, int use_list) {
     free(q); free(kc); free(vc); free(sel); free(ref);
 }
 
+/* MiMo's attention (vkc_attn_w): row s at pos = pos_base + s sees the positions
+ * max(0, pos - win + 1)..pos (win 0: from 0); position t sits in row t % ring of the
+ * cache (ring 0: row t), rows position-major (kv_pm) or head-major; V has its own head
+ * dim vd; with a sink, one more logit per head joins the softmax denominator. */
+static void test_attn_win(int S, int pos_base, int H, int KVH, int hd, int vd, int win, int ring, int sink, int kv_pm) {
+    int rows = ring ? ring : pos_base + S + 3, koff = 32, voff = 16, qrow = H * hd + 40;
+    size_t kn = (size_t)koff + (size_t)rows * KVH * hd, vn = (size_t)voff + (size_t)rows * KVH * vd;
+    float *q = fvec((size_t)S * qrow, 1.f), *kc = fvec(kn, 1.f), *vc = fvec(vn, 1.f), *snk = fvec(H + 5, 2.f);
+    float scale = 1.f / sqrtf((float)hd);
+    float *ref = malloc((size_t)S * H * vd * sizeof *ref);
+    for (int s = 0; s < S; s++) for (int h = 0; h < H; h++) {
+        int kvh = h / (H / KVH), pos = pos_base + s, first = win ? (pos - win + 1 > 0 ? pos - win + 1 : 0) : 0, n = pos - first + 1;
+        double *sc = malloc(n * sizeof *sc), mx = sink ? snk[5 + h] : -1e300, sum = 0;
+        for (int j = 0; j < n; j++) {
+            int r = ring ? (first + j) % ring : first + j;
+            size_t kb = koff + (kv_pm ? ((size_t)r * KVH + kvh) : ((size_t)kvh * rows + r)) * hd;
+            double a = 0; for (int d = 0; d < hd; d++) a += (double)q[(size_t)s * qrow + h * hd + d] * kc[kb + d];
+            sc[j] = a * scale; if (sc[j] > mx) mx = sc[j];
+        }
+        if (sink) sum = exp(snk[5 + h] - mx);
+        for (int j = 0; j < n; j++) { sc[j] = exp(sc[j] - mx); sum += sc[j]; }
+        for (int d = 0; d < vd; d++) {
+            double a = 0;
+            for (int j = 0; j < n; j++) {
+                int r = ring ? (first + j) % ring : first + j;
+                size_t vb = voff + (kv_pm ? ((size_t)r * KVH + kvh) : ((size_t)kvh * rows + r)) * vd;
+                a += sc[j] / sum * vc[vb + d];
+            }
+            ref[((size_t)s * H + h) * vd + d] = (float)a;
+        }
+        free(sc);
+    }
+    VkcBuf *qb = up(q, (size_t)S * qrow), *kb = up(kc, kn), *vb = up(vc, vn), *sb = up(snk, H + 5);
+    VkcBuf *ob = vkc_buf((size_t)S * H * vd * 4, VKC_DOWN);
+    VkcAttnW p = {{S, H, KVH, hd, pos_base, rows, 0, qrow, hd, 0, 0, 0, 0, 0, H * vd, 0, 0, scale, koff, voff},
+                  win, ring, vd, kv_pm, sink, 5};
+    vkc_begin(); int ok = vkc_attn_w(qb, kb, vb, ob, NULL, NULL, sink ? sb : NULL, &p); vkc_submit(1);
+    float *o = vkc_ptr(ob);
+    double e = relerr(o, ref, (size_t)S * H * vd, 1e-3);
+    CHECK(ok && e < 2e-5, "attn window S %d pos %d hd %d vd %d win %d ring %d sink %d pm %d: err %.2e",
+          S, pos_base, hd, vd, win, ring, sink, kv_pm, e);
+    vkc_free(qb); vkc_free(kb); vkc_free(vb); vkc_free(sb); vkc_free(ob);
+    free(q); free(kc); free(vc); free(snk); free(ref);
+}
+
 /* ---- DeltaNet: convolution and recurrence ------------------------------------------ */
 static void conv_ref(int S, int CD, int CK, const float *in, const float *w, float *ring, float *out, int order, int snap_row, float *snap) {
     for (int s = 0; s < S; s++) for (int c = 0; c < CD; c++) {
@@ -309,7 +356,8 @@ static void test_ew(void) {
     struct { int op, flags, n; const char *name; } ops[] = {
         {VKC_EW_ADD, 0, R * D, "add"}, {VKC_EW_COMBINE, 1 | 2 | 4, R * D, "combine"}, {VKC_EW_COMBINE, 2 | 8, R * D, "combine-noresid"},
         {VKC_EW_COMBINE, 1, R * D, "combine-routed"}, {VKC_EW_SWIGLU, 0, R * D, "swiglu"}, {VKC_EW_HC_LOW, 0, R * D, "hc-low"},
-        {VKC_EW_HC_MIX, 0, R * D, "hc-mix"}, {VKC_EW_HC_INJ, 0, R * C, "hc-inj"}, {VKC_EW_HC_APPLY, 0, R * W, "hc-apply"}};
+        {VKC_EW_HC_MIX, 0, R * D, "hc-mix"}, {VKC_EW_HC_INJ, 0, R * C, "hc-inj"}, {VKC_EW_HC_APPLY, 0, R * W, "hc-apply"},
+        {VKC_EW_SCALE, 0, R * D, "scale"}};
     for (size_t k = 0; k < sizeof ops / sizeof *ops; k++) {
         int n = ops[k].n, op = ops[k].op, f = ops[k].flags;
         for (int i = 0; i < n; i++) {
@@ -325,6 +373,7 @@ static void test_ew(void) {
             case VKC_EW_HC_INJ: ref[i] = 2.f * sigm(a[i] / C); break;
             case VKC_EW_HC_APPLY: { int rr = i / W, rem = i % W, s = rem / D, dd = rem % D;
                 ref[i] = c[i] + a[rr * C + s] * b[rr * D + dd]; break; }
+            case VKC_EW_SCALE: ref[i] = a[i] * (float)C; break;
             }
         }
         if (op == VKC_EW_HC_APPLY) { vkc_begin(); vkc_write(yb, 0, c, nw * 4); vkc_submit(1); }
@@ -658,6 +707,15 @@ int main(int argc, char **argv) {
     printf("norm done\n");
     test_rope();
     test_attn(1, 0, 16, 0); test_attn(1, 140, 32, 0); test_attn(5, 200, 64, 0); test_attn(6, 9, 256, 1); test_attn(130, 3, 24, 0);
+    /* MiMo: a prompt's rows through a window (from position 0, and past it), a decode row
+     * over a ring as large as the window, prefill rows over a larger ring, full attention
+     * with V's own head dim, a window wider than a tile, the head-major layout with a
+     * window, the release's head dims (192 / 128) over a ring of 128 */
+    test_attn_win(5, 0, 4, 2, 48, 32, 8, 0, 1, 1);  test_attn_win(5, 20, 4, 2, 48, 32, 8, 0, 1, 1);
+    test_attn_win(1, 30, 4, 4, 48, 32, 8, 8, 1, 1); test_attn_win(1, 3, 4, 4, 48, 32, 8, 8, 1, 1);
+    test_attn_win(3, 40, 4, 2, 48, 32, 8, 10, 0, 1); test_attn_win(4, 6, 4, 2, 64, 48, 0, 0, 1, 1);
+    test_attn_win(2, 300, 4, 2, 16, 16, 150, 0, 1, 1); test_attn_win(130, 3, 4, 2, 24, 40, 16, 0, 0, 0);
+    test_attn_win(1, 500, 8, 4, 192, 128, 128, 128, 1, 1);
     printf("attn done\n");
     test_dnconv(0); test_dnconv(1);
     test_dnrec(8, 8, 8, 4, 0); test_dnrec(4, 4, 4, 2, 1); test_dnrec(128, 128, 4, 2, 0); test_dnrec(32, 100, 6, 3, 1);
