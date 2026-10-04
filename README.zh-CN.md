@@ -326,7 +326,7 @@ context 点积改为累加整数乘积并只舍入一次，因此验证行中的
 
 ## 开始使用
 
-你需要两样东西：**程序本体**（几百 KB）和**模型**（372 GB）。各平台的分步
+你需要两样东西：**程序本体**（几百 KB）和**模型**（429 GB）。各平台的分步
 指引见 [Quick Start 指南](docs/quickstart.md)。
 
 ### 一步完成
@@ -380,7 +380,7 @@ git clone https://github.com/JustVugg/colibri && cd colibri/c
 ### 2. 获取模型
 
 Hugging Face 上已有预转换的 **GLM-5.2 int4** 容器——请务必使用
-**含 int8 MTP head 的 group-scaled（gs64）版本**。它约为 **372 GB**，请放在空间足够的磁盘上，最好是快盘：
+**含 int8 MTP head 的 group-scaled（gs64）版本**。它约为 **429 GB**，请放在空间足够的磁盘上，最好是快盘：
 
 **https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp**
 
@@ -421,7 +421,7 @@ GLM-5.2 是参考模型，但同样的流式方法还能运行另外九个语言
 > | 模型 | 权重所需磁盘 | RAM | GPU |
 > |---|---|---|---|
 > | **OLMoE** | 约 7 GB（int8 容器） | 8 GB | 不需要；可选 Vulkan |
-> | **GLM-5.2/5.3** | 约 372 GB（5.2）／约 419 GB（5.3） | 最低 16 GB，舒适 24 GB | 不需要；可选 Vulkan |
+> | **GLM-5.2/5.3** | 约 429 GB（5.2）／约 419 GB（5.3） | 最低 16 GB，舒适 24 GB | 不需要；可选 Vulkan |
 > | **GLM-5.3-Flash** | 转换后约 195 GB | 25 GB（int4 权重 12 GB + 专家缓存） | 不需要；可选 Vulkan |
 > | **Inkling** | 约 469 GB | 使用 int4 稠密容器时 25 GB，不使用时约 120 GB | 不需要；可选 Vulkan |
 > | **Kimi K3** | 约 1.6 TB | 32 GB 以上 | 不需要；可选 Vulkan |
@@ -431,7 +431,7 @@ GLM-5.2 是参考模型，但同样的流式方法还能运行另外九个语言
 > | **MiMo-V2.6 Pro** | 约 574 GB（不含引擎从不加载的三个文件时约 564 GB） | 稠密部分按发布格式为 30.2 GiB，int8 下为 21.7 GiB；每层缓存 12 个专家时实测常驻 48.0 GB（稠密部分按发布格式），20 个时 50.7 GB（稠密部分为 int8） | 不需要；可选 Vulkan |
 > | **Qwen3.8-Flash-Next** | 约 185.5 GB（官方 FP8 checkpoint），可选的 int4-g64 专家 sidecar 另需 68.0 GB | 使用 FP8 专家、默认上下文时舒适为 24 GB（cap 32；16 GB 低于下限）；使用 int4-g64 sidecar 时 cap 32 实测 RSS 11.6 GB | 可选；CUDA VRAM 专家层级（仅限 FP8 专家），稠密主干在 VRAM 中量化为 int8；可选 Vulkan |
 > | **Qwen3.8-27B**（稠密，文本与图像） | 转换后约 51 GB（f16） | 稠密权重为 int4 时 20 GB，int8 时 30 GB | 不需要；暂无 CUDA 层级；可选 Vulkan |
-> | **Qwen3.6-35B-A3B** | 约 20 GB（int4-gs64 容器） | 24 GB（需要完全常驻 RAM） | 可选；CUDA VRAM 专家层级在两张 8 GB 显卡上实测 **1.44 -> 10.05 tok/s（7.0x）**，输出与 CPU 逐位一致；可选 Vulkan |
+> | **Qwen3.6-35B-A3B** | 约 23 GB（int4-gs64 容器） | 24 GB（需要完全常驻 RAM） | 可选；CUDA VRAM 专家层级在两张 8 GB 显卡上实测 **1.44 -> 10.05 tok/s（7.0x）**，输出与 CPU 逐位一致；可选 Vulkan |
 > | **Qwen3-Coder-30B-A3B** | 约 19 GB（int4-gs64 容器；int8 为 30 GB） | 每层缓存 32 个专家时实测常驻 6.5 GB，全部 128 个时 15.2 GB | 不需要；可选 Vulkan |
 > | **Qwen-Image-2.1**（文生图） | 约 33 GB（官方 diffusers checkpoint） | 全部常驻 16.0 GB；每个 prompt 加载文本编码器时峰值 8.5 GB，另加工作缓冲区（生成一张 768x512 图像实测峰值 9.0 GB） | 不需要；可选 Vulkan，尚未在 GPU 上计时 |
 >
@@ -449,7 +449,7 @@ GLM-5.2 是参考模型，但同样的流式方法还能运行另外九个语言
 
 | 家族 | 总参数 / 激活参数 | 权重 | 构建 | 文档 |
 |---|---|---|---|---|
-| **GLM-5.2/5.3** | 744B / 40B | [`mastouri/…-int4-g64-with-int8-mtp`](https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp)（372 GB）或 [`Justvugg/GLM-5.3-colibri-int4-g64`](https://huggingface.co/Justvugg/GLM-5.3-colibri-int4-g64)（419 GB） | `make -C c glm` | 本页 |
+| **GLM-5.2/5.3** | 744B / 40B | [`mastouri/…-int4-g64-with-int8-mtp`](https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp)（429 GB）或 [`Justvugg/GLM-5.3-colibri-int4-g64`](https://huggingface.co/Justvugg/GLM-5.3-colibri-int4-g64)（419 GB） | `make -C c glm` | 本页 |
 | **Inkling**（Thinking Machines） | 975B / 41B | [`nbeerbower/Inkling-colibri-int4`](https://huggingface.co/nbeerbower/Inkling-colibri-int4)（469 GB） | `make -C c inkling` | [inkling.md](docs/inkling.md) |
 | **GLM-5.3-Flash**（Z.ai） | 321B / 18B | [`zai-org/GLM-5.3-Flash`](https://huggingface.co/zai-org/GLM-5.3-Flash)，路由专家转换为 **int4-gs64**，稠密部分保持 BF16，精度在加载时选择；含视觉 | `make -C c glm53` | [glm53-flash.md](docs/glm53-flash.md) |
 | **Kimi K3**（Moonshot） | 2.8T / 104B | [`moonshotai/Kimi-K3`](https://huggingface.co/moonshotai/Kimi-K3)，原始 checkpoint，路由专家保持**原生 MXFP4** | `make -C c kimi_k3` | [kimi_k3.md](docs/kimi_k3.md) |
@@ -458,7 +458,7 @@ GLM-5.2 是参考模型，但同样的流式方法还能运行另外九个语言
 | **MiMo-V2.6 Flash**（Xiaomi） | 309B / 15B | [`XiaomiMiMo/MiMo-V2.6-Flash-MOPD`](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-MOPD)（178 GB），官方 checkpoint，**无需转换**：路由专家保持**原生 MXFP4**，稠密部分保持 FP8/BF16。48 层中有 39 层只关注 128 个 token 的窗口，因此长上下文只需 9 层的 KV。支持视觉与工具调用 | `make -C c mimo` | [mimo.md](docs/mimo.md) |
 | **MiMo-V2.6 Pro**（Xiaomi） | 1.02T / 42B | [`XiaomiMiMo/MiMo-V2.6-Pro-MOPD`](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-MOPD)（573.5 GB），官方 checkpoint，**无需转换**，运行在 MiMo 引擎上：同一架构，70 层、384 个专家。已在 70 层中的前 32 层上与 Xiaomi 自己的建模代码对照验证。支持视觉与工具调用 | `make -C c mimo` | [mimo.md](docs/mimo.md#pro) |
 | **Qwen3.8-Flash-Next**（Alibaba） | 125B + 51B n-gram / 6B | [`Qwen/Qwen3.8-Flash-Next-FP8`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8)，原始 checkpoint；PLE 保持可分页，专家保持**原生 block-FP8**，或从可选的 sidecar 以 **int4-g64** 读取（见下文）。可选 MTP 草稿（`Q38_MTP=1`） | `make -C c qwen38`（VRAM 专家层级需 `CUDA=1`） | [qwen38.md](docs/qwen38.md) |
-| **Qwen3.6**（Alibaba） | 35B / 3B | [`Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64`](https://huggingface.co/Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64)（约 20 GB，**推荐**），Gated Attention + Gated DeltaNet 混合架构 | `make -C c qwen36`（VRAM 专家层级需 `CUDA=1`） | [qwen36.md](docs/qwen36.md) |
+| **Qwen3.6**（Alibaba） | 35B / 3B | [`Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64`](https://huggingface.co/Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64)（约 23 GB，**推荐**），Gated Attention + Gated DeltaNet 混合架构 | `make -C c qwen36`（VRAM 专家层级需 `CUDA=1`） | [qwen36.md](docs/qwen36.md) |
 | **Qwen3.8-27B**（Alibaba） | 27B，稠密 | 用 `c/tools/convert_qwen36.py` 将 [`Qwen/Qwen3.8-27B`](https://huggingface.co/Qwen/Qwen3.8-27B) 转换为 f16 容器（51 GB）；引擎在加载时将其量化为 int8，设置 `COLI_DENSE_BITS=4` 时量化为 int4。每层一个 MLP，没有路由器，运行在 Qwen3.6 引擎上。支持文本与图像 | `make -C c qwen36` | [qwen36.md](docs/qwen36.md#the-dense-27b) |
 | **Qwen3-Coder-30B-A3B**（Alibaba） | 30B / 3B | [`Justvugg/Qwen3-Coder-30B-A3B-colibri-int4`](https://huggingface.co/Justvugg/Qwen3-Coder-30B-A3B-colibri-int4)（19 GB，int4-gs64），由 [`Qwen/Qwen3-Coder-30B-A3B-Instruct`](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct) 转换而来。运行在 Qwen3.6 引擎上的全注意力 Qwen3 MoE，128 个专家 top-8，有自己的 XML 工具调用格式，不带思考；在 teacher forcing 下，int4 容器在 96.9% 的位置上选出与 bf16 发布版相同的 top-1 token | `make -C c qwen36` | [qwen36.md](docs/qwen36.md#qwen3-coder-30b-a3b) |
 | **OLMoE**（AI2） | 7B / 1B | 用 `c/tools/convert_olmoe_merged.py` 转换，**int8** 容器，约 7 GB | `make -C c olmoe` | 无 |

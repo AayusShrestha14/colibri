@@ -365,7 +365,7 @@ n=64 の GLM-5.2 ではまだ捕捉されていません。
 
 ## はじめに
 
-必要なものは 2 つです: **プログラム**（数百 KB）と **モデル**（372 GB）。
+必要なものは 2 つです: **プログラム**（数百 KB）と **モデル**（429 GB）。
 全プラットフォーム向けの手順は [クイックスタートガイド](docs/quickstart.md) にあります。
 
 ### ワンステップで始める
@@ -422,7 +422,7 @@ git clone https://github.com/JustVugg/colibri && cd colibri/c
 ### 2. モデルを入手する
 
 変換済みの **GLM-5.2 int4** コンテナが Hugging Face にあります — **int8 MTP ヘッド** 付きの
-**グループスケール（gs64）** ビルドを使ってください。サイズは約 **372 GB** なので、
+**グループスケール（gs64）** ビルドを使ってください。サイズは約 **429 GB** なので、
 十分な容量のある、できれば高速なディスクに置いてください:
 
 **https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp**
@@ -466,7 +466,7 @@ GLM-5.2 がリファレンスモデルですが、同じストリーミング手
 > | モデル | 重み用のディスク | RAM | GPU |
 > |---|---|---|---|
 > | **OLMoE** | 約 7 GB（int8 コンテナ） | 8 GB | 不要。Vulkan はオプトイン |
-> | **GLM-5.2/5.3** | 約 372 GB（5.2）/ 約 419 GB（5.3） | 最低 16 GB、快適には 24 GB | 不要。Vulkan はオプトイン |
+> | **GLM-5.2/5.3** | 約 429 GB（5.2）/ 約 419 GB（5.3） | 最低 16 GB、快適には 24 GB | 不要。Vulkan はオプトイン |
 > | **GLM-5.3-Flash** | 変換後 約 195 GB | 25 GB（int4 の重み 12 GB + エキスパートキャッシュ） | 不要。Vulkan はオプトイン |
 > | **Inkling** | 約 469 GB | int4 密コンテナ使用時 25 GB、未使用時 約 120 GB | 不要。Vulkan はオプトイン |
 > | **Kimi K3** | 約 1.6 TB | 32 GB 以上 | 不要。Vulkan はオプトイン |
@@ -476,7 +476,7 @@ GLM-5.2 がリファレンスモデルですが、同じストリーミング手
 > | **MiMo-V2.6 Pro** | 約 574 GB（エンジンが読み込まない 3 ファイルを除くと約 564 GB） | 密部分はリリースのままで 30.2 GiB、int8 で 21.7 GiB。レイヤーあたり 12 エキスパート（密部分はリリースのまま）で常駐 48.0 GB、20（密部分は int8）で 50.7 GB を計測 | 不要。Vulkan はオプトイン |
 > | **Qwen3.8-Flash-Next** | 約 185.5 GB（公式 FP8 チェックポイント）、オプションの int4-g64 エキスパートサイドカーに追加で 68.0 GB | FP8 エキスパートならデフォルトのコンテキストで快適には 24 GB（cap 32。16 GB では足りない）。int4-g64 サイドカー使用時は cap 32 で RSS 11.6 GB を計測 | オプション。CUDA VRAM エキスパートティア（FP8 エキスパートのみ）、密なトランクは VRAM 上で int8 に量子化。Vulkan はオプトイン |
 > | **Qwen3.8-27B**（密モデル、テキストと画像） | 変換後 約 51 GB（f16） | int4 の密な重みで 20 GB、int8 で 30 GB | 不要。CUDA ティアはまだなし。Vulkan はオプトイン |
-> | **Qwen3.6-35B-A3B** | 約 20 GB（int4-gs64 コンテナ） | 24 GB（RAM への完全常駐が必要） | オプション。CUDA VRAM エキスパートティアは 8 GB カード 2 枚で **1.44 -> 10.05 tok/s（7.0 倍）** を計測、出力は CPU とビット単位で同一。Vulkan はオプトイン |
+> | **Qwen3.6-35B-A3B** | 約 23 GB（int4-gs64 コンテナ） | 24 GB（RAM への完全常駐が必要） | オプション。CUDA VRAM エキスパートティアは 8 GB カード 2 枚で **1.44 -> 10.05 tok/s（7.0 倍）** を計測、出力は CPU とビット単位で同一。Vulkan はオプトイン |
 > | **Qwen3-Coder-30B-A3B** | 約 19 GB（int4-gs64 コンテナ。int8 では 30 GB） | レイヤーあたり 32 エキスパートをキャッシュして常駐 6.5 GB、128 個すべてで 15.2 GB を計測 | 不要。Vulkan はオプトイン |
 > | **Qwen-Image-2.1**（テキストから画像） | 約 33 GB（公式 diffusers チェックポイント） | すべて常駐で 16.0 GB、テキストエンコーダをプロンプトごとに読み込むとピーク 8.5 GB、これに作業バッファが加わる（768x512 の画像 1 枚でピーク 9.0 GB を計測） | 不要。Vulkan はオプトイン、GPU での計時はまだなし |
 >
@@ -496,7 +496,7 @@ GLM-5.2 がリファレンスモデルですが、同じストリーミング手
 
 | ファミリー | 総数 / アクティブ | 重み | ビルド | ドキュメント |
 |---|---|---|---|---|
-| **GLM-5.2/5.3** | 744B / 40B | [`mastouri/…-int4-g64-with-int8-mtp`](https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp)（372 GB）または [`Justvugg/GLM-5.3-colibri-int4-g64`](https://huggingface.co/Justvugg/GLM-5.3-colibri-int4-g64)（419 GB） | `make -C c glm` | このページ |
+| **GLM-5.2/5.3** | 744B / 40B | [`mastouri/…-int4-g64-with-int8-mtp`](https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp)（429 GB）または [`Justvugg/GLM-5.3-colibri-int4-g64`](https://huggingface.co/Justvugg/GLM-5.3-colibri-int4-g64)（419 GB） | `make -C c glm` | このページ |
 | **Inkling**（Thinking Machines） | 975B / 41B | [`nbeerbower/Inkling-colibri-int4`](https://huggingface.co/nbeerbower/Inkling-colibri-int4)（469 GB） | `make -C c inkling` | [inkling.md](docs/inkling.md) |
 | **GLM-5.3-Flash**（Z.ai） | 321B / 18B | [`zai-org/GLM-5.3-Flash`](https://huggingface.co/zai-org/GLM-5.3-Flash)。ルーティングエキスパートを **int4-gs64** に変換、密部分は BF16 のままで精度はロード時に選択。ビジョン対応 | `make -C c glm53` | [glm53-flash.md](docs/glm53-flash.md) |
 | **Kimi K3**（Moonshot） | 2.8T / 104B | [`moonshotai/Kimi-K3`](https://huggingface.co/moonshotai/Kimi-K3) — オリジナルのチェックポイント、ルーティングエキスパートは **ネイティブ MXFP4** のまま | `make -C c kimi_k3` | [kimi_k3.md](docs/kimi_k3.md) |
@@ -505,7 +505,7 @@ GLM-5.2 がリファレンスモデルですが、同じストリーミング手
 | **MiMo-V2.6 Pro**（Xiaomi） | 1.02T / 42B | [`XiaomiMiMo/MiMo-V2.6-Pro-MOPD`](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-MOPD)（573.5 GB）、公式チェックポイント、**変換不要**、MiMo エンジンで動作: 同じアーキテクチャで 70 層、384 エキスパート。全 70 層のうち最初の 32 層について Xiaomi 自身のモデリングコードと照合済み。ビジョンとツール呼び出しに対応 | `make -C c mimo` | [mimo.md](docs/mimo.md#pro) |
 | **DeepSeek V4.1 Flash** | 552B / 16B | 公式チェックポイント、**変換不要**: エキスパートはすでに fp4、密部分は fp8-e4m3。そのうち 203 GB は一度に数百バイトずつディスクから読まれる n-gram メモリで、ルーティングエキスパートのコストは GLM-5.2 の 12.7 GB に対して **1 トークンあたり 4.5 GB**。ビジョン、ツール呼び出し、DSpark ドラフトヘッドはすべて有効 | `make -C c deepseek_v41` | [deepseek-v41.md](docs/deepseek-v41.md) |
 | **Qwen3.8-Flash-Next**（Alibaba） | 125B + 51B n-gram / 6B | [`Qwen/Qwen3.8-Flash-Next-FP8`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8)、オリジナルのチェックポイント。PLE はページング可能なまま、エキスパートは **ネイティブのブロック FP8** のまま、またはオプションのサイドカーから **int4-g64** として読み込み（下記参照）。MTP ドラフトはオプトイン（`Q38_MTP=1`） | `make -C c qwen38`（VRAM エキスパートティアには `CUDA=1`） | [qwen38.md](docs/qwen38.md) |
-| **Qwen3.6**（Alibaba） | 35B / 3B | [`Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64`](https://huggingface.co/Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64)（約 20 GB、**推奨**）— Gated Attention + Gated DeltaNet のハイブリッド | `make -C c qwen36`（VRAM エキスパートティアには `CUDA=1`） | [qwen36.md](docs/qwen36.md) |
+| **Qwen3.6**（Alibaba） | 35B / 3B | [`Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64`](https://huggingface.co/Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64)（約 23 GB、**推奨**）— Gated Attention + Gated DeltaNet のハイブリッド | `make -C c qwen36`（VRAM エキスパートティアには `CUDA=1`） | [qwen36.md](docs/qwen36.md) |
 | **Qwen3.8-27B**（Alibaba） | 27B、密モデル | [`Qwen/Qwen3.8-27B`](https://huggingface.co/Qwen/Qwen3.8-27B) を `c/tools/convert_qwen36.py` で f16 コンテナ（51 GB）に変換。エンジンはロード時に int8、`COLI_DENSE_BITS=4` なら int4 に量子化。レイヤーごとに MLP が 1 つでルーターはなく、Qwen3.6 エンジンで動作。テキストと画像に対応 | `make -C c qwen36` | [qwen36.md](docs/qwen36.md#the-dense-27b) |
 | **Qwen3-Coder-30B-A3B**（Alibaba） | 30B / 3B | [`Justvugg/Qwen3-Coder-30B-A3B-colibri-int4`](https://huggingface.co/Justvugg/Qwen3-Coder-30B-A3B-colibri-int4)（19 GB、int4-gs64）、[`Qwen/Qwen3-Coder-30B-A3B-Instruct`](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct) から変換。Qwen3.6 エンジンで動く全層アテンションの Qwen3 MoE で、128 エキスパートの top-8、独自の XML 形式のツール呼び出しを持ち、思考モードはなし。teacher forcing で、int4 コンテナは 96.9% の位置で bf16 リリースと同じ top-1 トークンを選ぶ | `make -C c qwen36` | [qwen36.md](docs/qwen36.md#qwen3-coder-30b-a3b) |
 | **OLMoE**（AI2） | 7B / 1B | `c/tools/convert_olmoe_merged.py` で変換 — **int8** コンテナ、約 7 GB | `make -C c olmoe` | — |

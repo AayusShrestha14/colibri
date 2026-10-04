@@ -13,7 +13,7 @@ KAT-Coder-V2.5-Dev) run on this engine unchanged.
 
 ## Quickstart
 
-Pre-converted containers (int4 experts, self-contained, ~20 GB):
+Pre-converted containers (int4 experts, self-contained, ~23 GB):
 
 ```sh
 # group-scaled int4 (gs64) — recommended, see "Which container" below

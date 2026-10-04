@@ -379,7 +379,7 @@ scale-granularity/rotation ablations live in
 ## Get started
 
 You need two things: **the program** (a few hundred KB) and **the model**
-(372 GB). Step-by-step for every platform in the
+(429 GB). Step-by-step for every platform in the
 [Quick Start guide](docs/quickstart.md).
 
 ### The one-step way
@@ -438,7 +438,7 @@ engine still lives in `c/` — an editable install from the clone, not a wheel).
 ### 2. Get the model
 
 A pre-converted **GLM-5.2 int4** container is on Hugging Face — use the
-**group-scaled (gs64)** build with the **int8 MTP head**. It is about **372 GB**,
+**group-scaled (gs64)** build with the **int8 MTP head**. It is about **429 GB**,
 so put it on a disk with the room, ideally a fast one:
 
 **https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp**
@@ -484,7 +484,7 @@ or from `model_index.json` for the image model):
 > | Model | Disk for the weights | RAM | GPU |
 > |---|---|---|---|
 > | **OLMoE** | ~7 GB (int8 container) | 8 GB | not needed; Vulkan opt-in |
-> | **GLM-5.2/5.3** | ~372 GB (5.2) / ~419 GB (5.3) | 16 GB min, 24 GB comfortable | not needed; Vulkan opt-in |
+> | **GLM-5.2/5.3** | ~429 GB (5.2) / ~419 GB (5.3) | 16 GB min, 24 GB comfortable | not needed; Vulkan opt-in |
 > | **GLM-5.3-Flash** | ~195 GB converted | 25 GB (12 GB weights at int4 + expert cache) | not needed; Vulkan opt-in |
 > | **Inkling** | ~469 GB | 25 GB with the int4 dense container, ~120 GB without | not needed; Vulkan opt-in |
 > | **Kimi K3** | ~1.6 TB | 32 GB+ | not needed; Vulkan opt-in |
@@ -494,7 +494,7 @@ or from `model_index.json` for the image model):
 > | **MiMo-V2.6 Pro** | ~574 GB (~564 GB without the three files the engine never loads) | dense set 30.2 GiB as released, 21.7 GiB in int8; 48.0 GB resident measured with 12 experts cached per layer (dense as released), 50.7 GB with 20 (dense in int8) | not needed; Vulkan opt-in |
 > | **Qwen3.8-Flash-Next** | ~185.5 GB (official FP8 checkpoint), plus 68.0 GB for the optional int4-g64 expert sidecar | 24 GB comfortable at the default context with the FP8 experts (cap 32; 16 GB is below the floor); 11.6 GB RSS measured at cap 32 with the int4-g64 sidecar | optional; the CUDA VRAM expert tier (FP8 experts only) with dense trunk quantized to int8 in VRAM; Vulkan opt-in |
 > | **Qwen3.8-27B** (dense, text and images) | ~51 GB converted (f16) | 20 GB with int4 dense weights, 30 GB in int8 | not needed; no CUDA tier yet; Vulkan opt-in |
-> | **Qwen3.6-35B-A3B** | ~20 GB (int4-gs64 container) | 24 GB (needs full RAM residency) | optional; the CUDA VRAM expert tier measured **1.44 -> 10.05 tok/s (7.0x)** on two 8 GB cards, output bit-identical to CPU; Vulkan opt-in |
+> | **Qwen3.6-35B-A3B** | ~23 GB (int4-gs64 container) | 24 GB (needs full RAM residency) | optional; the CUDA VRAM expert tier measured **1.44 -> 10.05 tok/s (7.0x)** on two 8 GB cards, output bit-identical to CPU; Vulkan opt-in |
 > | **Qwen3-Coder-30B-A3B** | ~19 GB (int4-gs64 container; 30 GB in int8) | 6.5 GB resident measured with 32 experts cached per layer, 15.2 GB with all 128 | not needed; Vulkan opt-in |
 > | **Qwen-Image-2.1** (text to image) | ~33 GB (official diffusers checkpoint) | 16.0 GB with everything resident, 8.5 GB peak with the text encoder loaded per prompt, plus working buffers (9.0 GB peak measured for one 768x512 image) | not needed; Vulkan opt-in, not timed on a GPU yet |
 >
@@ -517,7 +517,7 @@ or from `model_index.json` for the image model):
 
 | Family | Total / active | Weights | Build | Docs |
 |---|---|---|---|---|
-| **GLM-5.2/5.3** | 744B / 40B | [`mastouri/…-int4-g64-with-int8-mtp`](https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp) (372 GB) or [`Justvugg/GLM-5.3-colibri-int4-g64`](https://huggingface.co/Justvugg/GLM-5.3-colibri-int4-g64) (419 GB) | `make -C c glm` | this page |
+| **GLM-5.2/5.3** | 744B / 40B | [`mastouri/…-int4-g64-with-int8-mtp`](https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp) (429 GB) or [`Justvugg/GLM-5.3-colibri-int4-g64`](https://huggingface.co/Justvugg/GLM-5.3-colibri-int4-g64) (419 GB) | `make -C c glm` | this page |
 | **Inkling** (Thinking Machines) | 975B / 41B | [`nbeerbower/Inkling-colibri-int4`](https://huggingface.co/nbeerbower/Inkling-colibri-int4) (469 GB) | `make -C c inkling` | [inkling.md](docs/inkling.md) |
 | **GLM-5.3-Flash** (Z.ai) | 321B / 18B | [`zai-org/GLM-5.3-Flash`](https://huggingface.co/zai-org/GLM-5.3-Flash), converted to **int4-gs64** routed experts, dense stays BF16 and the precision is a load-time choice; vision included | `make -C c glm53` | [glm53-flash.md](docs/glm53-flash.md) |
 | **Kimi K3** (Moonshot) | 2.8T / 104B | [`moonshotai/Kimi-K3`](https://huggingface.co/moonshotai/Kimi-K3) — original checkpoint, routed experts stay **native MXFP4** | `make -C c kimi_k3` | [kimi_k3.md](docs/kimi_k3.md) |
@@ -526,7 +526,7 @@ or from `model_index.json` for the image model):
 | **MiMo-V2.6 Flash** (Xiaomi) | 309B / 15B | [`XiaomiMiMo/MiMo-V2.6-Flash-MOPD`](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-MOPD) (178 GB), official checkpoint, **no conversion**: routed experts stay **native MXFP4**, dense stays FP8/BF16. 39 of its 48 layers attend a 128-token window, so a long context costs the KV of 9. Vision and tool calling on | `make -C c mimo` | [mimo.md](docs/mimo.md) |
 | **MiMo-V2.6 Pro** (Xiaomi) | 1.02T / 42B | [`XiaomiMiMo/MiMo-V2.6-Pro-MOPD`](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-MOPD) (573.5 GB), official checkpoint, **no conversion**, on the MiMo engine: the same architecture at 70 layers and 384 experts. Checked against Xiaomi's own modeling code on the first 32 of its 70 layers. Vision and tool calling on | `make -C c mimo` | [mimo.md](docs/mimo.md#pro) |
 | **Qwen3.8-Flash-Next** (Alibaba) | 125B + 51B n-gram / 6B | [`Qwen/Qwen3.8-Flash-Next-FP8`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8), original checkpoint; PLE stays pageable and experts stay **native block-FP8**, or are read as **int4-g64** from an optional sidecar (see below). Opt-in MTP drafting (`Q38_MTP=1`) | `make -C c qwen38` (`CUDA=1` for the VRAM expert tier) | [qwen38.md](docs/qwen38.md) |
-| **Qwen3.6** (Alibaba) | 35B / 3B | [`Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64`](https://huggingface.co/Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64) (~20 GB, **recommended**) — hybrid Gated Attention + Gated DeltaNet | `make -C c qwen36` (`CUDA=1` for the VRAM expert tier) | [qwen36.md](docs/qwen36.md) |
+| **Qwen3.6** (Alibaba) | 35B / 3B | [`Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64`](https://huggingface.co/Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64) (~23 GB, **recommended**) — hybrid Gated Attention + Gated DeltaNet | `make -C c qwen36` (`CUDA=1` for the VRAM expert tier) | [qwen36.md](docs/qwen36.md) |
 | **Qwen3.8-27B** (Alibaba) | 27B, dense | [`Qwen/Qwen3.8-27B`](https://huggingface.co/Qwen/Qwen3.8-27B) converted with `c/tools/convert_qwen36.py` to an f16 container (51 GB); the engine quantizes it to int8, or int4 with `COLI_DENSE_BITS=4`, while loading. One MLP per layer and no router, on the Qwen3.6 engine. Text and images | `make -C c qwen36` | [qwen36.md](docs/qwen36.md#the-dense-27b) |
 | **Qwen3-Coder-30B-A3B** (Alibaba) | 30B / 3B | [`Justvugg/Qwen3-Coder-30B-A3B-colibri-int4`](https://huggingface.co/Justvugg/Qwen3-Coder-30B-A3B-colibri-int4) (19 GB, int4-gs64), converted from [`Qwen/Qwen3-Coder-30B-A3B-Instruct`](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct). All-attention Qwen3 MoE on the Qwen3.6 engine, 128 experts top-8, its own XML tool-call form and no thinking; teacher forced, the int4 container picks the bf16 release's top-1 token at 96.9% of positions | `make -C c qwen36` | [qwen36.md](docs/qwen36.md#qwen3-coder-30b-a3b) |
 | **OLMoE** (AI2) | 7B / 1B | converted with `c/tools/convert_olmoe_merged.py` — **int8** container, ~7 GB | `make -C c olmoe` | — |
