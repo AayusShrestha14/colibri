@@ -153,10 +153,18 @@ void coli_vk_pool_stats(int pool, ColiVkPoolStats *st);
 void coli_vk_tier_pool_limit(size_t bytes);
 /* A tensor in the tier's pool, to fill in place: O rows of coli_vk_tensor_row_bytes
  * at *stride apart (padding zeroed) and coli_vk_tensor_scale_count floats of scales
- * (fmt 10/11: one, set it to 1). Thread-safe. Returns 0 at the budget or when the
- * device is out of memory. */
+ * (fmt 10/11: one, set it to 1), then coli_vk_tensor_commit. Thread-safe. Returns 0
+ * at the budget or when the device is out of memory. */
 int    coli_vk_tier_tensor(ColiVkTensor **t, int fmt, int I, int O, int gs,
                            uint8_t **rows, size_t *stride, float **scales);
+/* Staged uploads (a discrete card without Resizable BAR, or COLI_VK_STAGED=1; see
+ * docs/vulkan.md, "Memory placement without Resizable BAR"): the tier's tensors live in
+ * device memory the host does not map, so the rows and scales coli_vk_tier_tensor hands
+ * out are a host image, which this copies to the device (all n before it returns) and
+ * frees. With mapped memory it does nothing. Thread-safe; the n tensors on one device.
+ * 0 = the copy failed (the device is lost): free the tensors. */
+int    coli_vk_tensor_commit(ColiVkTensor *const *t, int n);
+int    coli_vk_staged(void);   /* 1 = resident data goes to the device through staged uploads */
 size_t coli_vk_tensor_row_bytes(int fmt, int I);
 size_t coli_vk_buffer_alignment(void);   /* where a weight range may start (bytes) */
 size_t coli_vk_tensor_scale_count(int fmt, int I, int O, int gs);
@@ -269,6 +277,9 @@ typedef struct { void *wbuf, *sbuf; int fmt, I, O, rowWords, gs; } ColiVkTensorI
 int  coli_vk_tensor_info(const ColiVkTensor *t, ColiVkTensorInfo *out);
 /* The chain's fence wait failed: the device is lost, the backend stops. */
 void coli_vk_mark_lost(void);
+/* vkQueueSubmit(queue, 1, submit_info, fence) as the backend submits (a VkResult): the
+ * staged uploader may share the main queue from its own thread. */
+int  coli_vk_queue_submit(void *queue, const void *submit_info, void *fence);
 
 #ifdef __cplusplus
 }

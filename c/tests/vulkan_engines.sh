@@ -12,6 +12,10 @@
 #   bash tests/vulkan_engines.sh glm-chain | glm-chain-sanitize     # the same for colibri and glm53
 #   bash tests/vulkan_engines.sh kimi-chain | kimi-chain-sanitize   # the same for Kimi K3
 #   bash tests/vulkan_engines.sh deepseek-chain | deepseek-chain-sanitize   # deepseek_v41 and deepseek_v4
+#   bash tests/vulkan_engines.sh staged    # staged uploads: the same bits as mapped memory, the decision
+#   bash tests/vulkan_engines.sh <family>-staged   # a family with COLI_VK_STAGED=1 (qwen-staged: and
+#                                                  # an engine under an emulated small window)
+#   bash tests/vulkan_engines.sh staged-faults | staged-faults-sanitize   # staged uploads failing
 #
 # Needs libvulkan-dev, glslc and mesa-vulkan-drivers, plus the Python packages of
 # the family's tiny fixtures (see the vulkan-engines job in .github/workflows/ci.yml).
@@ -64,6 +68,160 @@ shader_formats() {
   tail -1 vk_test.log | grep -qx PASS || fail "qmatmul format cases"
   ./tests/test_vk_tier shaders/qmatmul.spv | tee vk_tier.log
   tail -1 vk_tier.log | grep -qx PASS || fail "routed-expert tier"
+}
+
+# Staged uploads (docs/vulkan.md, "Memory placement without Resizable BAR"): resident
+# data copied from a host staging buffer into device-local memory the host does not map,
+# as a discrete card without Resizable BAR needs, against the mapped path on this device:
+#   - the harness's results (every format, the tiled GEMMs, the expert batch) bit for bit
+#     the same mapped (COLI_VK_STAGED=0), staged (=1, twice: no run-to-run difference) and
+#     under an emulated 246 MB host-visible window (COLI_VK_HOST_VISIBLE_CAP_MB=246 and
+#     nothing else), which must choose staging on its own;
+#   - the routed-expert tier (test_vk_tier) and the chain's ops (test_vk_chain) staged;
+#   - each staged run ends with no resident data in host memory ("[VK] memory at exit").
+staged_check() {  # <err log> <tag>: staged, and nothing resident left in host memory
+  grep -q '^\[VK\] memory: staged uploads' "$1" || { cat "$1"; fail "$2: not staged"; }
+  grep -q 'resident data in host memory: 0.0 MiB' "$1" || { grep '\[VK\] memory' "$1"; fail "$2: resident data in host memory"; }
+}
+family_staged() {
+  make tests/test_vk_tier tests/test_vk_chain VK=1   # the shaders too
+  cc -O2 -pthread -DVK_TEST backend_vulkan.c -o vk_test -lvulkan -lm
+  local m e d d0=""
+  for m in mapped staged staged-again window; do
+    case $m in
+      mapped) e=COLI_VK_STAGED=0 ;;
+      staged|staged-again) e=COLI_VK_STAGED=1 ;;
+      window) e=COLI_VK_HOST_VISIBLE_CAP_MB=246 ;;
+    esac
+    env -u COLI_VK_STAGED -u COLI_VK_HOST_VISIBLE_CAP_MB $e COLI_VK_TEST_MATMUL_ONLY=1 ./vk_test shaders/qmatmul.spv > vk_test.log 2> vk_test.err
+    tail -1 vk_test.log | grep -qx PASS || { cat vk_test.log vk_test.err; fail "staged harness, $m"; }
+    if [ $m = mapped ]; then grep -qx 'memory: mapped' vk_test.log || { cat vk_test.err; fail "staged harness: COLI_VK_STAGED=0 staged"; }
+    else staged_check vk_test.err "staged harness, $m"; fi
+    d=$(sed -n 's/^outputs digest //p' vk_test.log)
+    [ -n "$d" ] || fail "staged harness, $m: no digest"
+    [ -n "$d0" ] || d0=$d
+    [ "$d" = "$d0" ] || fail "staged harness, $m: the results differ from the mapped run's ($d against $d0)"
+    echo "OK staged harness $m: $(grep '^memory:' vk_test.log), results digest $d"
+  done
+  COLI_VK_STAGED=1 ./tests/test_vk_tier shaders/qmatmul.spv > vk_tier.log 2> vk_tier.err
+  tail -1 vk_tier.log | grep -qx PASS || { cat vk_tier.log vk_tier.err; fail "staged routed-expert tier"; }
+  staged_check vk_tier.err "staged routed-expert tier"
+  echo "OK staged routed-expert tier: $(grep -o 'resident data in host memory: .*' vk_tier.err)"
+  COLI_VK_STAGED=1 ./tests/test_vk_chain shaders/qmatmul.spv > vk_chain.log 2> vk_chain.err
+  tail -1 vk_chain.log | grep -qx PASS || { cat vk_chain.log vk_chain.err; fail "staged chain ops"; }
+  staged_check vk_chain.err "staged chain ops"
+  echo "OK staged chain ops: $(grep -o 'resident data in host memory: .*' vk_chain.err)"
+}
+# An engine under the emulated window, COLI_VK_STAGED unset: it stages on its own, the
+# tier with the trunk on the device and the chain give the CPU's tokens (and logits),
+# and nothing resident ends in host memory.
+staged_window() {
+  make qwen36 VK=1
+  $PY tools/make_qwen36_tiny.py --out qwen36_tiny --ref-mode full --emit-ref qwen36_tiny/ref_full.json
+  $PY tools/convert_qwen36.py --model qwen36_tiny --out qwen36_tiny_c --ebits 8
+  tier_gate qwen36 "window qwen36 tier and trunk" COLI_VK_HOST_VISIBLE_CAP_MB=246 COLI_VK_DENSE=1 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
+  staged_check vk.log "window qwen36 tier and trunk"
+  chain_gate qwen36 "window qwen36 chain" 1 COLI_VK_HOST_VISIBLE_CAP_MB=246 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
+  staged_check vk.log "window qwen36 chain"
+  echo "OK window qwen36: staged on its own, $(grep -o 'resident data in host memory: .*' vk.log)"
+}
+
+# Staged uploads failing (COLI_VK_STAGED_FAULT=<point>[:n], the n-th time) at every point
+# they can: the uploader's staging buffer (stage), the KV mirror's (pwstage), a weight
+# pool's device-local block (block), a KV mirror or norm-weight buffer (kvbuf), a command
+# buffer's begin or end (record), a submit, a fence wait (the device is then lost), a tier
+# expert's commit after its first matrix (commit). qwen36 with its trunk's matrices on the
+# device one by one, its tier awaited (COLI_VK_TIER_SYNC=1) and with the uploader thread
+# free after a warm start, and its chain; colibri's attention core for the KV mirror. Every
+# run: no crash and no sanitizer report, the fault fired, the CPU's tokens. A matrix that
+# failed stays on the CPU (one fewer resident); an expert whose commit failed stays on the
+# CPU and the tier's budget stands; a lost device takes everything to the CPU, the chain
+# rebuilding its state there. SAN=1 (staged-faults-sanitize): a sanitized build.
+fault_run() {  # <tag> <fault> <cpu tokens> <env...> -- <command...>
+  local tag=$1 fault=$2 ref=$3 rc=0; shift 3
+  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  if [ -f hist.usage ]; then cp hist.usage run.usage; else rm -f run.usage; fi
+  env "${envs[@]}" COLI_USAGE=run.usage COLI_VULKAN=1 COLI_VK_STAGED=1 ${fault:+COLI_VK_STAGED_FAULT=$fault} "$@" > vk.log 2>&1 || rc=$?
+  if [ $rc -ge 128 ] || grep -qE "ERROR: AddressSanitizer|runtime error:" vk.log; then cat vk.log; fail "$tag: crashed (exit $rc)"; fi
+  [ -z "$fault" ] || grep -q "COLI_VK_STAGED_FAULT: ${fault%%:*} " vk.log || { cat vk.log; fail "$tag: the fault never fired"; }
+  grep -a 'C engine' vk.log > vk.tok || true
+  { [ -s "$ref" ] && cmp -s "$ref" vk.tok; } || { cat "$ref" vk.tok; fail "$tag: tokens differ from the CPU's"; }
+}
+fault_num() {  # <sed expression> <log>: the first number it extracts, 0 without one
+  local n; n=$(sed -n "$1" "$2" | tail -1); echo "${n:-0}"
+}
+family_staged_faults() {
+  if [ "${SAN:-0}" = 1 ]; then
+    make clean >/dev/null 2>&1 || true
+    make qwen36 colibri VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+    export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
+  else
+    make qwen36 colibri VK=1
+  fi
+  $PY tools/make_qwen36_tiny.py --out qwen36_tiny --ref-mode full --emit-ref qwen36_tiny/ref_full.json
+  $PY tools/convert_qwen36.py --model qwen36_tiny --out qwen36_tiny_c --ebits 8
+  mkdir -p glm_fp8 && (cd glm_fp8 && $PY ../tools/make_glm_oracle.py --fp8 > /dev/null)
+  $PY tools/convert_fp8_to_int4.py --indir glm_fp8/glm_tiny --outdir glm_tiny_i4 --ebits 4 --io-bits 4 \
+    --n-layers 5 --min-free-gb 0 > /dev/null
+  cp glm_fp8/ref_glm.json glm_tiny_i4/
+  local q=(COLI_DENSE_I8=0 SNAP=qwen36_tiny_c ./qwen36 8 8 qwen36_tiny/ref_full.json)
+  local g=(IDOT=0 SNAP=glm_tiny_i4 REF=glm_tiny_i4/ref_glm.json ./colibri 2 4 4)
+  env "${q[@]}" > cpu.log 2>&1 || true; grep -a 'C engine' cpu.log > q.tok || true
+  env "${g[@]}" > cpu.log 2>&1 || true; grep -a 'C engine' cpu.log > g.tok || true
+  local f n S
+  rm -f hist.usage
+  # the trunk's matrices one by one (no tier, no chain)
+  local D=(COLI_VK_TIER=0 COLI_VK_CHAIN=0 COLI_VK_DENSE=1)
+  fault_run "faults: qwen36 matrices, none" "" q.tok "${D[@]}" -- "${q[@]}"
+  n=$(fault_num 's/.*matmuls on the GPU (\([0-9]*\) matrices.*/\1/p' vk.log)
+  for f in stage:1 block:1 record:4 submit:4 wait:1 wait:4; do
+    fault_run "faults: qwen36 matrices, $f" $f q.tok "${D[@]}" -- "${q[@]}"
+    case $f in block:1|record:4|submit:4)
+      [ "$(fault_num 's/.*matmuls on the GPU (\([0-9]*\) matrices.*/\1/p' vk.log)" = $((n - 1)) ] || {
+        grep '\[VK\]' vk.log; fail "faults: qwen36 matrices, $f: not exactly one matrix left on the CPU"; } ;;
+      wait:*) grep -q 'the device is lost' vk.log || { cat vk.log; fail "faults: qwen36 matrices, $f: the device was not lost"; } ;;
+    esac
+    echo "OK faults: qwen36 matrices, $f: tokens = CPU, $(grep -ao 'staged upload failed[^:]*: [^)]*): .*' vk.log | head -1 | sed 's/.*): //')"
+  done
+  # the tier awaited: the trunk on the CPU, every upload at the next step
+  local T=(COLI_VK_CHAIN=0 COLI_VK_DENSE=0 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0)
+  fault_run "faults: qwen36 tier, none" "" q.tok "${T[@]}" -- "${q[@]}"
+  local budget; budget=$(fault_num 's/.*resident [0-9]* (budget \([0-9]*\),.*/\1/p' vk.log)
+  cp run.usage hist.usage.next
+  for f in stage:1 block:1 record:3 record:4 submit:2 wait:2 commit:1 commit:3; do
+    fault_run "faults: qwen36 tier, $f" $f q.tok "${T[@]}" -- "${q[@]}"
+    case $f in commit:*|record:*|submit:*)
+      [ "$(fault_num 's/.*resident [0-9]* (budget \([0-9]*\),.*/\1/p' vk.log)" = "$budget" ] || {
+        grep '\[VK\] tier' vk.log; fail "faults: qwen36 tier, $f: the budget shrank"; } ;;
+    esac
+    echo "OK faults: qwen36 tier, $f: tokens = CPU, $(grep -ao 'resident [0-9]* (budget [0-9]*' vk.log | tail -1), $(grep -ao 'failed [0-9]* |' vk.log | tail -1 | tr -d '|')"
+  done
+  # the tier's uploader thread free: a warm start from a history (vkt_put, any thread),
+  # then promotions as experts pass
+  mv hist.usage.next hist.usage
+  T=(COLI_VK_CHAIN=0 COLI_VK_DENSE=0)
+  for f in stage:1 block:1 record:3 submit:2 wait:3 commit:1 commit:5; do
+    fault_run "faults: qwen36 tier, uploader thread, $f" $f q.tok "${T[@]}" -- "${q[@]}"
+    echo "OK faults: qwen36 tier, uploader thread, $f: tokens = CPU, $(grep -ao 'resident [0-9]* (budget [0-9]*' vk.log | tail -1)"
+  done
+  rm -f hist.usage
+  # the chain: a failure before it starts declines it (or leaves one matrix behind), a
+  # lost device in the middle has the CPU rebuild the state
+  local C=(COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1)
+  fault_run "faults: qwen36 chain, none" "" q.tok "${C[@]}" -- "${q[@]}"
+  S=$(fault_num 's/.*copies (\([0-9]*\) submits).*/\1/p' vk.log)
+  for f in stage:1 block:1 record:4 submit:4 commit:1 wait:4 wait:$((S - 2)); do
+    fault_run "faults: qwen36 chain, $f" $f q.tok "${C[@]}" -- "${q[@]}"
+    [ $f != wait:$((S - 2)) ] || grep -q 'rebuilding the state of [1-9]' vk.log || { cat vk.log; fail "faults: qwen36 chain, $f: no state rebuilt on the CPU"; }
+    echo "OK faults: qwen36 chain, $f: tokens = CPU, $(grep -ao 'qwen36 chain: [0-9]* forwards\|rebuilding the state of [0-9]* positions' vk.log | tr '\n' ' ')"
+  done
+  # colibri's attention core: the KV mirror's buffers and its staging
+  local A=(COLI_VK_DENSE=1 COLI_VK_ATTN=1 COLI_VK_TIER_SYNC=1)
+  for f in pwstage:1 kvbuf:1 kvbuf:3 wait:3; do
+    fault_run "faults: colibri attention, $f" $f g.tok "${A[@]}" -- "${g[@]}"
+    echo "OK faults: colibri attention, $f: tokens = CPU"
+  done
+  if [ "${SAN:-0}" = 1 ]; then make clean >/dev/null 2>&1 || true; fi
 }
 
 # tier_count <engine> <log>: N from the last "[VK] tier <engine> run: device N of M" line;
@@ -2535,5 +2693,12 @@ case "${1:-}" in
   kimi-chain-sanitize) family_kimi_chain_sanitize ;;
   deepseek-chain) family_deepseek_chain ;;
   deepseek-chain-sanitize) family_deepseek_chain_sanitize ;;
-  *) echo "usage: $0 shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize|mimo-chain|mimo-chain-sanitize|inkling-olmoe-chain|inkling-olmoe-chain-sanitize|glm-chain|glm-chain-sanitize|kimi-chain|kimi-chain-sanitize|deepseek-chain|deepseek-chain-sanitize" >&2; exit 2 ;;
+  staged)         family_staged ;;
+  *-staged)       # COLI_VK_STAGED unset for the window's run, then the whole family staged
+                  if [ "$1" = qwen-staged ]; then env -u COLI_VK_STAGED bash tests/vulkan_engines.sh staged-window; fi
+                  COLI_VK_STAGED=1 bash tests/vulkan_engines.sh "${1%-staged}" ;;
+  staged-window)  staged_window ;;
+  staged-faults)  family_staged_faults ;;
+  staged-faults-sanitize) SAN=1 family_staged_faults ;;
+  *) echo "usage: $0 staged|<family>-staged|shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize|mimo-chain|mimo-chain-sanitize|inkling-olmoe-chain|inkling-olmoe-chain-sanitize|glm-chain|glm-chain-sanitize|kimi-chain|kimi-chain-sanitize|deepseek-chain|deepseek-chain-sanitize" >&2; exit 2 ;;
 esac

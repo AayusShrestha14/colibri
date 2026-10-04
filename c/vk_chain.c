@@ -415,6 +415,9 @@ static const VkAccessFlags ALL_RW = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER
 #define ALL_STAGES (VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT)
 
 int vkc_begin(void) {
+    /* the backend found the device lost (a staged upload's fence): this frame fails as a
+     * lost device's would, and the engine takes over on the CPU */
+    if (K.ready && !K.lost && !coli_vk_available()) lose("the backend's device", VK_ERROR_DEVICE_LOST);
     if (!vkc_ready()) return 0;
     if (K.cur >= 0) return 1;                     /* already open */
     int i = (int)(K.serial % VKC_FRAMES);
@@ -454,7 +457,7 @@ int vkc_submit(int wait) {
     }
     vkResetFences(K.dev, 1, &f->fence);
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &f->cmd};
-    VkResult r = vkQueueSubmit(K.queue, 1, &si, f->fence);
+    VkResult r = (VkResult)coli_vk_queue_submit(K.queue, &si, f->fence);   /* the backend's lock, staged uploads */
     if (r != VK_SUCCESS) { lose("queue submit", r); return 0; }
     f->inflight = 1;
     K.st.frames++;

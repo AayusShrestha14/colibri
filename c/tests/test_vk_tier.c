@@ -2,7 +2,8 @@
  * device (CI: Lavapipe). A small synthetic MoE -- L layers of E experts, top-K --
  * whose weights are random in every source format the tier accepts, decoded here
  * on their own, independently of the tier and of the backend. Gates:
- *   formats  every VktSrc kind and both activations: each row the device returns
+ *   formats  every VktSrc kind and both activations (uploads awaited, COLI_VK_TIER_SYNC):
+ *            each row the device returns
  *            equals the reference expert output, and the rank-order sum of a mixed
  *            step (device and CPU rows) equals the all-CPU sum, within 2e-3;
  *   warm     a history fills the budget in heat order (vkt_plan / vkt_put);
@@ -231,8 +232,15 @@ static void formats(void) {
         g_act = cs[c].act; g_limit = cs[c].limit;
         set_budget(L * E, cs[c].gu, cs[c].dn);
         setenv("COLI_VK_TIER_RATE", "64", 1);
+        /* each step waits for the uploads staged so far: the numbers are this section's
+         * point, and twelve tiny steps can end before the first upload lands (with
+         * staged uploads a commit is a submit and a fence wait: 8.5 ms for the first,
+         * 0.6 ms after, on an Iris Xe through Dozen); warm, adapt and partial keep the
+         * uploader running free */
+        setenv("COLI_VK_TIER_SYNC", "1", 1);
         VktConfig vc = cfg_of(cs[c].gu, cs[c].dn, cs[c].act, cs[c].limit);
         int on = vkt_init(&vc, NULL);
+        unsetenv("COLI_VK_TIER_SYNC");
         CHECK(on, "%s: the tier did not start", cs[c].name);
         if (!on) { model_free(); continue; }
         Books bk = {0, 0}; double worst = 0;
@@ -514,6 +522,7 @@ int main(int argc, char **argv) {
     printf("DeepSeek V4:\n"); v4_act();
     ColiVkPoolStats ps; coli_vk_pool_stats(1, &ps);
     CHECK(ps.live == 0, "%d tier ranges still live after every shutdown", ps.live);
+    coli_vk_shutdown();   /* with staged uploads: where the experts were ("[VK] memory at exit") */
     printf(fails ? "FAIL (%d)\n" : "PASS\n", fails);
     return fails != 0;
 }
