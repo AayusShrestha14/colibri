@@ -1,4 +1,7 @@
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import shutil
 import subprocess
+import threading
 import tempfile
 import unittest
 from pathlib import Path
@@ -24,3 +27,32 @@ class CurlPublicationTests(unittest.TestCase):
                 final = Path(destination, 'model.safetensors')
                 self.assertEqual(final.exists(), complete)
                 self.assertEqual((final if complete else Path(str(final) + '.part')).read_bytes(), payload)
+
+    @unittest.skipUnless(shutil.which("curl"), "curl not installed")
+    def test_native_curl_does_not_publish_http_error_body(self):
+        class ErrorBodyHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(404)
+                self.send_header("Content-Length", "4")
+                self.end_headers()
+                self.wfile.write(b"oops")
+
+            def log_message(self, *args):
+                pass
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), ErrorBodyHandler) as server:
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            try:
+                with tempfile.TemporaryDirectory() as destination, \
+                        mock.patch.object(download_fp8, "DEST", destination):
+                    base = f"http://127.0.0.1:{server.server_port}"
+                    self.assertFalse(download_fp8.download_file_curl("model.safetensors", base, 4))
+                    self.assertFalse(Path(destination, "model.safetensors").exists())
+            finally:
+                server.shutdown()
+                worker.join(timeout=5)
+
+
+if __name__ == "__main__":
+    unittest.main()
