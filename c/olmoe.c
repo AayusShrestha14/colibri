@@ -163,10 +163,12 @@ static int g_pilot = 0;
 static int g_wide  = 1;  /* IMPROVEMENT 4: top-K * g_wide candidates prefetched */
 static int g_pilot_evict_guard = 1; /* PILOT_EVICT_GUARD=0 to disable LFRU prefetch eviction guard */
 static int g_expert_drop = 0;       /* EXPERT_DROP=1 restores fadvise(DONTNEED) after expert reads */
+#if defined(__AVX2__) || !defined(OLMOE_NO_MAIN)
 static int g_fused3 = 0;            /* FUSED3=1: AVX2 activation quant + gate/up pair matmul
                                      * (fused_simd.h: quant_x_q8_avx2, matmul_q_idot_v3,
                                      * matmul_q_idot_pair_v3). Exact integer arithmetic only —
                                      * bit-identical to the stock matmul_q path; OFF by default. */
+#endif
 
 static uint64_t lfru_score(uint32_t heat, uint64_t last, uint64_t clock) {
     uint64_t age = (clock > last) ? (clock - last) : 0;
