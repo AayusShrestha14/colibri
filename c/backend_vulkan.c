@@ -33,7 +33,73 @@ struct ColiVkTensor {
     VkWPool *pool;         /* the weight pool its two ranges came from */
     VkaRange wr, sr;       /* where the rows and the scales sit in the pool's blocks */
     struct ColiVkTensor *next_free;   /* deferred-free list (a free while async work is in flight) */
+    uint8_t *img;          /* staged uploads: the host image a tier tensor is filled in, until committed */
 };
+
+/* ---- memory placement without Resizable BAR (docs/vulkan.md) ------------------------
+ * Resident data (the weights, the expert tier, the MLA KV mirror) is written by the host
+ * once and read by the device for the rest of the run. The mapped path puts it in the
+ * HOST_VISIBLE|DEVICE_LOCAL type and writes it through the mapping: on an integrated GPU,
+ * a CPU device or a discrete card with Resizable BAR that type covers the device's
+ * memory. Without Resizable BAR a discrete card exposes it as a window of about 256 MB:
+ * NVIDIA refuses allocations past it, RADV puts them in system RAM, read over PCIe.
+ * Staged uploads put resident data in a DEVICE_LOCAL type the host does not map and copy
+ * it there from a host staging buffer (vkCmdCopyBuffer), on a queue of their own when the
+ * device has a spare one (a transfer-only family first), else on the main queue, every
+ * submit on which then takes a lock. One uploader per device (index 0 = G, 1 = G2). */
+#define VK_UP_SLOTS 2
+#define VK_UP_SLOT ((size_t)16 << 20)
+typedef struct {
+    int on;                           /* staged uploads on this device */
+    uint32_t mt_dev, mt_stage;        /* the device-local target type, the host staging type */
+    VkDevice dev; VkQueue q; uint32_t fam; int shared;   /* shared: q is the main queue, locked */
+    uint32_t fams[3], nfams;          /* the families that touch device-local tensors (CONCURRENT when > 1) */
+    pthread_mutex_t mx;               /* one upload at a time: the slots and their command buffers */
+    VkCommandPool cpool; VkCommandBuffer cmd[VK_UP_SLOTS]; VkFence fence[VK_UP_SLOTS];
+    int pending[VK_UP_SLOTS];         /* submitted and not waited for */
+    int cur, open; size_t used;       /* the slot being filled: commands recorded, bytes used */
+    VkBuffer sbuf; VkDeviceMemory smem; uint8_t *sptr;   /* VK_UP_SLOTS slots of VK_UP_SLOT bytes */
+    int fill;                         /* zero-fill a fresh device-local block before its first use */
+    int failed;                       /* the upload under way failed (cleared by up_finish) */
+    int lost;                         /* a fence wait failed: the device is gone, for good */
+    VkResult err; const char *what;   /* the failure, for the message */
+    unsigned long long bytes, copies, submits, blocks_filled;
+    char why[200];
+} VkUp;
+static VkUp g_up[2] = {{.mx = PTHREAD_MUTEX_INITIALIZER, .fill = 1}, {.mx = PTHREAD_MUTEX_INITIALIZER, .fill = 1}};
+static pthread_mutex_t g_qmx[2] = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER};
+/* Every submit of the backend and the chain: when the uploader shares the main queue
+ * its thread submits there too, and vkQueueSubmit wants the queue externally synced. */
+static VkResult vk_submit(int dev, VkQueue q, const VkSubmitInfo *si, VkFence f) {
+    if (!g_up[dev].shared || q != g_up[dev].q) return vkQueueSubmit(q, 1, si, f);
+    pthread_mutex_lock(&g_qmx[dev]);
+    VkResult r = vkQueueSubmit(q, 1, si, f);
+    pthread_mutex_unlock(&g_qmx[dev]);
+    return r;
+}
+/* COLI_VK_STAGED_FAULT=<point>[:n] (tests): the n-th time (the first by default) a staged
+ * upload reaches <point> it fails there, as a driver can: stage (the uploader's staging
+ * buffer), pwstage (the KV mirror's), block (a weight pool's device-local block), kvbuf (a
+ * KV mirror or norm-weight buffer), record (a command buffer's begin or end), submit, wait
+ * (a fence wait: the device is then taken as lost), commit (a tier expert's commit, after
+ * its first matrix). One stderr line says when it fired. */
+static char g_fault_point[16];
+static long g_fault_at, g_fault_n;
+static void up_fault_init(void) {
+    const char *e = getenv("COLI_VK_STAGED_FAULT"), *c = e ? strchr(e, ':') : NULL;
+    size_t n = e ? (c ? (size_t)(c - e) : strlen(e)) : 0;
+    g_fault_point[0] = 0; g_fault_n = 0;
+    if (!n || n >= sizeof g_fault_point) return;
+    memcpy(g_fault_point, e, n); g_fault_point[n] = 0;
+    g_fault_at = c ? atol(c + 1) : 1;
+    if (g_fault_at < 1) g_fault_at = 1;
+}
+static int up_fault(const char *point) {
+    if (!g_fault_point[0] || strcmp(point, g_fault_point)) return 0;
+    if (__atomic_add_fetch(&g_fault_n, 1, __ATOMIC_RELAXED) != g_fault_at) return 0;
+    fprintf(stderr, "[VK] COLI_VK_STAGED_FAULT: %s #%ld fails\n", point, g_fault_at);
+    return 1;
+}
 
 typedef struct {
     VkBuffer buf; VkDeviceMemory mem; void *ptr; size_t cap;
@@ -201,9 +267,100 @@ static int pick_memtype_device(VkPhysicalDevice phys) {
     return pick_memtype(phys);
 }
 
-static int alloc_hostvis_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr, uint32_t memtype) {
+/* Staged or mapped (see VkUp above). Staged when COLI_VK_STAGED=1, or, unset, when the
+ * host-visible device-local heap (the heap of mt_host, the type the mapped path writes,
+ * when that is device-local; none otherwise) holds less than a quarter of the largest
+ * device-local heap: a discrete card without Resizable BAR (256 MB of 8 GB), never one
+ * with it, an integrated GPU or Lavapipe (the whole heap is host-visible).
+ * COLI_VK_HOST_VISIBLE_CAP_MB=N treats the host-visible heap as at most N MiB, which
+ * lets a device with Resizable BAR or unified memory take the decision a card without
+ * it takes. The target type: device-local and not host-visible on the largest
+ * device-local heap (the host never maps it), else that heap's device-local type
+ * (Lavapipe has one type for everything); vendor-specific types (uncached, coherent)
+ * are passed over. The staging type: host-visible and coherent, not device-local
+ * where there is one, so staging never takes the window. */
+static int place_plain(VkMemoryPropertyFlags f) {
+    return !(f & (VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT | VK_MEMORY_PROPERTY_PROTECTED_BIT | 0xC0u));
+}
+static int place_decide(VkPhysicalDevice phys, int mt_host, VkUp *u) {
+    VkPhysicalDeviceMemoryProperties m;
+    vkGetPhysicalDeviceMemoryProperties(phys, &m);
+    VkDeviceSize dl_max = 0, hv = 0;
+    for (uint32_t i = 0; i < m.memoryHeapCount; i++)
+        if ((m.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && m.memoryHeaps[i].size > dl_max)
+            dl_max = m.memoryHeaps[i].size;
+    if (mt_host >= 0 && (m.memoryTypes[mt_host].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+        hv = m.memoryHeaps[m.memoryTypes[mt_host].heapIndex].size;
+    const char *cap = getenv("COLI_VK_HOST_VISIBLE_CAP_MB");
+    if (cap && *cap && (VkDeviceSize)atoll(cap) << 20 < hv) hv = (VkDeviceSize)atoll(cap) << 20;
+    int dev = -1, any = -1, st = -1;
+    for (uint32_t i = 0; i < m.memoryTypeCount; i++) {
+        VkMemoryPropertyFlags f = m.memoryTypes[i].propertyFlags;
+        if (!place_plain(f)) continue;
+        int big = (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && m.memoryHeaps[m.memoryTypes[i].heapIndex].size == dl_max;
+        if (big && any < 0) any = (int)i;
+        if (big && !(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && dev < 0) dev = (int)i;
+        if ((f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) &&
+            !(f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && st < 0) st = (int)i;
+    }
+    if (dev < 0) dev = any;
+    if (st < 0) st = mt_host;
+    const char *e = getenv("COLI_VK_STAGED");
+    int on;
+    if (e && *e) { on = atoi(e) != 0; snprintf(u->why, sizeof u->why, "COLI_VK_STAGED=%s", e); }
+    else {
+        on = dl_max > 0 && hv * 4 < dl_max;
+        snprintf(u->why, sizeof u->why, "%llu of %llu MiB of device-local memory is host-visible%s",
+                 (unsigned long long)(hv >> 20), (unsigned long long)(dl_max >> 20),
+                 cap && *cap ? " (COLI_VK_HOST_VISIBLE_CAP_MB)" : "");
+    }
+    if (on && (dev < 0 || st < 0)) {
+        snprintf(u->why, sizeof u->why, "no device-local or no host-visible coherent memory type");
+        on = 0;
+    }
+    u->on = on;
+    if (on) { u->mt_dev = (uint32_t)dev; u->mt_stage = (uint32_t)st; }
+    return on;
+}
+/* The uploader's command buffers, fences and staging slots (u->dev, u->fam set). */
+static int up_init(VkUp *u) {
+    VkCommandPoolCreateInfo cp = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = u->fam};
+    if (vkCreateCommandPool(u->dev, &cp, NULL, &u->cpool) != VK_SUCCESS) return 0;
+    VkCommandBufferAllocateInfo ca = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = u->cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = VK_UP_SLOTS};
+    if (vkAllocateCommandBuffers(u->dev, &ca, u->cmd) != VK_SUCCESS) return 0;
+    VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    for (int s = 0; s < VK_UP_SLOTS; s++)
+        if (vkCreateFence(u->dev, &fi, NULL, &u->fence[s]) != VK_SUCCESS) return 0;
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = VK_UP_SLOTS * VK_UP_SLOT,
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    if (vkCreateBuffer(u->dev, &bi, NULL, &u->sbuf) != VK_SUCCESS) return 0;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(u->dev, u->sbuf, &req);
+    if (!(req.memoryTypeBits & (1u << u->mt_stage)) || up_fault("stage")) return 0;
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = req.size, .memoryTypeIndex = u->mt_stage};
+    if (vkAllocateMemory(u->dev, &ai, NULL, &u->smem) != VK_SUCCESS) return 0;
+    if (vkBindBufferMemory(u->dev, u->sbuf, u->smem, 0) != VK_SUCCESS ||
+        vkMapMemory(u->dev, u->smem, 0, VK_WHOLE_SIZE, 0, (void **)&u->sptr) != VK_SUCCESS) return 0;
+    return 1;
+}
+static void up_destroy(VkUp *u) {
+    if (!u->dev) return;
+    if (u->sbuf) vkDestroyBuffer(u->dev, u->sbuf, NULL);
+    if (u->smem) vkFreeMemory(u->dev, u->smem, NULL);
+    for (int s = 0; s < VK_UP_SLOTS; s++) if (u->fence[s]) vkDestroyFence(u->dev, u->fence[s], NULL);
+    if (u->cpool) vkDestroyCommandPool(u->dev, u->cpool, NULL);
+    u->sbuf = VK_NULL_HANDLE; u->smem = VK_NULL_HANDLE; u->sptr = NULL; u->cpool = VK_NULL_HANDLE;
+    for (int s = 0; s < VK_UP_SLOTS; s++) { u->fence[s] = VK_NULL_HANDLE; u->cmd[s] = VK_NULL_HANDLE; u->pending[s] = 0; }
+    u->open = 0; u->used = 0; u->cur = 0; u->failed = u->lost = 0; u->what = NULL;
+}
+
+static int alloc_buf_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr, uint32_t memtype,
+                        VkBufferUsageFlags usage) {
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = bytes, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .size = bytes, .usage = usage,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
     VKCHECK(vkCreateBuffer(G.dev, &bi, NULL, buf), "vkCreateBuffer");
     VkMemoryRequirements req;
@@ -219,6 +376,9 @@ static int alloc_hostvis_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, vo
     VKCHECK(vkBindBufferMemory(G.dev, *buf, *mem, 0), "vkBindBufferMemory");
     if (ptr) VKCHECK(vkMapMemory(G.dev, *mem, 0, bytes, 0, ptr), "vkMapMemory");
     return 1;
+}
+static int alloc_hostvis_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr, uint32_t memtype) {
+    return alloc_buf_mt(bytes, buf, mem, ptr, memtype, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 }
 /* Priority class of subsequent allocations (VK_EXT_memory_priority; no-op without it).
  * Scratches/KV force 1.0 internally; weight uploads take whatever is current — the
@@ -442,6 +602,7 @@ static int g_vk_prof;
 
 int coli_vk_init(const char *spv_path) {
     if (G.ready) return 1;
+    up_fault_init();
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .apiVersion = VK_API_VERSION_1_2};
     VkInstanceCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
@@ -481,8 +642,8 @@ int coli_vk_init(const char *spv_path) {
      * compute family, a compute-only one first (RADV's async compute), else the main
      * queue is shared (Lavapipe) and the two serialize. COLI_VK_TIER_QUEUE=0 shares it
      * on purpose. Nothing else changes for the engines that never open a batch. */
-    float qprio[2] = {1.0f, 1.0f};
-    VkDeviceQueueCreateInfo qis[2] = {{.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+    float qprio[3] = {1.0f, 1.0f, 1.0f};
+    VkDeviceQueueCreateInfo qis[3] = {{.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
         .queueFamilyIndex = G.qfam, .queueCount = 1, .pQueuePriorities = qprio}};
     uint32_t nqi = 1;
     G.tq_fam = G.qfam; G.tq_idx = 0;
@@ -505,6 +666,25 @@ int coli_vk_init(const char *spv_path) {
             }
         }
         G.tq_ts = qf[G.tq_fam].timestampValidBits;
+    }
+    /* Staged uploads (VkUp), decided before the device exists since their queue is one of
+     * its queues: a transfer-only family (a copy engine), else a spare queue of a family
+     * already asked for, else the main queue, shared under g_qmx[0]. */
+    uint32_t up_fam = G.qfam, up_idx = 0; int up_shared = 1;
+    if (place_decide(G.phys, pick_memtype(G.phys), &g_up[0])) {
+        uint32_t t = UINT32_MAX;
+        for (uint32_t i = 0; i < nq && t == UINT32_MAX; i++)
+            if ((qf[i].queueFlags & VK_QUEUE_TRANSFER_BIT) && qf[i].queueCount &&
+                !(qf[i].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) && i != G.qfam && i != G.tq_fam) t = i;
+        if (t != UINT32_MAX) {
+            qis[nqi++] = (VkDeviceQueueCreateInfo){.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+                .queueFamilyIndex = t, .queueCount = 1, .pQueuePriorities = qprio};
+            up_fam = t; up_shared = 0;
+        } else
+            for (uint32_t k = 0; k < nqi && up_shared; k++)
+                if (qf[qis[k].queueFamilyIndex].queueCount > qis[k].queueCount) {
+                    up_fam = qis[k].queueFamilyIndex; up_idx = qis[k].queueCount++; up_shared = 0;
+                }
     }
     /* Pressure-proofing extensions (both optional, detected at runtime):
      * memory_priority ranks allocations for the kernel's eviction order,
@@ -627,6 +807,17 @@ int coli_vk_init(const char *spv_path) {
     vkGetDeviceQueue(G.dev, G.qfam, 0, &G.queue);
     vkGetDeviceQueue(G.dev, G.tq_fam, G.tq_idx, &G.tqueue);
     G.tq_shared = G.tqueue == G.queue;
+    if (g_up[0].on) {
+        VkUp *u = &g_up[0];
+        u->dev = G.dev; u->fam = up_fam; u->shared = up_shared;
+        if (up_shared) u->q = G.queue; else vkGetDeviceQueue(G.dev, up_fam, up_idx, &u->q);
+        uint32_t fs[3] = {G.qfam, G.tq_fam, up_fam};
+        for (int k = 0; k < 3; k++) {
+            int seen = 0;
+            for (uint32_t j = 0; j < u->nfams; j++) seen |= u->fams[j] == fs[k];
+            if (!seen) u->fams[u->nfams++] = fs[k];
+        }
+    }
     {   /* what the expert batch's scratch offsets must respect */
         VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(G.phys, &pp);
         G.ssbo_align = (size_t)pp.limits.minStorageBufferOffsetAlignment;
@@ -657,8 +848,9 @@ int coli_vk_init(const char *spv_path) {
      * HOST_VISIBLE|DEVICE_LOCAL. With ReBAR disabled that combination exists only in a
      * ~256 MB BAR window (or not at all), so tier allocations silently land in system
      * RAM and every access crosses PCIe — measurably SLOWER than the CPU path, while
-     * the resident-experts log still reports an apparently healthy VRAM tier. Compare
-     * the chosen type's heap against the largest DEVICE_LOCAL heap and say so up front. */
+     * the resident-experts log still reports an apparently healthy VRAM tier. Staged
+     * uploads (VkUp) are the answer: the warnings below are for a device where they are
+     * off (COLI_VK_STAGED=0, or no staging buffer). */
     {
         VkPhysicalDeviceMemoryProperties mp;
         vkGetPhysicalDeviceMemoryProperties(G.phys, &mp);
@@ -668,14 +860,28 @@ int coli_vk_init(const char *spv_path) {
                 mp.memoryHeaps[i].size > dl_max) dl_max = mp.memoryHeaps[i].size;
         VkMemoryPropertyFlags cf = mp.memoryTypes[G.memtype].propertyFlags;
         VkDeviceSize hv_dl = mp.memoryHeaps[mp.memoryTypes[G.memtype].heapIndex].size;
-        if (dl_max && !(cf & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+        if (g_up[0].on && !up_init(&g_up[0])) {
+            fprintf(stderr, "[VK] staged uploads unavailable (no staging buffer): resident data stays in mapped memory\n");
+            up_destroy(&g_up[0]);
+            g_up[0].on = g_up[0].shared = 0;
+        }
+        if (g_up[0].on) {
+            VkUp *u = &g_up[0];
+            fprintf(stderr, "[VK] memory: staged uploads, resident data in device-local memory (type %u, %llu MiB heap) "
+                    "copied from host staging memory (type %u) on %s (%s)\n", u->mt_dev,
+                    (unsigned long long)(mp.memoryHeaps[mp.memoryTypes[u->mt_dev].heapIndex].size >> 20), u->mt_stage,
+                    u->shared ? "the main queue" : u->fam != G.qfam && u->fam != G.tq_fam ? "a transfer queue" : "a queue of its own",
+                    u->why);
+        } else if (dl_max && !(cf & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
             fprintf(stderr, "[VK] warning: no host-visible+device-local memory type — weight tiers "
                     "will live in system RAM and every access crosses PCIe (expect slower than "
-                    "CPU-only). On a discrete card, enable Resizable BAR in the BIOS.\n");
+                    "CPU-only). On a discrete card, enable Resizable BAR in the BIOS or leave "
+                    "COLI_VK_STAGED unset.\n");
         else if (dl_max && hv_dl * 4 < dl_max)
             fprintf(stderr, "[VK] warning: only %llu of %llu MB VRAM is host-visible (Resizable BAR "
                     "appears disabled) — allocations beyond the %llu MB window fall back to system "
-                    "RAM and will be slow. Enable Resizable BAR / Smart Access Memory in the BIOS.\n",
+                    "RAM and will be slow. Enable Resizable BAR / Smart Access Memory in the BIOS, "
+                    "or leave COLI_VK_STAGED unset.\n",
                     (unsigned long long)(hv_dl >> 20), (unsigned long long)(dl_max >> 20),
                     (unsigned long long)(hv_dl >> 20));
     }
@@ -789,6 +995,7 @@ int coli_vk_init(const char *spv_path) {
             G.shader_gu ? ", fused gate+up" : "", G.shader_att ? ", absorb attention" : "");
     if (G.gemm_min_s) fprintf(stderr, ", tiled GEMM from S=%d%s%s", G.gemm_min_s,
                               G.gemm_min_so ? " and S*O>=4096" : "", G.pipe_coop[0] ? " (cooperative matrix)" : "");
+    if (g_up[0].on) fprintf(stderr, ", staged uploads");
     fprintf(stderr, "\n");
     return 1;
 }
@@ -831,6 +1038,149 @@ static VkWPool g_wpool2 = {.p = {.block_bytes = VK_WBLOCK}, .mx = PTHREAD_MUTEX_
 static VkDevice pool_device(const VkWPool *P);
 static uint32_t pool_memtype(const VkWPool *P);
 static int pool_has_prio(const VkWPool *P);
+static VkResult vk_fence_wait(VkDevice dev, VkFence f);
+static void up_lost(int dev);
+
+/* ---- the uploader at work (staged uploads, VkUp above) ---------------------------
+ * The caller holds u->mx from its first up_add to its up_finish. The bytes go through
+ * the slots: a slot fills up with copies and is submitted, the next one fills while it
+ * runs, and up_finish submits the last and waits for every slot, so what was added is
+ * on the device when it returns (its fence waited: any queue may read it next).
+ * Failures: a command buffer that would not record or a submit refused fails this upload
+ * only (up_finish still waits for the slots already sent, so the caller may free the
+ * tensors, and the next upload starts clean); a fence wait that fails means the copy may
+ * still run: the device is taken as lost (up_lost), as for every other wait. */
+typedef void (*UpFill)(uint8_t *dst, size_t off, size_t n, const void *ctx);
+static int up_fail(VkUp *u, VkResult r, const char *what) {
+    if (!u->failed) { u->err = r; u->what = what; }
+    u->failed = 1;
+    if (r == VK_ERROR_DEVICE_LOST) u->lost = 1;
+    return 0;
+}
+static int up_wait(VkUp *u, int s) {
+    if (!u->pending[s]) return 1;
+    u->pending[s] = 0;
+    VkResult r = vk_fence_wait(u->dev, u->fence[s]);
+    if (r == VK_SUCCESS && up_fault("wait")) r = VK_TIMEOUT;
+    if (r == VK_SUCCESS) return 1;
+    up_fail(u, r, "fence wait");
+    u->lost = 1;
+    return 0;
+}
+static int up_open(VkUp *u) {
+    if (u->failed || u->lost) return 0;
+    if (u->open) return 1;
+    if (!up_wait(u, u->cur)) return 0;
+    VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    VkResult r = vkResetCommandBuffer(u->cmd[u->cur], 0);
+    if (r == VK_SUCCESS && up_fault("record")) r = VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (r == VK_SUCCESS) r = vkBeginCommandBuffer(u->cmd[u->cur], &bi);
+    if (r != VK_SUCCESS) return up_fail(u, r, "command buffer");
+    u->open = 1; u->used = 0;
+    return 1;
+}
+static int up_submit(VkUp *u, int dev) {
+    if (!u->open) return !u->failed && !u->lost;
+    VkCommandBuffer c = u->cmd[u->cur];
+    u->open = 0;
+    if (u->failed) { vkEndCommandBuffer(c); return 0; }   /* out of recording; never submitted */
+    /* the copies' writes made available to every later access, on whatever queue */
+    VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
+    vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &c};
+    VkResult r = vkEndCommandBuffer(c);
+    if (r == VK_SUCCESS && up_fault("record")) r = VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (r != VK_SUCCESS) return up_fail(u, r, "command buffer");
+    r = vkResetFences(u->dev, 1, &u->fence[u->cur]);
+    if (r == VK_SUCCESS && up_fault("submit")) r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    if (r == VK_SUCCESS) r = vk_submit(dev, u->q, &si, u->fence[u->cur]);
+    if (r != VK_SUCCESS) return up_fail(u, r, "submit");
+    u->pending[u->cur] = 1; u->submits++;
+    u->cur = (u->cur + 1) % VK_UP_SLOTS;
+    return 1;
+}
+/* `bytes` that fill() writes, copied to dst at dst_off */
+static int up_add(VkUp *u, int dev, VkBuffer dst, size_t dst_off, size_t bytes, UpFill fill, const void *ctx) {
+    for (size_t off = 0; off < bytes; ) {
+        if (!up_open(u)) return 0;
+        size_t room = VK_UP_SLOT - u->used, n = bytes - off < room ? bytes - off : room;
+        size_t so = (size_t)u->cur * VK_UP_SLOT + u->used;
+        fill(u->sptr + so, off, n, ctx);
+        VkBufferCopy c = {so, dst_off + off, n};
+        vkCmdCopyBuffer(u->cmd[u->cur], u->sbuf, dst, 1, &c);
+        u->used = (u->used + n + 255) & ~(size_t)255;
+        u->bytes += n; u->copies++; off += n;
+        if (u->used >= VK_UP_SLOT && !up_submit(u, dev)) return 0;
+    }
+    return 1;
+}
+/* Always called, also after a failed up_add: the slots sent are waited for. 1 = all on
+ * the device; 0 = this upload failed (u->lost: and the device with it). */
+static int up_finish(VkUp *u, int dev) {
+    int ok = up_submit(u, dev);
+    for (int s = 0; s < VK_UP_SLOTS; s++) ok &= up_wait(u, s);
+    ok = ok && !u->failed && !u->lost;
+    if (!u->lost) u->failed = 0;   /* the next upload starts clean */
+    return ok;
+}
+/* An upload failed (u->what says where): the device lost with it, or only this one. */
+static void up_failed(int dev, const char *what) {
+    VkUp *u = &g_up[dev];
+    if (u->lost) { up_lost(dev); return; }
+    fprintf(stderr, "[VK] %sstaged upload failed (%s: %d): %s\n", dev ? "dev2 " : "",
+            u->what ? u->what : "?", (int)u->err, what);
+}
+typedef struct { const uint8_t *w; size_t cpu_rb, stride; } UpRows;
+/* the rows at their padded stride, zeros past each row's bytes */
+static void up_fill_rows(uint8_t *dst, size_t off, size_t n, const void *ctx) {
+    const UpRows *r = ctx;
+    for (size_t end = off + n; off < end; ) {
+        size_t o = off / r->stride, in = off - o * r->stride, take = r->stride - in;
+        if (take > end - off) take = end - off;
+        size_t data = in < r->cpu_rb ? r->cpu_rb - in : 0;
+        if (data > take) data = take;
+        if (data) memcpy(dst, r->w + o * r->cpu_rb + in, data);
+        if (take > data) memset(dst + data, 0, take - data);
+        dst += take; off += take;
+    }
+}
+static void up_fill_bytes(uint8_t *dst, size_t off, size_t n, const void *ctx) {
+    memcpy(dst, (const uint8_t *)ctx + off, n);
+}
+/* A buffer of the device-local tensors: every family that touches them shares it. */
+static void up_sharing(const VkUp *u, VkBufferCreateInfo *bi) {
+    if (u->nfams > 1) {
+        bi->sharingMode = VK_SHARING_MODE_CONCURRENT;
+        bi->queueFamilyIndexCount = u->nfams; bi->pQueueFamilyIndices = u->fams;
+    }
+}
+/* A fresh device-local block, filled with zeros before its first tensor. A contributor
+ * measured on an RX 580 (RADV, Polaris) that without this first touch the results
+ * read from a fresh block differed slightly and from run to run (#1338); the fill value
+ * did not matter. Cheap: one fill per 256 MB block. A failure only skips the fill. */
+static void up_zero(int dev, VkDeviceMemory mem, uint64_t cap) {
+    VkUp *u = &g_up[dev];
+    if (!u->fill) return;
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = cap,
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    up_sharing(u, &bi);
+    VkBuffer b;
+    if (vkCreateBuffer(u->dev, &bi, NULL, &b) != VK_SUCCESS) return;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(u->dev, b, &req);
+    int lost = 0;
+    if (req.size <= cap && (req.memoryTypeBits & (1u << u->mt_dev)) && vkBindBufferMemory(u->dev, b, mem, 0) == VK_SUCCESS) {
+        pthread_mutex_lock(&u->mx);
+        if (up_open(u)) vkCmdFillBuffer(u->cmd[u->cur], b, 0, VK_WHOLE_SIZE, 0);
+        if (up_finish(u, dev)) u->blocks_filled++;
+        else up_failed(dev, "the block is used unfilled");
+        lost = u->lost;
+        pthread_mutex_unlock(&u->mx);
+    }
+    if (!lost) vkDestroyBuffer(u->dev, b, NULL);   /* a failed wait: the fill may still run, leave it */
+}
 
 /* Block memory for a pool (lock held). */
 static VkBlk *pool_new_block(VkWPool *P, uint64_t cap) {
@@ -844,17 +1194,20 @@ static VkBlk *pool_new_block(VkWPool *P, uint64_t cap) {
     if (pool_has_prio(P)) ai.pNext = &pri;
 #endif
     VkDevice dev = pool_device(P);
+    int staged = g_up[P->dev].on;   /* device-local, never mapped: the uploader fills it */
+    if (staged && up_fault("block")) { free(bk); return NULL; }
     if (vkAllocateMemory(dev, &ai, NULL, &bk->mem) != VK_SUCCESS ||
-        vkMapMemory(dev, bk->mem, 0, cap, 0, (void **)&bk->base) != VK_SUCCESS) {
+        (!staged && vkMapMemory(dev, bk->mem, 0, cap, 0, (void **)&bk->base) != VK_SUCCESS)) {
         if (bk->mem) vkFreeMemory(dev, bk->mem, NULL);
         free(bk); return NULL;
     }
+    if (staged) up_zero(P->dev, bk->mem, cap);
     return bk;
 }
 static void pool_release_block(VkWPool *P, int k) {   /* lock held, block empty */
     VkBlk *bk = P->p.b[k].user;
     VkDevice dev = pool_device(P);
-    if (bk) { vkUnmapMemory(dev, bk->mem); vkFreeMemory(dev, bk->mem, NULL); free(bk); }
+    if (bk) { if (bk->base) vkUnmapMemory(dev, bk->mem); vkFreeMemory(dev, bk->mem, NULL); free(bk); }
     vka_pool_drop_block(&P->p, k);
 }
 
@@ -865,6 +1218,7 @@ static int pool_suballoc(VkWPool *P, size_t bytes, VkBuffer *buf, void **ptr, Vk
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = bytes ? bytes : 4, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    if (g_up[P->dev].on) { bi.usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT; up_sharing(&g_up[P->dev], &bi); }
     VKCHECK(vkCreateBuffer(dev, &bi, NULL, buf), "vkCreateBuffer");
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(dev, *buf, &req);
@@ -882,7 +1236,8 @@ static int pool_suballoc(VkWPool *P, size_t bytes, VkBuffer *buf, void **ptr, Vk
         VkBlk *bk = vka_pool_can_grow(&P->p, cap) && cap >= req.size ? pool_new_block(P, cap) : NULL;
         if (bk) {
             if (vka_pool_add_block(&P->p, cap, bk) < 0) {
-                vkUnmapMemory(dev, bk->mem); vkFreeMemory(dev, bk->mem, NULL); free(bk);
+                if (bk->base) vkUnmapMemory(dev, bk->mem);
+                vkFreeMemory(dev, bk->mem, NULL); free(bk);
             } else ok = vka_alloc(&P->p, req.size, align, r);
         } else P->p.refusals++;
     }
@@ -896,7 +1251,7 @@ static int pool_suballoc(VkWPool *P, size_t bytes, VkBuffer *buf, void **ptr, Vk
         pthread_mutex_unlock(&P->mx);
         return 0;
     }
-    if (ptr) *ptr = blk->base + r->off;
+    if (ptr) *ptr = blk->base ? blk->base + r->off : NULL;
     return 1;
 }
 static void pool_free_range(VkWPool *P, VkaRange r) {
@@ -911,7 +1266,7 @@ static void pool_destroy(VkWPool *P) {
     for (int k = 0; k < P->p.nb; k++) {
         if (!P->p.b[k].present) continue;
         VkBlk *bk = P->p.b[k].user;
-        if (bk) { if (dev) { vkUnmapMemory(dev, bk->mem); vkFreeMemory(dev, bk->mem, NULL); } free(bk); }
+        if (bk) { if (dev) { if (bk->base) vkUnmapMemory(dev, bk->mem); vkFreeMemory(dev, bk->mem, NULL); } free(bk); }
     }
     uint64_t bb = P->p.block_bytes, lim = P->p.limit;
     vka_pool_destroy(&P->p);
@@ -921,7 +1276,10 @@ static void pool_destroy(VkWPool *P) {
 }
 
 /* Lay out a tensor's two ranges in pool P: rows at their padded stride, zeroed, and
- * the scales; *wptr and *sptr are the mappings to fill. */
+ * the scales; *wptr and *sptr are the mappings to fill. With staged uploads the ranges
+ * are device-local: *wptr and *sptr are then a zeroed host image of the same layout
+ * that coli_vk_tensor_commit copies over (or, wptr NULL, nothing: upload_tensor_pool
+ * streams the rows itself). */
 static ColiVkTensor *tensor_alloc(VkWPool *P, int fmt, int I, int O, int gs, void **wptr, void **sptr) {
     ColiVkTensor *t = calloc(1, sizeof(*t));
     if (!t) return NULL;
@@ -930,11 +1288,21 @@ static ColiVkTensor *tensor_alloc(VkWPool *P, int fmt, int I, int O, int gs, voi
     t->dev = P->dev; t->pool = P;
     t->wbytes = (size_t)t->rowWords * 4 * (size_t)O;
     size_t sbytes = scale_floats(fmt, I, O, gs) * sizeof(float);
-    if (!pool_suballoc(P, t->wbytes, &t->wbuf, wptr, &t->wr)) { free(t); return NULL; }
-    if (!pool_suballoc(P, sbytes, &t->sbuf, sptr, &t->sr)) {
+    void *wp = NULL, *sp = NULL;
+    if (!pool_suballoc(P, t->wbytes, &t->wbuf, &wp, &t->wr)) { free(t); return NULL; }
+    if (!pool_suballoc(P, sbytes, &t->sbuf, &sp, &t->sr)) {
         vkDestroyBuffer(pool_device(P), t->wbuf, NULL); pool_free_range(P, t->wr); free(t); return NULL;
     }
-    memset(*wptr, 0, t->wbytes);
+    if (g_up[P->dev].on) {
+        if (wptr && !(t->img = calloc(1, t->wbytes + sbytes))) {
+            vkDestroyBuffer(pool_device(P), t->wbuf, NULL); vkDestroyBuffer(pool_device(P), t->sbuf, NULL);
+            pool_free_range(P, t->wr); pool_free_range(P, t->sr); free(t); return NULL;
+        }
+        if (wptr) { *wptr = t->img; *sptr = t->img + t->wbytes; }
+    } else {
+        *wptr = wp; *sptr = sp;
+        memset(*wptr, 0, t->wbytes);
+    }
     __atomic_add_fetch(&P->bytes, t->wbytes + sbytes, __ATOMIC_RELAXED);
     __atomic_add_fetch(&P->tensors, 1, __ATOMIC_RELAXED);
     if (P->counted) {
@@ -951,10 +1319,31 @@ static int fmt_uploadable(int fmt, int gs) {
            ((fmt == 12 || fmt == 13) && gs >= 4 && gs % 4 == 0);           /* fp8 / int8: 4 per word */
 }
 
+static void tensor_release(ColiVkTensor *t);
 static int upload_tensor_pool(VkWPool *P, ColiVkTensor **out, const void *weights, const float *scales,
                               int fmt, int I, int O, int gs) {
     if (*out) return (*out)->fmt == fmt && (*out)->I == I && (*out)->O == O;
     if (!fmt_uploadable(fmt, gs)) return 0;
+    if (g_up[P->dev].on) {   /* staged: the rows and the scales through the uploader */
+        ColiVkTensor *t = tensor_alloc(P, fmt, I, O, gs, NULL, NULL);
+        if (!t) return 0;
+        static const float one = 1.0f;   /* float weights: no scales */
+        UpRows rows = {weights, cpu_row_bytes(fmt, I), (size_t)t->rowWords * 4};
+        size_t sb = scale_floats(fmt, I, O, gs) * sizeof(float);
+        VkUp *u = &g_up[P->dev];
+        pthread_mutex_lock(&u->mx);
+        int ok = up_add(u, P->dev, t->wbuf, 0, t->wbytes, up_fill_rows, &rows) &&
+                 up_add(u, P->dev, t->sbuf, 0, sb, up_fill_bytes, fmt == 10 || fmt == 11 ? (const void *)&one : scales);
+        ok = up_finish(u, P->dev) && ok;
+        pthread_mutex_unlock(&u->mx);
+        if (!ok) {   /* the matrix stays on the CPU (with the device, if it was lost) */
+            up_failed(P->dev, "a matrix stays on the CPU");
+            tensor_release(t);
+            return 0;
+        }
+        *out = t;
+        return 1;
+    }
     void *wptr, *sptr;
     ColiVkTensor *t = tensor_alloc(P, fmt, I, O, gs, &wptr, &sptr);
     if (!t) return 0;
@@ -1142,7 +1531,7 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
-    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    VKCHECK(vk_submit(0, G.queue, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { tA = vk_now(); p_sub += tA - t0; g_vsub_ms += tA - t0; t0 = tA; }
     // Bounded wait: a GPU hang/TDR must never wedge the process. 10s is orders of
     // magnitude over a single-GEMV dispatch; on timeout/device-loss disable VK for
@@ -1318,7 +1707,7 @@ int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
     double vp0 = G.eg_prof ? vk_now() : 0;
-    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    VKCHECK(vk_submit(0, G.queue, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
@@ -1422,7 +1811,7 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.eg_cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.eg_fence), "eg resetFence");
     { double vp0 = G.eg_prof ? vk_now() : 0;
-      VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.eg_fence), "eg queueSubmit");
+      VKCHECK(vk_submit(0, G.queue, &si, G.eg_fence), "eg queueSubmit");
       if (G.eg_prof) g_vsub_ms += vk_now() - vp0; }
     G.eg_pending_yb = yb; G.eg_inflight = 1; async_begin(0);
     return 1;
@@ -1510,7 +1899,16 @@ static int scratch_reserve_d2(Scratch *s, size_t bytes, uint32_t memtype) {
     return 1;
 }
 static VkDevice pool_device(const VkWPool *P) { return P->dev ? G2.dev : G.dev; }
-static uint32_t pool_memtype(const VkWPool *P) { return P->dev ? G2.memtype : G.memtype; }
+static uint32_t pool_memtype(const VkWPool *P) {
+    return g_up[P->dev].on ? g_up[P->dev].mt_dev : P->dev ? G2.memtype : G.memtype;
+}
+/* An upload's fence failed: the device is gone, as for any other wait. */
+static void up_lost(int dev) {
+    fprintf(stderr, "[VK] %sstaged upload failed (%s: %d): the device is lost, disabling %s\n", dev ? "dev2 " : "",
+            g_up[dev].what ? g_up[dev].what : "?", (int)g_up[dev].err, dev ? "dev2 offload" : "GPU offload");
+    /* another thread (the tier's uploader) may be the one that finds out */
+    if (dev) __atomic_store_n(&G2.ready, 0, __ATOMIC_RELEASE); else __atomic_store_n(&G.ready, 0, __ATOMIC_RELEASE);
+}
 static int pool_has_prio(const VkWPool *P) { return P->dev ? 0 : G.has_prio; }
 static int upload_tensor_d2(ColiVkTensor **out, const void *weights, const float *scales,
                             int fmt, int I, int O, int gs) {
@@ -1579,6 +1977,17 @@ int coli_vk_init_dev2(const char *spv_path, int devidx) {
     if (mt < 0) { fprintf(stderr, "[VK] dev2: no host-visible memory\n"); return 0; }
     G2.memtype = (uint32_t)mt;
     G2.memtype_cached = (uint32_t)pick_memtype_cached(G2.phys);
+    /* its experts as device 0's: staged uploads by the same rule, on its one queue */
+    if (place_decide(G2.phys, mt, &g_up[1])) {
+        VkUp *u = &g_up[1];
+        u->dev = G2.dev; u->q = G2.queue; u->fam = G2.qfam; u->shared = 1;
+        u->fams[0] = G2.qfam; u->nfams = 1;
+        if (!up_init(u)) {
+            fprintf(stderr, "[VK] dev2: staged uploads unavailable (no staging buffer): its experts stay in mapped memory\n");
+            up_destroy(u); u->on = u->shared = 0;
+        } else fprintf(stderr, "[VK] dev2 memory: staged uploads, experts in device-local memory (type %u) copied from "
+                       "host staging memory (type %u) (%s)\n", u->mt_dev, u->mt_stage, u->why);
+    }
     G2.sh_qmm = load_spv(G2.dev, spv_path);
     if (!G2.sh_qmm) return 0;
     char gu_path[512]; derive_sibling(spv_path, "_gate_up.spv", gu_path, sizeof(gu_path));
@@ -1704,7 +2113,7 @@ static int eg2_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *u
     if (G.eg_prof) { tA = vk_now(); q_rec += tA - t0; t0 = tA; }
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G2.cmd};
     VKCHECK(vkResetFences(G2.dev, 1, &G2.fence), "d2 eg resetFence");
-    VKCHECK(vkQueueSubmit(G2.queue, 1, &si, G2.fence), "d2 eg queueSubmit");
+    VKCHECK(vk_submit(1, G2.queue, &si, G2.fence), "d2 eg queueSubmit");
     if (G.eg_prof) { tA = vk_now(); q_sub += tA - t0;
         if ((++q_n & 2047) == 0)
             fprintf(stderr, "[VK_PROF d2iss] n=%ld | memcpy_x %.0f | desc %.0f | record %.0f | submit %.0f ms\n",
@@ -1745,13 +2154,96 @@ int coli_vk_expert_group2(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
  * canonical; glm.c tracks a valid-watermark and re-appends after invalidation).
  * Rows are indexed by ABSOLUTE position, so kv_start windows just skip rows. */
 
+/* ---- staged writes on the main queue (the KV mirror, the q-prep norm weights) -------
+ * With staged uploads these buffers are device-local and the host's writes go through
+ * this staging buffer: each is a pending copy, recorded at the head of the next absorb or
+ * q-prep command buffer (their only readers) and done when its fence has signalled. A
+ * row written again before then (a rewound cache) first sends what is pending, so no two
+ * pending copies overlap. Engine thread only, as the KV mirror's calls are. */
+typedef struct { VkBuffer dst; VkBufferCopy c; } PwCopy;
+static struct {
+    VkBuffer buf; VkDeviceMemory mem; uint8_t *ptr; size_t cap, used;
+    PwCopy *cp; int n, ccp, rec;
+    int last1[VK_KV_LAYERS];      /* per layer, 1 + the last row pending (0: none) */
+    size_t bytes;                 /* staged so far */
+} PW;
+static void pw_record(VkCommandBuffer cmd) {
+    if (!PW.n) return;
+    for (int i = 0; i < PW.n; i++) vkCmdCopyBuffer(cmd, PW.buf, PW.cp[i].dst, 1, &PW.cp[i].c);
+    VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    PW.rec = PW.n;
+}
+static void pw_done(void) {   /* the command buffer that recorded them has finished */
+    if (!PW.rec) return;
+    PW.n = PW.rec = 0; PW.used = 0;
+    memset(PW.last1, 0, sizeof PW.last1);
+}
+static int pw_flush(void) {   /* send what is pending now, in a command buffer of its own */
+    if (!PW.n) return 1;
+    if (!G.ready) { PW.n = PW.rec = 0; PW.used = 0; return 0; }
+    G.cmd_ready = 0; G.bound_tensor = NULL;   /* the matmul's recorded command buffer goes */
+    VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
+    pw_record(G.cmd);
+    VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
+    VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
+    VKCHECK(vk_submit(0, G.queue, &si, G.fence), "queueSubmit");
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    pw_done();
+    return 1;
+}
+static int pw_add(VkBuffer dst, size_t dst_off, const void *src, size_t bytes) {
+    if (PW.used + bytes > PW.cap) {
+        if (!pw_flush()) return 0;
+        if (bytes > PW.cap) {
+            if (PW.buf) { vkDestroyBuffer(G.dev, PW.buf, NULL); vkFreeMemory(G.dev, PW.mem, NULL); }
+            PW.buf = VK_NULL_HANDLE; PW.mem = VK_NULL_HANDLE; PW.ptr = NULL; PW.cap = 0;
+            size_t cap = (size_t)4 << 20;
+            while (cap < bytes) cap *= 2;
+            void *p;
+            if (up_fault("pwstage") ||
+                !alloc_buf_mt(cap, &PW.buf, &PW.mem, &p, g_up[0].mt_stage, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) {
+                PW.buf = VK_NULL_HANDLE; PW.mem = VK_NULL_HANDLE; return 0;
+            }
+            PW.ptr = p; PW.cap = cap;
+        }
+    }
+    if (PW.n == PW.ccp) {
+        int c = PW.ccp ? 2 * PW.ccp : 256;
+        PwCopy *n = realloc(PW.cp, (size_t)c * sizeof *n);
+        if (!n) return 0;
+        PW.cp = n; PW.ccp = c;
+    }
+    memcpy(PW.ptr + PW.used, src, bytes);
+    PW.cp[PW.n++] = (PwCopy){dst, {PW.used, dst_off, bytes}};
+    PW.used = (PW.used + bytes + 15) & ~(size_t)15;
+    PW.bytes += bytes;
+    return 1;
+}
+/* A device-local buffer the main queue writes (PW) and reads, never mapped. */
+static int alloc_dev(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem) {
+    if (up_fault("kvbuf")) return 0;
+    return alloc_buf_mt(bytes, buf, mem, NULL, g_up[0].mt_dev,
+                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+}
+
 int coli_vk_kv_ensure(int layer, int max_rows, int K, int Rd) {
     if (!G.ready || layer < 0 || layer >= VK_KV_LAYERS || max_rows < 1 || K < 1 || Rd < 1) return 0;
     VkKvLayer *v = &G.kv[layer];
     if (v->bl) return v->rows >= max_rows && v->K == K && v->R == Rd;  /* resize goes through coli_vk_kv_reset */
     float p0 = G.prio; G.prio = 1.0f;            /* KV mirror rides every attention submit */
-    int ok1 = alloc_hostvis((size_t)max_rows * K * 4, &v->bl, &v->ml, &v->pl);
-    int ok = ok1 && alloc_hostvis((size_t)max_rows * Rd * 4, &v->br, &v->mr, &v->pr);
+    int ok1, ok;
+    if (g_up[0].on) {   /* staged: device-local, the rows through PW */
+        ok1 = alloc_dev((size_t)max_rows * K * 4, &v->bl, &v->ml);
+        ok = ok1 && alloc_dev((size_t)max_rows * Rd * 4, &v->br, &v->mr);
+    } else {
+        ok1 = alloc_hostvis((size_t)max_rows * K * 4, &v->bl, &v->ml, &v->pl);
+        ok = ok1 && alloc_hostvis((size_t)max_rows * Rd * 4, &v->br, &v->mr, &v->pr);
+    }
     G.prio = p0;
     if (!ok) {
         if (ok1) { vkDestroyBuffer(G.dev, v->bl, NULL); vkFreeMemory(G.dev, v->ml, NULL); }
@@ -1766,7 +2258,14 @@ int coli_vk_kv_ensure(int layer, int max_rows, int K, int Rd) {
 int coli_vk_kv_row(int layer, int pos, const float *L, const float *R) {
     if (layer < 0 || layer >= VK_KV_LAYERS) return 0;
     VkKvLayer *v = &G.kv[layer];
-    if (!v->pl || pos < 0 || pos >= v->rows) return 0;
+    if (!v->bl || pos < 0 || pos >= v->rows) return 0;
+    if (g_up[0].on) {
+        if (pos < PW.last1[layer] && !pw_flush()) return 0;
+        if (!pw_add(v->bl, (size_t)pos * v->K * 4, L, (size_t)v->K * 4) ||
+            !pw_add(v->br, (size_t)pos * v->R * 4, R, (size_t)v->R * 4)) return 0;
+        PW.last1[layer] = pos + 1;
+        return 1;
+    }
     memcpy((float *)v->pl + (size_t)pos * v->K, L, (size_t)v->K * 4);
     memcpy((float *)v->pr + (size_t)pos * v->R, R, (size_t)v->R * 4);
     return 1;
@@ -1774,6 +2273,7 @@ int coli_vk_kv_row(int layer, int pos, const float *L, const float *R) {
 
 /* Drop all per-layer KV device caches (cache resize in kv_alloc). */
 void coli_vk_kv_reset(void) {
+    if (PW.n) pw_flush();   /* nothing pending may name a buffer that goes */
     for (int i = 0; i < VK_KV_LAYERS; i++) {
         VkKvLayer *v = &G.kv[i];
         if (!v->bl) continue;
@@ -1821,6 +2321,7 @@ int coli_vk_attention_absorb(ColiVkTensor **kvb, const void *w, const float *sc,
     VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
+    pw_record(G.cmd);   /* staged: the mirror's pending rows first */
     vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_att);
     vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_att, 0, 1, &G.dset_att, 0, NULL);
     struct PCAttn pc = {fmt, S, H, Q, R, V, K, st0, T, t->rowWords, cap, scale, t->gs};
@@ -1831,9 +2332,10 @@ int coli_vk_attention_absorb(ColiVkTensor **kvb, const void *w, const float *sc,
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
     double vp0 = G.eg_prof ? vk_now() : 0;
-    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    VKCHECK(vk_submit(0, G.queue, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    pw_done();
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
     memcpy(ctx, G.y.ptr, cb);
     G.cmd_ready = 0; G.bound_tensor = NULL;   /* the shared command buffer/binding was clobbered */
@@ -1890,7 +2392,7 @@ int coli_vk_matmul_pair(ColiVkTensor **t1p, float *y1, const void *w1, const flo
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
     double vp0 = G.eg_prof ? vk_now() : 0;
-    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    VKCHECK(vk_submit(0, G.queue, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
@@ -1919,11 +2421,17 @@ int coli_vk_attn_qprep(int layer,
         !upload_tensor(qb, wqb, sqb, fmt, Oqa, Oqb, grp)) return 0;
     ColiVkTensor *tqa = *qa, *tkv = *kva, *tqb = *qb;
     if (!G.lnbuf[layer]) {                       /* resident norm weights, uploaded once */
-        void *lp; float p0 = G.prio; G.prio = 1.0f;
-        int ok = alloc_hostvis((size_t)Oqa * 4, &G.lnbuf[layer], &G.lnmem[layer], &lp);
+        void *lp = NULL; float p0 = G.prio; G.prio = 1.0f;
+        int ok = g_up[0].on ? alloc_dev((size_t)Oqa * 4, &G.lnbuf[layer], &G.lnmem[layer])
+                            : alloc_hostvis((size_t)Oqa * 4, &G.lnbuf[layer], &G.lnmem[layer], &lp);
         G.prio = p0;
         if (!ok) { G.lnbuf[layer] = VK_NULL_HANDLE; return 0; }
-        memcpy(lp, lnw, (size_t)Oqa * 4); G.lnlen[layer] = Oqa;
+        if (lp) memcpy(lp, lnw, (size_t)Oqa * 4);
+        else if (!pw_add(G.lnbuf[layer], 0, lnw, (size_t)Oqa * 4)) {   /* staged: rides this submit */
+            vkDestroyBuffer(G.dev, G.lnbuf[layer], NULL); vkFreeMemory(G.dev, G.lnmem[layer], NULL);
+            G.lnbuf[layer] = VK_NULL_HANDLE; return 0;
+        }
+        G.lnlen[layer] = Oqa;
     }
     if (G.lnlen[layer] != Oqa) return 0;
     size_t xb = (size_t)S * I * 4, qb_b = (size_t)S * Oqb * 4, kvb_b = (size_t)S * Okva * 4;
@@ -1961,6 +2469,7 @@ int coli_vk_attn_qprep(int layer,
     VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
+    pw_record(G.cmd);   /* staged: the norm weights (and any pending mirror rows) first */
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
     vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
@@ -1991,9 +2500,10 @@ int coli_vk_attn_qprep(int layer,
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
     double vp0 = G.eg_prof ? vk_now() : 0;
-    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    VKCHECK(vk_submit(0, G.queue, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    pw_done();
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
     memcpy(q_out, G.y.ptr, qb_b);
     memcpy(kv_out, G.y2.ptr, kvb_b);
@@ -2045,6 +2555,7 @@ int coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const fl
     VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
+    pw_record(G.cmd);   /* staged: the mirror's pending rows first */
     vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_att);
     vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_att, 0, 1, &G.dset_att, 0, NULL);
     struct PCAttn pc = {fmt, S, H, Q, R, V, K, st0, T, t->rowWords, cap, scale, t->gs};
@@ -2064,9 +2575,10 @@ int coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const fl
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
     double vp0 = G.eg_prof ? vk_now() : 0;
-    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    VKCHECK(vk_submit(0, G.queue, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    pw_done();
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
     memcpy(out, G.y.ptr, ob);
     G.cmd_ready = 0; G.bound_tensor = NULL;   /* the shared command buffer/binding was clobbered */
@@ -2096,6 +2608,7 @@ static void tensor_release(ColiVkTensor *t) {
         __atomic_sub_fetch(&G.tensor_count, 1, __ATOMIC_RELAXED);
         __atomic_sub_fetch(&G.used_bytes, b, __ATOMIC_RELAXED);
     }
+    free(t->img);
     free(t);
 }
 /* Async work in flight per device (the GLM expert group, the dev2 group, the expert
@@ -2458,7 +2971,7 @@ int coli_vk_xb_init(int D, int I, int act, float limit, float a, float b) {
     XB.ready = 1;
     return 1;
 }
-int coli_vk_xb_ready(void) { return XB.ready; }
+int coli_vk_xb_ready(void) { return XB.ready && G.ready; }   /* a device lost elsewhere stops the tier too */
 int coli_vk_xb_queue_shared(void) { return G.tq_shared; }
 
 ColiVkExpert *coli_vk_xb_expert(ColiVkTensor *g, ColiVkTensor *u, ColiVkTensor *d) {
@@ -2648,7 +3161,7 @@ static int xb_issue(ColiVkExpert *const *ex, const int *rows, int count, const f
     if (vkEndCommandBuffer(cmd) != VK_SUCCESS) return 0;
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd};
     if (vkResetFences(G.dev, 1, &XB.fence) != VK_SUCCESS) return 0;
-    if (vkQueueSubmit(G.tqueue, 1, &si, XB.fence) != VK_SUCCESS) {
+    if (vk_submit(0, G.tqueue, &si, XB.fence) != VK_SUCCESS) {
         fprintf(stderr, "[VK] expert batch: submit failed, the tier stops\n");
         XB.ready = 0; return 0;
     }
@@ -2744,13 +3257,67 @@ int coli_vk_tier_tensor(ColiVkTensor **t, int fmt, int I, int O, int gs,
     *t = n; *rows = w; *stride = (size_t)n->rowWords * 4; *scales = s;
     return 1;
 }
+/* Staged uploads: the host images of tensors filled in place (coli_vk_tier_tensor) go
+ * to their device-local ranges, all of them before this returns, and are freed. Mapped
+ * memory: nothing to do. Any thread; the tensors of one call on one device. */
+int coli_vk_tensor_commit(ColiVkTensor *const *t, int n) {
+    int dev = -1;
+    for (int k = 0; k < n; k++) if (t[k] && t[k]->img) dev = t[k]->dev;
+    if (dev < 0) return 1;
+    VkUp *u = &g_up[dev];
+    pthread_mutex_lock(&u->mx);
+    int ok = 1;
+    for (int k = 0; k < n && ok; k++) {
+        if (!t[k] || !t[k]->img) continue;
+        size_t sb = scale_floats(t[k]->fmt, t[k]->I, t[k]->O, t[k]->gs) * sizeof(float);
+        ok = up_add(u, dev, t[k]->wbuf, 0, t[k]->wbytes, up_fill_bytes, t[k]->img) &&
+             up_add(u, dev, t[k]->sbuf, 0, sb, up_fill_bytes, t[k]->img + t[k]->wbytes);
+        if (ok && k == 0 && n > 1 && up_fault("commit")) ok = up_fail(u, VK_ERROR_OUT_OF_DEVICE_MEMORY, "commit");
+    }
+    ok = up_finish(u, dev) && ok;
+    if (!ok) up_failed(dev, "the tensors are not resident");
+    pthread_mutex_unlock(&u->mx);
+    for (int k = 0; k < n; k++) if (t[k]) { free(t[k]->img); t[k]->img = NULL; }
+    return ok;
+}
+int coli_vk_staged(void) { return G.ready && g_up[0].on; }
 size_t coli_vk_tensor_row_bytes(int fmt, int I) { return cpu_row_bytes(fmt, I); }
 size_t coli_vk_buffer_alignment(void) { return G.buf_align ? G.buf_align : 256; }
 size_t coli_vk_tensor_scale_count(int fmt, int I, int O, int gs) { return scale_floats(fmt, I, O, gs); }
 
+/* Staged uploads: where the resident data ended up, at exit (the tests read it). */
+static void place_report(void) {
+    VkUp *u = &g_up[0];
+    if (!u->on) return;
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(G.phys, &mp);
+    ColiVkPoolStats w, t;
+    coli_vk_pool_stats(0, &w); coli_vk_pool_stats(1, &t);
+    size_t kv = 0, ln = 0;
+    for (int l = 0; l < VK_KV_LAYERS; l++) {
+        if (G.kv[l].bl) kv += (size_t)G.kv[l].rows * (G.kv[l].K + G.kv[l].R) * 4;
+        if (G.lnbuf[l]) ln += (size_t)G.lnlen[l] * 4;
+    }
+    VkMemoryPropertyFlags fd = mp.memoryTypes[u->mt_dev].propertyFlags, fc = mp.memoryTypes[G.memtype_dev].propertyFlags;
+    size_t host = ((fd & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? 0 : w.peak_used + t.peak_used + kv + ln);
+    const double M = 1048576.0;
+    fprintf(stderr, "[VK] memory at exit: weights %.1f MiB, expert tier %.1f MiB (peaks), KV mirror %.1f MiB in "
+            "device-local memory type %u (%s); the dense chain's state in type %u (%s); %.1f MiB staged in %llu copies "
+            "(%llu submits), %llu blocks zero-filled; resident data in host memory: %.1f MiB\n",
+            w.peak_used / M, t.peak_used / M, (kv + ln) / M, u->mt_dev,
+            (fd & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ? "host-visible" : "not host-visible", G.memtype_dev,
+            (fc & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? "device-local" : "host memory",
+            (u->bytes + PW.bytes) / M, u->copies, u->submits, u->blocks_filled,
+            host / M);
+}
+
 void coli_vk_shutdown(void) {
     if (!G.ready) return;
+    place_report();
+    /* the uploader's thread may still be in a submit on a shared queue */
+    pthread_mutex_lock(&g_up[0].mx); pthread_mutex_lock(&g_qmx[0]);
     vkDeviceWaitIdle(G.dev);
+    pthread_mutex_unlock(&g_qmx[0]); pthread_mutex_unlock(&g_up[0].mx);
     xb_shutdown();
     if (G.x.buf) { vkDestroyBuffer(G.dev, G.x.buf, NULL); vkFreeMemory(G.dev, G.x.mem, NULL); }
     if (G.y.buf) { vkDestroyBuffer(G.dev, G.y.buf, NULL); vkFreeMemory(G.dev, G.y.mem, NULL); }
@@ -2798,6 +3365,11 @@ void coli_vk_shutdown(void) {
     tensor_reap(0);
     pool_destroy(&g_wpool);    /* weight blocks: unmapped/freed with the device */
     pool_destroy(&g_tpool);
+    if (PW.buf) { vkDestroyBuffer(G.dev, PW.buf, NULL); vkFreeMemory(G.dev, PW.mem, NULL); }
+    free(PW.cp);
+    memset(&PW, 0, sizeof PW);
+    up_destroy(&g_up[0]);
+    g_up[0].on = g_up[0].shared = 0; g_up[0].failed = 0; g_up[0].nfams = 0; g_up[0].dev = VK_NULL_HANDLE;
     vkDestroyDevice(G.dev, NULL);
     vkDestroyInstance(G.inst, NULL);
     memset(&G, 0, sizeof(G));
@@ -2812,7 +3384,10 @@ int coli_vk_core(ColiVkCore *o) {
     memset(o, 0, sizeof *o);
     o->instance = (void *)G.inst; o->phys = (void *)G.phys; o->device = (void *)G.dev;
     o->queue = (void *)G.queue; o->qfam = G.qfam;
-    o->memtype_host = G.memtype; o->memtype_cached = G.memtype_cached; o->memtype_dev = G.memtype_dev;
+    /* staged uploads: the chain's host-written buffers (its frames' staging, the rows
+     * each layer step uploads) in host staging memory, not in the small window */
+    o->memtype_host = g_up[0].on ? g_up[0].mt_stage : G.memtype;
+    o->memtype_cached = G.memtype_cached; o->memtype_dev = G.memtype_dev;
     o->ssbo_align = G.ssbo_align; o->ssbo_range = G.ssbo_range; o->spv_path = G.spv_path;
     o->has_prio = G.has_prio;
     for (int k = 0; k < VK_GEMM_SLOTS && k < 4; k++) {
@@ -2834,6 +3409,10 @@ int coli_vk_tensor_info(const ColiVkTensor *t, ColiVkTensorInfo *o) {
 }
 /* A fence the chain waited on failed: the device is gone, everyone falls back. */
 void coli_vk_mark_lost(void) { G.ready = 0; }
+/* The chain's submits: through the lock the staged uploader takes on a shared queue. */
+int coli_vk_queue_submit(void *queue, const void *submit_info, void *fence) {
+    return (int)vk_submit(0, (VkQueue)queue, (const VkSubmitInfo *)submit_info, (VkFence)fence);
+}
 
 #ifdef VK_TEST
 // ---- standalone GPU-vs-CPU validation + microbench --------------------------
@@ -2844,6 +3423,13 @@ static double now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts
     return ts.tv_sec + ts.tv_nsec / 1e9; }
 
 static int g_ref_gs = 64;   /* fmt=4 group size the harness cases use */
+/* A digest (FNV-1a) of the device's results in every case below: mapped memory and
+ * staged uploads must print the same one (tests/vulkan_engines.sh staged). */
+static uint64_t g_digest = 1469598103934665603ULL;
+static void digest(const void *p, size_t n) {
+    const uint8_t *b = p;
+    for (size_t i = 0; i < n; i++) { g_digest ^= b[i]; g_digest *= 1099511628211ULL; }
+}
 static size_t ref_rowbytes(int fmt, int I) {
     return fmt == 1 || fmt == 12 || fmt == 13 ? (size_t)I : fmt == 5 ? (size_t)((I + 63) / 64) * 24
          : fmt == 10 ? (size_t)I * 4 : fmt == 11 ? (size_t)I * 2 : (size_t)(I + 1) / 2;
@@ -2939,6 +3525,7 @@ static int run_case(int fmt, int S, int I, int O, int iters) {
 
     ColiVkTensor *t = NULL;
     if (!coli_vk_matmul(&t, yg, x, w, sc, fmt, S, I, O, g_ref_gs)) { printf("matmul failed\n"); return 1; }
+    digest(yg, (size_t)S * O * sizeof(float));
     const char *path = G.bound_gemm == 2 ? "coop" : G.bound_gemm ? "gemm" : "gemv";
     double c0 = now(); cpu_ref(yc, x, w, sc, fmt, S, I, O); double cpu_ms = (now() - c0) * 1000;
     double maxerr = 0, maxrel = 0;
@@ -3108,6 +3695,7 @@ static int run_gate_up(int fmt, int S, int D, int I) {
     for (size_t o = 0; o < nsc; o++) { gs[o] = 0.01f+(rand()%100)/10000.0f; us[o] = 0.01f+(rand()%100)/10000.0f; }
     ColiVkTensor *tg = NULL, *tu = NULL;
     if (!coli_vk_gate_up(&tg, &tu, hg, x, gw, gs, uw, us, fmt, S, D, I, g_ref_gs)) { printf("gate_up failed\n"); return 1; }
+    digest(hg, (size_t)S * I * 4);
     for (int s = 0; s < S; s++) for (int o = 0; o < I; o++) {
         float gt = (float)ref_dot(x+(size_t)s*D, gw+(size_t)o*rb, gs, o, fmt, D);
         float ut = (float)ref_dot(x+(size_t)s*D, uw+(size_t)o*rb, us, o, fmt, D);
@@ -3229,6 +3817,7 @@ static int run_expert_group(int fmt, int D, int I, int K) {
     }
     int rows[64]; for (int c = 0; c < K; c++) rows[c] = 1;
     if (!coli_vk_expert_group(tg, tu, td, rows, K, yg, x)) { printf("expert_group failed\n"); return 1; }
+    digest(yg, (size_t)K * D * 4);
     float *hid = malloc((size_t)I*4);
     for (int c = 0; c < K; c++) {
         float *xc = x + (size_t)c*D;
@@ -3282,6 +3871,7 @@ static int run_expert_group(int fmt, int D, int I, int K) {
 /* MLA absorb attention vs a CPU ref that mirrors glm.c's absorb loop exactly:
  * qabs = sum_d q[d]*deq(row rbase+d)*ws, scores over cache rows [st0, T-S+s],
  * softmax, weighted latent, value-row projection. */
+static int g_absorb_rewind;   /* write every row twice, first garbage: a rewound mirror */
 static int run_absorb(int fmt, int S, int H, int Q, int R, int V, int K, int st0, int T, int layer) {
     size_t rb = ref_rowbytes(fmt, K);
     int O = H * (Q + V), ngK = (K + 63) / 64;
@@ -3297,11 +3887,18 @@ static int run_absorb(int fmt, int S, int H, int Q, int R, int V, int K, int st0
     for (int i = 0; i < T * R; i++) Rr[i] = (rand() % 200 - 100) / 100.0f;
     float scale = 0.13f;
     if (!coli_vk_kv_ensure(layer, T, K, R)) { printf("kv_ensure failed\n"); return 1; }
+    if (g_absorb_rewind) {   /* garbage rows, then the real ones from the middle and from 0 */
+        for (int t = 0; t < T; t++)
+            if (!coli_vk_kv_row(layer, t, Rr, L)) { printf("kv_row failed\n"); return 1; }
+        for (int t = T / 2; t < T; t++)
+            if (!coli_vk_kv_row(layer, t, L + (size_t)t * K, Rr + (size_t)t * R)) { printf("kv_row failed\n"); return 1; }
+    }
     for (int t = 0; t < T; t++)
         if (!coli_vk_kv_row(layer, t, L + (size_t)t * K, Rr + (size_t)t * R)) { printf("kv_row failed\n"); return 1; }
     ColiVkTensor *kvb = NULL;
     if (!coli_vk_attention_absorb(&kvb, w, ws, fmt, g_ref_gs, cg, q, layer, S, H, Q, R, V, K, st0, T, scale)) {
         printf("absorb failed\n"); return 1; }
+    digest(cg, (size_t)S * H * V * 4);
     float *qabs = malloc((size_t)K * 4), *clat = malloc((size_t)K * 4), *sc = malloc((size_t)(T - st0) * 4);
     for (int s = 0; s < S; s++) for (int h = 0; h < H; h++) {
         const float *qp = q + ((size_t)s * H + h) * (Q + R), *qr = qp + Q;
@@ -3345,6 +3942,7 @@ static int run_absorb(int fmt, int S, int H, int Q, int R, int V, int K, int st0
     ColiVkTensor *ot = NULL;
     if (!coli_vk_attention_absorb_project(&kvb, w, ws, fmt, g_ref_gs, &ot, owt, osc, fmt, g_ref_gs,
             og, q, layer, S, H, Q, R, V, K, st0, T, scale, Dout)) { printf("absorb_project failed\n"); return 1; }
+    digest(og, (size_t)S * Dout * 4);
     cpu_ref(oc, cc, owt, osc, fmt, S, H * V, Dout);
     double pmaxrel = 0;
     for (int i = 0; i < S * Dout; i++) { double e = fabs(og[i] - oc[i]);
@@ -3387,6 +3985,7 @@ static int run_qprep(int fmt, int S, int I, int Oqa, int Okva, int Oqb) {
     if (!coli_vk_attn_qprep(layer, &ta, wa, sa, Oqa, &tk, wk, sk, Okva, &tb, wb, sb, Oqb,
                             fmt, g_ref_gs, ln, 1e-6f, x, S, I, qg, kvg, NULL)) {
         printf("qprep unavailable (rmsnorm.spv missing?)\n"); return 1; }
+    digest(qg, (size_t)S * Oqb * 4); digest(kvg, (size_t)S * Okva * 4);
     cpu_ref(lat, x, wa, sa, fmt, S, I, Oqa);
     cpu_ref(kvc, x, wk, sk, fmt, S, I, Okva);
     for (int s = 0; s < S; s++) {                       /* rmsnorm rows like colibri.c */
@@ -3445,7 +4044,7 @@ static int xmat_make(XMat *m, int fmt, int I, int O, int gs) {
     size_t rb = coli_vk_tensor_row_bytes(fmt, I), ns = coli_vk_tensor_scale_count(fmt, I, O, gs);
     for (int o = 0; o < O; o++) memcpy(rows + (size_t)o * stride, m->w + (size_t)o * rb, rb);
     if (fmt == 10 || fmt == 11) scales[0] = 1.0f; else memcpy(scales, m->s, ns * sizeof(float));
-    return 1;
+    return coli_vk_tensor_commit(&m->t, 1);
 }
 static void xmat_drop(XMat *m) { free(m->w); free(m->s); m->w = NULL; m->s = NULL; }
 
@@ -3484,6 +4083,7 @@ static int run_xbatch(int fmt, int dfmt, int gs, int D, int I, int act, float li
         }
     int bad = 0; double dms = 0;
     if (!coli_vk_xb_issue(ex, rows, K, xr) || !coli_vk_xb_join(yr, &dms)) { printf("xbatch fmt=%d/%d: issue/join failed\n", fmt, dfmt); bad = 1; }
+    for (int jj = 0; !bad && jj < total; jj++) digest(yr[jj], (size_t)D * 4);
     double maxrel = 0, scale = 0;
     for (int i = 0; i < total * D; i++) if (fabs(ref[i]) > scale) scale = fabs(ref[i]);
     for (int jj = 0; !bad && jj < total; jj++)
@@ -3688,6 +4288,7 @@ static int run_xbatch_v4(void) {
             for (int o = 0; o < (k < 2 ? I : D); o++) memcpy(rws + (size_t)o * stride, src[k] + (size_t)o * D, (size_t)D * 4);
             sc[0] = 1.0f;
         }
+        if (!coli_vk_tensor_commit(t, 3)) { printf("xbatch v4: commit failed\n"); return 1; }
         if (!(ex[c] = coli_vk_xb_expert(t[0], t[1], t[2]))) { printf("xbatch v4: no expert\n"); return 1; }
     }
     int total = 0; for (int c = 0; c < K; c++) total += rows[c];
@@ -3697,6 +4298,7 @@ static int run_xbatch_v4(void) {
     for (int j = 0; j < total; j++) { x[(size_t)j * D] = j == 0 ? 1.0f : xs[j % 4]; w[j] = j == 0 ? 1.0f : ws[j % 5]; xr[j] = x + (size_t)j * D; }
     int mism = 0, sub = 0; double dms = 0;
     if (!coli_vk_xb_issue_w(ex, rows, K, xr, w) || !coli_vk_xb_join(yr, &dms)) { printf("xbatch v4: issue/join failed\n"); bad = 1; }
+    for (int j = 0; !bad && j < total; j++) digest(yr[j], (size_t)I * 4);
     float h[I];
     for (int c = 0, j = 0; !bad && c < K; c++)
         for (int r = 0; r < rows[c]; r++, j++) {
@@ -3833,7 +4435,7 @@ static void bench_hostmem(void) {
                 double c0 = vk_now();
                 for (int o = 0; o < On; o++) memcpy(rows + (size_t)o * stride, cs + (size_t)o * rb, rb);
                 memcpy(sc, ss, ns * 4);
-                if (kind == 0) copy_ms += vk_now() - c0;
+                if (kind == 0) { coli_vk_tensor_commit(&t[k], 1); copy_ms += vk_now() - c0; }
             }
             if (kind == 0) { double c0 = vk_now(); memcpy(mbuf, src, 2 * rbg * I + rbd * D); memcpy(mbuf + 2 * rbg * I + rbd * D, ssrc, (2 * sg + sd) * 4);
                          __asm__ volatile("" :: "r"(mbuf) : "memory");   /* the copy is kept: nothing reads mbuf */
@@ -3883,6 +4485,10 @@ static void bench_hostmem(void) {
 int main(int argc, char **argv) {
     const char *spv = argc > 1 ? argv[1] : "shaders/qmatmul.spv";
     if (!coli_vk_init(spv)) { printf("vk init failed\n"); return 1; }
+    /* COLI_VK_TEST_NOFILL=1: staged uploads without the zero fill of a fresh block (the
+     * Polaris finding of #1338: does it still matter on this device?) */
+    if (getenv("COLI_VK_TEST_NOFILL") && atoi(getenv("COLI_VK_TEST_NOFILL"))) g_up[0].fill = 0;
+    printf("memory: %s\n", g_up[0].on ? g_up[0].fill ? "staged uploads" : "staged uploads, no zero fill" : "mapped");
     srand(1234);
     int bad = 0;
     /* COLI_VK_TEST_BALLAST=N: allocate N idle 4 MB device buffers before benching.
@@ -3970,6 +4576,7 @@ int main(int argc, char **argv) {
      * cases above. CI runs this on Lavapipe, where the benches below say nothing and
      * take most of the time. */
     if (getenv("COLI_VK_TEST_MATMUL_ONLY") && atoi(getenv("COLI_VK_TEST_MATMUL_ONLY"))) {
+        printf("outputs digest %016llx\n", (unsigned long long)g_digest);
         printf(bad ? "FAIL\n" : "PASS\n");
         coli_vk_shutdown();
         return bad;
@@ -4061,6 +4668,7 @@ int main(int argc, char **argv) {
         if (!coli_vk_matmul_pair(&t1, y1, w1, s1, O1, &t2, y2, w2, s2, O2, pf, x, S, I, g_ref_gs)) {
             printf("matmul_pair fmt=%d failed\n", pf); bad = 1;
         } else {
+            digest(y1, (size_t)O1 * 4); digest(y2, (size_t)O2 * 4);
             cpu_ref(c1, x, w1, s1, pf, S, I, O1); cpu_ref(c2, x, w2, s2, pf, S, I, O2);
             double mr = 0;
             for (int i = 0; i < O1; i++) { double e = fabs(y1[i]-c1[i]); if (fabs(c1[i])>1e-2) { double r=e/fabs(c1[i]); if (r>mr) mr=r; } }
@@ -4084,7 +4692,11 @@ int main(int argc, char **argv) {
         bad |= run_absorb(5, 2, 64, 192, 64, 256, 512, 17, 300, 6);   // int3 S=2 causal + window
         bad |= run_absorb(4, 1, 64, 192, 64, 256, 512, 0, 300, 7);    // grouped-int4 kv_b + o
         bad |= run_absorb(4, 2, 64, 192, 64, 256, 512, 17, 300, 8);   // fmt=4 S=2 causal + window
+        g_absorb_rewind = 1;   /* every row written twice, out of order: a rewound mirror */
+        bad |= run_absorb(2, 1, 64, 192, 64, 256, 512, 0, 300, 9);
+        g_absorb_rewind = 0;
     }
+    printf("outputs digest %016llx\n", (unsigned long long)g_digest);
     printf(bad ? "FAIL\n" : "PASS\n");
     coli_vk_shutdown();
     return bad;
