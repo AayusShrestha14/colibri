@@ -182,7 +182,7 @@ python ./coli serve --model C:\models\DeepSeek-V4-Flash --ram 32 --ctx 20000
 target (answers end at EOS; an oversized ceiling is clamped to the context
 with a stderr note). `CTX`/`--ctx` sets the context window.
 
-What the knobs do (full table in [Environment reference](#environment-reference)):
+What the knobs do (full table in [Environment reference](#environment-reference-v4-engine)):
 `COLI_CUDA_ATTN_BATCH=1` puts the batched prefill attention block on the GPU
 (compressor/indexer projections, sparse attention on a persistent device KV
 ring, wo, mHC) and enables the GPU decode attention/indexer paths;
@@ -218,6 +218,17 @@ the hit rate they add (~11 000 experts total; 600 mirrors ≈ 5 %); more RAM
 On non-Blackwell cards the generic DLL is selected automatically (fp32
 kernels): same settings, prefill roughly 2–3× slower than the DeepGEMM
 numbers, still far ahead of CPU.
+
+**Give it RAM.** 43 × 256 routed experts are ~137 GiB on disk and a token
+touches 301 of them, so the expert cache hit rate is what sets tok/s: `--ram`
+is the single most valuable knob, and it changes speed only, never output.
+
+Two opt-in GPU levers are looking for community numbers, both default off and
+byte-identical when unset: `DSV4_HYBRID=1` splits VRAM-tier misses between the
+GPU fill branch and the CPU branch using bandwidths measured at runtime, and
+`COLI_CUDA_MOE_DOUBLE=1` (on top of `COLI_CUDA_MOE_BATCH=1`) prefetches the next
+layer's full expert set into a second VRAM bank while the current layer
+computes, falling back to the single bank when VRAM is short.
 
 ## Prefill: segments, chunks, checkpoints
 
@@ -408,6 +419,15 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 `V4_MTP_MIN`, `V4_MTP_DRAFT`, `V4_MTP_PARTIAL_KEEP`, `V4_NGRAM` (1),
 `V4_NGRAM_PARTIAL_KEEP`, `COLI_V4_MARKOV_SPEC`, `COLI_V4_MARKOV_BLOCK`,
 `COLI_V4_MARKOV_KEEP`.
+
+Why it is off: DSpark's markov drafter and full MTP are both implemented and
+verified. A draft can save forward passes but never change a token, because
+every accepted token is still the target's own argmax. Measured on real
+multi-turn chat, they accepted 1 in 15 and 10 in 24, and the rejected-suffix
+replay of this engine's recurrent attention state cost more than the drafts
+saved: one 14-token answer took 495 seconds. So `V4_DRAFT` and `V4_MTP` default
+to `0` and the code stays, with the numbers beside it, for whoever retries this
+on faster storage.
 
 **Diagnostics**: `DSV4_ATTN_PROF`, `DSV4_DECODE_PROF`, `DSV4_IDX_VERIFY`,
 `DSV4_CUDA_MOE_PROF`, `DSV4_CUDA_DG_PROFILE`/`_AB`/`_DUMP` (`.cu`),

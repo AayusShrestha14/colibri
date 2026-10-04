@@ -9,7 +9,7 @@ head are not loaded.
 
 ## Quickstart
 
-Pre-converted weights (int4 experts + bf16 residents, ~469 GiB):
+Pre-converted weights (int4 experts + bf16 residents, 514 GB as Hugging Face lists the repository):
 
 ```sh
 hf download nbeerbower/Inkling-colibri-int4 --local-dir ~/Models/inkling_i4

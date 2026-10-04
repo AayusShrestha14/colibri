@@ -13,7 +13,7 @@ KAT-Coder-V2.5-Dev) run on this engine unchanged.
 
 ## Quickstart
 
-Pre-converted containers (int4 experts, self-contained, ~20 GB):
+Pre-converted containers (int4 experts, self-contained, ~23 GB):
 
 ```sh
 # group-scaled int4 (gs64) — recommended, see "Which container" below
@@ -102,7 +102,10 @@ On an integrated Radeon 780M, with the int4 gs64 container at cap 64 and the tru
 on the CPU, the tier decoded at 8.03 tok/s against the CPU's 6.02 and reached the
 first token of a 512-token prompt in 12.3 s against 35.7 s, the same text; the
 measurements and what they leave out are in
-[vulkan.md](vulkan.md#measured-on-a-radeon-780m).
+[vulkan.md](vulkan.md#measured-on-a-radeon-780m). With the dense chain on as well
+(the default for this engine on an integrated GPU with the tier), decode reached
+9.94 tok/s against the CPU's 6.01 and the 512-token prompt 9.5 s
+([vulkan.md](vulkan.md#the-chain-on-a-radeon-780m)).
 
 ## The expert kernel
 
@@ -204,7 +207,9 @@ same prompt and seed, tok/s and hit rate against agreement and KL, and treat
 ## Which container?
 
 The gs64 container carries one scale per 64-weight group instead of one per
-row. On GLM, per-row int4 was the root cause of think-mode loops and
+row. Against the per-row container it measured a cosine to the int8 anchor of
+0.99313 instead of 0.98777 and a KL of 0.080 instead of 0.109, about 44% less
+quantization error. On GLM, per-row int4 was the root cause of think-mode loops and
 never-terminating generations (#455), and group scales fixed them in
 controlled A/Bs — with `moe_intermediate_size=512`, Qwen's rows are short, so
 per-row quantization error concentrates the same way. The gs64 container costs

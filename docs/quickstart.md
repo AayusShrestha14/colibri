@@ -67,7 +67,7 @@ Your machine
 Models that fit this machine
   (fits = the dense part, which always stays in RAM, plus a minimum expert cache fit in RAM, and the download fits on the disk)
    1) Qwen3.6-35B-A3B                   23 GB   runs from RAM         [recommended]
-      general chat with thinking, tools and images; int4-gs64 container; the whole model fits in RAM (20 GB)
+      general chat with thinking and tools; int4-gs64 container; the whole model fits in RAM (20 GB)
    2) Qwen3-Coder-30B-A3B               19 GB   runs from RAM
       coding model with tool calls, no thinking; int4-gs64 container; the whole model fits in RAM (18 GB)
    3) DeepSeek V4 Flash REAP 150B       85 GB   streams from the SSD
@@ -115,7 +115,7 @@ The rest of this page is the same thing done by hand, step by step.
 | | Minimum | Recommended |
 |---|---|---|
 | **RAM** | ~16 GB | 24 GB+ |
-| **Free disk** | ~380 GB for the int4 model | a fast NVMe SSD (streaming speed = your token speed) |
+| **Free disk** | ~430 GB for the GLM-5.2 int4 model (19 GB for the smallest model the one-step setup offers) | a fast NVMe SSD (streaming speed = your token speed) |
 | **OS** | Linux, Windows 10/11, or macOS | any |
 | **Tools** | a C compiler + `make` + `git` + `python3` | — |
 
@@ -261,7 +261,14 @@ also required: plain int4 heads disable speculative decoding, see
 [#8](https://github.com/JustVugg/colibri/issues/8).)
 
 Download it into a folder on a fast disk, e.g. `/nvme/glm52_i4` (Linux/macOS) or
-`D:\glm52_i4` (Windows). It is about **372 GB**, so make sure you have the space.
+`D:\glm52_i4` (Windows). It is about **429 GB**, so make sure you have the space.
+
+The MTP head must be **int8, not int4** (int4 gives 0% draft acceptance,
+[#8](https://github.com/JustVugg/colibri/issues/8)). Check it with
+`ls -l <model>/out-mtp-*`: int8 (correct) is `3527131672 / 5366238584 / 1065950496`
+as three files, or a single `out-mtp-00000.safetensors` of `9959321520` bytes
+(the current upload of the recommended container ships it as one file: same
+int8 tensors, 777 of them at one byte per element).
 
 ### Or convert it yourself from the FP8 source
 
