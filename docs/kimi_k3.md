@@ -244,6 +244,11 @@ is returned as `reasoning_content`, response text as `content`, and
 honoured between generated tokens. Long prefill also polls `CANCEL` between
 layers and drops the unpublished partial state before serving another request.
 
+Long agent sessions can opt into recurrent-state checkpoints (`COLI_K3_CKPT=N`
+slots in RAM, or parked on disk with `COLI_K3_CKPT_DIR`): an edited or follow-up
+prompt restores the deepest surviving checkpoint and re-prefills only the tail,
+instead of replaying the whole conversation through the SSM layers.
+
 ## Vulkan (`make VK=1 kimi_k3`)
 
 Run with `COLI_VULKAN=1`, a `VK=1` build puts the routed experts on the shared Vulkan

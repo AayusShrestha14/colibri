@@ -1218,6 +1218,7 @@ not measured; the tests prove the tokens on the tiny fixtures.
 
 ```
 [VK] deepseek_v4: dense chain off (an integrated GPU with the expert tier: not measured; COLI_VK_CHAIN=0 off, 1 on, 2 prompts only)
+```
 
 ### Kimi K3 on the chain
 
@@ -1705,9 +1706,10 @@ hit-rate line is the tier-effectiveness number.
   except with the dense chain (`COLI_VK_CHAIN=1`), which runs the whole layer, prefill
   and the DSA selection included. Its routed experts are on the shared expert tier,
   which serves prefill too.
-- The expert tier's uploads are host writes into host-visible device memory: a
-  discrete card needs Resizable BAR for them (above). A staging copy on a transfer
-  queue, for cards without it, is not written.
+- On a discrete card without Resizable BAR, resident data (the dense weights, the
+  expert tier, the KV mirror) goes through staged uploads
+  ([above](#memory-placement-without-resizable-bar)); that path is tested by forcing
+  it and by emulating the small window, and not yet measured on such a card.
 - Without the dense chain, DSA top-k selection, ragged multi-slot serving, and
   quantized-KV caches fall back to the CPU attention path; with it, the DSA selection
   runs on the device.

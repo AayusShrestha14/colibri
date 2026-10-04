@@ -68,7 +68,7 @@ CATALOG = (
         # docs/qwen36.md: peak RSS 17 GB with every expert cached (cap 256);
         # the minimum follows the same engine's measured 6.5 GB at 32 experts/layer.
         ram_min_gb=10, ram_good_gb=20, dense_gb=3.5, rank=3, size_class="small",
-        summary="general chat with thinking, tools and images; int4-gs64 container",
+        summary="general chat with thinking and tools; int4-gs64 container",
         doc="docs/qwen36.md"),
     CatalogModel(
         id="qwen3-coder-30b", family="qwen36", name="Qwen3-Coder-30B-A3B",
