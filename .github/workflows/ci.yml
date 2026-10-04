@@ -149,6 +149,15 @@ jobs:
           # int8, int4, grouped int4, int3, f32, bf16 and fp8-e4m3, through the staged,
           # batched and unstaged paths and odd widths, before any engine is involved.
           bash tests/vulkan_engines.sh shader
+      - name: Staged device-local uploads against mapped memory
+        run: |
+          cd c
+          # The path a discrete card without Resizable BAR takes (docs/vulkan.md, "Memory
+          # placement without Resizable BAR"), forced here: the harness's results bit for
+          # bit equal mapped, staged and under an emulated 246 MB window, which must
+          # choose staging on its own; then the formats, the tier and the chain's ops staged.
+          bash tests/vulkan_engines.sh staged
+          COLI_VK_STAGED=1 bash tests/vulkan_engines.sh shader
 
   # Every engine with a Vulkan hook, run twice on its tiny fixture: on the CPU and on
   # Lavapipe, with the same snapshot and settings. The gate is the CPU's tokens (and
@@ -173,6 +182,19 @@ jobs:
           - family: qwen-chain
             req: c/tools/requirements-qwen38-tiny.txt
           - family: qwen-chain-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
+          # staged device-local uploads (COLI_VK_STAGED=1): the tier and the chain of qwen36
+          # and qwen38, and an engine choosing staging on its own under an emulated window
+          - family: qwen-staged
+            req: c/tools/requirements-qwen38-tiny.txt
+          - family: qwen-chain-staged
+            req: c/tools/requirements-qwen38-tiny.txt
+          # staged uploads failing at every point they can (COLI_VK_STAGED_FAULT): qwen36's
+          # matrices, tier and chain, colibri's KV mirror; the CPU's tokens, and the same
+          # under ASan and UBSan
+          - family: staged-faults
+            req: c/tools/requirements-qwen38-tiny.txt
+          - family: staged-faults-sanitize
             req: c/tools/requirements-qwen38-tiny.txt
           - family: inkling-olmoe
             req: c/tools/oracle-requirements.txt
