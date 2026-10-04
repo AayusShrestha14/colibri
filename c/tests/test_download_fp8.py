@@ -83,6 +83,22 @@ class DownloadExitStatusTests(unittest.TestCase):
                  mock.patch.object(download_fp8, "download_file_hf"):
                 self.assertEqual(self.run_main(dest, "--source", "hf"), 1)
 
+    def test_unknown_shard_sizes_do_not_terminate_worker(self):
+        names = ["model-00001.safetensors", "model-00002.safetensors"]
+        manifest = (names, {name: 0 for name in names})
+        with tempfile.TemporaryDirectory() as dest, \
+             mock.patch.object(download_fp8, "get_shard_list_ms", return_value=manifest), \
+             mock.patch.object(download_fp8.threading, "excepthook") as failed_worker:
+            def download(name):
+                with open(os.path.join(dest, name), "wb") as output:
+                    output.write(b"data")
+            with mock.patch.object(download_fp8, "download_file_ms", side_effect=download):
+                self.assertEqual(self.run_main(dest, "--source", "ms", "--parallel", "1"), 0)
+            failed_worker.assert_not_called()
+            for name in names:
+                with open(os.path.join(dest, name), "rb") as shard:
+                    self.assertEqual(shard.read(), b"data")
+
     def test_empty_manifest_returns_nonzero(self):
         with tempfile.TemporaryDirectory() as dest, \
              mock.patch.object(download_fp8, "get_shard_list_hf",

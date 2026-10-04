@@ -229,7 +229,8 @@ def main():
                     completed.append(fn)
                     elapsed = time.time() - t0
                     have = sum(sizes.get(f,0) for f in completed)
-                    pct = 100.0 * have / total_bytes
+                    pct = (100.0 * have / total_bytes if total_bytes > 0
+                           else 100.0 * len(completed) / total)
                     speed = (have - sum(sizes[f] for f in done_set)) / max(elapsed, 1)
                     eta = (total_bytes - have) / speed if speed > 0 else 0
                     print(f"  {C.grn}✓{C.r} {fn} {C.dim}— {len(completed)}/{total} · "
