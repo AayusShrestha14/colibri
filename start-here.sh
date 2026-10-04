@@ -13,6 +13,7 @@
 #   ./start-here.sh --model qwen3-coder-30b   a specific model
 #   ./start-here.sh --reconfigure             choose another model
 #   ./start-here.sh --no-gpu                  CPU only
+#   ./start-here.sh --backend vulkan          the GPU through Vulkan rather than CUDA
 # Stop: Ctrl+C in this terminal, or `c/coli stop` from another one.
 # The engine build itself is c/setup.sh, unchanged.
 here=$(cd "$(dirname "$0")" && pwd)

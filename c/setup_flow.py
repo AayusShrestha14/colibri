@@ -172,6 +172,107 @@ def _nvcc():
     return None
 
 
+#: What each CUDA release compiles for, for an nvcc that cannot answer
+#: --list-gpu-arch: (first release, oldest compute_XX, newest compute_XX).
+#: From 11.4 on, the bounds are the measured `nvcc --list-gpu-arch` of NVIDIA's
+#: own nvcc (the redistributable archives for 11.4.152 to 12.9.86, the
+#: nvidia-cuda-nvcc wheels for 13.0.88 and 13.4.92; tests/test_setup_flow.py
+#: keeps the outputs); the earlier rows are from the toolkit release notes
+#: (9.0 added Volta and dropped Fermi, 10.0 Turing, 11.0 Ampere and dropped
+#: sm_30/sm_32, 11.1 sm_86). The table is also what says when a card was
+#: dropped and which toolkit still builds for it.
+CUDA_RELEASES = (
+    ((9, 0), 30, 70),
+    ((10, 0), 30, 75),
+    ((11, 0), 35, 80),
+    ((11, 1), 35, 86),
+    ((11, 4), 35, 87),
+    ((11, 8), 35, 90),
+    ((12, 0), 50, 90),
+    ((12, 8), 50, 120),
+    ((12, 9), 50, 121),
+    ((13, 0), 75, 121),
+)
+#: nvcc takes -arch=native from 11.6 on (measured: 11.5.119 answers "Value
+#: 'native' is not defined for option 'gpu-architecture'", 11.6.55 takes it).
+#: Below that the build names the card's architecture itself.
+CUDA_NATIVE_SINCE = (11, 6)
+CUDA_ARCHIVE_URL = "https://developer.nvidia.com/cuda-toolkit-archive"
+
+
+def parse_nvcc_version(text):
+    """(13, 0) from `nvcc --version` ("Cuda compilation tools, release 13.0,
+    V13.0.88"); None when there is no release line."""
+    match = re.search(r"\brelease (\d+)\.(\d+)", text or "")
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+def parse_nvcc_arch_list(text):
+    """The compute_XX numbers of `nvcc --list-gpu-arch`, sorted ([75, 80, ...]).
+    None when it lists none: an nvcc without the option prints an error."""
+    found = {int(n) for n in re.findall(r"^\s*compute_(\d+)[a-z]?\s*$", text or "", re.M)}
+    return sorted(found) or None
+
+
+def cuda_toolkit(nvcc):
+    """What this nvcc is and builds for: {"cuda_version": "13.0" or None,
+    "cuda_archs": [75, 80, ...] or None (then the release table answers)}."""
+    version = parse_nvcc_version(setup_hw._run([nvcc, "--version"], timeout=30))
+    archs = parse_nvcc_arch_list(setup_hw._run([nvcc, "--list-gpu-arch"], timeout=30))
+    return {"cuda_version": f"{version[0]}.{version[1]}" if version else None,
+            "cuda_archs": archs}
+
+
+def _version_tuple(text):
+    match = re.match(r"^\s*(\d+)\.(\d+)", str(text or ""))
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+def _release_bounds(version):
+    bounds = None
+    for first, low, high in CUDA_RELEASES:
+        if version >= first:
+            bounds = (low, high)
+    return bounds
+
+
+def toolkit_builds(tc, sm):
+    """Whether this machine's CUDA toolkit compiles for compute_<sm>: True or
+    False, or None when nothing says (the card or the toolkit is unknown)."""
+    if sm is None:
+        return None
+    if tc.get("cuda_archs"):
+        return sm in tc["cuda_archs"]
+    version = _version_tuple(tc.get("cuda_version"))
+    bounds = _release_bounds(version) if version else None
+    if bounds is None:
+        return None
+    return bounds[0] <= sm <= bounds[1]
+
+
+def _release_name(version):
+    return str(version[0]) if version[1] == 0 else f"{version[0]}.{version[1]}"
+
+
+def cuda_release_advice(sm, version=None):
+    """For a card the toolkit here cannot build for: (what happened, what to
+    install). ("dropped in CUDA 13", "install a CUDA 12.x toolkit") for a card
+    older than the toolkit, ("needs CUDA 12.8 or newer", "install CUDA 12.8 or
+    newer") for one newer than it; from CUDA_RELEASES."""
+    rows = [index for index, (_first, low, high) in enumerate(CUDA_RELEASES) if low <= sm <= high]
+    if not rows:
+        return None, f"install a CUDA toolkit whose `nvcc --list-gpu-arch` lists compute_{sm}"
+    first = CUDA_RELEASES[rows[0]][0]
+    if version is not None and version < first:
+        return (f"needs CUDA {first[0]}.{first[1]} or newer",
+                f"install CUDA {first[0]}.{first[1]} or newer")
+    if rows[-1] + 1 < len(CUDA_RELEASES):
+        dropped = CUDA_RELEASES[rows[-1] + 1][0]
+        return (f"dropped in CUDA {_release_name(dropped)}",
+                f"install a CUDA {CUDA_RELEASES[rows[-1]][0][0]}.x toolkit")
+    return None, f"install a CUDA toolkit whose `nvcc --list-gpu-arch` lists compute_{sm}"
+
+
 def toolchain(here=None):
     """What can be built here, and with what."""
     here = here or HERE
@@ -205,6 +306,11 @@ def toolchain(here=None):
     tc["can_build"] = bool(tc["source_checkout"] and tc["make"] and tc["cc"])
     tc["can_build_vulkan"] = bool(tc["can_build"] and tc["glslc"] and tc["vulkan_headers"])
     tc["can_build_cuda"] = bool(tc["can_build"] and tc["nvcc"] and sys.platform.startswith("linux"))
+    # A toolkit is not enough: CUDA 13 cannot build for a V100 (#1852).
+    # choose_backend asks toolkit_builds() about each card.
+    tc["cuda_version"], tc["cuda_archs"] = None, None
+    if tc["nvcc"]:
+        tc.update(cuda_toolkit(tc["nvcc"]))
     return tc
 
 
@@ -291,46 +397,161 @@ def package_hint(kinds, os_info=None, platform_name=None):
 #: (--backend vulkan). A discrete GPU, with its own VRAM, runs Vulkan for every one.
 VULKAN_IGPU_MEASURED = frozenset({"qwen36", "qwen38"})
 
+#: The engines with a CUDA path on Linux, and what their CUDA build needs, read
+#: from the code (tests/test_setup_flow.py, CudaEngineTable, checks each entry
+#: against the Makefiles and the sources):
+#:
+#:   backend_cuda.o (qwen36, qwen38, colibri, kimi_k3): nvcc -std=c++17, no
+#:     compute floor in the code. The tensor-core kernels are guarded
+#:     (__CUDA_ARCH__ >= 700 on the device, compute_major >= 7 where they are
+#:     dispatched) and fall back below that; the engine ran on four sm_50 Tesla
+#:     M10 (#1652, docs/qwen36-cuda-tier.md).
+#:   backend_cuda_ink.o (inkling): plain bf16 GEMV kernels, no floor either.
+#:   backend_cuda_dsv4.o (deepseek_v4, Makefile.deepseek-v4): nvcc -std=c++20,
+#:     which nvcc takes from 12.0 on (measured: 11.8.89 answers "Value 'c++20'
+#:     is not defined for option 'std'"); NO_TC=1 below 12.8, whose cuBLASLt
+#:     block-scaling API the opt-in tensor-core path calls (docs/deepseek-v4.md,
+#:     "Linux CUDA tier"); and dsv4_cuda_backend_arch_ok turns the tier on from
+#:     compute 6.0, so an older card would sit idle while the CPU did the work.
+#:
+#: glm53 links no CUDA object (its accelerator is Metal) and the remaining
+#: engines are CPU-only: none of them is here, so none of them is built with CUDA.
+CUDA_ENGINES = {
+    "qwen36": {"object": "backend_cuda.o"},
+    "qwen38": {"object": "backend_cuda.o"},
+    "glm": {"object": "backend_cuda.o"},
+    "kimi": {"object": "backend_cuda.o"},
+    "inkling": {"object": "backend_cuda_ink.o"},
+    "deepseek_v4": {"object": "backend_cuda_dsv4.o", "min_compute": 60,
+                    "min_toolkit": (12, 0), "no_tc_below": (12, 8)},
+}
 
-def choose_backend(hw, family, tc, requested="auto"):
+#: How a backend is named in a sentence: "the CUDA build", "using the CPU".
+BACKEND_NAME = {"cuda": "CUDA", "vulkan": "Vulkan", "cpu": "CPU"}
+USING = {"cuda": "CUDA", "vulkan": "Vulkan", "cpu": "the CPU"}
+
+
+def cuda_problem(cards, family, tc):
+    """Why this engine's CUDA build cannot serve these NVIDIA cards, as
+    {"why": ..., "fix": ...}, or None when it can.
+
+    Unknown is not a no: a card whose compute capability nothing reported, or
+    a toolkit that did not say what it builds, passes, and a build that then
+    fails falls back to the next backend (resolve_with_fallback). `fix` is
+    what to install; None when no toolkit would help (the card is older than
+    the engine's CUDA code runs on). With -arch=native nvcc builds for every
+    card it sees and stops at the first it cannot, so every card is checked."""
+    engine = CUDA_ENGINES.get(family.id, {})
+    version = _version_tuple(tc.get("cuda_version"))
+    floor = engine.get("min_compute")
+    for card in cards:
+        sm = setup_hw.compute_cap_sm(card.get("compute_cap"))
+        if floor and sm is not None and sm < floor:
+            return {"why": (f"{family.display_name}'s CUDA tier runs on compute "
+                            f"{floor // 10}.{floor % 10} and newer, and the {card['name']} "
+                            f"is compute {card['compute_cap']}"),
+                    "fix": None}
+    need = engine.get("min_toolkit")
+    if need and version and version < need:
+        return {"why": (f"{family.display_name}'s CUDA code needs CUDA {need[0]}.{need[1]} "
+                        f"or newer (it is C++20), and the toolkit here is CUDA {tc['cuda_version']}"),
+                "fix": f"install CUDA {need[0]}.{need[1]} or newer"}
+    toolkit = f"CUDA {tc['cuda_version']}" if tc.get("cuda_version") else "CUDA"
+    for card in cards:
+        sm = setup_hw.compute_cap_sm(card.get("compute_cap"))
+        if toolkit_builds(tc, sm) is False:
+            note, fix = cuda_release_advice(sm, version)
+            detail = f"compute {card['compute_cap']}" + (f", {note}" if note else "")
+            return {"why": f"the {toolkit} toolkit cannot build for the {card['name']} ({detail})",
+                    "fix": fix}
+    return None
+
+
+def cuda_make_args(family, tc, cards):
+    """The make variables the CUDA build of this engine needs on this toolkit:
+    the card's own architecture when nvcc is too old for -arch=native (and
+    CUDA_ARCH is not set by hand), NO_TC=1 where the engine needs it."""
+    args = []
+    version = _version_tuple(tc.get("cuda_version"))
+    if version and version < CUDA_NATIVE_SINCE and not os.environ.get("CUDA_ARCH") and cards:
+        sm = setup_hw.compute_cap_sm(cards[0].get("compute_cap"))
+        if sm:
+            args.append(f"CUDA_ARCH=sm_{sm}")
+    below = CUDA_ENGINES.get(family.id, {}).get("no_tc_below")
+    if below and version and version < below:
+        args.append("NO_TC=1")
+    return args
+
+
+def choose_backend(hw, family, tc, requested="auto", exclude=()):
     """Which build to run the model with, and why.
 
-    CUDA first for an NVIDIA card when this engine has a CUDA path and the
-    toolkit is here (its VRAM expert tier is the measured fast path); else
-    Vulkan when a Vulkan GPU answered and the build has its headers and glslc;
-    else the CPU. On an integrated GPU, Vulkan only for the engines measured
-    faster there (VULKAN_IGPU_MEASURED) unless Vulkan was asked for by name.
-    Every GPU path the machine has but cannot build yet comes back in `missing`
-    with the command that would enable it."""
+    CUDA first for an NVIDIA card when this engine has a CUDA path (CUDA_ENGINES)
+    and the toolkit here builds for every card (cuda_problem); its VRAM expert
+    tier is the measured fast path. Else Vulkan when a Vulkan GPU answered and
+    the build has its headers and glslc; else the CPU. On an integrated GPU,
+    Vulkan only for the engines measured faster there (VULKAN_IGPU_MEASURED)
+    unless Vulkan was asked for by name. Every GPU path the machine has but
+    cannot build yet comes back in `missing` with what would enable it.
+
+    A toolkit that cannot build for the card is not a build to try: auto says
+    why and takes the next backend, and an explicit --backend cuda stops here
+    with the same reason instead of failing inside make. `exclude` names the
+    backends whose build already failed (resolve_with_fallback)."""
     gpu = hw.get("gpu") or {}
     vk, nvidia = gpu.get("vulkan"), gpu.get("nvidia") or []
     decision = {"backend": "cpu", "reason": "", "missing": [], "gpu": None}
     if requested == "cpu":
         decision["reason"] = "CPU only, as requested"
         return decision
-    cuda_engine = family.supports_accelerator and host_os().startswith("linux")
-    if nvidia and requested in ("auto", "cuda"):
+    cuda_engine = family.id in CUDA_ENGINES and host_os().startswith("linux")
+    blocked = None
+    if nvidia and requested in ("auto", "cuda") and "cuda" not in exclude:
         if cuda_engine and tc.get("can_build_cuda"):
-            decision.update(backend="cuda", gpu=nvidia[0]["name"],
-                            reason=f"NVIDIA {nvidia[0]['name']} with the CUDA toolkit")
-            return decision
-        if cuda_engine:
+            blocked = cuda_problem(nvidia, family, tc)
+            if blocked is None:
+                card = nvidia[0]
+                detail = f" (compute {card['compute_cap']})" if card.get("compute_cap") else ""
+                toolkit = f"CUDA {tc['cuda_version']}" if tc.get("cuda_version") else "CUDA"
+                decision.update(backend="cuda", gpu=card["name"],
+                                reason=f"NVIDIA {card['name']}{detail} with the {toolkit} toolkit",
+                                make_args=cuda_make_args(family, tc, nvidia))
+                return decision
+            if requested == "cuda":
+                instead = choose_backend(hw, family, tc, "auto", exclude=tuple(exclude) + ("cuda",))
+                raise SetupError(f"{blocked['why']}: "
+                                 + (f"{blocked['fix']} for the CUDA path, or " if blocked["fix"] else "")
+                                 + f"run with --backend auto to use {USING[instead['backend']]}")
+            if blocked["fix"]:
+                decision["missing"].append(("cuda", f"{blocked['fix']} ({CUDA_ARCHIVE_URL})"))
+        elif cuda_engine:
             needs = ["cuda"] if tc.get("can_build") else ["build", "cuda"]
             decision["missing"].append(("cuda", _gpu_hint(needs, hw, tc)))
         elif requested == "cuda" and not cuda_engine:
             decision["missing"].append(("cuda", f"{family.display_name} has no CUDA path here; "
                                                 "Vulkan or the CPU run it"))
+
+    def because(using, otherwise):
+        """The reason, led by why CUDA was passed over when it was."""
+        if blocked is None:
+            return otherwise
+        text = f"{blocked['why']}: using {using}"
+        if blocked["fix"]:
+            text += f"; {blocked['fix']} for the CUDA path"
+        return text
+
     if (vk and vk.get("type") == "integrated" and requested in ("auto", "cuda")
             and family.id not in VULKAN_IGPU_MEASURED):
-        decision["reason"] = (f"{vk['name']} is an integrated GPU, which shares the CPU's RAM, "
-                              f"and {family.display_name} was not measured faster on one: "
-                              "the engine runs on the CPU (--backend vulkan uses the GPU anyway)")
+        igpu = (f"{vk['name']} is an integrated GPU, which shares the CPU's RAM, "
+                f"and {family.display_name} was not measured faster on one: "
+                "the engine runs on the CPU (--backend vulkan uses the GPU anyway)")
+        decision["reason"] = igpu if blocked is None else f"{because('the CPU', '')}. {igpu}"
         return decision
-    if vk and requested in ("auto", "vulkan", "cuda"):
+    if vk and requested in ("auto", "vulkan", "cuda") and "vulkan" not in exclude:
         if tc.get("can_build_vulkan"):
             kind = vk.get("type")
             decision.update(backend="vulkan", gpu=vk["name"],
-                            reason=f"{vk['name']}, {kind} GPU")
+                            reason=because("Vulkan", f"{vk['name']}, {kind} GPU"))
             return decision
         needs = ["vulkan"] if tc.get("can_build") else ["build", "vulkan"]
         decision["missing"].append(("vulkan", _gpu_hint(needs, hw, tc)))
@@ -339,7 +560,8 @@ def choose_backend(hw, family, tc, requested="auto"):
     elif requested == "vulkan" and not vk:
         decision["reason"] = "no Vulkan GPU answered: the engine runs on the CPU"
     else:
-        decision["reason"] = "the GPU build is not possible yet: the engine runs on the CPU"
+        decision["reason"] = because("the CPU",
+                                     "the GPU build is not possible yet: the engine runs on the CPU")
     return decision
 
 
@@ -380,14 +602,20 @@ def engine_path(directory, family):
 # ---------------------------------------------------------------- building
 
 
-def make_command(family, backend, tc):
-    """The make invocation for this engine and backend (argv, cwd, env)."""
+def make_command(family, backend, tc, make_args=()):
+    """The make invocation for this engine and backend (argv, cwd, env).
+    `make_args` are the extra variables the decision asked for
+    (cuda_make_args): they come last, and a CUDA_ARCH among them replaces
+    the default one."""
     target = family.build_target
     args = [target, f"ARCH={os.environ.get('ARCH') or 'native'}"]
     if backend == "vulkan":
         args.append("VK=1")
     elif backend == "cuda":
-        args += ["CUDA=1", f"CUDA_ARCH={os.environ.get('CUDA_ARCH') or 'native'}"]
+        args.append("CUDA=1")
+        if not any(arg.startswith("CUDA_ARCH=") for arg in make_args):
+            args.append(f"CUDA_ARCH={os.environ.get('CUDA_ARCH') or 'native'}")
+    args += list(make_args)
     if host_os() == "win32" and tc.get("msys2"):
         bash = os.path.join(tc["msys2"], "usr", "bin", "bash.exe")
         script = 'cd "$(cygpath -u "$1")" && shift && exec make "$@"'
@@ -396,12 +624,28 @@ def make_command(family, backend, tc):
     return [tc.get("make") or "make", "-C", HERE] + args, HERE, dict(os.environ)
 
 
-def build_engine(family, backend, tc, out=print):
-    cmd, cwd, env = make_command(family, backend, tc)
+class BuildError(SetupError):
+    """A build that failed: which backend, and where its log is."""
+
+    def __init__(self, message, backend, log):
+        super().__init__(message)
+        self.backend = backend
+        self.log = log
+
+
+def build_log_name(backend):
+    """One log per backend (logs/build-cuda.log, ...): when a failed CUDA build
+    falls back to Vulkan, the CUDA log is still there to read."""
+    return f"build-{backend}"
+
+
+def build_engine(family, backend, tc, out=print, make_args=()):
+    cmd, cwd, env = make_command(family, backend, tc, make_args)
     shown = [a for a in cmd if a == family.build_target or re.match(r"^[A-Z_]+=", a)]
-    out(f"  building: make {' '.join(shown)}  (a few minutes; log: {log_path('build')})")
+    log_file = log_path(build_log_name(backend))
+    out(f"  building: make {' '.join(shown)}  (a few minutes; log: {log_file})")
     write_state("build", engine=family.engine_artifact, backend=backend)
-    with open(_ensure_log("build"), "w", encoding="utf-8", errors="replace") as log:
+    with open(_ensure_log(build_log_name(backend)), "w", encoding="utf-8", errors="replace") as log:
         process = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, encoding="utf-8", errors="replace")
         tail = []
@@ -412,7 +656,8 @@ def build_engine(family, backend, tc, out=print):
     path = engine_path(HERE, family)
     if process.returncode != 0 or not os.path.exists(path):
         detail = "\n".join("    " + line for line in tail[-12:])
-        raise SetupError(f"the {family.build_target} build failed (full log: {log_path('build')}):\n{detail}")
+        raise BuildError(f"the {family.build_target} {BACKEND_NAME[backend]} build "
+                         f"failed (full log: {log_file}):\n{detail}", backend, log_file)
     return path
 
 
@@ -611,7 +856,8 @@ def resolve_engine(family, entry, decision, tc, out=print, allow_prebuilt=True):
             return {"launcher_dir": HERE, "engine": local, "backend": have if have != "cuda" else "cpu",
                     "source": "present"}
     if tc.get("can_build"):
-        path = build_engine(family, decision["backend"], tc, out=out)
+        path = build_engine(family, decision["backend"], tc, out=out,
+                            make_args=decision.get("make_args", ()))
         return {"launcher_dir": HERE, "engine": path, "backend": decision["backend"], "source": "built"}
     if not allow_prebuilt:
         raise SetupError(f"no compiler here to build {family.engine_artifact}: "
@@ -632,6 +878,38 @@ def resolve_engine(family, entry, decision, tc, out=print, allow_prebuilt=True):
         out(f"  the prebuilt engine runs on the CPU; the {decision['backend']} build needs a "
             f"source checkout and a compiler: {package_hint(['build', decision['backend']])}")
     return {"launcher_dir": runtime, "engine": engine, "backend": "cpu", "source": f"release {tag}"}
+
+
+def resolve_with_fallback(ui, family, entry, decision, tc, hw, requested, failed=()):
+    """resolve_engine, and when a build fails the next backend that can work
+    instead of a stop: CUDA, then Vulkan, then the CPU (choose_backend again,
+    without the backends that failed). With someone at the terminal it asks
+    first; with --yes it goes ahead. Either way it says which build failed and
+    where its log is. A CPU build that fails still stops the setup.
+
+    Returns (engine_info, decision, failed): the decision the engine was built
+    for, and the backends whose build failed, which the run configuration
+    keeps so that a resumed setup does not build them again."""
+    failed = list(failed)
+    while True:
+        try:
+            return resolve_engine(family, entry, decision, tc, out=ui.say), decision, failed
+        except BuildError as error:
+            if error.backend == "cpu":
+                raise
+            failed.append(error.backend)
+            following = choose_backend(hw, family, tc, requested, exclude=tuple(failed))
+            ui.say(f"  {error}")
+            if ui.interactive and not ui.confirm(
+                    f"  Build for {USING[following['backend']]} instead?", True):
+                raise
+            following["reason"] = (f"the {BACKEND_NAME[error.backend]} build failed "
+                                   f"(full log: {error.log}): using {USING[following['backend']]}")
+            decision = following
+            ui.say(f"\nEngine: {family.engine_artifact} with {decision['backend'].upper()} "
+                   f"({decision['reason']})")
+            for kind, hint in decision["missing"]:
+                ui.say(f"  to use the GPU through {kind.upper()}, first run:  {hint}")
 
 
 # ---------------------------------------------------------------- the run configuration
@@ -1225,7 +1503,20 @@ def gpu_now_buildable(cfg, tc=None):
     if not pending or cfg.get("backend") != "cpu":
         return False
     tc = tc or toolchain()
-    return any(tc.get(f"can_build_{kind}") for kind in pending)
+    for kind in pending:
+        if not tc.get(f"can_build_{kind}"):
+            continue
+        if kind == "cuda":
+            # A toolkit is here, but it has to build for the cards the last
+            # setup found (kept in the configuration: no hardware probe here).
+            try:
+                family = family_by_id(cfg.get("family"))
+            except Exception:
+                continue
+            if cuda_problem(cfg.get("nvidia") or [], family, tc) is not None:
+                continue
+        return True
+    return False
 
 
 def config_ready(cfg):
@@ -1321,7 +1612,15 @@ def cmd_setup(a, ui=None):
         save_config(pending)
 
     tc = toolchain()
-    decision = choose_backend(hw, family, tc, requested)
+    # A build that failed in the run this one resumes is not tried again; a new
+    # choice (another model, --reconfigure, --backend) starts clean.
+    failed = [] if (a.backend or a.no_gpu or picking or not resume) else \
+        [b for b in (resume.get("failed_builds") or []) if b in ("cuda", "vulkan")]
+    decision = choose_backend(hw, family, tc, requested, exclude=tuple(failed))
+    if failed:
+        decision["reason"] = (f"the {BACKEND_NAME[failed[-1]]} build failed in the last run "
+                              f"(log: {log_path(build_log_name(failed[-1]))}): "
+                              f"using {USING[decision['backend']]}")
     ui.say(f"\nEngine: {family.engine_artifact} with {decision['backend'].upper()} "
            f"({decision['reason']})")
     for kind, hint in decision["missing"]:
@@ -1329,7 +1628,12 @@ def cmd_setup(a, ui=None):
     if decision["missing"] and ui.interactive and decision["backend"] == "cpu":
         if not ui.confirm("  Continue on the CPU for now (rerun after installing to switch)?", True):
             raise SetupError("stopped so you can install the GPU packages; rerun afterwards")
-    engine_info = resolve_engine(family, entry, decision, tc, out=ui.say)
+    engine_info, decision, failed = resolve_with_fallback(ui, family, entry, decision, tc, hw,
+                                                          requested, failed)
+    if failed:
+        current = load_config()
+        if current:
+            save_config(dict(current, failed_builds=failed))
     engine_info["gpu"] = decision.get("gpu") if engine_info["backend"] != "cpu" else None
     ui.say(f"  engine ready: {engine_info['engine']} ({engine_info['backend']}, {engine_info['source']})")
 
@@ -1357,6 +1661,11 @@ def cmd_setup(a, ui=None):
     # the packages arrived and rebuilds (gpu_now_buildable).
     cfg["gpu_pending"] = ([kind for kind, _hint in decision["missing"]]
                           if engine_info["backend"] == "cpu" and requested == "auto" else [])
+    # The cards a pending CUDA build has to serve: a rerun checks the toolkit
+    # against them without probing the hardware again.
+    cfg["nvidia"] = [{"name": card.get("name"), "compute_cap": card.get("compute_cap")}
+                     for card in (hw.get("gpu") or {}).get("nvidia") or []]
+    cfg["failed_builds"] = failed
     cfg = save_config(cfg)
     write_state("ready", model=cfg["model"].get("id"), model_dir=model_dir)
     ui.say(f"\nSaved the run configuration: {config_path()}")
