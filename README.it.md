@@ -126,7 +126,7 @@ Cosa fa ogni passo, nel dettaglio: [docs/quickstart.md](docs/quickstart.md#the-o
 |---|---|
 | si è fermato durante il download | rilancia lo stesso comando: riprende dai byte già presenti sul disco |
 | `to use the GPU through ..., first run: <command>` | esegui quel comando, poi di nuovo l'installazione: ricompila per la GPU e non riscarica nulla |
-| `the ... build failed` durante la compilazione con CUDA, per esempio `Unsupported gpu architecture` quando il CUDA toolkit installato non supporta più la scheda | `./start-here.sh --backend vulkan` usa la scheda tramite Vulkan; `--no-gpu` resta sulla CPU |
+| `the ... build failed`, per esempio `Unsupported gpu architecture` quando il CUDA toolkit installato non supporta più la scheda | l'installazione controlla prima il toolkit rispetto alla scheda e sceglie Vulkan da sé, spiegando perché; se una compilazione fallisce ancora, offre la prossima (Vulkan, poi la CPU). `./start-here.sh --backend vulkan` forza Vulkan; `--no-gpu` resta sulla CPU |
 | `needs N GB free for the download` | `--dir` con una cartella su un disco più grande |
 | su WSL, la cartella del modello è sotto `/mnt/c` | tienila sul disco Linux (il predefinito, `~/colibri-models`): `/mnt/c` è molte volte più lento |
 | qualsiasi altra cosa | `c/coli logs -n 50` mostra il log del server e `c/coli logs --install` quello dell'installazione; apri una [issue](https://github.com/JustVugg/colibri/issues) con le ultime righe stampate dall'installazione |
@@ -307,11 +307,12 @@ motore decide da sé se usare lì la catena densa (Qwen3.6 sì, Qwen3.8 no).
 
 Su una GPU dedicata l'installazione compila Vulkan per ogni motore (prima CUDA,
 dove il motore ce l'ha e il toolkit è installato), con i layer densi sulla
-scheda. È il caso per cui il progetto è pensato, ed è **ancora da misurare:
-nessuna GPU dedicata ha ancora eseguito il livello degli expert o la catena
-densa.** (Prima di questi, il precedente percorso Vulkan di GLM-5.2 faceva
-1.7-1.8 tok/s in decode su una RX 9070 dedicata.) I numeri della tua scheda sono
-benvenuti.
+scheda. È il caso per cui il progetto è pensato. **Non abbiamo ancora misurato
+una GPU dedicata noi stessi.** Il primo numero viene da un utente: Qwen3.6 da
+17 a 19 tok/s su una Tesla V100 16 GB, con il livello degli expert e la catena
+densa ([#1852](https://github.com/JustVugg/colibri/issues/1852)). (Prima di
+questi, il precedente percorso Vulkan di GLM-5.2 faceva 1.7-1.8 tok/s in decode
+su una RX 9070 dedicata.) I numeri della tua scheda sono benvenuti.
 
 **Le schede senza Resizable BAR** ora funzionano. Una scheda così (tutte le
 Turing, le Ampere con il firmware di lancio, le AMD più vecchie con l'opzione
@@ -352,8 +353,9 @@ motore CUDA è una DLL separata ([windows.md](docs/windows.md)).
   ([qwen36-cuda-tier.md](docs/qwen36-cuda-tier.md#the-deltanet-layer-on-the-card-q36_dn_gpu1)).
 - **Schede più vecchie.** Se il CUDA toolkit non compila più per la tua scheda
   (CUDA 13 e una V100, in [#1852](https://github.com/JustVugg/colibri/issues/1852)),
-  la compilazione si ferma: `--backend vulkan` usa invece la scheda tramite
-  Vulkan. Il livello CUDA di DeepSeek V4 si compila anche per Pascal e Turing
+  l'installazione lo vede prima di compilare e usa la scheda tramite Vulkan,
+  spiegando perché; un CUDA toolkit 12.x riporta il percorso CUDA. Il livello
+  CUDA di DeepSeek V4 si compila anche per Pascal e Turing
   (`CUDA_ARCH=portable-pre-ampere NO_TC=1`).
 
 Tutti i dettagli: [docs/cuda.md](docs/cuda.md).
@@ -727,6 +729,55 @@ rilasciano apertamente i loro pesi: **Z.ai** (GLM), **Moonshot AI** (Kimi),
 convertiti; e a ogni contributore che ha fatto benchmark, bisect, replicato
 un'esecuzione dell'atlante o mandato una patch. Il codice di terze parti in
 questo repository e le sue licenze: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+Gli esperimenti del progetto su piazzamento, compressione e routing degli expert si
+basano anche su idee ed evidenze dei seguenti lavori aperti di ricerca e di sistemi:
+
+- [REAP](https://github.com/CerebrasResearch/reap) e
+  [EASY-EP](https://github.com/RUCAIBox/EASYEP) per l'importanza degli expert
+  consapevole dell'output e specifica del dominio.
+- [SERE](https://github.com/JL-Cheng/SERE) per il re-routing degli expert basato
+  sulla similarità, e [ReMoE](https://github.com/BUAA-OSCAR/ReMoE) per il
+  fine-tuning del router consapevole della località della cache.
+- [MC-SMoE](https://github.com/UNITES-Lab/MC-SMoE) per il merging e la compressione
+  degli expert guidati dal routing.
+- [MoBE](https://github.com/inclusionAI/MoBE) e
+  [D²-MoE](https://github.com/lliai/D2MoE) per le basi di expert condivise e i
+  delta di expert a basso rango.
+- [HybriMoE](https://github.com/PKU-SEC-Lab/HybriMoE) per lo scheduling ibrido
+  CPU/GPU degli expert, [ScMoE](https://arxiv.org/abs/2404.05019) per la
+  sovrapposizione tra comunicazione degli expert e calcolo, e
+  [OD-MoE](https://arxiv.org/abs/2512.03927) per il caricamento distribuito degli
+  expert su richiesta.
+- [vLLM](https://github.com/vllm-project/vllm),
+  [llama.cpp](https://github.com/ggml-org/llama.cpp) e
+  [kTransformers](https://github.com/kvcache-ai/ktransformers) per i sistemi di
+  inferenza aperti e il lavoro sull'offload degli expert che rendono riproducibili i
+  confronti.
+
+Il motore poggia anche su lavoro di ingegneria concreto, non solo su idee. Ognuno
+di questi è usato o reimplementato oggi nel repository:
+
+- [safetensors](https://github.com/huggingface/safetensors): il container che ogni
+  motore legge (`c/st.h`), compresi i suoi dtype fp8 e I64.
+- [tiktoken](https://github.com/openai/tiktoken): `c/tok.h` reimplementa
+  esattamente il suo `byte_pair_encode`, unendo la coppia adiacente la cui
+  concatenazione ha l'id di vocabolario più basso, così un vocabolario derivato da
+  tiktoken non ha bisogno di una lista di merge.
+- [llama.cpp](https://github.com/ggml-org/llama.cpp): il sottoinsieme della
+  grammatica GBNF in `c/grammar.h` segue la sua sintassi e il suo PDA a insieme di
+  stack, e il percorso Metal prende in prestito il suo trucco di residenza
+  `newBufferWithBytesNoCopy`.
+- [vLLM](https://github.com/vllm-project/vllm): il riferimento per la semantica
+  dell'output che il motore riproduce posizione per posizione (per esempio dove cade
+  la norma finale rispetto alla LM head).
+- [transformers](https://github.com/huggingface/transformers): l'oracle; la CI
+  riproduce token per token contro di esso un modello inizializzato a caso.
+- [DietGPU](https://github.com/facebookresearch/dietgpu): il codec ANS su GPU dietro
+  il livello sperimentale di expert compressi (`COLI_ANS`).
+- [rocWMMA](https://github.com/ROCm/rocWMMA): il backend HIP mappa su di esso l'API
+  di frammenti e mma_sync `nvcuda::wmma` di CUDA (`c/backend_gpu_compat.h`), ed è
+  ciò che permette a un unico sorgente .cu di compilare per entrambi i produttori.
 
 ## Licenza
 

@@ -94,7 +94,7 @@ Starting colibri
 |---|---|
 | 下载过程中停止了 | 再次运行同一条命令：它会从磁盘上已有的字节处继续 |
 | `to use the GPU through ..., first run: <command>` | 运行这条命令，然后再运行一次安装程序：它会为 GPU 重新编译，不会重新下载 |
-| 用 CUDA 编译时出现 `the ... build failed`，例如已安装的 CUDA toolkit 不再支持这张显卡时出现的 `Unsupported gpu architecture` | `./start-here.sh --backend vulkan` 通过 Vulkan 使用这张显卡；`--no-gpu` 则只使用 CPU |
+| `the ... build failed`，例如已安装的 CUDA toolkit 不再支持这张显卡时出现的 `Unsupported gpu architecture` | 安装程序会先把 toolkit 和显卡对照检查，自行选择 Vulkan，并说明原因；如果编译仍然失败，它会提供下一个选项（先 Vulkan，再 CPU）。`./start-here.sh --backend vulkan` 强制使用 Vulkan；`--no-gpu` 则只使用 CPU |
 | `needs N GB free for the download` | 用 `--dir` 指定一个更大磁盘上的文件夹 |
 | 在 WSL 中，模型文件夹位于 `/mnt/c` 下 | 把它放在 Linux 磁盘上（即默认的 `~/colibri-models`）：`/mnt/c` 要慢很多倍 |
 | 其他情况 | `c/coli logs -n 50` 显示服务器日志，`c/coli logs --install` 显示安装程序的日志；提交一个 [issue](https://github.com/JustVugg/colibri/issues)，附上安装程序最后打印的几行 |
@@ -205,7 +205,7 @@ Starting colibri
 
 集成显卡与 CPU 共用内存。它节省的是它所持有的那些专家的计算量和磁盘读取，因此在 Qwen3.6 这样的模型上有收益，而像 OLMoE 这样专家本来就在内存中的小模型，反而可能变慢。正因如此，安装程序只为 Qwen3.6、Qwen3-Coder 和 Qwen3.8-Flash-Next 在集成显卡上开启 Vulkan，并且每个引擎自行决定是否在集成显卡上运行稠密链（Qwen3.6 会，Qwen3.8 不会）。`--backend vulkan` 则无论如何都会使用 Vulkan。
 
-在独立显卡上，安装程序会为每个引擎编译 Vulkan 版本（如果引擎有 CUDA 路径且装有 toolkit，则优先使用 CUDA），并把稠密层放在显卡上。这正是该设计所针对的情形，但它**尚未实测：还没有任何独立显卡运行过专家层级或稠密链。**（在它们之前，GLM-5.2 较早的 Vulkan 路径在独立显卡 RX 9070 上的解码速度为 1.7-1.8 tok/s。）欢迎提供你的显卡上的数据。
+在独立显卡上，安装程序会为每个引擎编译 Vulkan 版本（如果引擎有 CUDA 路径且装有 toolkit，则优先使用 CUDA），并把稠密层放在显卡上。这正是该设计所针对的情形。**我们自己还没有实测过独立显卡。**第一份数据来自一位用户：Qwen3.6 在 Tesla V100 16 GB 上，配合专家层级和稠密链，解码速度为 17 到 19 tok/s（[#1852](https://github.com/JustVugg/colibri/issues/1852)）。（在它们之前，GLM-5.2 较早的 Vulkan 路径在独立显卡 RX 9070 上的解码速度为 1.7-1.8 tok/s。）欢迎提供你的显卡上的数据。
 
 **没有 Resizable BAR 的显卡**现在也能用了。这类显卡（所有 Turing 显卡、使用首发固件的 Ampere 显卡、关闭了该选项的较旧 AMD 显卡）只允许 CPU 直接写入其显存中约 256 MB 的部分；colibri 现在会自动通过一个暂存缓冲区（staging buffer）把权重复制进去。这条路径已通过强制启用以及在三种设备上模拟小窗口进行了测试，在 780M 上没有可测量的开销；尚未在真正没有 Resizable BAR 的显卡上实测（[vulkan.md](docs/vulkan.md#memory-placement-without-resizable-bar)）。
 
@@ -217,7 +217,7 @@ CI 在软件驱动上将每个引擎的 Vulkan 路径与 CPU 的 token 对照检
 
 - **显存专家层级**把最热的专家放在显卡上，这些专家根据实测路由选出；未命中的专家同时在 CPU 上计算。Qwen3.6 在两张 8 GB 显卡（RTX 3070 和 Quadro RTX 4000）上、有热的路由历史时，解码速度为 11.3 tok/s（[qwen36-cuda-tier.md](docs/qwen36-cuda-tier.md)）；GLM-5.2 在六张 RTX 5090 上、全部专家常驻时为 9.0-9.2 tok/s（[benchmarks.md](docs/benchmarks.md)）；DeepSeek V4 Flash 在一张 RTX 5080 上为 1.5-1.6 tok/s，3,324 个 token 的提示词用时 90 秒（[deepseek-v4.md](docs/deepseek-v4.md)）。
 - **Qwen3.6 新功能：DeltaNet 层放在显卡上**（`Q36_DN_GPU=1`，需手动开启）。以前，Qwen3.6 的 30 个 DeltaNet 层中，每一层对每个 token 都要在显卡和 CPU 之间复制四次数据；现在，解码一个 token 时整个层都在显卡上运行，其循环状态保留在显存中。在 RTX 3070 上、稠密层位于显存时：从 25.4 提升到 30.0 tok/s（[qwen36-cuda-tier.md](docs/qwen36-cuda-tier.md#the-deltanet-layer-on-the-card-q36_dn_gpu1)）。
-- **较旧的显卡。** 如果 CUDA toolkit 已不再支持为你的显卡编译（例如 CUDA 13 与 V100，见 [#1852](https://github.com/JustVugg/colibri/issues/1852)），编译会停止：此时 `--backend vulkan` 会改为通过 Vulkan 使用这张显卡。DeepSeek V4 的 CUDA 层级也可以为 Pascal 和 Turing 编译（`CUDA_ARCH=portable-pre-ampere NO_TC=1`）。
+- **较旧的显卡。** 如果 CUDA toolkit 已不再支持为你的显卡编译（例如 CUDA 13 与 V100，见 [#1852](https://github.com/JustVugg/colibri/issues/1852)），安装程序会在编译之前就发现这一点，并说明原因，转而通过 Vulkan 使用这张显卡；装上 CUDA 12.x toolkit 可以恢复 CUDA 路径。DeepSeek V4 的 CUDA 层级也可以为 Pascal 和 Turing 编译（`CUDA_ARCH=portable-pre-ampere NO_TC=1`）。
 
 全部内容：[docs/cuda.md](docs/cuda.md)。
 
@@ -453,6 +453,41 @@ colibri 最初是一个人在一台 12 核心、25 GB 内存的笔记本上开�
 ## 致谢
 
 colibri 只是一个引擎；它运行的智慧是一份馈赠。感谢以开放方式发布权重的团队：**Z.ai**（GLM）、**Moonshot AI**（Kimi）、**Alibaba Qwen**、**DeepSeek**、**Xiaomi**（MiMo）、**Thinking Machines**（Inkling）、**Allen AI**（OLMoE）、**Convai Innovations**（Laya）、**fastino**（GLiNER2.5-Decide）和 **Cloudflare**（Clef）；感谢发布转换后容器的人；也感谢每一位做过基准测试、二分定位问题、复现图谱运行或提交补丁的贡献者。本仓库中的第三方代码及其许可证：[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+本项目在专家放置、压缩与路由方面的实验，也建立在以下开放研究与系统工作的思路和证据之上：
+
+- [REAP](https://github.com/CerebrasResearch/reap) 与
+  [EASY-EP](https://github.com/RUCAIBox/EASYEP)：输出感知的与特定领域的专家重要性。
+- [SERE](https://github.com/JL-Cheng/SERE)：基于相似度的专家重路由；
+  [ReMoE](https://github.com/BUAA-OSCAR/ReMoE)：感知缓存局部性的路由器微调。
+- [MC-SMoE](https://github.com/UNITES-Lab/MC-SMoE)：路由引导的专家合并与压缩。
+- [MoBE](https://github.com/inclusionAI/MoBE) 与
+  [D²-MoE](https://github.com/lliai/D2MoE)：共享专家基与低秩专家增量。
+- [HybriMoE](https://github.com/PKU-SEC-Lab/HybriMoE)：CPU/GPU 混合专家调度；
+  [ScMoE](https://arxiv.org/abs/2404.05019)：专家通信与计算的重叠；
+  [OD-MoE](https://arxiv.org/abs/2512.03927)：分布式按需专家加载。
+- [vLLM](https://github.com/vllm-project/vllm)、
+  [llama.cpp](https://github.com/ggml-org/llama.cpp) 与
+  [kTransformers](https://github.com/kvcache-ai/ktransformers)：开放的推理系统与专家卸载工作，
+  使对比得以复现。
+
+引擎也建立在具体的工程成果之上，而不只是思路。以下每一项如今都在代码树中被使用或重新实现：
+
+- [safetensors](https://github.com/huggingface/safetensors)：每个引擎读取的容器格式
+  （`c/st.h`），包括其 fp8 与 I64 数据类型。
+- [tiktoken](https://github.com/openai/tiktoken)：`c/tok.h` 精确地重新实现了它的
+  `byte_pair_encode`，合并拼接后词表 id 最小的相邻对，因此源自 tiktoken 的词表不需要 merges 列表。
+- [llama.cpp](https://github.com/ggml-org/llama.cpp)：`c/grammar.h` 中的 GBNF 语法子集遵循它的
+  语法与 set-of-stacks PDA，Metal 路径也借用了它的 `newBufferWithBytesNoCopy` 常驻技巧。
+- [vLLM](https://github.com/vllm-project/vllm)：引擎逐位置对齐的输出语义参考（例如最终 norm
+  相对于 LM head 的位置）。
+- [transformers](https://github.com/huggingface/transformers)：oracle；CI 以它为基准逐 token
+  复现一个随机初始化的模型。
+- [DietGPU](https://github.com/facebookresearch/dietgpu)：实验性压缩专家层级（`COLI_ANS`）背后的
+  GPU ANS 编解码器。
+- [rocWMMA](https://github.com/ROCm/rocWMMA)：HIP 后端把 CUDA 的 `nvcuda::wmma`
+  fragment/mma_sync API 映射到它之上（`c/backend_gpu_compat.h`），这让同一份 .cu 源码可以为
+  两家厂商编译。
 
 ## 许可证
 

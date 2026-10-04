@@ -123,7 +123,7 @@ What each step does, in detail: [docs/quickstart.md](docs/quickstart.md#the-one-
 |---|---|
 | it stopped during the download | run the same command again: it resumes from the bytes already on disk |
 | `to use the GPU through ..., first run: <command>` | run that command, then the setup again: it rebuilds for the GPU and does not download again |
-| `the ... build failed` while building with CUDA, for example `Unsupported gpu architecture` when the installed CUDA toolkit no longer supports the card | `./start-here.sh --backend vulkan` uses the card through Vulkan; `--no-gpu` stays on the CPU |
+| `the ... build failed`, for example `Unsupported gpu architecture` when the installed CUDA toolkit no longer supports the card | the setup checks the toolkit against the card first and picks Vulkan by itself, saying why; if a build still fails it offers the next one (Vulkan, then the CPU). `./start-here.sh --backend vulkan` forces Vulkan; `--no-gpu` stays on the CPU |
 | `needs N GB free for the download` | `--dir` with a folder on a bigger disk |
 | on WSL, the model folder is under `/mnt/c` | keep it on the Linux disk (the default, `~/colibri-models`): `/mnt/c` is many times slower |
 | anything else | `c/coli logs -n 50` shows the server log and `c/coli logs --install` the setup's; open an [issue](https://github.com/JustVugg/colibri/issues) with the last lines the setup printed |
@@ -292,8 +292,10 @@ anyway.
 
 On a discrete GPU the setup builds Vulkan for every engine (CUDA first, where
 the engine has it and the toolkit is installed), with the dense layers on the
-card. That is the case the design is for, and it is **not measured yet: no
-discrete GPU has run the expert tier or the dense chain.** (Before them,
+card. That is the case the design is for. **We have not measured a discrete
+GPU ourselves yet.** The first number comes from a user: Qwen3.6 at 17 to 19
+tok/s on a Tesla V100 16 GB, with the expert tier and the dense chain
+([#1852](https://github.com/JustVugg/colibri/issues/1852)). (Before them,
 GLM-5.2's earlier Vulkan path decoded 1.7-1.8 tok/s on a discrete RX 9070.)
 Numbers from your card are welcome.
 
@@ -333,7 +335,8 @@ Windows the CUDA engine is a separate DLL ([windows.md](docs/windows.md)).
   ([qwen36-cuda-tier.md](docs/qwen36-cuda-tier.md#the-deltanet-layer-on-the-card-q36_dn_gpu1)).
 - **Older cards.** If the CUDA toolkit no longer compiles for your card (CUDA
   13 and a V100, in [#1852](https://github.com/JustVugg/colibri/issues/1852)),
-  the build stops: `--backend vulkan` uses the card through Vulkan instead.
+  the setup sees it before building and uses the card through Vulkan, saying
+  why; a CUDA 12.x toolkit brings the CUDA path back.
   DeepSeek V4's CUDA tier also builds for Pascal and Turing
   (`CUDA_ARCH=portable-pre-ampere NO_TC=1`).
 
@@ -691,6 +694,52 @@ release their weights in the open: **Z.ai** (GLM), **Moonshot AI** (Kimi),
 converted containers; and to every contributor who benchmarked, bisected,
 replicated an atlas run or sent a patch. Third-party code in this repository
 and its licences: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+The project's expert placement, compression, and routing experiments also build
+on ideas and evidence from the following open research and systems work:
+
+- [REAP](https://github.com/CerebrasResearch/reap) and
+  [EASY-EP](https://github.com/RUCAIBox/EASYEP) for output-aware and
+  domain-specific expert importance.
+- [SERE](https://github.com/JL-Cheng/SERE) for similarity-based expert
+  re-routing, and [ReMoE](https://github.com/BUAA-OSCAR/ReMoE) for
+  cache-locality-aware router fine-tuning.
+- [MC-SMoE](https://github.com/UNITES-Lab/MC-SMoE) for routing-guided expert
+  merging and compression.
+- [MoBE](https://github.com/inclusionAI/MoBE) and
+  [D²-MoE](https://github.com/lliai/D2MoE) for shared expert bases and
+  low-rank expert deltas.
+- [HybriMoE](https://github.com/PKU-SEC-Lab/HybriMoE) for hybrid CPU/GPU expert
+  scheduling, [ScMoE](https://arxiv.org/abs/2404.05019) for overlapping expert
+  communication with computation, and
+  [OD-MoE](https://arxiv.org/abs/2512.03927) for distributed on-demand expert
+  loading.
+- [vLLM](https://github.com/vllm-project/vllm),
+  [llama.cpp](https://github.com/ggml-org/llama.cpp), and
+  [kTransformers](https://github.com/kvcache-ai/ktransformers) for the open
+  inference systems and expert-offload work that make comparisons reproducible.
+
+The engine also stands on concrete engineering work, not only ideas. Each of
+these is used or reimplemented in the tree today:
+
+- [safetensors](https://github.com/huggingface/safetensors): the container
+  every engine reads (`c/st.h`), including its fp8 and I64 dtypes.
+- [tiktoken](https://github.com/openai/tiktoken): `c/tok.h` reimplements its
+  `byte_pair_encode` exactly, merging the adjacent pair whose concatenation has
+  the lowest vocab id, so a tiktoken-derived vocabulary needs no merges list.
+- [llama.cpp](https://github.com/ggml-org/llama.cpp): the GBNF grammar subset
+  in `c/grammar.h` follows its syntax and its set-of-stacks PDA, and the Metal
+  path borrows its `newBufferWithBytesNoCopy` residency trick.
+- [vLLM](https://github.com/vllm-project/vllm): the reference for output
+  semantics the engine matches position by position (e.g. where the final norm
+  lands relative to the LM head).
+- [transformers](https://github.com/huggingface/transformers): the oracle:
+  CI reproduces a random-init model token for token against it.
+- [DietGPU](https://github.com/facebookresearch/dietgpu): the GPU ANS codec
+  behind the experimental compressed expert tier (`COLI_ANS`).
+- [rocWMMA](https://github.com/ROCm/rocWMMA): the HIP backend maps CUDA's
+  `nvcuda::wmma` fragment/mma_sync API onto it (`c/backend_gpu_compat.h`), which
+  is what lets one .cu source compile for both vendors.
 
 ## License
 

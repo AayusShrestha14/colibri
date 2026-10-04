@@ -120,7 +120,7 @@ Starting colibri
 |---|---|
 | 下載到一半停止了 | 再執行一次相同的指令：它會從硬碟上已有的位元組接著下載 |
 | `to use the GPU through ..., first run: <command>` | 執行那條指令，然後再執行一次安裝程式：它會為 GPU 重新建置，不會重新下載 |
-| 用 CUDA 建置時出現 `the ... build failed`，例如已安裝的 CUDA toolkit 不再支援這張顯示卡時出現的 `Unsupported gpu architecture` | `./start-here.sh --backend vulkan` 會透過 Vulkan 使用這張顯示卡；`--no-gpu` 則留在 CPU 上 |
+| `the ... build failed`，例如已安裝的 CUDA toolkit 不再支援這張顯示卡時出現的 `Unsupported gpu architecture` | 安裝程式會先把 toolkit 和顯示卡對照檢查，自行選擇 Vulkan，並說明原因；如果建置仍然失敗，它會提供下一個選項（先 Vulkan，再 CPU）。`./start-here.sh --backend vulkan` 會強制使用 Vulkan；`--no-gpu` 則留在 CPU 上 |
 | `needs N GB free for the download` | 用 `--dir` 指定一個位於較大硬碟上的資料夾 |
 | 在 WSL 上，模型資料夾位於 `/mnt/c` 底下 | 把它放在 Linux 磁碟上（預設的 `~/colibri-models`）：`/mnt/c` 慢上好幾倍 |
 | 其他任何問題 | `c/coli logs -n 50` 會顯示伺服器日誌，`c/coli logs --install` 則顯示安裝程式的日誌；請附上安裝程式最後印出的幾行，開一個 [issue](https://github.com/JustVugg/colibri/issues) |
@@ -287,8 +287,10 @@ Qwen3.8-Flash-Next 在內建顯示晶片上開啟 Vulkan，
 `--backend vulkan` 則無論如何都會要求使用 Vulkan。
 
 在獨立顯示卡上，安裝程式會為每個引擎建置 Vulkan（若引擎有 CUDA 路徑且已安裝 toolkit，
-則優先使用 CUDA），並把稠密層放在顯示卡上。這正是此設計所針對的情況，
-但它**尚未實測：還沒有任何獨立顯示卡跑過專家層級或稠密鏈。**
+則優先使用 CUDA），並把稠密層放在顯示卡上。這正是此設計所針對的情況。
+**我們自己還沒有實測過獨立顯示卡。** 第一份數據來自一位使用者：Qwen3.6 在
+Tesla V100 16 GB 上，搭配專家層級與稠密鏈，解碼速度為 17 到 19 tok/s
+（[#1852](https://github.com/JustVugg/colibri/issues/1852)）。
 （在它們出現之前，GLM-5.2 較早的 Vulkan 路徑在獨立的 RX 9070 上解碼速度為 1.7-1.8 tok/s。）
 歡迎提供你的顯示卡的數據。
 
@@ -328,7 +330,8 @@ DeepSeek V4 Flash、Qwen3.8-Flash-Next，以及 Qwen3.6 與 Qwen3-Coder。
   （[qwen36-cuda-tier.md](docs/qwen36-cuda-tier.md#the-deltanet-layer-on-the-card-q36_dn_gpu1)）。
 - **較舊的顯示卡**。如果 CUDA toolkit 已不再支援為你的顯示卡編譯（例如
   [#1852](https://github.com/JustVugg/colibri/issues/1852) 中的 CUDA 13 與 V100），
-  建置會停止：此時 `--backend vulkan` 會改為透過 Vulkan 使用這張顯示卡。
+  安裝程式會在建置之前就先發現，並說明原因，轉而透過 Vulkan 使用這張顯示卡；
+  安裝 CUDA 12.x toolkit 可以讓 CUDA 路徑恢復。
   DeepSeek V4 的 CUDA 層級也可以為 Pascal 與 Turing 建置
   （`CUDA_ARCH=portable-pre-ampere NO_TC=1`）。
 
@@ -675,6 +678,41 @@ colibri 只是一個引擎；它所執行的智慧是一份饋贈。感謝以開
 **Cloudflare**（Clef）；感謝發布轉換後容器的人；
 也感謝每一位做過基準測試、二分定位問題、重現圖譜執行或提交修補的貢獻者。
 本儲存庫中的第三方程式碼及其授權條款：[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+本專案在專家配置、壓縮與路由方面的實驗，也建立在以下開放研究與系統工作的構想和證據之上：
+
+- [REAP](https://github.com/CerebrasResearch/reap) 與
+  [EASY-EP](https://github.com/RUCAIBox/EASYEP)：輸出感知的與特定領域的專家重要性。
+- [SERE](https://github.com/JL-Cheng/SERE)：基於相似度的專家重新路由；
+  [ReMoE](https://github.com/BUAA-OSCAR/ReMoE)：感知快取區域性的路由器微調。
+- [MC-SMoE](https://github.com/UNITES-Lab/MC-SMoE)：路由引導的專家合併與壓縮。
+- [MoBE](https://github.com/inclusionAI/MoBE) 與
+  [D²-MoE](https://github.com/lliai/D2MoE)：共享專家基底與低秩專家增量。
+- [HybriMoE](https://github.com/PKU-SEC-Lab/HybriMoE)：CPU/GPU 混合專家排程；
+  [ScMoE](https://arxiv.org/abs/2404.05019)：專家通訊與運算的重疊；
+  [OD-MoE](https://arxiv.org/abs/2512.03927)：分散式隨需專家載入。
+- [vLLM](https://github.com/vllm-project/vllm)、
+  [llama.cpp](https://github.com/ggml-org/llama.cpp) 與
+  [kTransformers](https://github.com/kvcache-ai/ktransformers)：開放的推論系統與專家卸載工作，
+  讓比較得以重現。
+
+引擎也建立在具體的工程成果之上，而不只是構想。以下每一項如今都在程式碼樹中被使用或重新實作：
+
+- [safetensors](https://github.com/huggingface/safetensors)：每個引擎讀取的容器格式
+  （`c/st.h`），包括其 fp8 與 I64 資料型別。
+- [tiktoken](https://github.com/openai/tiktoken)：`c/tok.h` 精確地重新實作了它的
+  `byte_pair_encode`，合併串接後詞彙 id 最小的相鄰對，因此源自 tiktoken 的詞彙表不需要 merges 清單。
+- [llama.cpp](https://github.com/ggml-org/llama.cpp)：`c/grammar.h` 中的 GBNF 文法子集遵循它的
+  語法與 set-of-stacks PDA，Metal 路徑也借用了它的 `newBufferWithBytesNoCopy` 常駐技巧。
+- [vLLM](https://github.com/vllm-project/vllm)：引擎逐位置對齊的輸出語意參考（例如最終 norm
+  相對於 LM head 的位置）。
+- [transformers](https://github.com/huggingface/transformers)：oracle；CI 以它為基準逐 token
+  重現一個隨機初始化的模型。
+- [DietGPU](https://github.com/facebookresearch/dietgpu)：實驗性壓縮專家層級（`COLI_ANS`）背後的
+  GPU ANS 編解碼器。
+- [rocWMMA](https://github.com/ROCm/rocWMMA)：HIP 後端把 CUDA 的 `nvcuda::wmma`
+  fragment/mma_sync API 對應到它之上（`c/backend_gpu_compat.h`），這讓同一份 .cu 原始碼可以為
+  兩家廠商編譯。
 
 ## 授權條款
 

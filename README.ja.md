@@ -94,7 +94,7 @@ Starting colibri
 |---|---|
 | ダウンロード中に止まった | 同じコマンドをもう一度実行する：ディスクにすでにあるバイトから再開します |
 | `to use the GPU through ..., first run: <command>` | そのコマンドを実行してから、もう一度セットアップを実行する：GPU 向けにビルドし直し、ダウンロードはやり直しません |
-| CUDA でのビルド中に `the ... build failed`。たとえば、インストールされている CUDA ツールキットがそのカードをもうサポートしていないときの `Unsupported gpu architecture` | `./start-here.sh --backend vulkan` なら Vulkan 経由でカードを使います。`--no-gpu` なら CPU のままです |
+| `the ... build failed`。たとえば、インストールされている CUDA ツールキットがそのカードをもうサポートしていないときの `Unsupported gpu architecture` | セットアップはまずツールキットをカードと照らし合わせてチェックし、自分で Vulkan を選びます（理由も表示します）。それでもビルドが失敗する場合は次の選択肢（Vulkan、その次に CPU）を提示します。`./start-here.sh --backend vulkan` は Vulkan を強制します。`--no-gpu` なら CPU のままです |
 | `needs N GB free for the download` | `--dir` で、より大きなディスク上のフォルダーを指定する |
 | WSL で、モデルのフォルダーが `/mnt/c` の下にある | Linux 側のディスク（デフォルトの `~/colibri-models`）に置く：`/mnt/c` は何倍も遅くなります |
 | それ以外 | `c/coli logs -n 50` でサーバーのログを、`c/coli logs --install` でセットアップのログを表示できます。セットアップが最後に表示した数行を添えて [issue](https://github.com/JustVugg/colibri/issues) を作成してください |
@@ -209,7 +209,7 @@ Mixture-of-Experts モデルは、ディスク上では巨大でも、1 トー�
 
 内蔵 GPU は CPU と RAM を共有しています。内蔵 GPU が節約するのは、保持しているエキスパートの計算とディスク読み込みです。そのため Qwen3.6 のようなモデルでは効果がありますが、OLMoE のようにエキスパートがすでに RAM にある小さなモデルでは、かえって遅くなることがあります。だからセットアップは、内蔵 GPU では Qwen3.6、Qwen3-Coder、Qwen3.8-Flash-Next の場合にだけ Vulkan を有効にし、各エンジンもそこで密チェーンを動かすかどうかを自分で判断します（Qwen3.6 は動かし、Qwen3.8 は動かしません）。それでも Vulkan を使いたい場合は `--backend vulkan` を指定します。
 
-ディスクリート GPU では、セットアップはすべてのエンジンを Vulkan 向けにビルドし（エンジンに CUDA の経路があり、ツールキットがインストールされている場合は CUDA が優先）、密レイヤーをカード上に置きます。これこそこの設計が想定しているケースですが、**まだ計測されていません：エキスパートティアも密チェーンも、ディスクリート GPU ではまだ一度も動かされていません。**（これらより前の、GLM-5.2 の以前の Vulkan 経路は、ディスクリートの RX 9070 で 1.7-1.8 tok/s でデコードしました。）あなたのカードでの数値を歓迎します。
+ディスクリート GPU では、セットアップはすべてのエンジンを Vulkan 向けにビルドし（エンジンに CUDA の経路があり、ツールキットがインストールされている場合は CUDA が優先）、密レイヤーをカード上に置きます。これこそこの設計が想定しているケースです。**私たちはまだディスクリート GPU 自体を計測していません。** 最初の数値はあるユーザーから届いたもので、Tesla V100 16 GB 上の Qwen3.6 がエキスパートティアと密チェーンを使って 17 から 19 tok/s でした（[#1852](https://github.com/JustVugg/colibri/issues/1852)）。（これらより前の、GLM-5.2 の以前の Vulkan 経路は、ディスクリートの RX 9070 で 1.7-1.8 tok/s でデコードしました。）あなたのカードでの数値を歓迎します。
 
 **Resizable BAR のないカード** でも動くようになりました。そうしたカード（すべての Turing カード、発売時のファームウェアのままの Ampere カード、このオプションを無効にした古い AMD カード）では、CPU がカードのメモリに直接書き込めるのは約 256 MB だけです。colibri は現在、ステージングバッファを通して重みを自動でコピーします。この経路は、強制的に使わせる方法と、3 つのデバイスで小さなウィンドウをエミュレートする方法でテストされており、780M では計測できるほどのコストはありません。ただし、Resizable BAR のないカードではまだ計測されていません（[vulkan.md](docs/vulkan.md#memory-placement-without-resizable-bar)）。
 
@@ -221,7 +221,7 @@ Linux で CUDA ツールキットがインストールされている場合、�
 
 - **VRAM エキスパートティア** は、計測されたルーティングから選んだ最もホットなエキスパートをカード上に置きます。ミスしたエキスパートは同時に CPU で計算されます。8 GB のカード 2 枚（RTX 3070 と Quadro RTX 4000）での Qwen3.6 は、履歴が温まった状態で 11.3 tok/s でデコードしました（[qwen36-cuda-tier.md](docs/qwen36-cuda-tier.md)）。全エキスパートを常駐させた RTX 5090 6 枚での GLM-5.2 は 9.0-9.2 tok/s（[benchmarks.md](docs/benchmarks.md)）。RTX 5080 での DeepSeek V4 Flash は 1.5-1.6 tok/s で、3,324 トークンのプロンプトを 90 秒で処理しました（[deepseek-v4.md](docs/deepseek-v4.md)）。
 - **Qwen3.6 の新機能：DeltaNet レイヤーをカード上で実行**（`Q36_DN_GPU=1`、オプトイン）。これまで Qwen3.6 の 30 個の DeltaNet レイヤーはそれぞれ、1 トークンごとに 4 回、カードと CPU の間でデータをコピーしていました。現在はデコード時の 1 トークンがレイヤー全体をカード上で実行し、そのリカレント状態は VRAM に保持されます。密レイヤーを VRAM に置いた RTX 3070 で：25.4 から 30.0 tok/s に向上しました（[qwen36-cuda-tier.md](docs/qwen36-cuda-tier.md#the-deltanet-layer-on-the-card-q36_dn_gpu1)）。
-- **古いカード。** CUDA ツールキットがもうあなたのカード向けにコンパイルできない場合（[#1852](https://github.com/JustVugg/colibri/issues/1852) の CUDA 13 と V100 の例）、ビルドは止まります：その場合は `--backend vulkan` で、代わりに Vulkan 経由でカードを使います。DeepSeek V4 の CUDA ティアは Pascal と Turing 向けにもビルドできます（`CUDA_ARCH=portable-pre-ampere NO_TC=1`）。
+- **古いカード。** CUDA ツールキットがもうあなたのカード向けにコンパイルできない場合（[#1852](https://github.com/JustVugg/colibri/issues/1852) の CUDA 13 と V100 の例）、セットアップはビルドの前にそれを見抜き、理由を示してカードを Vulkan 経由で使います。CUDA 12.x ツールキットがあれば CUDA の経路が戻ります。DeepSeek V4 の CUDA ティアは Pascal と Turing 向けにもビルドできます（`CUDA_ARCH=portable-pre-ampere NO_TC=1`）。
 
 すべての詳細：[docs/cuda.md](docs/cuda.md)。
 
@@ -461,6 +461,50 @@ colibri は、RAM 25 GB の 12 コアのラップトップ上で、1 人のプ�
 ## 謝辞
 
 colibri はエンジンにすぎず、それが動かす知性は贈り物です。重みをオープンに公開しているチーム、**Z.ai**（GLM）、**Moonshot AI**（Kimi）、**Alibaba Qwen**、**DeepSeek**、**Xiaomi**（MiMo）、**Thinking Machines**（Inkling）、**Allen AI**（OLMoE）、**Convai Innovations**（Laya）、**fastino**（GLiNER2.5-Decide）、**Cloudflare**（Clef）に、変換済みコンテナを公開してくれる人々に、そしてベンチマークを取り、バイセクトし、アトラスの実行を再現し、パッチを送ってくれたすべてのコントリビューターに感謝します。このリポジトリに含まれるサードパーティのコードとそのライセンス：[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+このプロジェクトのエキスパート配置、圧縮、ルーティングの実験は、以下のオープンな研究と
+システムのアイデアやエビデンスにも基づいています:
+
+- 出力を考慮した、ドメイン固有のエキスパート重要度については
+  [REAP](https://github.com/CerebrasResearch/reap) と
+  [EASY-EP](https://github.com/RUCAIBox/EASYEP)。
+- 類似度に基づくエキスパートの再ルーティングについては [SERE](https://github.com/JL-Cheng/SERE)、
+  キャッシュ局所性を考慮したルーターのファインチューニングについては
+  [ReMoE](https://github.com/BUAA-OSCAR/ReMoE)。
+- ルーティングに導かれたエキスパートのマージと圧縮については
+  [MC-SMoE](https://github.com/UNITES-Lab/MC-SMoE)。
+- 共有エキスパート基底と低ランクのエキスパート差分については
+  [MoBE](https://github.com/inclusionAI/MoBE) と
+  [D²-MoE](https://github.com/lliai/D2MoE)。
+- CPU/GPU ハイブリッドのエキスパートスケジューリングについては
+  [HybriMoE](https://github.com/PKU-SEC-Lab/HybriMoE)、エキスパート通信と計算のオーバーラップについては
+  [ScMoE](https://arxiv.org/abs/2404.05019)、分散オンデマンドのエキスパートロードについては
+  [OD-MoE](https://arxiv.org/abs/2512.03927)。
+- 比較を再現可能にしているオープンな推論システムとエキスパートオフロードの取り組みについては
+  [vLLM](https://github.com/vllm-project/vllm)、
+  [llama.cpp](https://github.com/ggml-org/llama.cpp)、
+  [kTransformers](https://github.com/kvcache-ai/ktransformers)。
+
+エンジンはアイデアだけでなく、具体的なエンジニアリングの成果の上にも成り立っています。以下はいずれも
+現在ツリー内で使われているか、再実装されています:
+
+- [safetensors](https://github.com/huggingface/safetensors)：すべてのエンジンが読むコンテナ
+  （`c/st.h`）。fp8 と I64 の dtype を含みます。
+- [tiktoken](https://github.com/openai/tiktoken)：`c/tok.h` はその `byte_pair_encode` を
+  正確に再実装しており、連結した結果の語彙 ID が最も小さい隣接ペアをマージするため、
+  tiktoken 由来の語彙にはマージリストが不要です。
+- [llama.cpp](https://github.com/ggml-org/llama.cpp)：`c/grammar.h` の GBNF 文法サブセットは
+  その構文とスタック集合による PDA に従っており、Metal の経路はその
+  `newBufferWithBytesNoCopy` による常駐テクニックを借用しています。
+- [vLLM](https://github.com/vllm-project/vllm)：エンジンが位置ごとに一致させている出力
+  セマンティクスのリファレンス（例: 最終ノルムが LM ヘッドに対してどこに入るか）。
+- [transformers](https://github.com/huggingface/transformers)：オラクル:
+  CI はランダム初期化モデルをこれに対してトークン単位で再現します。
+- [DietGPU](https://github.com/facebookresearch/dietgpu)：実験的な圧縮エキスパートティア
+  （`COLI_ANS`）の背後にある GPU ANS コーデック。
+- [rocWMMA](https://github.com/ROCm/rocWMMA)：HIP バックエンドは CUDA の
+  `nvcuda::wmma` の fragment/mma_sync API をこれにマッピングしており（`c/backend_gpu_compat.h`）、
+  それによって 1 つの .cu ソースを両ベンダー向けにコンパイルできます。
 
 ## ライセンス
 
