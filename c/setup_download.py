@@ -179,6 +179,9 @@ def download_file(url, dest, spec, *, token=None, progress=None, opener=None,
     if have > size:
         os.remove(part)
         have = 0
+    if size == 0:
+        with open(part, "wb"):
+            pass
     hasher, expected = _hasher(spec) if verify else (None, None)
     if hasher is not None and have:
         _feed_prefix(hasher, part, have)

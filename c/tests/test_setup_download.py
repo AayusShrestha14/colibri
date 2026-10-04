@@ -106,6 +106,18 @@ class DownloadTest(unittest.TestCase):
         setup_download.download_repo(REPO, "main", self.dst, files, base=self.hub.base)
         self.assertEqual(len(self.hub.requests), before)
 
+    def test_empty_repository_file_is_completed_and_manifest_is_reusable(self):
+        Path(self.src, "empty.txt").write_bytes(b"")
+        files = self.listing(include=("empty.txt",))
+        self.assertEqual(files[0]["git_oid"], hashlib.sha1(b"blob 0\0").hexdigest())
+        setup_download.download_repo(REPO, "main", self.dst, files, base=self.hub.base)
+        self.assertEqual(Path(self.dst, "empty.txt").read_bytes(), b"")
+        self.assertFalse(Path(self.dst, "empty.txt.part").exists())
+        self.assertTrue(setup_download.is_complete(self.dst))
+        before = len(self.hub.requests)
+        setup_download.download_repo(REPO, "main", self.dst, files, base=self.hub.base)
+        self.assertEqual(len(self.hub.requests), before)
+
     def test_interrupted_download_resumes_with_range(self):
         name = "model-00000.safetensors"
         spec = self.spec(name)
