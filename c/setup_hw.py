@@ -4,7 +4,8 @@
 What it answers, and nothing more: how much RAM there is, how much disk is free
 where the model would go, which CPU features the engine can use, and which GPUs
 are there (Vulkan devices with their type and memory, NVIDIA cards through
-nvidia-smi). It never changes anything on the machine.
+nvidia-smi with their compute capability). It never changes anything on the
+machine.
 
 Every probe is split in two: a function that runs a command or a system call,
 and a pure parser that turns its output into data. The parsers are what the
@@ -320,34 +321,94 @@ def windows_fixed_drives():
 
 # ---------------------------------------------------------------- NVIDIA
 
-NVIDIA_SMI_QUERY = ["--query-gpu=index,name,memory.total,memory.free,driver_version",
-                    "--format=csv,noheader,nounits"]
+#: What the setup asks nvidia-smi, in this order. compute_cap is the card's CUDA
+#: compute capability ("7.0" for a V100): which nvcc can build for the card
+#: depends on it (setup_flow.choose_backend). pci.bus_id ties a row to the CUDA
+#: driver's own device when compute_cap has to come from there.
+NVIDIA_FIELDS = ("index", "name", "memory.total", "memory.free", "driver_version",
+                 "compute_cap", "pci.bus_id")
+#: The same without compute_cap: a driver that predates the field refuses the
+#: whole query and prints no rows, so the setup asks again without it.
+NVIDIA_FIELDS_NO_CC = tuple(f for f in NVIDIA_FIELDS if f != "compute_cap")
 
 
-def parse_nvidia_smi(text):
-    """Rows of `nvidia-smi --query-gpu=index,name,memory.total,memory.free,
-    driver_version --format=csv,noheader,nounits` (MiB). A unified-memory part
-    prints [N/A] for memory: that is None, not zero."""
+def nvidia_smi_query(fields=NVIDIA_FIELDS):
+    return [f"--query-gpu={','.join(fields)}", "--format=csv,noheader,nounits"]
+
+
+NVIDIA_SMI_QUERY = nvidia_smi_query()
+
+
+def parse_nvidia_smi(text, fields=NVIDIA_FIELDS):
+    """Rows of `nvidia-smi --query-gpu=<fields> --format=csv,noheader,nounits`
+    (memory in MiB). A unified-memory part prints [N/A] for memory: that is
+    None, not zero; so is a compute capability the driver does not report.
+    Rows with fewer columns than `fields` (an older query) leave the missing
+    ones None."""
     import csv
     gpus = []
-    for fields in csv.reader((text or "").splitlines()):
-        fields = [f.strip() for f in fields]
-        if len(fields) < 4:
+    for row in csv.reader((text or "").splitlines()):
+        row = [f.strip() for f in row]
+        if len(row) < 4:
             continue
+        values = dict(zip(fields, row))
         try:
-            index = int(fields[0])
-        except ValueError:
+            index = int(values["index"])
+        except (KeyError, ValueError):
             continue
 
         def mib(value):
             try:
                 return int(float(value)) * 1024 * 1024
-            except ValueError:
+            except (TypeError, ValueError):
                 return None
 
-        gpus.append({"index": index, "name": fields[1], "total_bytes": mib(fields[2]),
-                     "free_bytes": mib(fields[3]),
-                     "driver": fields[4] if len(fields) > 4 and fields[4] else None})
+        def known(value):
+            return value if value and not value.startswith("[") else None
+
+        gpus.append({"index": index, "name": values.get("name"),
+                     "total_bytes": mib(values.get("memory.total")),
+                     "free_bytes": mib(values.get("memory.free")),
+                     "driver": known(values.get("driver_version")),
+                     "compute_cap": compute_cap_text(values.get("compute_cap")),
+                     "pci_bus_id": known(values.get("pci.bus_id"))})
+    return gpus
+
+
+def compute_cap_text(value):
+    """A compute capability as "7.0", from nvidia-smi or the CUDA driver; None
+    for [N/A], an empty field or anything that is not major.minor."""
+    match = re.match(r"^\s*(\d+)\.(\d+)\s*$", value or "")
+    return f"{int(match.group(1))}.{int(match.group(2))}" if match else None
+
+
+def compute_cap_sm(value):
+    """The number nvcc names an architecture by: "7.0" -> 70 (compute_70,
+    sm_70), "12.0" -> 120, "10.3" -> 103. None when the capability is unknown."""
+    text = compute_cap_text(value)
+    if text is None:
+        return None
+    major, minor = text.split(".")
+    return int(major) * 10 + int(minor)
+
+
+def pci_bus_key(value):
+    """nvidia-smi writes 00000000:01:00.0, the CUDA driver 0000:01:00.0: the
+    same slot. (domain, bus, device, function) as integers, or None."""
+    match = re.match(r"^\s*([0-9a-fA-F]+):([0-9a-fA-F]+):([0-9a-fA-F]+)\.([0-7])\s*$", value or "")
+    return tuple(int(part, 16) for part in match.groups()) if match else None
+
+
+def fill_compute_caps(gpus, cuda_devices):
+    """Give each nvidia-smi row without a compute capability the one the CUDA
+    driver reports for the same PCI slot. Rows that cannot be matched stay None:
+    an unknown capability is not a guess."""
+    by_slot = {pci_bus_key(d.get("pci_bus_id")): compute_cap_text(d.get("compute_cap"))
+               for d in cuda_devices or []}
+    by_slot.pop(None, None)
+    for gpu in gpus:
+        if gpu.get("compute_cap") is None:
+            gpu["compute_cap"] = by_slot.get(pci_bus_key(gpu.get("pci_bus_id")))
     return gpus
 
 
@@ -363,10 +424,81 @@ def nvidia_smi_path():
 
 
 def detect_nvidia():
+    """The NVIDIA cards, each with its compute capability when anything can tell.
+
+    First nvidia-smi with compute_cap. A driver that does not know that field
+    refuses the whole query, so no rows means asking again without it; then
+    (and for any card printed as [N/A]) the CUDA driver itself is asked, in a
+    child process like the Vulkan probe, and its answer matched by PCI slot."""
     exe = nvidia_smi_path()
     if not exe:
         return []
-    return parse_nvidia_smi(_run([exe] + NVIDIA_SMI_QUERY, timeout=10))
+    gpus = parse_nvidia_smi(_run([exe] + nvidia_smi_query(NVIDIA_FIELDS), timeout=10), NVIDIA_FIELDS)
+    if not gpus:
+        gpus = parse_nvidia_smi(_run([exe] + nvidia_smi_query(NVIDIA_FIELDS_NO_CC), timeout=10),
+                                NVIDIA_FIELDS_NO_CC)
+    if any(gpu.get("compute_cap") is None for gpu in gpus):
+        probe = _probe_cuda_child()
+        if probe:
+            fill_compute_caps(gpus, probe.get("devices"))
+    return gpus
+
+
+def _cuda_driver_library():
+    names = {"win32": ["nvcuda.dll"]}.get(sys.platform, ["libcuda.so.1", "libcuda.so"])
+    for name in names:
+        try:
+            return ctypes.CDLL(name)
+        except OSError:
+            continue
+    return None
+
+
+def _cuda_probe_inprocess():
+    """Compute capability and PCI slot of every device, from the CUDA driver
+    API (the same driver the engine's CUDA runtime talks to)."""
+    lib = _cuda_driver_library()
+    if lib is None:
+        return {"driver": False, "devices": []}
+    c_int = ctypes.c_int
+    if lib.cuInit(0) != 0:
+        return {"driver": True, "devices": []}
+    count = c_int(0)
+    if lib.cuDeviceGetCount(ctypes.byref(count)) != 0:
+        return {"driver": True, "devices": []}
+    devices = []
+    for ordinal in range(count.value):
+        device = c_int(0)
+        if lib.cuDeviceGet(ctypes.byref(device), ordinal) != 0:
+            continue
+        major, minor = c_int(0), c_int(0)
+        # CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75, _MINOR = 76 (cuda.h)
+        lib.cuDeviceGetAttribute(ctypes.byref(major), 75, device)
+        lib.cuDeviceGetAttribute(ctypes.byref(minor), 76, device)
+        bus = ctypes.create_string_buffer(64)
+        name = ctypes.create_string_buffer(256)
+        lib.cuDeviceGetPCIBusId(bus, 64, device)
+        lib.cuDeviceGetName(name, 256, device)
+        devices.append({"name": name.value.decode("utf-8", "replace"),
+                        "pci_bus_id": bus.value.decode("ascii", "replace"),
+                        "compute_cap": f"{major.value}.{minor.value}" if major.value else None})
+    return {"driver": True, "devices": devices}
+
+
+def _probe_cuda_child(timeout=25):
+    try:
+        result = subprocess.run([sys.executable, os.path.join(HERE, "setup_hw.py"), "--cuda-probe"],
+                                capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in reversed(result.stdout.splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except ValueError:
+                return None
+    return None
 
 
 # ---------------------------------------------------------------- Vulkan
@@ -770,6 +902,7 @@ def format_report(report):
         shown = True
     for card in gpu.get("nvidia", []):
         lines.append(f"  GPU     {card['name']} (NVIDIA, {fmt_gb(card.get('total_bytes'))} VRAM"
+                     + (f", compute {card['compute_cap']}" if card.get("compute_cap") else "")
                      + (f", driver {card['driver']}" if card.get("driver") else "") + ")")
         shown = True
     if not shown:
@@ -796,6 +929,12 @@ def main(argv=None):
             print(json.dumps(_vk_probe_inprocess()))
         except Exception as error:  # report, never crash the parent's parse
             print(json.dumps({"loader": False, "error": str(error), "devices": []}))
+        return 0
+    if argv[:1] == ["--cuda-probe"]:
+        try:
+            print(json.dumps(_cuda_probe_inprocess()))
+        except Exception as error:  # same rule as the Vulkan probe
+            print(json.dumps({"driver": False, "error": str(error), "devices": []}))
         return 0
     sys.path.insert(0, HERE)
     targets = [arg for arg in argv if not arg.startswith("--")]

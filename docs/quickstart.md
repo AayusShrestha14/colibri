@@ -40,7 +40,12 @@ Both run `coli setup`, which does the rest:
    prebuilt one (CPU) when there is no compiler. If a package is missing for
    your GPU it prints the exact command to install it and carries on with the
    CPU; nothing is installed system-wide without you. Run the setup again once
-   you have installed it, and it rebuilds the engine for the GPU.
+   you have installed it, and it rebuilds the engine for the GPU. CUDA is used
+   only when the installed CUDA toolkit can build for your card: CUDA 13, for
+   example, no longer builds for Maxwell, Pascal or Volta cards (a V100), so
+   there the setup says so and uses Vulkan. If a GPU build fails anyway, it
+   moves to the next one (CUDA, then Vulkan, then the CPU) and tells you where
+   the build log is.
 4. **Downloads the model** with progress and resume. Interrupt it whenever you
    like: running it again continues where it stopped.
 5. **Starts colibri** and opens the dashboard in your browser, and prints the
@@ -98,7 +103,8 @@ download through Windows' `curl.exe` into the same folder.
 Useful options (`c/coli setup --help` lists them all): `--yes` takes every
 default without asking, `--model ID` picks a model (`--list` shows the ids
 against your machine), `--dir DIR` puts the models elsewhere, `--no-gpu` keeps
-everything on the CPU, `--model-dir DIR` uses a model you already have.
+everything on the CPU, `--backend vulkan` (or `cuda`) picks the GPU path
+yourself, `--model-dir DIR` uses a model you already have.
 
 The rest of this page is the same thing done by hand, step by step.
 

@@ -42,6 +42,15 @@ NVIDIA_SMI = """0, NVIDIA GeForce RTX 4070, 12282, 11520, 560.94
 garbage line
 """
 
+# The query with compute_cap and pci.bus_id (setup_hw.NVIDIA_FIELDS): a V100 as
+# in #1852, an RTX 3090, a GB10 whose memory is unified, and a card the driver
+# gives no compute capability for.
+NVIDIA_SMI_CC = """0, Tesla V100-SXM2-16GB, 16384, 16144, 580.178.04, 7.0, 00000000:1A:00.0
+1, NVIDIA GeForce RTX 3090, 24576, 24253, 580.65, 8.6, 00000000:68:00.0
+2, NVIDIA GB10, [N/A], [N/A], 580.65, 12.1, 0000000F:01:00.0
+3, Some Card, 8192, 8000, 580.65, [N/A], 00000000:B1:00.0
+"""
+
 VULKANINFO_SUMMARY = """==========
 VULKANINFO
 ==========
@@ -219,6 +228,130 @@ class NvidiaParsing(unittest.TestCase):
     def test_empty(self):
         self.assertEqual(setup_hw.parse_nvidia_smi(""), [])
 
+    def test_compute_capability_and_slot(self):
+        gpus = setup_hw.parse_nvidia_smi(NVIDIA_SMI_CC)
+        self.assertEqual([g["compute_cap"] for g in gpus], ["7.0", "8.6", "12.1", None])
+        self.assertEqual(gpus[0]["name"], "Tesla V100-SXM2-16GB")
+        self.assertEqual(gpus[0]["total_bytes"], 16384 * 2**20)
+        self.assertEqual(gpus[0]["driver"], "580.178.04")
+        self.assertEqual(gpus[0]["pci_bus_id"], "00000000:1A:00.0")
+        self.assertIsNone(gpus[2]["total_bytes"])                 # GB10: unified memory
+        self.assertEqual(setup_hw.compute_cap_sm(gpus[0]["compute_cap"]), 70)
+        self.assertEqual(setup_hw.compute_cap_sm("12.0"), 120)
+        self.assertEqual(setup_hw.compute_cap_sm("10.3"), 103)
+        self.assertIsNone(setup_hw.compute_cap_sm("[N/A]"))
+        self.assertIsNone(setup_hw.compute_cap_sm(None))
+
+    def test_the_old_query_has_no_compute_capability(self):
+        gpus = setup_hw.parse_nvidia_smi("0, Tesla V100-SXM2-16GB, 16384, 16144, 470.256.02, "
+                                         "00000000:1A:00.0\n", setup_hw.NVIDIA_FIELDS_NO_CC)
+        self.assertIsNone(gpus[0]["compute_cap"])
+        self.assertEqual(gpus[0]["pci_bus_id"], "00000000:1A:00.0")
+
+    def test_the_query_asks_for_the_compute_capability(self):
+        self.assertEqual(setup_hw.NVIDIA_SMI_QUERY,
+                         ["--query-gpu=index,name,memory.total,memory.free,driver_version,"
+                          "compute_cap,pci.bus_id", "--format=csv,noheader,nounits"])
+        self.assertNotIn("compute_cap", setup_hw.nvidia_smi_query(setup_hw.NVIDIA_FIELDS_NO_CC)[0])
+
+    def run_detect(self, answers, exe, probe=None):
+        """detect_nvidia with nvidia-smi answering `answers` by query, and the
+        CUDA driver probe answering `probe`."""
+        seen = []
+
+        def run(cmd, timeout=10):
+            seen.append(cmd)
+            return answers.get(cmd[1], "")
+
+        with mock.patch.object(setup_hw, "nvidia_smi_path", return_value=exe), \
+             mock.patch.object(setup_hw, "_run", side_effect=run), \
+             mock.patch.object(setup_hw, "_probe_cuda_child", return_value=probe) as child:
+            gpus = setup_hw.detect_nvidia()
+        return gpus, seen, child
+
+    def test_detect_on_linux_windows_and_wsl(self):
+        """The same query through every nvidia-smi the setup finds: the Linux
+        one, Windows' nvidia-smi.exe and the one WSL maps in."""
+        query = setup_hw.nvidia_smi_query()[0]
+        for exe in ("/usr/bin/nvidia-smi", r"C:\Windows\System32\nvidia-smi.exe",
+                    "/usr/lib/wsl/lib/nvidia-smi"):
+            with self.subTest(exe=exe):
+                gpus, seen, child = self.run_detect({query: NVIDIA_SMI_CC.splitlines()[0] + "\n"}, exe)
+                self.assertEqual(seen[0][:2], [exe, query])
+                self.assertEqual(len(seen), 1)
+                self.assertEqual(gpus[0]["compute_cap"], "7.0")
+                child.assert_not_called()                         # nvidia-smi answered
+
+    def test_an_old_driver_is_asked_again_and_the_cuda_driver_fills_in(self):
+        query = setup_hw.nvidia_smi_query()[0]
+        old_query = setup_hw.nvidia_smi_query(setup_hw.NVIDIA_FIELDS_NO_CC)[0]
+        # A driver that does not know the field: an error instead of rows (the
+        # wording does not matter, no row parses).
+        answers = {query: 'Field "compute_cap" is not a valid field to query.\n\n',
+                   old_query: ("0, Tesla V100-SXM2-16GB, 16384, 16144, 470.256.02, 00000000:1A:00.0\n"
+                               "1, Tesla P40, 22919, 22800, 470.256.02, 00000000:3B:00.0\n")}
+        probe = {"driver": True, "devices": [
+            {"name": "Tesla P40", "pci_bus_id": "0000:3B:00.0", "compute_cap": "6.1"},
+            {"name": "Tesla V100-SXM2-16GB", "pci_bus_id": "0000:1a:00.0", "compute_cap": "7.0"}]}
+        gpus, seen, child = self.run_detect(answers, "/usr/bin/nvidia-smi", probe)
+        self.assertEqual([cmd[1] for cmd in seen], [query, old_query])
+        child.assert_called_once()
+        self.assertEqual([(g["name"], g["compute_cap"]) for g in gpus],
+                         [("Tesla V100-SXM2-16GB", "7.0"), ("Tesla P40", "6.1")])   # matched by slot
+        # No driver to ask: unknown, not a guess.
+        gpus, _seen, _child = self.run_detect(answers, "/usr/bin/nvidia-smi", None)
+        self.assertEqual([g["compute_cap"] for g in gpus], [None, None])
+
+    def test_pci_slots_in_both_spellings(self):
+        self.assertEqual(setup_hw.pci_bus_key("00000000:1A:00.0"), setup_hw.pci_bus_key("0000:1a:00.0"))
+        self.assertNotEqual(setup_hw.pci_bus_key("00000000:1A:00.0"), setup_hw.pci_bus_key("0000:1b:00.0"))
+        self.assertIsNone(setup_hw.pci_bus_key("[N/A]"))
+
+    def test_the_cuda_driver_probe(self):
+        """_cuda_probe_inprocess against a stand-in for libcuda/nvcuda.dll: the
+        attribute numbers are the compute capability's (75, 76 in cuda.h)."""
+        cards = [("Tesla V100-SXM2-16GB", "0000:1A:00.0", 7, 0), ("NVIDIA GeForce RTX 3090", "0000:68:00.0", 8, 6)]
+
+        class Driver:
+            def cuInit(self, flags):
+                return 0
+
+            def cuDeviceGetCount(self, count):
+                count._obj.value = len(cards)
+                return 0
+
+            def cuDeviceGet(self, device, ordinal):
+                device._obj.value = ordinal
+                return 0
+
+            def cuDeviceGetAttribute(self, value, attribute, device):
+                value._obj.value = {75: cards[device.value][2], 76: cards[device.value][3]}[attribute]
+                return 0
+
+            def cuDeviceGetPCIBusId(self, buffer, size, device):
+                buffer.value = cards[device.value][1].encode()
+                return 0
+
+            def cuDeviceGetName(self, buffer, size, device):
+                buffer.value = cards[device.value][0].encode()
+                return 0
+
+        with mock.patch.object(setup_hw, "_cuda_driver_library", return_value=Driver()):
+            probe = setup_hw._cuda_probe_inprocess()
+        self.assertEqual(probe["devices"], [
+            {"name": "Tesla V100-SXM2-16GB", "pci_bus_id": "0000:1A:00.0", "compute_cap": "7.0"},
+            {"name": "NVIDIA GeForce RTX 3090", "pci_bus_id": "0000:68:00.0", "compute_cap": "8.6"}])
+        with mock.patch.object(setup_hw, "_cuda_driver_library", return_value=None):
+            self.assertEqual(setup_hw._cuda_probe_inprocess(), {"driver": False, "devices": []})
+
+    def test_the_child_probe_reads_the_last_json_line(self):
+        done = mock.Mock(stdout='driver noise\n{"driver": true, "devices": [{"compute_cap": "7.0"}]}\n')
+        with mock.patch.object(setup_hw.subprocess, "run", return_value=done) as run:
+            self.assertEqual(setup_hw._probe_cuda_child()["devices"], [{"compute_cap": "7.0"}])
+        self.assertEqual(run.call_args[0][0][-1], "--cuda-probe")
+        with mock.patch.object(setup_hw.subprocess, "run", side_effect=OSError("no python")):
+            self.assertIsNone(setup_hw._probe_cuda_child())
+
 
 class VulkanParsing(unittest.TestCase):
     def test_vulkaninfo_summary(self):
@@ -339,6 +472,18 @@ class Report(unittest.TestCase):
                       "Iris Xe via Vulkan", "integrated, shares RAM", "NVIDIA RTX 4070", "WSL2",
                       "/home/u/dzn.json"):
             self.assertIn(piece, text)
+
+    def test_the_report_names_the_compute_capability(self):
+        card = setup_hw.parse_nvidia_smi(NVIDIA_SMI_CC)[0]
+        report = {"os": {"platform": "linux", "pretty_name": "Ubuntu 26.04.1 LTS"},
+                  "cpu": {"name": "Test CPU", "features": [], "logical_cores": 16},
+                  "memory": {"total": 31.6e9, "available": 24.1e9}, "disk": None,
+                  "vulkan": {"devices": []}, "nvidia": [card], "windows_video": [],
+                  "gpu": setup_hw.gpu_summary({"devices": []}, [card, dict(card, compute_cap=None)])}
+        lines = setup_hw.format_report(report).splitlines()
+        self.assertIn("  GPU     Tesla V100-SXM2-16GB (NVIDIA, 17.2 GB VRAM, compute 7.0, "
+                      "driver 580.178.04)", lines)
+        self.assertIn("  GPU     Tesla V100-SXM2-16GB (NVIDIA, 17.2 GB VRAM, driver 580.178.04)", lines)
 
     def test_detect_without_gpu_probe_is_plain_data(self):
         import json

@@ -54,7 +54,8 @@ python3 c/coli setup --list --json       # every model against this machine
 `cpu.features`, `gpu.vulkan` (the Vulkan device the engine would use, with its
 `type`, `integrated` or `discrete`, and `budget_bytes` or `device_local_bytes`),
 `gpu.vulkan_icd` (a driver manifest found under the home folder, typical on
-WSL) and `gpu.nvidia` (from nvidia-smi).
+WSL) and `gpu.nvidia` (from nvidia-smi, each card with its `compute_cap`,
+for example `7.0`, or null when nothing reported it).
 
 `setup --list --json` returns one object per model:
 
@@ -84,15 +85,10 @@ Non-interactive, with the model the user chose:
 python3 c/coli setup --yes --model qwen36-35b --no-start
 ```
 
-What it does, in order: detects the hardware, picks the engine build (CUDA
-for an NVIDIA card when the CUDA toolkit is installed and the engine has a
-CUDA path, else Vulkan when a Vulkan GPU answered and the Vulkan headers and
-`glslc` are installed, else the CPU; on an integrated GPU, which shares the
-CPU's RAM, Vulkan only for the engines measured faster there, today Qwen3.6,
-Qwen3-Coder and Qwen3.8, unless `--backend vulkan` asks for it), builds or
-fetches the engine, downloads
-the model with resume, runs the planner on the files, and writes the run
-configuration. It prints each step.
+What it does, in order: detects the hardware, picks the engine build (see
+[How the engine build is chosen](#how-the-engine-build-is-chosen)), builds or
+fetches the engine, downloads the model with resume, runs the planner on the
+files, and writes the run configuration. It prints each step.
 
 The download can take hours. If your command runner has a time limit, start
 it detached and poll the status instead of waiting:
@@ -129,7 +125,7 @@ rerun the same setup command.
 | `--model ID` | the model to install (ids from `--list`) |
 | `--model-dir DIR` | use a model already on disk instead of downloading |
 | `--dir DIR` | where models are downloaded (default `~/colibri-models`) |
-| `--backend auto\|cpu\|vulkan\|cuda` | force the engine build; `--no-gpu` is `--backend cpu` |
+| `--backend auto\|cpu\|vulkan\|cuda` | force the engine build (`auto`: see below); `--no-gpu` is `--backend cpu` |
 | `--host H`, `--port N` | where the server listens (default `127.0.0.1:8000`) |
 | `--no-start` | stop after writing the configuration |
 | `--background` | start the server detached at the end |
@@ -139,6 +135,48 @@ rerun the same setup command.
 | `--via-windows auto\|yes\|no` | WSL only: download through Windows' `curl.exe` |
 | `--no-verify` | skip the checksums of downloaded files |
 | `--json` | machine-readable result (implies `--yes` and a background start) |
+
+### How the engine build is chosen
+
+With `--backend auto` (the default):
+
+1. **CUDA**, for an NVIDIA card, when all of these hold:
+   - the engine has a CUDA path on Linux: Qwen3.6 (with Qwen3-Coder and
+     Qwen3.8-27B), Qwen3.8 Flash Next, GLM-5.2/5.3 (the `colibri` engine; not
+     GLM-5.3-Flash), Kimi K3, Inkling and DeepSeek V4 Flash;
+   - a CUDA toolkit (`nvcc`) is installed;
+   - the toolkit builds for every NVIDIA card here. The card's compute
+     capability comes from `nvidia-smi` (`gpu.nvidia[].compute_cap` in
+     `setup_hw.py --json`, for example `7.0` for a V100). The toolkit's list
+     comes from `nvcc --list-gpu-arch`, or from its version for an nvcc too
+     old to answer. CUDA 13 dropped Maxwell, Pascal and Volta (compute 5.x to
+     7.2), and Blackwell (compute 12.0) needs CUDA 12.8 or newer;
+   - the engine's own CUDA code supports the card and the toolkit.
+     DeepSeek V4 Flash needs compute 6.0 or newer and CUDA 12.0 or newer, and
+     below CUDA 12.8 the setup builds it with `NO_TC=1`.
+2. **Vulkan**, when a Vulkan GPU answered and the Vulkan headers and `glslc`
+   are installed. On an integrated GPU, which shares the CPU's RAM, only the
+   engines measured faster there (today Qwen3.6, Qwen3-Coder and Qwen3.8)
+   use it, unless `--backend vulkan` asks for it.
+3. **The CPU** otherwise.
+
+When the toolkit cannot build for the card, the setup does not try. It says
+why and what to install, and takes the next backend:
+
+```
+Engine: qwen36 with VULKAN (the CUDA 13.0 toolkit cannot build for the Tesla V100-SXM2-16GB (compute 7.0, dropped in CUDA 13): using Vulkan; install a CUDA 12.x toolkit for the CUDA path)
+```
+
+With `--backend cuda` the same check stops the setup before any build, with
+the same reason. `--backend auto` then takes the next backend.
+
+If a build still fails, the setup prints the end of the log and the log's
+path, then moves to the next backend: CUDA, then Vulkan, then the CPU. With
+someone at the terminal it asks first; with `--yes` it goes ahead. A setup
+resumed later does not retry a backend whose build failed. A failed CPU build
+stops the setup. Each backend has its own log, `logs/build-cuda.log`,
+`logs/build-vulkan.log` or `logs/build-cpu.log`, so the log of the failed
+build is still there after the fallback.
 
 ### When a GPU package is missing
 
@@ -225,7 +263,7 @@ Linux, `~/Library/Application Support/colibri` on macOS,
 |---|---|
 | `setup.json` | the run configuration: model, engine, backend, environment, launcher arguments, URLs |
 | `install-state.json` | phase and progress of the current or last install |
-| `logs/serve.log`, `logs/install.log`, `logs/build.log` | logs |
+| `logs/serve.log`, `logs/install.log`, `logs/build-<backend>.log` | logs (one build log per backend: `cuda`, `vulkan`, `cpu`) |
 | `runtime/` | a prebuilt release, when there is no compiler |
 
 The model folder holds `.colibri-download.json`, which lists the files and
@@ -242,6 +280,8 @@ says when the download is complete. Partial files end in `.part`.
 | `checksum mismatch` | the partial file was removed; rerun |
 | `needs N GB free for the download` | pass `--dir` with a folder on a bigger disk |
 | `the published release ... predates <model>` | there is no compiler and the last release cannot run that model: install the compiler (the message names the command) or pick another model |
+| `... toolkit cannot build for the <card> (compute X.Y, ...)` | the setup took Vulkan or the CPU; for CUDA, install the toolkit the line names and rerun with `--reconfigure` |
+| `the <engine> CUDA build failed (full log: ...)` | the setup moved to the next backend; the log says why the CUDA build failed |
 | `Already set up: ...` but the user wants another model | `--reconfigure`, or `--model ID` |
 | `server.state` stays `loading` | `coli logs -n 50`; large models take minutes to load |
 | `plan warning: RAM budget cannot hold one expert slot` | the model does not fit in the free RAM: close programs or choose a smaller model |
