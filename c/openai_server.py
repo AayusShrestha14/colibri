@@ -5969,6 +5969,15 @@ class APIServer(ThreadingHTTPServer):
         super().close_request(request)
 
 
+def _content_length(value):
+    # int() also accepts signs and underscores, but HTTP lengths are 1*DIGIT.
+    # Read and early-error drain must agree on that exact framing grammar.
+    value = value.strip()
+    if re.fullmatch(r"[0-9]+", value) is None:
+        raise ValueError("invalid Content-Length")
+    return int(value)
+
+
 class _DeadlineReader:
     """rfile wrapper enforcing a CUMULATIVE deadline on reading one request.
 
@@ -6107,11 +6116,12 @@ class APIHandler(BaseHTTPRequestHandler):
         if self._body_read:
             return
         self._body_read = True
-        if self.headers.get("Transfer-Encoding"):
+        if (self.headers.get_all("Transfer-Encoding")
+                or len(self.headers.get_all("Content-Length", [])) > 1):
             self.close_connection = True   # not framed by Content-Length; we don't de-chunk
             return
         try:
-            remaining = int(self.headers.get("Content-Length", "0"))
+            remaining = _content_length(self.headers.get("Content-Length", "0"))
         except ValueError:
             self.close_connection = True   # unparseable framing: the body length is unknown
             return
@@ -6209,9 +6219,20 @@ class APIHandler(BaseHTTPRequestHandler):
                 None, "forbidden")
 
     def read_json(self):
+        # No transfer decoder lives here: accepting TE+CL would choose CL even
+        # though HTTP gives TE precedence. Multiple CL fields are likewise not
+        # a boundary we should guess. Refuse before engine work and never reuse
+        # the connection after an ambiguous frame (RFC 9112 section 6.3).
+        if self.headers.get_all("Transfer-Encoding"):
+            self.close_connection = True
+            raise APIError(400, "Transfer-Encoding is not supported; send one Content-Length.")
+        if len(self.headers.get_all("Content-Length", [])) > 1:
+            self.close_connection = True
+            raise APIError(400, "Multiple Content-Length headers are not supported.")
         try:
-            length = int(self.headers.get("Content-Length", "0"))
+            length = _content_length(self.headers.get("Content-Length", "0"))
         except ValueError:
+            self.close_connection = True
             raise APIError(400, "Invalid Content-Length header.")
         if length < 1 or length > MAX_BODY:
             raise APIError(400, f"Request body must be between 1 and {MAX_BODY} bytes.")
