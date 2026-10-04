@@ -17,6 +17,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -39,6 +40,7 @@ import setup_catalog  # noqa: E402
 import setup_download  # noqa: E402
 import setup_flow  # noqa: E402
 import setup_hw  # noqa: E402
+import family_registry  # noqa: E402
 from fake_hub import FakeHub  # noqa: E402
 from family_registry import family_by_id  # noqa: E402
 
@@ -211,6 +213,294 @@ class BackendChoice(unittest.TestCase):
         self.assertIn("mingw-w64-ucrt-x86_64-gcc", hint)
         self.assertIn("mingw-w64-ucrt-x86_64-shaderc", hint)
         self.assertIn("source checkout", hint)      # a release archive cannot rebuild itself
+
+
+#: What NVIDIA's own nvcc prints, measured: 11.x and 12.x from the
+#: redistributable archives (developer.download.nvidia.com/compute/cuda/redist/
+#: cuda_nvcc/linux-x86_64/cuda_nvcc-linux-x86_64-<version>-archive.tar.xz), 13.x
+#: from NVIDIA's nvidia-cuda-nvcc wheels. The release line of `nvcc --version`, and
+#: `nvcc --list-gpu-arch` with its one-per-line output joined by spaces. The
+#: order is nvcc's own (13.x does not sort).
+NVCC_SAMPLES = {
+    "11.4.152": ("Cuda compilation tools, release 11.4, V11.4.152",
+                 "compute_35 compute_37 compute_50 compute_52 compute_53 compute_60 compute_61 compute_62 "
+                 "compute_70 compute_72 compute_75 compute_80 compute_86 compute_87"),
+    "11.8.89": ("Cuda compilation tools, release 11.8, V11.8.89",
+                "compute_35 compute_37 compute_50 compute_52 compute_53 compute_60 compute_61 compute_62 "
+                "compute_70 compute_72 compute_75 compute_80 compute_86 compute_87 compute_89 compute_90"),
+    "12.0.140": ("Cuda compilation tools, release 12.0, V12.0.140",
+                 "compute_50 compute_52 compute_53 compute_60 compute_61 compute_62 compute_70 compute_72 "
+                 "compute_75 compute_80 compute_86 compute_87 compute_89 compute_90"),
+    "12.6.85": ("Cuda compilation tools, release 12.6, V12.6.85",
+                "compute_50 compute_52 compute_53 compute_60 compute_61 compute_62 compute_70 compute_72 "
+                "compute_75 compute_80 compute_86 compute_87 compute_89 compute_90"),
+    "12.8.93": ("Cuda compilation tools, release 12.8, V12.8.93",
+                "compute_50 compute_52 compute_53 compute_60 compute_61 compute_62 compute_70 compute_72 "
+                "compute_75 compute_80 compute_86 compute_87 compute_89 compute_90 compute_100 compute_101 "
+                "compute_120"),
+    "12.9.86": ("Cuda compilation tools, release 12.9, V12.9.86",
+                "compute_50 compute_52 compute_53 compute_60 compute_61 compute_62 compute_70 compute_72 "
+                "compute_75 compute_80 compute_86 compute_87 compute_89 compute_90 compute_100 compute_101 "
+                "compute_103 compute_120 compute_121"),
+    "13.0.88": ("Cuda compilation tools, release 13.0, V13.0.88",
+                "compute_75 compute_80 compute_86 compute_87 compute_88 compute_89 compute_90 compute_100 "
+                "compute_110 compute_103 compute_120 compute_121"),
+    "13.4.92": ("Cuda compilation tools, release 13.4, V13.4.92",
+                "compute_75 compute_80 compute_86 compute_87 compute_88 compute_89 compute_90 compute_100 "
+                "compute_110 compute_103 compute_120 compute_121 compute_107"),
+}
+#: `nvcc --version` in full (13.0.88), and an option nvcc does not know (11.4.152).
+NVCC_VERSION_13 = """nvcc: NVIDIA (R) Cuda compiler driver
+Copyright (c) 2005-2025 NVIDIA Corporation
+Built on Wed_Aug_20_01:58:59_PM_PDT_2025
+Cuda compilation tools, release 13.0, V13.0.88
+Build cuda_13.0.r13.0/compiler.36424714_0
+"""
+NVCC_UNKNOWN_OPTION = "nvcc fatal   : Unknown option '--list-gpu-foo'\n"
+
+
+def nvcc_toolkit(version):
+    """The toolchain fields toolchain() fills from that nvcc's real output."""
+    release, archs = NVCC_SAMPLES[version]
+    return {"cuda_version": "%d.%d" % setup_flow.parse_nvcc_version(release),
+            "cuda_archs": setup_flow.parse_nvcc_arch_list(archs.replace(" ", "\n") + "\n")}
+
+
+V100 = {"index": 0, "name": "Tesla V100-SXM2-16GB", "total_bytes": 16384 * 2**20,
+        "free_bytes": 16144 * 2**20, "driver": "580.178.04", "compute_cap": "7.0"}
+V100_VK = {"name": "Tesla V100-SXM2-16GB", "type": "discrete", "api_version": "1.4.312",
+           "api_version_raw": (1 << 22) | (4 << 12) | 312}
+RTX3090 = {"index": 0, "name": "NVIDIA GeForce RTX 3090", "total_bytes": 24576 * 2**20,
+           "free_bytes": 23000 * 2**20, "driver": "580.65", "compute_cap": "8.6"}
+RTX5080 = {"index": 0, "name": "NVIDIA GeForce RTX 5080", "total_bytes": 16303 * 2**20,
+           "free_bytes": 15000 * 2**20, "driver": "580.65", "compute_cap": "12.0"}
+GTX970 = {"index": 0, "name": "NVIDIA GeForce GTX 970", "total_bytes": 4096 * 2**20,
+          "free_bytes": 3900 * 2**20, "driver": "535.183", "compute_cap": "5.2"}
+
+
+class CudaToolkit(unittest.TestCase):
+    """What nvcc says it builds for, from its real output."""
+
+    def test_list_gpu_arch(self):
+        for version, (release, archs) in NVCC_SAMPLES.items():
+            with self.subTest(nvcc=version):
+                parsed = setup_flow.parse_nvcc_arch_list(archs.replace(" ", "\n") + "\n")
+                self.assertEqual(parsed, sorted(int(a.split("_")[1]) for a in archs.split()))
+                self.assertEqual(setup_flow.parse_nvcc_version(release),
+                                 tuple(int(p) for p in version.split(".")[:2]))
+        self.assertNotIn(70, nvcc_toolkit("13.0.88")["cuda_archs"])      # Volta is gone in 13
+        self.assertIn(70, nvcc_toolkit("12.9.86")["cuda_archs"])
+        self.assertNotIn(120, nvcc_toolkit("12.6.85")["cuda_archs"])     # Blackwell needs 12.8
+        self.assertEqual(setup_flow.parse_nvcc_version(NVCC_VERSION_13), (13, 0))
+
+    def test_an_nvcc_without_the_option_lists_nothing(self):
+        self.assertIsNone(setup_flow.parse_nvcc_arch_list(NVCC_UNKNOWN_OPTION))
+        self.assertIsNone(setup_flow.parse_nvcc_arch_list(""))
+        self.assertIsNone(setup_flow.parse_nvcc_version(""))
+
+    def test_the_release_table_matches_what_nvcc_lists(self):
+        """Each measured nvcc's oldest and newest architecture is its row of
+        CUDA_RELEASES, which answers for an nvcc that cannot list them."""
+        for version in NVCC_SAMPLES:
+            with self.subTest(nvcc=version):
+                archs = nvcc_toolkit(version)["cuda_archs"]
+                bounds = setup_flow._release_bounds(tuple(int(p) for p in version.split(".")[:2]))
+                self.assertEqual(bounds, (min(archs), max(archs)))
+
+    def test_the_version_answers_when_the_list_does_not(self):
+        old = {"cuda_version": "10.2", "cuda_archs": None}
+        self.assertTrue(setup_flow.toolkit_builds(old, 70))
+        self.assertFalse(setup_flow.toolkit_builds(old, 80))
+        self.assertFalse(setup_flow.toolkit_builds({"cuda_version": "13.1", "cuda_archs": None}, 70))
+        self.assertIsNone(setup_flow.toolkit_builds({"cuda_version": None, "cuda_archs": None}, 70))
+        self.assertIsNone(setup_flow.toolkit_builds({"cuda_version": "8.0", "cuda_archs": None}, 60))
+        self.assertIsNone(setup_flow.toolkit_builds(nvcc_toolkit("13.0.88"), None))  # card unknown
+
+    def test_what_to_install(self):
+        advice = setup_flow.cuda_release_advice
+        self.assertEqual(advice(70, (13, 0)), ("dropped in CUDA 13", "install a CUDA 12.x toolkit"))
+        self.assertEqual(advice(61, (13, 2)), ("dropped in CUDA 13", "install a CUDA 12.x toolkit"))
+        self.assertEqual(advice(37, (12, 6)), ("dropped in CUDA 12", "install a CUDA 11.x toolkit"))
+        self.assertEqual(advice(120, (12, 6)), ("needs CUDA 12.8 or newer", "install CUDA 12.8 or newer"))
+        self.assertEqual(advice(121, (12, 8)), ("needs CUDA 12.9 or newer", "install CUDA 12.9 or newer"))
+        self.assertIn("compute_200", advice(200, (13, 0))[1])
+
+    def test_cuda_toolkit_runs_nvcc(self):
+        release, archs = NVCC_SAMPLES["13.0.88"]
+        answers = {"--version": NVCC_VERSION_13, "--list-gpu-arch": archs.replace(" ", "\n") + "\n"}
+        with mock.patch.object(setup_hw, "_run", side_effect=lambda cmd, timeout=10: answers[cmd[1]]):
+            info = setup_flow.cuda_toolkit("/usr/local/cuda/bin/nvcc")
+        self.assertEqual(info, {"cuda_version": "13.0", "cuda_archs": nvcc_toolkit("13.0.88")["cuda_archs"]})
+        answers["--list-gpu-arch"] = NVCC_UNKNOWN_OPTION          # an nvcc without the option
+        with mock.patch.object(setup_hw, "_run", side_effect=lambda cmd, timeout=10: answers[cmd[1]]):
+            self.assertIsNone(setup_flow.cuda_toolkit("nvcc")["cuda_archs"])
+
+
+class CudaBackendChoice(unittest.TestCase):
+    """#1852: a CUDA toolkit is there, but it has to build for the card."""
+
+    def choose(self, nvidia, toolkit, family="qwen36", vulkan=None, requested="auto", tc=None):
+        tc = dict(tc or TC_ALL, **(nvcc_toolkit(toolkit) if toolkit else {}))
+        with modeled("linux"):
+            return setup_flow.choose_backend(hw_report(vulkan=vulkan, nvidia=nvidia),
+                                             family_by_id(family), tc, requested)
+
+    def test_v100_with_cuda_13_takes_vulkan_and_says_why(self):
+        decision = self.choose([V100], "13.0.88", vulkan=V100_VK)
+        self.assertEqual(decision["backend"], "vulkan")
+        self.assertEqual(decision["reason"],
+                         "the CUDA 13.0 toolkit cannot build for the Tesla V100-SXM2-16GB (compute 7.0, "
+                         "dropped in CUDA 13): using Vulkan; install a CUDA 12.x toolkit for the CUDA path")
+        self.assertEqual(decision["missing"][0][0], "cuda")
+        self.assertIn("CUDA 12.x", decision["missing"][0][1])
+        self.assertIn(setup_flow.CUDA_ARCHIVE_URL, decision["missing"][0][1])
+
+    def test_v100_with_cuda_12_takes_cuda(self):
+        for toolkit in ("12.0.140", "12.6.85", "12.9.86", "11.8.89"):
+            with self.subTest(nvcc=toolkit):
+                decision = self.choose([V100], toolkit, vulkan=V100_VK)
+                self.assertEqual(decision["backend"], "cuda")
+                self.assertEqual(decision["make_args"], [])
+                self.assertIn("compute 7.0", decision["reason"])
+
+    def test_rtx_30_with_cuda_13_takes_cuda(self):
+        for toolkit in ("13.0.88", "13.4.92"):
+            with self.subTest(nvcc=toolkit):
+                decision = self.choose([RTX3090], toolkit)
+                self.assertEqual(decision["backend"], "cuda")
+                self.assertEqual(decision["gpu"], "NVIDIA GeForce RTX 3090")
+
+    def test_a_card_newer_than_the_toolkit(self):
+        decision = self.choose([RTX5080], "12.6.85")
+        self.assertEqual(decision["backend"], "cpu")            # no Vulkan GPU here
+        self.assertIn("needs CUDA 12.8 or newer", decision["reason"])
+        self.assertIn("using the CPU", decision["reason"])
+        self.assertEqual(decision["missing"][0][0], "cuda")
+        self.assertEqual(self.choose([RTX5080], "12.8.93")["backend"], "cuda")
+
+    def test_explicit_cuda_stops_before_building(self):
+        with self.assertRaises(setup_flow.SetupError) as caught:
+            self.choose([V100], "13.0.88", vulkan=V100_VK, requested="cuda")
+        self.assertEqual(str(caught.exception),
+                         "the CUDA 13.0 toolkit cannot build for the Tesla V100-SXM2-16GB (compute 7.0, "
+                         "dropped in CUDA 13): install a CUDA 12.x toolkit for the CUDA path, or run "
+                         "with --backend auto to use Vulkan")
+        with self.assertRaises(setup_flow.SetupError) as caught:
+            self.choose([V100], "13.0.88", requested="cuda")      # no Vulkan GPU: the CPU
+        self.assertIn("--backend auto to use the CPU", str(caught.exception))
+        # A toolkit that does build for the card is taken as asked.
+        self.assertEqual(self.choose([V100], "12.6.85", requested="cuda")["backend"], "cuda")
+
+    def test_every_card_has_to_be_buildable(self):
+        """-arch=native builds for every card nvcc sees and stops at the first
+        it cannot: a V100 next to an RTX 3090 stops CUDA 13 too."""
+        second = dict(V100, index=1)
+        decision = self.choose([RTX3090, second], "13.0.88")
+        self.assertNotEqual(decision["backend"], "cuda")
+        self.assertIn("Tesla V100", decision["reason"])
+
+    def test_unknown_is_not_a_no(self):
+        """No compute capability (an old driver, no CUDA probe) or a toolkit
+        that said nothing: CUDA as before; a failed build falls back later."""
+        unknown_card = dict(V100, compute_cap=None)
+        self.assertEqual(self.choose([unknown_card], "13.0.88")["backend"], "cuda")
+        self.assertEqual(self.choose([V100], None)["backend"], "cuda")
+
+    def test_deepseek_v4_needs_compute_6_and_cuda_12(self):
+        decision = self.choose([GTX970], "12.6.85", family="deepseek_v4")
+        self.assertEqual(decision["backend"], "cpu")
+        self.assertIn("DeepSeek V4 Flash's CUDA tier runs on compute 6.0 and newer", decision["reason"])
+        self.assertEqual(decision["missing"], [])           # no toolkit would change that
+        self.assertEqual(self.choose([GTX970], "12.6.85")["backend"], "cuda")   # backend_cuda.o: no floor
+        decision = self.choose([V100], "11.8.89", family="deepseek_v4")
+        self.assertNotEqual(decision["backend"], "cuda")
+        self.assertIn("needs CUDA 12.0 or newer", decision["reason"])
+
+    def test_deepseek_v4_below_cuda_12_8_builds_without_the_tensor_core_path(self):
+        self.assertEqual(self.choose([V100], "12.6.85", family="deepseek_v4")["make_args"], ["NO_TC=1"])
+        self.assertEqual(self.choose([RTX5080], "12.8.93", family="deepseek_v4")["make_args"], [])
+        self.assertEqual(self.choose([V100], "12.6.85")["make_args"], [])      # qwen36 has no NO_TC
+
+    def test_an_nvcc_without_native_gets_the_card_architecture(self):
+        tc = {"cuda_version": "11.5", "cuda_archs": [35, 37, 50, 52, 53, 60, 61, 62, 70, 72, 75, 80, 86, 87]}
+        with mock.patch.dict(os.environ, {"CUDA_ARCH": ""}):
+            decision = self.choose([V100], None, tc=dict(TC_ALL, **tc))
+            self.assertEqual(decision["make_args"], ["CUDA_ARCH=sm_70"])
+            self.assertEqual(self.choose([V100], "11.8.89")["make_args"], [])
+        with mock.patch.dict(os.environ, {"CUDA_ARCH": "sm_70"}):         # set by hand: kept
+            self.assertEqual(self.choose([V100], None, tc=dict(TC_ALL, **tc))["make_args"], [])
+
+    def test_glm53_has_no_cuda_path(self):
+        decision = self.choose([RTX3090], "13.0.88", family="glm53", vulkan=DGPU)
+        self.assertEqual(decision["backend"], "vulkan")
+
+    def test_make_command_takes_the_decision_arguments(self):
+        with modeled("linux"), mock.patch.dict(os.environ, {"ARCH": "", "CUDA_ARCH": ""}):
+            cmd, _cwd, _env = setup_flow.make_command(family_by_id("deepseek_v4"), "cuda", TC_ALL,
+                                                      ["NO_TC=1"])
+            self.assertEqual(cmd[cmd.index("deepseek-v4"):],
+                             ["deepseek-v4", "ARCH=native", "CUDA=1", "CUDA_ARCH=native", "NO_TC=1"])
+            cmd, _cwd, _env = setup_flow.make_command(family_by_id("qwen36"), "cuda", TC_ALL,
+                                                      ["CUDA_ARCH=sm_70"])
+            self.assertEqual(cmd[cmd.index("qwen36"):], ["qwen36", "ARCH=native", "CUDA=1", "CUDA_ARCH=sm_70"])
+
+    def test_a_pending_cuda_rebuild_checks_the_cards_it_was_for(self):
+        cfg = {"backend": "cpu", "gpu_pending": ["cuda"], "family": "qwen36",
+               "nvidia": [{"name": V100["name"], "compute_cap": "7.0"}]}
+        self.assertFalse(setup_flow.gpu_now_buildable(cfg, dict(TC_ALL, **nvcc_toolkit("13.0.88"))))
+        self.assertTrue(setup_flow.gpu_now_buildable(cfg, dict(TC_ALL, **nvcc_toolkit("12.6.85"))))
+        self.assertFalse(setup_flow.gpu_now_buildable(
+            cfg, dict(TC_ALL, nvcc=None, can_build_cuda=False, **nvcc_toolkit("12.6.85"))))
+
+
+class CudaEngineTable(unittest.TestCase):
+    """CUDA_ENGINES says what each engine's CUDA build is and needs; this reads
+    the same facts from the Makefiles and the sources."""
+
+    OBJECTS = {"CUDA_OBJ": "backend_cuda.o", "INK_CUDA_OBJ": "backend_cuda_ink.o"}
+
+    def rule(self, artifact):
+        makefile = (C_DIR / "Makefile").read_text(encoding="utf-8")
+        match = re.search(rf"^{re.escape(artifact)}\$\(EXE\):.*?(?=\n\S|\Z)", makefile, re.M | re.S)
+        return match.group(0) if match else ""
+
+    def test_the_cuda_object_each_engine_links(self):
+        for family in family_registry.FAMILIES:
+            with self.subTest(family=family.id):
+                if family.engine_artifact == "deepseek_v4":
+                    v4 = (C_DIR / "Makefile.deepseek-v4").read_text(encoding="utf-8")
+                    linked = "backend_cuda_dsv4.o" if "V4_WIN_EXTRA_OBJS += backend_cuda_dsv4.o" in v4 else None
+                else:
+                    rule = self.rule(family.engine_artifact)
+                    self.assertTrue(rule, f"no Makefile rule for {family.engine_artifact}")
+                    first_line = rule.splitlines()[0]
+                    linked = next((obj for var, obj in self.OBJECTS.items()
+                                   if f"$({var})" in first_line), None)
+                self.assertEqual((setup_flow.CUDA_ENGINES.get(family.id) or {}).get("object"), linked)
+
+    def test_deepseek_v4_needs_what_the_table_says(self):
+        v4 = (C_DIR / "Makefile.deepseek-v4").read_text(encoding="utf-8")
+        flags = v4[v4.index("V4_NVCCFLAGS ="):].split("\n\n")[0]
+        self.assertIn("-std=c++20", flags)                       # nvcc takes it from 12.0
+        self.assertEqual(setup_flow.CUDA_ENGINES["deepseek_v4"]["min_toolkit"], (12, 0))
+        self.assertIn("NO_TC ?= 0", v4)
+        source = (C_DIR / "backend_cuda_dsv4.cu").read_text(encoding="utf-8")
+        gate = source[source.index("int dsv4_cuda_backend_arch_ok"):]
+        self.assertIn("return prop.major>=6;", gate[:400])
+        self.assertEqual(setup_flow.CUDA_ENGINES["deepseek_v4"]["min_compute"], 60)
+
+    def test_backend_cuda_has_no_compute_floor(self):
+        """The tensor-core kernels are guarded and fall back; nothing refuses an
+        older card, so the table puts no floor on the engines that link it."""
+        makefile = (C_DIR / "Makefile").read_text(encoding="utf-8")
+        self.assertIn("NVCC_STD ?= c++17", makefile)
+        source = (C_DIR / "backend_cuda.cu").read_text(encoding="utf-8")
+        self.assertIn("#if __CUDA_ARCH__ >= 700", source)
+        self.assertIn("ctx->compute_major<7)return 0", source)
+        for family_id, entry in setup_flow.CUDA_ENGINES.items():
+            if entry["object"] in ("backend_cuda.o", "backend_cuda_ink.o"):
+                self.assertNotIn("min_compute", entry, family_id)
+                self.assertNotIn("min_toolkit", entry, family_id)
 
 
 class PackageHints(unittest.TestCase):
@@ -593,7 +883,7 @@ class WholeSetup(HomeTestCase):
         os.remove(os.path.join(self.engines, "qwen36"))
         shard_fetches = sum("/cdn/" in r["path"] for r in self.hub.requests)
 
-        def rebuild(family, backend, tc, out=print):
+        def rebuild(family, backend, tc, out=print, make_args=()):
             Path(self.engines, "qwen36").write_bytes(b"libvulkan.so.1")
             return os.path.join(self.engines, "qwen36")
 
@@ -619,7 +909,7 @@ class WholeSetup(HomeTestCase):
             code, text = self.run_setup()
         self.assertIn("Already set up", text)
 
-        def rebuild(family, backend, tc, out=print):
+        def rebuild(family, backend, tc, out=print, make_args=()):
             self.assertEqual(backend, "vulkan")
             Path(self.engines, "qwen36").write_bytes(b"libvulkan.so.1")
             return os.path.join(self.engines, "qwen36")
@@ -631,6 +921,117 @@ class WholeSetup(HomeTestCase):
         cfg = setup_flow.load_config()
         self.assertEqual((cfg["backend"], cfg["gpu_pending"]), ("vulkan", []))
         self.assertEqual(cfg["env"]["COLI_VULKAN"], "1")
+
+    def failing_build(self, *broken):
+        """build_engine as a mock: the backends in `broken` fail the way make
+        does (BuildError with their log), the others write a matching engine."""
+        loaders = {"cuda": b"libcudart.so.12", "vulkan": b"libvulkan.so.1", "cpu": b"plain"}
+        calls = []
+
+        def build(family, backend, tc, out=print, make_args=()):
+            calls.append(backend)
+            log = setup_flow.log_path(setup_flow.build_log_name(backend))
+            if backend in broken:
+                raise setup_flow.BuildError(
+                    f"the qwen36 {setup_flow.BACKEND_NAME[backend]} build failed (full log: {log}):\n"
+                    "    make: *** [Makefile:949: backend_cuda.o] Error 1", backend, log)
+            Path(self.engines, "qwen36").write_bytes(b"\x7fELF " + loaders[backend])
+            return os.path.join(self.engines, "qwen36")
+
+        return build, calls
+
+    def v100_machine(self):
+        """The #1852 machine, with a toolkit that did not say what it builds:
+        CUDA is chosen, so the build is what fails."""
+        Path(self.engines, "qwen36").write_bytes(b"\x7fELF plain")
+        return mock.patch.object(setup_hw, "detect", return_value=hw_report(vulkan=V100_VK, nvidia=[V100]))
+
+    def test_a_failed_cuda_build_falls_back_to_vulkan(self):
+        build, calls = self.failing_build("cuda")
+        with self.v100_machine(), mock.patch.object(setup_flow, "build_engine", side_effect=build):
+            code, text = self.run_setup(pick="tiny")
+        self.assertEqual(code, 0, text)
+        self.assertEqual(calls, ["cuda", "vulkan"])
+        cuda_log = setup_flow.log_path("build-cuda")
+        self.assertIn(f"the qwen36 CUDA build failed (full log: {cuda_log})", text)
+        self.assertIn(f"Engine: qwen36 with VULKAN (the CUDA build failed (full log: {cuda_log}): "
+                      "using Vulkan)", text)
+        cfg = setup_flow.load_config()
+        self.assertEqual((cfg["backend"], cfg["failed_builds"]), ("vulkan", ["cuda"]))
+        self.assertEqual(cfg["env"]["COLI_VULKAN"], "1")
+
+    def test_a_failed_vulkan_build_falls_back_to_the_cpu(self):
+        build, calls = self.failing_build("cuda", "vulkan")
+        with self.v100_machine(), mock.patch.object(setup_flow, "build_engine", side_effect=build):
+            code, text = self.run_setup(pick="tiny")
+        self.assertEqual(code, 0, text)
+        self.assertEqual(calls, ["cuda", "vulkan"])        # a plain engine is already here for the CPU
+        self.assertIn("the qwen36 Vulkan build failed (full log: ", text)
+        self.assertIn("using the CPU", text)
+        cfg = setup_flow.load_config()
+        self.assertEqual((cfg["backend"], cfg["failed_builds"], cfg["gpu_pending"]),
+                         ("cpu", ["cuda", "vulkan"], []))  # nothing to install: no rebuild on rerun
+
+    def test_a_failed_cpu_build_stops(self):
+        os.remove(os.path.join(self.engines, "qwen36"))
+        build, calls = self.failing_build("cpu")
+        with mock.patch.object(setup_flow, "build_engine", side_effect=build):
+            code, text = self.run_setup(pick="tiny", backend="cpu")
+        self.assertEqual(code, 1)
+        self.assertEqual(calls, ["cpu"])
+        self.assertEqual(setup_flow.read_state()["phase"], "error")
+        self.assertIn("build-cpu.log", setup_flow.read_state()["message"])
+
+    def test_the_fallback_is_offered_when_someone_can_answer(self):
+        build, calls = self.failing_build("cuda")
+        out = io.StringIO()
+        ui = setup_flow.UI(True, stream=out)
+        with self.v100_machine(), mock.patch.object(setup_flow, "build_engine", side_effect=build), \
+             mock.patch("builtins.input", side_effect=["n"]) as asked:
+            code = setup_flow.run(lambda a: setup_flow.cmd_setup(a, ui=ui),
+                                  setup_args(dir=self.models, pick="tiny", yes=False))
+        self.assertEqual(code, 1, out.getvalue())
+        self.assertEqual(calls, ["cuda"])
+        self.assertIn("Build for Vulkan instead?", asked.call_args[0][0])
+        self.assertIn("build-cuda.log", setup_flow.read_state()["message"])
+
+    def test_a_resumed_setup_does_not_build_the_failed_backend_again(self):
+        build, calls = self.failing_build("cuda")
+        real = setup_download.download_repo
+        self.hub.cut_after["model-00000.safetensors"] = 150_000
+        with self.v100_machine(), mock.patch.object(setup_flow, "build_engine", side_effect=build), \
+             mock.patch.object(setup_download, "download_repo",
+                               side_effect=lambda *a, **k: real(*a, **dict(k, retries=0))):
+            code, text = self.run_setup(pick="tiny")
+        self.assertEqual(code, 1)                              # the download was cut
+        self.assertEqual(setup_flow.load_config()["failed_builds"], ["cuda"])
+        with self.v100_machine(), mock.patch.object(setup_flow, "build_engine", side_effect=build):
+            Path(self.engines, "qwen36").write_bytes(b"\x7fELF libvulkan.so.1")   # what the fallback built
+            code, text = self.run_setup()
+        self.assertEqual(code, 0, text)
+        self.assertEqual(calls, ["cuda", "vulkan"])            # nothing built the second time
+        self.assertIn("the CUDA build failed in the last run", text)
+        self.assertEqual(setup_flow.load_config()["backend"], "vulkan")
+
+    def test_explicit_cuda_with_a_toolkit_that_cannot_build_stops_before_make(self):
+        tc = dict(TC_ALL, **nvcc_toolkit("13.0.88"))
+        with self.v100_machine(), mock.patch.object(setup_flow, "toolchain", return_value=tc), \
+             mock.patch.object(setup_flow, "build_engine") as build:
+            code, text = self.run_setup(pick="tiny", backend="cuda")
+        self.assertEqual(code, 1)
+        build.assert_not_called()
+        self.assertIn("cannot build for the Tesla V100-SXM2-16GB (compute 7.0, dropped in CUDA 13)",
+                      setup_flow.read_state()["message"])
+        # auto takes Vulkan on the same machine, and says why.
+        with self.v100_machine(), mock.patch.object(setup_flow, "toolchain", return_value=tc), \
+             mock.patch.object(setup_flow, "build_engine", side_effect=self.failing_build()[0]):
+            code, text = self.run_setup(pick="tiny", backend="auto")
+        self.assertEqual(code, 0, text)
+        self.assertIn("Engine: qwen36 with VULKAN (the CUDA 13.0 toolkit cannot build for the "
+                      "Tesla V100-SXM2-16GB (compute 7.0, dropped in CUDA 13): using Vulkan; "
+                      "install a CUDA 12.x toolkit for the CUDA path)", text)
+        self.assertIn("GPU     Tesla V100-SXM2-16GB (NVIDIA, 17.2 GB VRAM, compute 7.0, "
+                      "driver 580.178.04)", text)
 
     def test_wsl_download_through_windows_when_faster(self):
         entry = setup_catalog.by_id("tiny")
