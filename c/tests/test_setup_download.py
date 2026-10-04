@@ -204,6 +204,28 @@ class DownloadTest(unittest.TestCase):
                 if not name.startswith("sub/"):
                     self.assertEqual(target.read_bytes(), b"")
 
+    def test_repository_manifest_refuses_existing_symlinks_outside_model_dir(self):
+        os.makedirs(self.dst)
+        for index, name in enumerate((setup_download.MANIFEST, setup_download.MANIFEST + ".tmp")):
+            with self.subTest(path=name):
+                outside = Path(self.tmp.name, f"outside-manifest-{index}.json")
+                outside.write_bytes(b"keep me")
+                linked = Path(self.dst, name)
+                try:
+                    linked.symlink_to(outside)
+                except NotImplementedError as error:
+                    self.skipTest(f"symlinks unavailable: {error}")
+                except OSError as error:
+                    if os.name == "nt" and getattr(error, "winerror", None) == 1314:
+                        self.skipTest(f"symlink privilege unavailable: {error}")
+                    raise
+                try:
+                    with self.assertRaises(setup_download.DownloadError):
+                        setup_download.download_repo(REPO, "main", self.dst, [self.spec("README.md")], base=self.hub.base)
+                    self.assertEqual(outside.read_bytes(), b"keep me")
+                finally:
+                    linked.unlink()
+
     def test_unsafe_paths_are_refused(self):
         for bad in ("../escape.bin", "a/../../b", "C:/x", ""):
             with self.subTest(path=bad), self.assertRaises(setup_download.DownloadError):

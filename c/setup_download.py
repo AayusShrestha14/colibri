@@ -380,8 +380,8 @@ def read_manifest(model_dir):
 
 
 def _write_manifest(model_dir, data):
-    path = os.path.join(model_dir, MANIFEST)
-    tmp = path + ".tmp"
+    path = safe_join(model_dir, MANIFEST)
+    tmp = safe_join(model_dir, MANIFEST + ".tmp")
     with open(tmp, "w", encoding="utf-8") as handle:
         json.dump(data, handle, indent=1)
     os.replace(tmp, path)
