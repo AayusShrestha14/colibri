@@ -287,6 +287,21 @@ def is_gliner_decide(model):
     except (FamilyConfigError, UnknownFamilyError, OSError, TypeError, ValueError):
         return False
 
+def decision_head_line(model, resolved):
+    """`coli info`'s line for a decision head over a chat model (Clef): what it
+    adds, and that the chat stays."""
+    from family_registry import decision_head_of
+    head = decision_head_of(resolved)
+    try:
+        with open(os.path.join(model, head.files[0]), encoding="utf-8") as f:
+            cfg = json.load(f)
+        shape = (f"{cfg.get('routing_layers')} routing + {cfg.get('layers')} decoder layers, "
+                 f"width {cfg.get('width')}")
+    except (OSError, ValueError, AttributeError):
+        shape = "head config unreadable"
+    return (f"{head.display_name} joint schema head ({shape}): POST /v1/systemone answers "
+            f"natively; chat, completions and messages work as on any {resolved.descriptor.id} model")
+
 def decision_refusal(family):
     """What every chatting command says about a decision model, and where to go.
     Laya ships a calibration; GLiNER2.5-Decide gives its classifier's softmax."""
@@ -797,8 +812,12 @@ def cuda_binary(engine=None):
     return False
 
 def resource_request(a, env):
-    family=resolve_model(a.model).descriptor if getattr(a,"model",None) else family_by_id("glm")
-    ctx=a.ctx or int(env.get(family.limits.context_env,family.limits.default_context))
+    from family_registry import default_context
+    resolved=resolve_model(a.model) if getattr(a,"model",None) else None
+    family=resolved.descriptor if resolved else family_by_id("glm")
+    # a Clef checkpoint plans for its own 16384 (family_registry.default_context)
+    fallback=default_context(resolved) if resolved else family.limits.default_context
+    ctx=a.ctx or int(env.get(family.limits.context_env,fallback))
     if ctx<1 or ctx>family.limits.max_context:
         raise ValueError(f"--ctx must be between 1 and {family.limits.max_context} "
                          f"for {family.display_name}")
@@ -1307,6 +1326,8 @@ def cmd_info(a):
         sts=[x for x in os.listdir(a.model) if x.endswith('.safetensors')]
         sz=sum(os.path.getsize(os.path.join(a.model,x)) for x in sts)
         row("shards", f"{len(sts)} files · {sz/1e9:.0f} GB on disk")
+        if resolved is not None and resolved.decision_head:
+            row("decision", decision_head_line(a.model, resolved))
     else:
         # No config.json means no family, and no family means no engine: say so
         # instead of letting the GLM default below stand in. A directory of shards

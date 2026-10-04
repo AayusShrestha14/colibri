@@ -1331,14 +1331,29 @@ gliner-decide-tiny-generate:
 gliner-decide-tiny-check: gliner-decide-tiny-generate gliner_decide$(EXE)
 	GLINER_DECIDE_TINY_REQUIRED=1 $(PYTHON) -m unittest -v tests.test_gliner_decide_tiny tests.test_decision_serve
 
+# Tiny Clef checkpoint (Cloudflare/clef's layout at toy widths) + the answers of
+# Clef's own joint_schema_model.py on it. The generator is numpy and
+# deterministic, the converter is the one users run (torch + safetensors);
+# clef_tiny/ref.json is committed and comes from tools/make_clef_ref.py
+# (maintainer-run, transformers 5.10.2, fixture SHA-256 pinned). The second
+# module is the same fixture through `coli serve`: POST /v1/systemone and a chat.
+.PHONY: clef-tiny-generate clef-tiny-check
+clef-tiny-generate:
+	$(PYTHON) tools/make_clef_tiny.py --output ./clef_tiny
+	$(PYTHON) tools/convert_qwen36.py --model ./clef_tiny --out ./clef_tiny_c --ebits 8 --no-readme >/dev/null
+
+clef-tiny-check: clef-tiny-generate qwen36$(EXE)
+	CLEF_TINY_REQUIRED=1 $(PYTHON) -m unittest -v tests.test_clef_tiny tests.test_decision_serve
+
 # TypeSafe's own SDKs (Python and TypeScript), unmodified, against `coli serve`
-# on a language model (tiny MiMo) and the decision engines (tiny Laya, tiny
-# GLiNER2.5-Decide): switching from Jev is a base-URL change. Needs the pinned
-# SDKs first:
+# on a language model (tiny MiMo), the decision engines (tiny Laya, tiny
+# GLiNER2.5-Decide) and a chat model with a decision head (tiny Clef on qwen36):
+# switching from Jev is a base-URL change. Needs the pinned SDKs first, and
+# torch for the Clef converter:
 #   pip install -r tools/requirements-jev-sdk.txt && (cd tools/jev-sdk && npm ci)
 .PHONY: jev-sdk-check
-jev-sdk-check: mimo$(EXE) laya$(EXE) gliner_decide$(EXE) mimo-tiny-generate laya-tiny-generate \
-		gliner-decide-tiny-generate
+jev-sdk-check: mimo$(EXE) laya$(EXE) gliner_decide$(EXE) qwen36$(EXE) mimo-tiny-generate \
+		laya-tiny-generate gliner-decide-tiny-generate clef-tiny-generate
 	JEV_SDK_REQUIRED=1 $(PYTHON) -m unittest -v tests.test_jev_sdk
 
 # In make check: every format and ragged edges against the naive product, and

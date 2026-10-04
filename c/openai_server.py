@@ -24,7 +24,7 @@ import v4_dsml                      # vendored DeepSeek V4 DSML reference primit
 import v41_dsml                     # ...and V4.1's, whose tag names differ by a space
 import image_engine                 # the qwenimage serve protocol, PNG and request rules
 from family_registry import (FamilyConfigError, UnknownFamilyError, family_by_id,
-                             family_ids, resolve_model)
+                             display_for, family_ids, resolve_model)
 from family_registry import default_model_id as registry_default_model_id
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -4761,6 +4761,49 @@ def cap_for_arch(arch, cap, env=None, model=None):
     return family_by_id(arch).limits.implicit_cap
 
 
+def decision_head_env(env, model):
+    """The dense trunk's width for a checkpoint with a decision head (Clef), when
+    the operator set none: the head's precise width (f16) if the planner's RAM
+    budget holds the trunk at that size, the engine's int8 otherwise. Measured on
+    Clef against its reference in bf16 (docs/clef.md): int8 moves a probability
+    by up to 0.22, f16 by 0.012, at 2.3x the time. Returns the line it printed,
+    or None when it had nothing to decide."""
+    if env.get("COLI_DENSE_BITS"):
+        return None
+    from family_registry import decision_head_of, default_context
+    try:
+        resolved = resolve_model(model)
+    except Exception:                   # not a checkpoint this can read: nothing to decide
+        return None
+    head = decision_head_of(resolved)
+    if not head or not head.precise_dense_bits:
+        return None
+    try:
+        from resource_plan import build_plan
+        limits = resolved.descriptor.limits
+        context = int(env.get(limits.context_env) or default_context(resolved))
+        ram = env.get("RAM_GB", "0")
+        plan = build_plan(model, ram_gb=0 if ram in ("", "auto") else float(ram), context=context,
+                          gpu_indices=[])
+    except Exception as error:          # the engine's own default stands
+        line = f"[{head.id}] dense trunk left at the engine's default (no plan: {error})"
+        print(line, file=sys.stderr)
+        return line
+    tier = plan["tiers"]["ram"]
+    need = (tier["dense_bytes"] + tier["runtime_bytes"] + tier["sequence_state_bytes"]
+            + tier["fixed_state_bytes"])
+    gib = 1 << 30
+    if need <= tier["budget_bytes"]:
+        env["COLI_DENSE_BITS"] = str(head.precise_dense_bits)
+        line = (f"[{head.id}] dense trunk in f16: {need / gib:.1f} GiB fit the {tier['budget_bytes'] / gib:.1f} "
+                f"GiB budget (COLI_DENSE_BITS=8 for int8, faster and less exact)")
+    else:
+        line = (f"[{head.id}] dense trunk in int8: f16 would need {need / gib:.1f} GiB, the budget is "
+                f"{tier['budget_bytes'] / gib:.1f} GiB (COLI_DENSE_BITS=16 to force it)")
+    print(line, file=sys.stderr)
+    return line
+
+
 def tune_child_env(env, arch):
     """Apply the engine-local defaults that a direct server launch otherwise misses.
 
@@ -4941,13 +4984,65 @@ def decision_state_type(value):
     return "number"
 
 
-def systemone_decision_record(body):
+def decision_json_sorted(value):
+    """A JSON value the way a raw-form engine's reference writes it (Clef's
+    render(): compact separators, keys sorted)."""
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _raw_decision_record(body):
+    """The raw form (docs/systemone.md, "Decision engines"): the caller's own
+    values, for an engine that renders the request the way its reference does.
+    Nothing is substituted: instructions are null when none were sent, an empty
+    text stays empty, a noul side the caller did not describe has no "text" key
+    (and null when it was described as null), and JSON values are written with
+    sorted keys and marked "json"."""
+    def option(label, value, given=True):
+        out = {"label": label}
+        if not given:
+            return out
+        if value is None or isinstance(value, str):
+            out["text"] = value
+        else:
+            out["text"] = decision_json_sorted(value)
+            out["json"] = True
+        return out
+
+    questions = []
+    for qid, question in body["questions"].items():
+        kind = question["type"]
+        criteria = question.get("criteria")
+        instructions = question.get("instructions")
+        if kind == "choice":
+            options = [option(str(label), text) for label, text in criteria.items()]
+        elif kind == "score":
+            options = [option(str(i), text) for i, text in enumerate(criteria)]
+        else:
+            given = criteria if isinstance(criteria, dict) else {}
+            options = [option(side, given.get(side), side in given) for side in ("false", "true")]
+        questions.append({"id": qid, "type": kind,
+                          "instructions": (instructions if instructions is None or
+                                           isinstance(instructions, str)
+                                           else decision_json_sorted(instructions)),
+                          "options": options})
+    state = body["state"]
+    return {"record": "raw",
+            "state": state if isinstance(state, str) else decision_json_sorted(state),
+            "state_type": decision_state_type(state), "questions": questions}
+
+
+def systemone_decision_record(body, form=None):
     """The DECIDE record for a /v1/systemone request that passed validation.
 
     Each question keeps its options in the caller's order: a choice's labels with
     their descriptions, a score's levels (level 0 first), a noul's false then true
     with the optional criteria. Instructions left out get the same default text the
-    LLM path asks with."""
+    LLM path asks with. form="raw" is the form an engine asks for with
+    `CAPS decide_record=raw` (_raw_decision_record)."""
+    if form == "raw":
+        return _raw_decision_record(body)
+    if form is not None:
+        raise ValueError(f"unknown DECIDE record form: {form!r}")
     defaults = {"noul": "Is this true?", "choice": "Which of the following applies?",
                 "score": "Rate this on the scale below."}
     questions = []
@@ -4983,7 +5078,7 @@ def _decision_texts(record):
         yield question["instructions"]
         for option in question["options"]:
             yield option["label"]
-            yield option["text"]
+            yield option.get("text")          # a raw record's undescribed noul side has none
 
 
 def decision_payload(record):
@@ -5066,6 +5161,7 @@ class Engine:
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
         tune_child_env(child_env, arch)
+        decision_head_env(child_env, model)
         resolved_cap = cap_for_arch(arch, cap, child_env, model=model)
         child_env.pop("COLI_PROFILE_CAP", None)
         child_env.pop("COLI_PLAN_CAP", None)
@@ -5111,6 +5207,10 @@ class Engine:
         # means it has nothing else: the generating endpoints answer 400.
         self.decides = self.caps.get("decide") == "1"
         self.chats = self.caps.get("chat") != "0"
+        # decide_record=raw: the engine renders the request the way its own reference
+        # does (Clef), so the record carries the caller's values, not the gateway's
+        # defaults (systemone_decision_record). None: the default form.
+        self.decide_record = self.caps.get("decide_record")
         self.dispatcher = threading.Thread(target=self._dispatch_stdout,
                                            name="colibri-stdout", daemon=True)
         self.dispatcher.start()
@@ -5886,7 +5986,7 @@ class APIServer(ThreadingHTTPServer):
         """The served model as Jev's GET /v1/models lists it. colibri does not know a
         model's release date; it gives the day this server started."""
         try:
-            name = family_by_id(ARCH).display_name
+            name = getattr(self, "display_name", None) or family_by_id(ARCH).display_name
         except Exception:
             name = self.model_id
         return {"name": self.model_id,
@@ -6783,7 +6883,11 @@ class APIHandler(BaseHTTPRequestHandler):
         """The native path: the request as one DECIDE record, the engine's
         probabilities back, shaped exactly like the LLM path's reply. No prompt is
         rendered and no option is scored on its own: one round trip, one forward."""
-        record = systemone_decision_record(body)
+        form = getattr(self.server.engine, "decide_record", None)
+        if form not in (None, "raw"):
+            raise APIError(502, f"The decision engine asks for a record form this server does not "
+                                f"write ({form!r}).", None, "engine_error", "server_error")
+        record = systemone_decision_record(body, form)
         if cache_slot is None:
             cache_slot = conversation_cache_slot([{"role": "system", "content": record["state"]}],
                                                  self.server.kv_slots)
@@ -7915,6 +8019,10 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
                 pending_model_id = family.default_model_id
         model_id = pending_model_id
         server.model_id = model_id
+        try:          # what the checkpoint on disk is called (a Clef, a 27B), for the Jev card
+            server.display_name = display_for(resolve_model(model))[0]
+        except Exception:
+            server.display_name = None
         if kv_slots > family.limits.max_kv_slots:
             raise ValueError(f"{family.id} engine supports at most "
                              f"{family.limits.max_kv_slots} KV slot(s)")

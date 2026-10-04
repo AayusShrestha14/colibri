@@ -142,6 +142,10 @@ c/qwen38_tiny/
 c/dsv41_tiny/
 c/qwen36_tiny/
 c/qwen36_tiny_c/
+# tools/make_clef_tiny.py and its container; clef_tiny/ref.json is committed
+c/clef_tiny/*
+!c/clef_tiny/ref.json
+c/clef_tiny_c/
 c/qwen38_2p4t_tiny/
 c/qwen38_2p4t_tiny_c/
 

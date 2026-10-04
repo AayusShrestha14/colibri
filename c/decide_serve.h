@@ -27,6 +27,16 @@
  * differently from a document. A noul question always has two options, false
  * then true; a score question has one option per level, level 0 first.
  *
+ * The raw form ("record": "raw"), sent to an engine whose CAPS line says
+ * decide_record=raw, carries the caller's values instead of the gateway's
+ * readings of them, for a model whose reference renders the request itself
+ * (Clef): instructions null when none were sent, a noul side the caller did
+ * not describe without a "text" key (null when it was described as null), an
+ * empty description kept, and JSON values written compactly with sorted keys
+ * (json.dumps(value, ensure_ascii=False, separators=(",", ":"),
+ * sort_keys=True)) and marked "json": true on an option. The shape and the
+ * option order are the default form's.
+ *
  * The answer (engine -> gateway), the DECISION payload:
  *
  *   {"answers": [{"id": "q", "logits": [...], "probs": [...],
@@ -63,12 +73,16 @@ enum { DECIDE_STATE_STRING = 0, DECIDE_STATE_OBJECT, DECIDE_STATE_ARRAY, DECIDE_
 typedef struct {
     char *label;
     char *text;          /* NULL when the option has no description */
+    int has_text;        /* the option carried a "text" key: in the raw form a noul
+                          * side the caller did not describe has none */
+    int text_json;       /* raw form: the text is a JSON value, not a string */
 } DecideOption;
 
 typedef struct {
     char *id;
     int type;            /* DECIDE_CHOICE | DECIDE_SCORE | DECIDE_NOUL */
-    char *instructions;
+    char *instructions;  /* "" when a raw record says null */
+    int has_instructions;/* 0: a raw record's caller sent none */
     int n_options;
     DecideOption *options;
 } DecideQuestion;
@@ -76,6 +90,7 @@ typedef struct {
 typedef struct {
     char *state;
     int state_type;
+    int raw;             /* "record": "raw", the caller's own values (see above) */
     int n_questions;
     DecideQuestion *questions;
     jval *root;          /* owns every string above */
@@ -134,8 +149,13 @@ static int decide_record_parse(const char *json, DecideRecord *record, char *err
     }
     record->root = root;
     jval *state = json_get(root, "state"), *kind = json_get(root, "state_type");
-    jval *questions = json_get(root, "questions");
+    jval *questions = json_get(root, "questions"), *form = json_get(root, "record");
     if (!state || state->t != J_STR) { decide_record_free(record); return decide_fail(err, cap, "state: must be a string"); }
+    if (form && (form->t != J_STR || strcmp(form->str, "raw"))) {
+        decide_record_free(record);
+        return decide_fail(err, cap, "record: unknown form (the one other than the default is \"raw\")");
+    }
+    record->raw = form != NULL;
     record->state = state->str;
     record->state_type = DECIDE_STATE_STRING;
     if (kind && kind->t == J_STR) {
@@ -169,11 +189,16 @@ static int decide_record_parse(const char *json, DecideRecord *record, char *err
         }
         out->type = !strcmp(type->str, "choice") ? DECIDE_CHOICE
                   : !strcmp(type->str, "score") ? DECIDE_SCORE : DECIDE_NOUL;
-        if (!ins || ins->t != J_STR) {
+        if (record->raw && ins && ins->t == J_NULL) {
+            out->instructions = (char *)"";
+        } else if (!ins || ins->t != J_STR) {
             decide_record_free(record);
-            return decide_fail(err, cap, "questions.%s.instructions: must be a string", out->id);
+            return decide_fail(err, cap, "questions.%s.instructions: must be a string%s", out->id,
+                               record->raw ? " or null" : "");
+        } else {
+            out->instructions = ins->str;
+            out->has_instructions = 1;
         }
-        out->instructions = ins->str;
         if (!opts || opts->t != J_ARR || opts->len < 1 || opts->len > DECIDE_MAX_OPTIONS ||
             (out->type == DECIDE_NOUL && opts->len != 2)) {
             decide_record_free(record);
@@ -187,14 +212,22 @@ static int decide_record_parse(const char *json, DecideRecord *record, char *err
         for (int o = 0; o < opts->len; o++) {
             jval *option = opts->kids[o];
             jval *label = json_get(option, "label"), *text = json_get(option, "text");
+            jval *is_json = json_get(option, "json");
             if (!option || option->t != J_OBJ || !label || label->t != J_STR ||
                 (text && text->t != J_STR && text->t != J_NULL)) {
                 decide_record_free(record);
                 return decide_fail(err, cap, "questions.%s.options[%d]: needs a string label "
                                    "and a string or null text", out->id, o);
             }
+            if (is_json && (is_json->t != J_BOOL || (is_json->boolean && (!text || text->t != J_STR)))) {
+                decide_record_free(record);
+                return decide_fail(err, cap, "questions.%s.options[%d]: \"json\" marks a string text "
+                                   "as a JSON value", out->id, o);
+            }
             out->options[o].label = label->str;
             out->options[o].text = text && text->t == J_STR ? text->str : NULL;
+            out->options[o].has_text = text != NULL;
+            out->options[o].text_json = is_json && is_json->boolean;
         }
     }
     return 1;

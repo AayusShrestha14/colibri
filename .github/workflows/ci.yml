@@ -1192,6 +1192,21 @@ jobs:
       - name: Generate the fixture, build gliner_decide, compare with the committed reference
         run: make -C c gliner-decide-tiny-check
 
+  clef-tiny-check:
+    name: Clef tiny oracle (vs joint_schema_model.py) and POST /v1/systemone on qwen36
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: c/tools/oracle-requirements.txt
+      - name: Install the generator's numpy and the converter's torch + safetensors
+        run: pip install numpy -r c/tools/oracle-requirements.txt
+      - name: Generate and convert the fixture, build qwen36, compare with the committed reference
+        run: make -C c clef-tiny-check
+
   jev-sdk-check:
     name: TypeSafe's SDKs (Python, TypeScript) against coli serve, base URL changed only
     runs-on: ubuntu-latest
@@ -1203,11 +1218,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: Install the pinned SDKs
+      - name: Install the pinned SDKs, and torch for the Clef fixture's converter
         run: |
           pip install -r c/tools/requirements-jev-sdk.txt
+          pip install numpy -r c/tools/oracle-requirements.txt
           cd c/tools/jev-sdk && npm ci
-      - name: Both SDKs against a language model (tiny MiMo) and the decision engines (tiny Laya, tiny GLiNER2.5-Decide)
+      - name: Both SDKs against a language model (tiny MiMo), the decision engines (tiny Laya, tiny GLiNER2.5-Decide) and Clef
         run: make -C c jev-sdk-check
 
   qwenimage-tiny-check:
