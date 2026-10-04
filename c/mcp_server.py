@@ -345,6 +345,9 @@ class Server:
         elif method == "tools/list":
             self.result(msg_id, {"tools": TOOLS})
         elif method == "tools/call":
+            # Keep EOF draining limited to calls still in flight, rather than
+            # retaining every completed worker for the lifetime of the session.
+            self.threads = [worker for worker in self.threads if worker.is_alive()]
             thread = threading.Thread(target=self.call_tool, args=(msg_id, params), daemon=True)
             self.threads.append(thread)
             thread.start()
