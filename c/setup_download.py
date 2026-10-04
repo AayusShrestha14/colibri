@@ -133,7 +133,16 @@ def safe_join(root, relative):
     parts = [p for p in relative.replace("\\", "/").split("/") if p not in ("", ".")]
     if not parts or any(p == ".." for p in parts) or re.match(r"^[A-Za-z]:", parts[0]):
         raise DownloadError(f"unsafe path in the repository listing: {relative!r}")
-    return os.path.join(root, *parts)
+    path = os.path.join(root, *parts)
+    resolved_root = os.path.realpath(root)
+    for candidate in (path, path + ".part"):
+        try:
+            contained = os.path.commonpath((resolved_root, os.path.realpath(candidate))) == resolved_root
+        except ValueError:
+            contained = False
+        if not contained:
+            raise DownloadError(f"repository path resolves outside the model folder: {relative!r}")
+    return path
 
 
 def _hasher(spec):
