@@ -5,7 +5,8 @@ option. There is one API for it, `POST /v1/systemone`, with the request and
 the reply of TypeSafe's Jev: a state, typed questions (`noul`, `choice`,
 `score`), and for every question a probability per option. A language model
 answers by **scoring** instead of writing; a decision model such as
-[Laya](laya.md) answers natively. Same server and same model as the chat: the
+[Laya](laya.md), [GLiNER2.5-Decide](gliner_decide.md) or [Clef](clef.md)
+answers natively. Same server and same model as the chat: the
 mode is the endpoint, not a build flag or a separate process.
 
 ## Why you would want it
@@ -168,7 +169,8 @@ const { answers } = await r.json();
 colibri answers `POST /v1/systemone` with the request and the reply of
 TypeSafe's Jev API. Code written against Jev keeps working: point it at
 colibri and change nothing else. The two official SDKs, unmodified, are
-tested against `coli serve` on a language model and on a decision engine
+tested against `coli serve` on a language model, on the decision engines
+(Laya, GLiNER2.5-Decide) and on a chat model with a decision head (Clef)
 (`tests/test_jev_sdk.py`, `make -C c jev-sdk-check`).
 
 Python, `typesafe_sdk`:
@@ -461,9 +463,10 @@ cannot tell which kind answered.
 | engine | model | doc |
 |---|---|---|
 | `c/laya` | Laya (Convai Innovations): ModernBERT encoder + decision head | [laya.md](laya.md) |
+| `c/gliner_decide` | GLiNER2.5-Decide (fastino): DeBERTa-v3 encoder + GLiNER2's classification head | [gliner_decide.md](gliner_decide.md) |
 | `c/qwen36` | Clef (Cloudflare): Qwen3.8-27B, post-trained, + joint schema head; it also chats | [clef.md](clef.md) |
 
-A decision-only engine (Laya) serves `POST /v1/systemone` only. Chat,
+A decision-only engine (Laya, GLiNER2.5-Decide) serves `POST /v1/systemone` only. Chat,
 completions and messages answer 400 with a pointer to `/v1/systemone`, and
 `/v1/models` lists the model with `capabilities: ["systemone", "decision"]`
 (a language model says `["chat", "systemone"]`). A chat model with a
@@ -524,7 +527,7 @@ all (`null` when it was described as `null`); and a JSON value (the state,
 instructions, a description) is written with sorted keys and compact
 separators, `json.dumps(value, ensure_ascii=False, separators=(",", ":"),
 sort_keys=True)`, with `"json": true` on an option whose text is one.
-Laya gets the default form, byte for byte as before.
+Laya and GLiNER2.5-Decide get the default form, byte for byte as before.
 
 **Answer.** One `DECISION <id> <bytes>` frame, then `DONE`:
 
@@ -546,20 +549,22 @@ the engine's own record of how it got there. A record the engine refuses is
 **Registry.** A family with `modality="decision"` and
 `FamilyCapabilities(decision=True)` in `c/family_registry.py`, and a way for
 `resolve_model` to recognise its checkpoint (Laya: `rl_agent_config.json`
-plus `encoder/config.json`, keyed `laya_<encoder model_type>`). `coli serve`
+plus `encoder/config.json`, keyed `laya_<encoder model_type>`;
+GLiNER2.5-Decide: a `config.json` whose `model_type` is `extractor` plus
+`encoder_config/config.json`, keyed
+`gliner2_<architecture>_<encoder model_type>`). `checkpoint_files` names the
+files `coli doctor` checks. `coli serve`
 and `coli web` then serve it, `coli info` and `coli plan` describe it, and
-`coli chat` / `coli run` refuse it with a pointer to the endpoint.
+`coli chat` / `coli run` refuse it with a pointer to the endpoint. A decision
+head over a chat family is a `DecisionHead` instead (Clef: a qwen36 checkpoint
+with `joint_head_config.json` and `joint_head.safetensors`): the family stays
+the chat one, `resolve_model` sets `decision_head`, and nothing is refused.
 
 **Tests.** A tiny fixture whose reference answers come from the model's own
 package (`tools/make_laya_tiny.py`, `tools/make_laya_ref.py`,
-`tests/test_laya_tiny.py`), and the fixture behind the real gateway
-(`tests/test_decision_serve.py`, `tests/test_jev_sdk.py`).
+`tests/test_laya_tiny.py`; `tools/make_gliner_decide_tiny.py`,
+`tools/make_gliner_decide_ref.py`, `tests/test_gliner_decide_tiny.py`;
+`tools/make_clef_tiny.py`, `tools/make_clef_ref.py`, `tests/test_clef_tiny.py`),
+and the fixture behind the real gateway (`tests/test_decision_serve.py`,
+`tests/test_jev_sdk.py`).
 
-### The next one
-
-- **GLiNER2.5-Decide** (DeBERTa-v3 encoder, GLiNER2 heads): a second encoder
-  engine on the same contract. It needs the DeBERTa-v3 encoder (relative
-  position buckets and disentangled attention, a SentencePiece tokenizer) and
-  its heads, its own rendering of a record into its input, and a
-  `resolve_model` rule for its checkpoint. `decide_serve.h`, the gateway and
-  the SDK tests stay as they are.

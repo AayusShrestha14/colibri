@@ -11,14 +11,14 @@ The official clients, unmodified, pointed at colibri with nothing but
   @typesafe-ai/sdk      TypeScript, new TypeSafeClient({apiKey, baseURL})
                         .systemOne(...) and .models.list(), run under node
 
-Each one is driven against three servers, each a real `coli serve` process:
+Each one is driven against four servers, each a real `coli serve` process:
 a language model (the tiny MiMo fixture, which scores options through the
-logprob channel), a decision engine (the tiny Laya fixture, DECIDE) and a
-chat model with a decision head (the tiny Clef on qwen36, DECIDE too). The
-same requests go to both: every question type, several questions at once,
-text, object and array states, objects and arrays as instructions and
-criteria, and a request the server refuses (422), which each SDK must raise
-as its own UnprocessableEntity error.
+logprob channel), two decision engines (the tiny Laya and GLiNER2.5-Decide
+fixtures, DECIDE) and a chat model with a decision head (the tiny Clef on
+qwen36, DECIDE too). The same requests go to all four: every question type,
+several questions at once, text, object and array states, objects and arrays
+as instructions and criteria, and a request the server refuses (422), which
+each SDK must raise as its own UnprocessableEntity error.
 
 Skipped when an SDK, the engines or the fixtures are missing. CI installs the
 pinned SDKs (tools/requirements-jev-sdk.txt, tools/jev-sdk/package.json) and
@@ -45,6 +45,8 @@ import mimo_serve_fixture  # noqa: E402
 REQUIRED = os.environ.get("JEV_SDK_REQUIRED") == "1"
 LAYA_FIXTURE = HERE / "laya_tiny"
 LAYA_BINARY = HERE / ("laya.exe" if os.name == "nt" else "laya")
+GLINER_FIXTURE = HERE / "gliner_decide_tiny"
+GLINER_BINARY = HERE / ("gliner_decide.exe" if os.name == "nt" else "gliner_decide")
 CLEF_CONTAINER = HERE / "clef_tiny_c"
 QWEN36_BINARY = HERE / ("qwen36.exe" if os.name == "nt" else "qwen36")
 TS_SDK_DIR = Path(os.environ.get("JEV_TS_SDK_DIR", HERE / "tools" / "jev-sdk"))
@@ -141,7 +143,7 @@ def long_mimo_fixture():
 
 
 def servers():
-    """(name, model dir, env) of the two servers, or a skip naming what is missing."""
+    """(name, model dir, env) of the three servers, or a skip naming what is missing."""
     found = []
     if mimo_serve_fixture.available():
         found.append(("mimo-tiny (language model)", long_mimo_fixture(), {"CTX": "4096"}))
@@ -151,12 +153,18 @@ def servers():
         found.append(("laya-tiny (decision engine)", LAYA_FIXTURE, {}))
     elif REQUIRED:
         raise AssertionError("laya or laya_tiny missing (make laya laya-tiny-generate)")
+    if GLINER_BINARY.exists() and (GLINER_FIXTURE / "model.safetensors").exists():
+        found.append(("gliner-decide-tiny (decision engine)", GLINER_FIXTURE, {}))
+    elif REQUIRED:
+        raise AssertionError("gliner_decide or gliner_decide_tiny missing "
+                             "(make gliner_decide gliner-decide-tiny-generate)")
     if QWEN36_BINARY.exists() and (CLEF_CONTAINER / "joint_head.safetensors").exists():
         found.append(("clef-tiny (chat model with a decision head)", CLEF_CONTAINER, {}))
     elif REQUIRED:
         raise AssertionError("qwen36 or clef_tiny_c missing (make qwen36 clef-tiny-generate)")
     if not found:
-        raise unittest.SkipTest("no tiny fixture to serve (make mimo laya laya-tiny-generate)")
+        raise unittest.SkipTest("no tiny fixture to serve (make mimo laya laya-tiny-generate "
+                                "gliner_decide gliner-decide-tiny-generate qwen36 clef-tiny-generate)")
     return found
 
 
