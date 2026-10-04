@@ -292,7 +292,7 @@ class Server:
         self.threads = []
 
     def send(self, message):
-        line = json.dumps(message, separators=(",", ":"), ensure_ascii=False)
+        line = json.dumps(message, separators=(",", ":"), ensure_ascii=True)
         with self.lock:
             self.out.write(line + "\n")
             self.out.flush()
