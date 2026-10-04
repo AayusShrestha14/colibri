@@ -3778,7 +3778,9 @@ static int g_pipe=0;      /* PIPE=1: async expert-load pipeline. Default ON for 
                            * Keeps expert pread off the forward-pass thread so loads overlap
                            * the matmul. PIPE=0 opts back into the blocking serial path. */
 static int g_pipe_nw=8;   /* PIPE_WORKERS=n: I/O worker threads (disk-parallel reads) */
+#if defined(__linux__) || !defined(COLIBRI_NO_MAIN)
 static int g_uring=0;     /* URING=1: Linux io_uring load/completion backend; implies PIPE */
+#endif
 static int g_pipe_block=0;/* COLI_PIPE_BLOCK=1: pipe_wait blocca su una condvar invece dello
                            * spin sched_yield (default OFF = spin byte-identico). EN: a yield
                            * storm on the main thread fights the OpenMP team for cycles during
