@@ -27,8 +27,8 @@
  *     chain_ew, chain_qsa, chain_ple. Offsets and strides are in floats.
  *   - multi-head latent attention: the MLA ops and the layer op below (chain_mla,
  *     chain_hgemv, chain_dsa, its k-pooled modes included), Kimi Delta Attention
- *     (chain_kda) and manifold-constrained hyper-connections (chain_mhc): loaded beside
- *     the others but optional.
+ *     (chain_kda), manifold-constrained hyper-connections (chain_mhc) and Kimi K3's
+ *     attention residuals and SiTU-GLU (chain_ares): loaded beside the others but optional.
  *
  * Threading: the engine thread only (the main queue is the backend's, used from the
  * same thread by coli_vk_matmul; the expert tier submits on its own queue).
@@ -267,13 +267,22 @@ int vkc_mla(const VkcMla *m, VkcMlaScratch *s, VkcBuf *x, size_t x_off, int S, i
  *   the raw decay, beta and output-gate projections; prm at prm_off: A_log[H], dt[P],
  *   norm[VD]; alpha = exp(lb * sigmoid(exp(A_log) * (f + dt))), beta = sigmoid(b), q and k
  *   l2-normalized with neps inside the root; y = RMSNorm(o, eps) * norm * sigmoid(g).
- *   The state [H][KD][VD] at st_off. */
+ *   The state [H][KD][VD] at st_off.
+ * vkc_kda_rec_flags: the same with flags (0 is vkc_kda_rec, GLM-5.3's arithmetic);
+ *   Kimi K3's (kimi_k3.c's kda_forward) sets both:
+ *   VKC_KDA_EXP_A   prm holds exp(A_log) itself, used as it is
+ *   VKC_KDA_K3      the l2 sums take neps after the squares, q is normalized, then
+ *                   scaled, and the update is k * ((v - mem) * beta) */
 int vkc_kda_ready(void);
 typedef struct { int S, C, K, P, in_off, in_row, in_part, out_off, out_row, w_off, win_off; } VkcKdaConv;
 int vkc_kda_conv(VkcBuf *in, VkcBuf *w, VkcBuf *win, VkcBuf *out, const VkcKdaConv *p);
+#define VKC_KDA_EXP_A 1
+#define VKC_KDA_K3    2
 typedef struct { int S, H, VD, P, m_off, m_row, f_off, f_row, b_off, b_row, g_off, g_row, y_off, y_row, st_off, prm_off;
                  float lb, neps, eps; } VkcKdaRec;
 int vkc_kda_rec(int KD, VkcBuf *m, VkcBuf *f, VkcBuf *b, VkcBuf *g, VkcBuf *prm, VkcBuf *st, VkcBuf *y, const VkcKdaRec *p);
+int vkc_kda_rec_flags(int KD, VkcBuf *m, VkcBuf *f, VkcBuf *b, VkcBuf *g, VkcBuf *prm, VkcBuf *st, VkcBuf *y,
+                      const VkcKdaRec *p, int flags);
 
 /* ---- manifold-constrained hyper-connections (chain_mhc.comp) ------------------------
  * hyper_connections.h for S rows of H <= 8 streams of D floats ([S][H*D] at x_off,
@@ -310,6 +319,99 @@ typedef struct { int S, H, KVH, hd, pos_base, cap, window, ext, d_rel;
 int  vkc_relattn_ready(void);
 int  vkc_relattn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *kvs, VkcBuf *r, VkcBuf *relp, VkcBuf *tau,
                  const VkcRelAttn *p);
+
+/* ---- attention residuals and SiTU-GLU (chain_ares.comp) ----------------------------
+ * Kimi K3's residual stream (AttnRes) and its activation, for S rows:
+ *   vkc_ares_mix  kimi_k3.c's res_mix: row s mixes the nb block snapshots ([nb][D] at
+ *                 b_off + s*b_row) and the running prefix (x_off + s*x_row) by the
+ *                 softmax of (v . w) / sqrt(mean(v^2) + eps), w at w_off in prm, into
+ *                 y_off + s*y_row; nb <= 15, y apart from x and blk
+ *   vkc_situ      y[i] = b1*tanh(g/b1)*sigmoid(g)*b2*tanh(u/b2), i < n, in the CPU's order */
+int vkc_ares_ready(void);
+typedef struct { int S, D, nb, x_off, x_row, b_off, b_row, w_off, y_off, y_row; float eps; } VkcAres;
+int vkc_ares_mix(VkcBuf *x, VkcBuf *blk, VkcBuf *prm, VkcBuf *y, const VkcAres *p);
+typedef struct { int n, g_off, u_off, y_off; float b1, b2; } VkcSitu;
+int vkc_situ(VkcBuf *g, VkcBuf *u, VkcBuf *y, const VkcSitu *p);
+
+/* ---- DeepSeek V4.1 Flash and DeepSeek V4 attention (chain_dsv4.comp) -----------------
+ * The model is MQA over one KV row per position (the same row is key and value): a
+ * sliding window of raw rows, plus compressed rows (a compressor pools `ratio`
+ * positions into one) that a DSA indexer picks per query. Optional like the MLA ops:
+ * vkc_dsv4_ready() says whether the shader is there; a missing one turns off these ops.
+ *   vkc_dsv4_attn     sparse attention with a sink over a per-row list (sparse_attn.h):
+ *                     entry e < 0 skipped, e < nwin the window ring's row e, else the
+ *                     compressed row e - nwin; scores (q . k) * scale, the sink in the
+ *                     denominator only, the value sum and the denominator in list order.
+ *                     flags 1: the weights round to bf16 before the value sum and the
+ *                     output to bf16 (DeepSeek V4). Limits: hd <= 1024, cnt <= 3072.
+ *   vkc_dsv4_rope     RoPE on interleaved pairs in place, the first rd floats of each
+ *                     segment, (cos, sin) pairs from a host table; inverse negates the sine
+ *                     (the attention output's un-rotation). flags 1: round to bf16.
+ *   vkc_dsv4_compress the compressor's rolling group for S rows in order: each row's kv
+ *                     and score rows (P floats; score + ape[slot] when ape_off >= 0) into
+ *                     the ring row pos % ratio (ratio + that with overlap), and at each
+ *                     completed group the per-channel softmax pooling of the ring rows
+ *                     (overlap: the first ratio rows read channel d, the next ratio rows
+ *                     channel D + d; the second half then moves to the first) into
+ *                     out[pos / ratio]. ring: (1 + overlap) * ratio kv rows of P at
+ *                     ring_off, then as many score rows.
+ *   vkc_dsv4_score    the indexer's scores: row s (position pos_base + s) scores columns
+ *                     j < lens = (pos + 1) / ratio (and mask[mask_off + s*mask_row + j] != 0
+ *                     when mask_row > 0) as sum_h [dot > 0] dot * hw_h * wscale, dot = q_h .
+ *                     key[j]; every other j < width scores -inf; into sc[sc_off + s*sc_row
+ *                     + j]. IH <= 4096; IH <= 64 and IH*ID <= 4096 stage the queries in
+ *                     shared memory, larger ones read them from memory (the same sums).
+ *   vkc_dsv4_cand     the candidate blocks: per row, each block's best score, the block of
+ *                     column lens - 1 pinned, then the best min(topb, blocks) blocks (the
+ *                     lower on a tie), mask 1 on their columns. At most 4096 blocks.
+ *   vkc_dsv4_topk     per row the min(topk, finite scores) largest, ties to the lower
+ *                     column, as base + j into the list, ascending (order 0) or by rank
+ *                     (order 1); -1 in the rest of the topk slots. topk <= 4096 for order 1.
+ *   vkc_dsv4_engram   the engram gate: per (stream c, row s) the stream gains
+ *                     sigmoid(signed sqrt(x . (qw * kw * key) * rms(x)^-1 * rms(key)^-1 /
+ *                     sqrt(D))) * value; kv[s] = H keys of D, then the value.
+ * Offsets and strides in floats; lists and masks are int32 buffers. */
+int vkc_dsv4_ready(void);
+typedef struct { int S, H, hd, cnt, l_off, l_row, nwin, w_off, c_off, q_off, q_row, o_off, o_row, sink_off, flags;
+                 float scale; } VkcDsAttn;
+int vkc_dsv4_attn(VkcBuf *q, VkcBuf *win, VkcBuf *cmp, VkcBuf *list, VkcBuf *prm, VkcBuf *out, const VkcDsAttn *p);
+typedef struct { int nseg, per_row, rd, x_off, x_row, x_seg, cs_off, cs_row, inverse, flags; } VkcDsRope;
+int vkc_dsv4_rope(VkcBuf *x, VkcBuf *cs, const VkcDsRope *p);
+typedef struct { int S, pos_base, ratio, P, D, overlap, kv_off, kv_row, sc_off, sc_row, ape_off, out_off, out_row,
+                 ring_off; } VkcDsComp;
+int vkc_dsv4_compress(VkcBuf *kv, VkcBuf *sc, VkcBuf *ring, VkcBuf *prm, VkcBuf *out, const VkcDsComp *p);
+typedef struct { int S, pos_base, ratio, IH, ID, width, q_off, q_row, w_off, w_row, k_off, k_row, mask_row, sc_row;
+                 float wscale; int sc_off, mask_off; } VkcDsScore;
+int vkc_dsv4_score(VkcBuf *iq, VkcBuf *hw, VkcBuf *keys, VkcBuf *mask, VkcBuf *sc, const VkcDsScore *p);
+typedef struct { int S, pos_base, ratio, width, block, topb, sc_row, mask_row; } VkcDsCand;
+int vkc_dsv4_cand(VkcBuf *sc, VkcBuf *mask, const VkcDsCand *p);
+typedef struct { int S, width, topk, sc_row, l_off, l_row, base, order; } VkcDsTopk;
+int vkc_dsv4_topk(VkcBuf *sc, VkcBuf *list, const VkcDsTopk *p);
+typedef struct { int S, H, D, kv_off, kv_row, x_off, x_row, qw_off, kw_off; float eps; } VkcDsEngram;
+int vkc_dsv4_engram(VkcBuf *kv, VkcBuf *prm, VkcBuf *x, const VkcDsEngram *p);
+/* DeepSeek V4's roundings, each the engine's C bit for bit (chain_dsv4.comp modes 7, 8):
+ *   vkc_dsv4_round    nseg segments of len floats (segment g at row g / per_row, index
+ *                     g % per_row: x_off + row*x_row + j*x_seg, y likewise) from x into y
+ *                     (y may be x: in place), as `kind`:
+ *                       VKC_DS_BF16      to bf16, nearest even (coli_bf16_round)
+ *                       VKC_DS_E4M3      E4M3 per block of `block` values with one
+ *                                        power-of-two scale (coli_fp8_activation_qdq_ref)
+ *                       VKC_DS_E2M1      E2M1 per block (coli_fp4_activation_qdq_ref)
+ *                       VKC_DS_HADAMARD  the Hadamard transform times hscale (the host's
+ *                                        1 / sqrtf(len)), to bf16 (coli_hadamard_bf16_ref)
+ *                     flags 1: the E4M3 or E2M1 result to bf16 after. Limits: block <= 256;
+ *                     the Hadamard's len a power of two up to 4096.
+ *   vkc_dsv4_swiglu   y[y_off + i] = bf16(g * sigmoid(g) * u), g = bf16(a[a_off + i]) and
+ *                     u = bf16(b[b_off + i]) clamped by lim when lim > 0, i < n (the shared
+ *                     expert's activation between its roundings; coli_v4_swiglu). */
+#define VKC_DS_BF16     0
+#define VKC_DS_E4M3     1
+#define VKC_DS_E2M1     2
+#define VKC_DS_HADAMARD 3
+typedef struct { int kind, nseg, per_row, len, block, flags, x_off, x_row, x_seg, y_off, y_row, y_seg; float hscale; } VkcDsRound;
+int vkc_dsv4_round(VkcBuf *x, VkcBuf *y, const VkcDsRound *p);
+typedef struct { int n, a_off, b_off, y_off; float lim; } VkcDsSwiglu;
+int vkc_dsv4_swiglu(VkcBuf *a, VkcBuf *b, VkcBuf *y, const VkcDsSwiglu *p);
 
 /* counters, for the engines' [VK] lines */
 typedef struct {

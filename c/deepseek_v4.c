@@ -2210,6 +2210,36 @@ int coli_v4_attention_window_token_ref(
     return attention_token_impl(output, state, weights, config, input, position,
                                 error, error_size);
 }
+
+#ifdef COLI_VULKAN
+/* The dense chain's view of this state (deepseek_v4_internal.h). */
+int coli_v4_attention_view(ColiDeepSeekV4WindowAttentionState *state,
+                           ColiV4AttentionView *view) {
+    if (!state || !view) return -1;
+    *view = (ColiV4AttentionView){state->kv, state->compressed, state->window_size,
+                                  state->head_dim, state->ratio, state->compressed_count,
+                                  state->compressed_capacity, state->compressor,
+                                  state->indexer};
+    return 0;
+}
+int coli_v4_attention_reserve(ColiDeepSeekV4WindowAttentionState *state, int rows) {
+    if (!state || rows < 0 || (rows && !state->compressed)) return -1;
+    if (rows <= state->compressed_capacity) return 0;
+    int capacity = state->compressed_capacity > 0 ? state->compressed_capacity : 16;
+    while (capacity < rows) capacity *= 2;
+    float *grown = realloc(state->compressed,
+        (size_t)capacity * state->head_dim * sizeof(*grown));
+    if (!grown) return -1;
+    state->compressed = grown;
+    state->compressed_capacity = capacity;
+    return 0;
+}
+int coli_v4_attention_set_count(ColiDeepSeekV4WindowAttentionState *state, int count) {
+    if (!state || count < 0 || count > state->compressed_capacity) return -1;
+    state->compressed_count = count;
+    return 0;
+}
+#endif
 #endif /* COLI_V4_UNIT_ATTENTION */
 
 #ifdef COLI_V4_UNIT_ATTENTION_BATCH
@@ -3482,6 +3512,18 @@ static int compressor_pool_and_emit(ColiDeepSeekV4CompressorState *state,
     *produced = 1;
     return 0;
 }
+
+#ifdef COLI_VULKAN
+/* The dense chain's view of the ring (deepseek_v4_internal.h). */
+int coli_v4_compressor_view(ColiDeepSeekV4CompressorState *state,
+                            ColiV4CompressorView *view) {
+    if (!state || !view) return -1;
+    *view = (ColiV4CompressorView){state->kv_state, state->score_state, state->state_rows,
+                                   state->projection_dim, state->ratio, state->head_dim,
+                                   state->rotate_fp4};
+    return 0;
+}
+#endif
 #endif /* COLI_V4_UNIT_COMPRESSOR */
 
 #ifdef COLI_V4_UNIT_INDEXER
@@ -4186,6 +4228,34 @@ const float *coli_v4_indexer_compressed_values(
 int coli_v4_indexer_compressed_count(const ColiDeepSeekV4Indexer *state) {
     return state ? state->count : 0;
 }
+
+#ifdef COLI_VULKAN
+/* The dense chain's view of the keys (deepseek_v4_internal.h). */
+int coli_v4_indexer_view(ColiDeepSeekV4Indexer *state, ColiV4IndexerView *view) {
+    if (!state || !view) return -1;
+    *view = (ColiV4IndexerView){state->compressed, state->count, state->capacity,
+                                state->config->index_head_dim, state->compressor};
+    return 0;
+}
+int coli_v4_indexer_reserve(ColiDeepSeekV4Indexer *state, int rows) {
+    if (!state || rows < 0) return -1;
+    if (rows <= state->capacity) return 0;
+    int dimension = state->config->index_head_dim, capacity = state->capacity > 0 ? state->capacity : 16;
+    while (capacity < rows) capacity *= 2;
+    float *grown = realloc(state->compressed, (size_t)capacity * dimension * sizeof(*grown));
+    if (!grown) return -1;
+    memset(grown + (size_t)state->capacity * dimension, 0,
+           (size_t)(capacity - state->capacity) * dimension * sizeof(*grown));
+    state->compressed = grown;
+    state->capacity = capacity;
+    return 0;
+}
+int coli_v4_indexer_set_count(ColiDeepSeekV4Indexer *state, int count) {
+    if (!state || count < 0 || count > state->capacity) return -1;
+    state->count = count;
+    return 0;
+}
+#endif
 #endif /* COLI_V4_UNIT_INDEXER */
 
 #ifdef COLI_V4_UNIT_SPARSE_ATTENTION
@@ -4280,6 +4350,15 @@ static int moe_fail(const char *format, ...) {
     va_end(arguments);
     return -1;
 }
+#ifdef COLI_VULKAN
+/* The dense chain (deepseek_v4_chain.h) runs the shared expert on the device and adds
+ * it there: while coli_v4_moe_routed runs, the MoE below leaves the shared expert out
+ * and returns the routed sum as it stands before that add (no rounding). */
+static __thread int v4_moe_routed_only;
+#define V4_SHARED_HERE (!v4_moe_routed_only)
+#else
+#define V4_SHARED_HERE 1
+#endif
 /* ######## deepseek_v4_block_hybrid.c ######## */
 /* Accepted decode pipeline plus batched causal attention for prompt prefill. */
 /* ---- begin include deepseek_v4_block_pipeline.c ---- */
@@ -5065,7 +5144,7 @@ static int v4_vk_token_finish(V4VkToken *vk, float *output, ColiExpertStore *sto
             for (int i = 0; !result && i < d; i++) output[i] += redo[i];
         }
     }
-    if (!result)
+    if (!result && V4_SHARED_HERE)
         for (int i = 0; i < d; i++) output[i] = coli_bf16_round(output[i] + shared_output[i]);
     free(redo); free(dev); free(rows);
     return result;
@@ -5236,7 +5315,7 @@ static int moe_token_pipeline(float *output,
                     fp8_view(&w3, weights, "ffn.shared_experts.w3")))
         result = moe_fail("layer %d: the shared expert's fp8 tensors are missing",
                           weights->plan.layer);
-    if (!result) result = coli_v4_shared_expert_forward_ref(
+    if (!result && V4_SHARED_HERE) result = coli_v4_shared_expert_forward_ref(
         shared_output, &w1, &w2, &w3, input, config->swiglu_limit);
     if (!result) memset(output, 0, (size_t)d * sizeof(*output));
 
@@ -5535,7 +5614,7 @@ static int moe_token_pipeline(float *output,
             if (!result)
                 for (int i = 0; i < d; i++) output[i] += expert_output[i];
         }
-        if (!result)
+        if (!result && V4_SHARED_HERE)
             for (int i = 0; i < d; i++)
                 output[i] = coli_bf16_round(output[i] + shared_output[i]);
 #if defined(COLI_VULKAN) && defined(COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER)
@@ -6095,7 +6174,9 @@ static int v4_moe_batch_union(
          fp8_view(&w3, weights, "ffn.shared_experts.w3")))
         result = moe_fail("layer %d: the shared expert's fp8 tensors are missing",
                           weights->plan.layer);
-    if (!result && batch > 1 && v4_shared_batch_enabled())
+    if (!V4_SHARED_HERE) {
+        /* the dense chain adds the shared expert itself */
+    } else if (!result && batch > 1 && v4_shared_batch_enabled())
         result = v4_shared_expert_forward_batch_ref(
             shared, &w1, &w2, &w3, inputs, batch, config->swiglu_limit);
     else
@@ -6196,7 +6277,7 @@ static int v4_moe_batch_union(
         coli_expert_release(store, &view);
     }
 #endif
-    for (int item = 0; !result && item < batch; item++)
+    for (int item = 0; !result && V4_SHARED_HERE && item < batch; item++)
         for (int column = 0; column < d; column++)
             outputs[(size_t)item * d + column] = coli_bf16_round(
                 outputs[(size_t)item * d + column] +
@@ -6233,6 +6314,31 @@ static double v4_block_prof_now(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + ts.tv_nsec / 1e9;
 }
+
+#ifdef COLI_VULKAN
+/* The dense chain's MoE step (deepseek_v4_internal.h): the routes of coli_v4_block_window_
+ * batch_ref and of the decode block (one row), without the shared expert. */
+int coli_v4_moe_routed(float *routed, const ColiDeepSeekV4LayerWeights *weights,
+                       const ColiDeepSeekV4Config *config, ColiExpertStore *store,
+                       const float *inputs, const int *tokens, int rows,
+                       char *error, size_t error_size) {
+    if (!routed || !weights || !config || !store || !inputs || !tokens || rows < 1 || rows > 128)
+        return set_error(error, error_size, "invalid chained MoE arguments");
+    int d = config->hidden_size, result = 0;
+    v4_moe_routed_only = 1;
+    if (rows > 1 && v4_expert_union_enabled())
+        result = v4_moe_batch_union(routed, weights, config, store, inputs, tokens, rows);
+    else
+        for (int item = 0; !result && item < rows; item++)
+            result = moe_token_pipeline(routed + (size_t)item * d, weights, config, store,
+                                        inputs + (size_t)item * d, tokens[item]);
+    v4_moe_routed_only = 0;
+    if (!result) return 0;
+    if (moe_reason()[0])
+        return set_error(error, error_size, "chained block failed in MoE: %s", moe_reason());
+    return set_error(error, error_size, "chained block failed in MoE");
+}
+#endif
 
 int coli_v4_block_window_batch_ref(
     float *outputs_hc, ColiDeepSeekV4WindowAttentionState *attention,
@@ -12628,6 +12734,13 @@ static void v4_vk_tier_report(const char *scope, unsigned long long hits,
 }
 #endif
 
+#ifdef COLI_VULKAN
+/* the dense chain (deepseek_v4_chain.h, included below) */
+static void v4c_start(const ColiV4Engine *engine);
+static void v4c_atexit(void);
+static void v4c_close(void);
+#endif
+
 static void v4_vk_open(const ColiV4Engine *engine) {
 #ifdef COLI_VULKAN
     g_v4_vk_thread = pthread_self();
@@ -12637,7 +12750,9 @@ static void v4_vk_open(const ColiV4Engine *engine) {
     int tier = vkt_wanted() && engine->experts && !engine->experts->gpu &&
                engine->config.n_routed_experts > 0;
     g_v4_vk_ready = coli_vk_init_env_tier("deepseek_v4", tier);
+    v4c_start(engine);              /* COLI_VK_CHAIN: the trunk on the device, before the tier sizes itself */
     v4_vk_tier_start(engine);
+    v4c_atexit();                   /* after the tier's: the chain goes before the device */
     if (g_v4_vk_ready && !vkt_ready() && !coli_vk_dense())
         coli_vk_dense_decide("deepseek_v4", 0, 1);   /* no tier after all: the trunk to the device */
     if (g_v4_vk_ready && coli_vk_dense()) coli_v4_vk_matmul = v4_vk_matmul_impl;   /* COLI_VK_DENSE=0: no hook */
@@ -12651,6 +12766,7 @@ static void v4_vk_open(const ColiV4Engine *engine) {
 static void v4_vk_close(void) {
 #ifdef COLI_VULKAN
     if (!g_v4_vk_ready) return;
+    v4c_close();                    /* the chain's line, its frames through before the matrices go */
     if (coli_v4_vk_tier) {   /* the tier's run line, then nothing reaches it any more */
         ColiExpertStoreStats st = {0};
         ColiExpertStore *store = coli_v4_vk_tier->store;
@@ -12733,6 +12849,18 @@ static int head_argmax(ColiV4Engine *engine, const float *hidden,
  * logprobs=k, docs/systemone.md) needs the whole row, so the row is computed here
  * once and the argmax is a scan over it. Same head_bf16_dot per row, same scan
  * order: the token picked and its logit do not change. */
+#ifdef COLI_VULKAN
+/* DUMP=<path> (VK=1 builds): every logits row the head computes, for the Vulkan gates */
+static void v4_dump_logits(const float *scores, size_t count) {
+    static FILE *dump;
+    static int dump_init;
+    if (!dump_init) { const char *d = getenv("DUMP"); dump_init = 1; if (d && *d) dump = fopen(d, "wb"); }
+    if (dump) { fwrite(scores, sizeof(float), count, dump); fflush(dump); }
+}
+#define V4_DUMP_LOGITS(scores, count) v4_dump_logits((scores), (count))
+#else
+#define V4_DUMP_LOGITS(scores, count) ((void)0)
+#endif
 static int head_scores_impl(ColiV4Engine *engine, const float *hidden,
                             const ColiSafetensorsIndex *index,
                             const ColiDeepSeekV4Config *config, float *scores) {
@@ -12752,14 +12880,17 @@ static int head_scores_impl(ColiV4Engine *engine, const float *hidden,
     if (resident) {
 #ifdef COLI_VULKAN
         if (coli_v4_vk_matmul &&
-            coli_v4_vk_matmul(11, resident, NULL, 0, vocab, d, scores, hidden, 1) == 0)
+            coli_v4_vk_matmul(11, resident, NULL, 0, vocab, d, scores, hidden, 1) == 0) {
+            V4_DUMP_LOGITS(scores, (size_t)vocab);
             return 0;
+        }
 #endif
         #pragma omp parallel for schedule(static)
         for (int row = 0; row < vocab; row++) {
             const uint16_t *weight = resident + (size_t)row * d;
             scores[row] = head_bf16_dot(weight, hidden, d);
         }
+        V4_DUMP_LOGITS(scores, (size_t)vocab);
         return 0;
     }
     /* Low-memory fallback: stream small row tiles exactly as before. */
@@ -12783,6 +12914,7 @@ static int head_scores_impl(ColiV4Engine *engine, const float *hidden,
         }
     }
     free(raw);
+    V4_DUMP_LOGITS(scores, (size_t)vocab);
     return 0;
 }
 /* First maximum in vocabulary order: the tie-break head_argmax always had. */
@@ -12859,6 +12991,7 @@ static int head_argmax_batch(ColiV4Engine *engine, const float *hidden,
             scores[(size_t)item * vocab + row] = head_bf16_dot(
                 weight, hidden + (size_t)item * d, d);
     }
+    V4_DUMP_LOGITS(scores, (size_t)batch * vocab);
     for (int item = 0; item < batch; item++) {
         int winner = -1;
         float maximum = -FLT_MAX;
@@ -13153,6 +13286,10 @@ static const float *v4_mainh_get(int64_t position) {
 
 #include "deepseek_v4_dspark.inc"
 
+#ifdef COLI_VULKAN
+#include "deepseek_v4_chain.h"   /* the layers as a dense chain on the device (COLI_VK_CHAIN) */
+#endif
+
 static int v4_prefill_pool_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
@@ -13206,6 +13343,14 @@ static int target_batch_impl(ColiV4Engine *engine, float **state_ptr, float **ne
      * does not change the caller's semantic distinction: speculative decode
      * always passes use_prefill_pool=0. */
     int pool_experts = use_prefill_pool && v4_prefill_pool_enabled();
+#ifdef COLI_VULKAN
+    {   /* the dense chain runs every layer on the device; 0: the CPU runs them, as below */
+        int chained = v4c_forward(engine, state_ptr, next_ptr, attention, config, experts, tokens,
+                                  start, batch, pool_experts, error, error_size);
+        if (chained) return chained > 0 ? 0 : -1;
+        v4c_cpu_step(start);
+    }
+#endif
     for (int layer_id = 0; layer_id < config->num_hidden_layers; layer_id++) {
         ColiDeepSeekV4LayerWeights layer;
         if (coli_v4_layer_load(engine, &layer, config, index, layer_id,
@@ -13303,6 +13448,14 @@ static int target_token_impl(ColiV4Engine *engine, float **state_ptr, float **ne
                         char *error, size_t error_size) {
     float *state = *state_ptr, *next = *next_ptr;
     if (load_embedding(state, index, config, token)) return -1;
+#ifdef COLI_VULKAN
+    {   /* the dense chain, as in target_batch */
+        int chained = v4c_forward(engine, state_ptr, next_ptr, attention, config, experts, &token,
+                                  position, 1, 0, error, error_size);
+        if (chained) return chained > 0 ? 0 : -1;
+        v4c_cpu_step(position);
+    }
+#endif
     for (int layer_id = 0; layer_id < config->num_hidden_layers; layer_id++) {
         ColiDeepSeekV4LayerWeights layer;
         if (coli_v4_layer_load(engine, &layer, config, index, layer_id,
@@ -14028,6 +14181,9 @@ static int v4_ckpt_restore(ColiV4Session *session, int prompt_count) {
             fprintf(stderr, "v4_ckpt restore failed layer=%d\n", layer);
             return 0;   /* partial restore is harmless: caller full-resets */
         }
+#ifdef COLI_VULKAN
+    v4c_reset();   /* a snapshot from another history: the chain's copies go */
+#endif
     kv_prefix_clear(&session->fed);
     kv_prefix_record(&session->fed, v4_ckpt_slots[best].ids, 0, best_len);
     v4_ckpt_slots[best].used = ++v4_ckpt_clock;
@@ -14199,6 +14355,9 @@ int coli_v4_session_generate(ColiV4Session *session,
 #endif
         for (int layer = 0; layer < config->num_hidden_layers; layer++)
             coli_v4_window_attention_reset(session->attention[layer]);
+#ifdef COLI_VULKAN
+        v4c_reset();
+#endif
         if (coli_v4_full_dspark_wanted) v4_ds_reset_history();
         /* Plan a capture: the longest common prefix of two successive fresh
          * prompts IS the stable system prefix. Snapshot there mid-prefill. */
@@ -14521,6 +14680,9 @@ int coli_v4_session_generate(ColiV4Session *session,
                                      batch, 0, NULL, NULL, error, error_size)) {
                         (void)spec_attention_restore(
                             attention, snapshots, config->num_hidden_layers);
+#ifdef COLI_VULKAN
+                        v4c_restored(old_last + 1);
+#endif
                         spec_attention_free(snapshots,
                                             config->num_hidden_layers);
                         kv_prefix_taint(&session->fed);
@@ -14542,6 +14704,9 @@ int coli_v4_session_generate(ColiV4Session *session,
                     if (!heads_ok) {
                         (void)spec_attention_restore(
                             attention, snapshots, config->num_hidden_layers);
+#ifdef COLI_VULKAN
+                        v4c_restored(old_last + 1);
+#endif
                         spec_attention_free(snapshots,
                                             config->num_hidden_layers);
                         kv_prefix_taint(&session->fed);
@@ -14595,6 +14760,9 @@ int coli_v4_session_generate(ColiV4Session *session,
                      * Restore the exact snapshot and replay only inputs that
                      * really correspond to emitted outputs. */
                     if (retained < batch) {
+#ifdef COLI_VULKAN
+                        v4c_restored(old_last + 1);   /* the rows past it rejected */
+#endif
                         if (spec_attention_restore(
                                 attention, snapshots,
                                 config->num_hidden_layers)) {
@@ -15378,6 +15546,7 @@ static int v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
 #endif
 #ifdef COLI_VULKAN
     v4_vk_tier_report("turn", (unsigned long long)hits, (unsigned long long)misses);
+    v4c_report();   /* the dense chain's line, when it ran */
 #endif
     coli_v4_expert_store_emit_hits(engine->experts);
     coli_v4_expert_store_emit_emap(engine->experts);
@@ -15778,6 +15947,9 @@ int main(int argc, char **argv) {
                (size_t)generated_count * sizeof(int));
         for (int layer = 0; layer < config.num_hidden_layers; layer++)
             coli_v4_window_attention_reset(attention[layer]);
+#ifdef COLI_VULKAN
+        v4c_reset();
+#endif
         /* Rebuild tf_pred for the fixture (argmax at each position). */
         size_t hd_tf = (size_t)config.hc_mult * config.hidden_size;
         tf_state = malloc((size_t)full_count * hd_tf * sizeof(float));

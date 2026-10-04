@@ -353,6 +353,15 @@ it has run on is an Intel Iris Xe through Mesa's Dozen (Direct3D 12 under WSL),
 for correctness: the same ids as the CPU in every configuration above. No speed
 has been measured.
 
+`COLI_VK_CHAIN=1` runs every layer as the dense chain instead
+([vulkan.md](vulkan.md#deepseek-v4-on-the-chain)): the streams, the attention with its
+window ring, compressors and indexer, every bf16 and E4M3 rounding the CPU makes, the
+mHC sites and the shared expert on the device, one host round trip per layer for the
+router and the routed experts; the host's state stays canonical. It needs resident
+dense layers and declines under the CUDA tier. Off by default on an integrated GPU (not
+measured on a V4 checkpoint); on the tiny fixtures every configuration gives the CPU's
+tokens (`tests/vulkan_engines.sh deepseek-chain`, `deepseek-chain-sanitize`).
+
 ## Environment reference (V4 engine)
 
 Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
