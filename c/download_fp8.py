@@ -74,11 +74,11 @@ def download_file_curl(fn, base_url, expected_size):
     if os.path.exists(outpath) and os.path.getsize(outpath) == expected_size:
         return True
     url = f"{base_url}/{fn}"
-    cmd = ["curl", "-L", "-C", "-", "--retry", "999", "--retry-delay", "5",
+    cmd = ["curl", "--fail", "-L", "-C", "-", "--retry", "999", "--retry-delay", "5",
            "--connect-timeout", "15", "--speed-time", "30", "--speed-limit", "1000",
            "-o", partpath, "-H", "User-Agent: colibri-download/1.0", url]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if os.path.exists(partpath) and os.path.getsize(partpath) >= expected_size:
+    result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if result.returncode == 0 and shard_complete(partpath, expected_size):
         os.replace(partpath, outpath)
         return True
     return False
