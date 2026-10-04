@@ -13,6 +13,7 @@ import os
 import select
 import queue
 import signal
+import stat
 import socket
 import subprocess
 import sys
@@ -2733,8 +2734,20 @@ def _image_bytes_from_url(url):
     except (ValueError, OSError):
         raise APIError(400, "image path is not allowed.", "messages")
     try:
-        with open(target, "rb") as handle:
-            return handle.read()
+        # An allowed directory can also contain a FIFO or device. Opening a
+        # FIFO in ordinary blocking mode would hold an API thread before the
+        # image decoder can reject it. Inspect the opened descriptor, rather
+        # than a pre-open path check, and never wait for a special-file writer.
+        fd = os.open(target, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise APIError(400, "local image paths must name regular files.", "messages")
+            with os.fdopen(fd, "rb") as handle:
+                fd = None                 # the file object now owns the descriptor
+                return handle.read()
+        finally:
+            if fd is not None:
+                os.close(fd)
     except OSError:
         raise APIError(400, "cannot read the requested image.", "messages")
 
