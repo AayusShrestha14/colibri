@@ -391,6 +391,16 @@ DSpark at every forced acceptance and a budget that evicts give the CPU's tokens
 do they on an Intel Iris Xe through Mesa's Dozen, the one GPU it has run on (for
 correctness; no speed has been measured).
 
+`COLI_VK_CHAIN=1` runs every layer as the dense chain instead
+([vulkan.md](vulkan.md#deepseek-v41-flash-and-deepseek-v4-on-the-chain)): the streams,
+the attention with its window ring, compressor and indexer, the engram's projection and
+gate, the mHC sites and the shared expert on the device, one host round trip per layer
+for the router and the routed experts; the host's state stays canonical (written back
+after every forward), so rollbacks, prefix reuse and a lost device need nothing extra.
+Off by default on an integrated GPU (not measured on a V4.1 checkpoint); on the tiny
+fixtures every configuration gives the CPU's tokens (`tests/vulkan_engines.sh
+deepseek-chain`, `deepseek-chain-sanitize`).
+
 ## Reusing a turn, and why it is asked for rather than assumed
 
 A chat client resends the whole conversation every turn. Every other engine in

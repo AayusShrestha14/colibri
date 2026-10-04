@@ -36,15 +36,15 @@ static const char *const pipe_file[P_NPIPE] = {
 /* COLI_VK_CHAIN_PROF=1: device time per kind of op (timestamps after every op; ops
  * that run side by side between two barriers share the time unevenly) */
 enum { PK_GEMV8, PK_GEMV, PK_GEMM, PK_NORM, PK_ROPE, PK_ATTN, PK_DNCONV, PK_DNREC, PK_EW, PK_QSA, PK_PLE, PK_COPY,
-       PK_MLA, PK_MLAW, PK_DSA, PK_KDA, PK_MHC, PK_N };
+       PK_MLA, PK_MLAW, PK_DSA, PK_KDA, PK_MHC, PK_ARES, PK_N };
 static const char *const pk_name[PK_N] = {"GEMV int8", "GEMV other", "tiled GEMM", "norm", "rope", "attention",
                                           "dn conv", "dn recurrence", "element-wise", "qsa", "ple", "copy",
-                                          "mla", "mla weights", "dsa", "kda", "mhc"};
-/* the MLA, KDA and mHC pipelines: optional (an engine without such layers needs none
- * of them, and a missing one turns off only its own ops) */
-enum { PM_MLA, PM_HGEMV, PM_DSA, PM_KDA, PM_MHC, PM_N };
+                                          "mla", "mla weights", "dsa", "kda", "mhc", "attnres"};
+/* the MLA, KDA, mHC and AttnRes pipelines: optional (an engine without such layers
+ * needs none of them, and a missing one turns off only its own ops) */
+enum { PM_MLA, PM_HGEMV, PM_DSA, PM_KDA, PM_MHC, PM_ARES, PM_N };
 static const char *const mla_file[PM_N] = {"chain_mla.spv", "chain_hgemv.spv", "chain_dsa.spv", "chain_kda.spv",
-                                           "chain_mhc.spv"};
+                                           "chain_mhc.spv", "chain_ares.spv"};
 #define VKC_KDA_MAX 8
 
 /* ---- memory: blocks per kind, buffers bound at offsets inside them -------------- */
@@ -247,6 +247,8 @@ static VkPipeline make_pipe(VkShaderModule m, const VkSpecializationInfo *si) {
     return p;
 }
 
+static void dsv4_init(void);       /* chain_dsv4.comp (DeepSeek V4.1 / V4), below */
+static void dsv4_shutdown(void);
 int vkc_init(void) {
     if (K.ready) return !K.lost;
     if (!coli_vk_core(&K.core)) return 0;
@@ -299,6 +301,7 @@ int vkc_init(void) {
         if (f && (K.mmod[i] = load_module(K.core.spv_path, mla_file[i]))) K.mpipe[i] = make_pipe(K.mmod[i], NULL);
     }
     K.mla_ok = K.mpipe[PM_MLA] && K.mpipe[PM_HGEMV] && K.mpipe[PM_DSA];
+    dsv4_init();
     /* the fp32 tiled GEMM at the backend's tiles; none = every S on the GEMV */
     K.mod_gemm = K.core.gemm_tiles ? load_module(K.core.spv_path, "qmatmul_gemm.spv") : VK_NULL_HANDLE;
     for (int k = 0; K.mod_gemm && k < K.core.gemm_tiles && k < VKC_GEMM_MAX; k++) {
@@ -891,11 +894,16 @@ static VkPipeline kda_pipe(int KD) {
     return p;
 }
 int vkc_kda_rec(int KD, VkcBuf *m, VkcBuf *f, VkcBuf *b, VkcBuf *g, VkcBuf *prm, VkcBuf *st, VkcBuf *y, const VkcKdaRec *p) {
+    return vkc_kda_rec_flags(KD, m, f, b, g, prm, st, y, p, 0);
+}
+int vkc_kda_rec_flags(int KD, VkcBuf *m, VkcBuf *f, VkcBuf *b, VkcBuf *g, VkcBuf *prm, VkcBuf *st, VkcBuf *y,
+                      const VkcKdaRec *p, int flags) {
     K.kind = PK_KDA;
-    if (!K.mpipe[PM_KDA] || KD < 1 || KD > 256 || p->VD < 1 || p->VD > 128 || p->H < 1 || p->S < 1) return 0;
+    if (!K.mpipe[PM_KDA] || KD < 1 || KD > 256 || p->VD < 1 || p->VD > 128 || p->H < 1 || p->S < 1 ||
+        (flags & ~(VKC_KDA_EXP_A | VKC_KDA_K3))) return 0;
     VkPipeline pipe = kda_pipe(KD);
     if (!pipe) return 0;
-    struct { int mode; VkcKdaRec b; } pc = {1, *p};
+    struct { int mode; VkcKdaRec b; int flags; } pc = {1, *p, flags};
     VkcBind bd[7] = {B(m, 0), B(prm, 0), B(st, 1), B(y, 1), B(f, 0), B(b, 0), B(g, 0)};
     return record(pipe, bd, 7, &pc, sizeof pc, (uint32_t)p->H, 1, 1);
 }
@@ -912,6 +920,28 @@ int vkc_mhc(int mode, VkcBuf *x, VkcBuf *m, VkcBuf *hp, VkcBuf *prm, VkcBuf *y, 
     if (mode == 0) return p->S == 0 || record(K.mpipe[PM_MHC], bd, 5, &pc, sizeof pc, (uint32_t)p->S, 1, 1);
     uint32_t gx, gy; grid((n + 255) / 256, &gx, &gy);
     return n == 0 || record(K.mpipe[PM_MHC], bd, 5, &pc, sizeof pc, gx, gy, 1);
+}
+
+/* ---- attention residuals and SiTU-GLU (chain_ares.comp) ---------------------------- */
+int vkc_ares_ready(void) { return vkc_ready() && K.mpipe[PM_ARES]; }
+int vkc_ares_mix(VkcBuf *x, VkcBuf *blk, VkcBuf *prm, VkcBuf *y, const VkcAres *p) {
+    K.kind = PK_ARES;
+    if (!K.mpipe[PM_ARES] || p->S < 0 || p->D < 1 || p->nb < 0 || p->nb > 15 || (p->nb > 0 && !blk) || y == x || y == blk) return 0;
+    if (p->S == 0) return open_frame() && !K.lost;
+    struct { int mode; VkcAres b; } pc = {0, *p};
+    VkcBind bd[4] = {B(x, 0), B(p->nb > 0 ? blk : NULL, 0), B(prm, 0), B(y, 1)};
+    uint32_t gx, gy; grid((uint64_t)p->S, &gx, &gy);
+    return record(K.mpipe[PM_ARES], bd, 4, &pc, sizeof pc, gx, gy, 1);
+}
+int vkc_situ(VkcBuf *g, VkcBuf *u, VkcBuf *y, const VkcSitu *p) {
+    K.kind = PK_ARES;
+    if (!K.mpipe[PM_ARES] || p->n < 0) return 0;
+    if (p->n == 0) return open_frame() && !K.lost;
+    int32_t pc[13] = {1, p->n, 0, 0, p->g_off, 0, p->u_off, 0, 0, p->y_off, 0, 0, 0};
+    memcpy(&pc[11], &p->b1, 4); memcpy(&pc[12], &p->b2, 4);
+    VkcBind bd[4] = {B(g, 0), B(u, 0), B(NULL, 0), B(y, 1)};
+    uint32_t gx, gy; grid(((uint64_t)p->n + 255) / 256, &gx, &gy);
+    return record(K.mpipe[PM_ARES], bd, 4, pc, sizeof pc, gx, gy, 1);
 }
 
 int vkc_mla_scratch(VkcMlaScratch *s, const VkcMla *m, int rows) {
@@ -1084,6 +1114,111 @@ void vkc_shutdown(void) {
     if (K.mod_dnrec) vkDestroyShaderModule(K.dev, K.mod_dnrec, NULL);
     if (K.pl) vkDestroyPipelineLayout(K.dev, K.pl, NULL);
     if (K.dsl) vkDestroyDescriptorSetLayout(K.dev, K.dsl, NULL);
+    dsv4_shutdown();
     memset(&K, 0, sizeof K);
     K.cur = -1; K.gemm_rows = -1;
+}
+
+/* ---- DeepSeek V4.1 Flash and DeepSeek V4 attention (chain_dsv4.comp) ------------------
+ * Its own optional pipeline: without the shader only these ops decline. */
+static struct { VkShaderModule mod; VkPipeline pipe; } D4;
+static void dsv4_init(void) {
+    char path[1200];
+    const char *sl = strrchr(K.core.spv_path, '/');
+    size_t pre = sl ? (size_t)(sl - K.core.spv_path) + 1 : 0;
+    const char *file = "chain_dsv4.spv";
+    if (pre + strlen(file) + 1 >= sizeof path) return;
+    memcpy(path, K.core.spv_path, pre); strcpy(path + pre, file);
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    fclose(f);
+    if ((D4.mod = load_module(K.core.spv_path, file))) D4.pipe = make_pipe(D4.mod, NULL);
+}
+static void dsv4_shutdown(void) {
+    if (D4.pipe) vkDestroyPipeline(K.dev, D4.pipe, NULL);
+    if (D4.mod) vkDestroyShaderModule(K.dev, D4.mod, NULL);
+    memset(&D4, 0, sizeof D4);
+}
+int vkc_dsv4_ready(void) { return vkc_ready() && D4.pipe; }
+
+/* the shader reads one block of 32 words: the mode, then the op's fields */
+typedef struct { int mode; int w[31]; } Dsv4PC;
+static int dsv4_rec(int kind, int mode, const void *b, size_t bytes, VkcBind *bd, int nb, uint32_t gx, uint32_t gy) {
+    if (!D4.pipe || !open_frame() || K.lost || bytes > sizeof(int) * 31) return 0;
+    Dsv4PC pc; memset(&pc, 0, sizeof pc);
+    pc.mode = mode; memcpy(pc.w, b, bytes);
+    K.kind = kind;
+    return record(D4.pipe, bd, nb, &pc, sizeof pc, gx, gy, 1);
+}
+int vkc_dsv4_attn(VkcBuf *q, VkcBuf *win, VkcBuf *cmp, VkcBuf *list, VkcBuf *prm, VkcBuf *out, const VkcDsAttn *p) {
+    if (p->S < 1 || p->S > 65535 || p->H < 1 || p->H > 65535 || p->hd < 1 || p->hd > 1024 || p->cnt < 0 || p->cnt > 3072)
+        return 0;
+    if (p->cnt == 0) return 0;
+    VkcBind bd[6] = {B(q, 0), B(win, 0), B(cmp ? cmp : win, 0), B(list, 0), B(prm, 0), B(out, 1)};
+    return dsv4_rec(PK_ATTN, 0, p, sizeof *p, bd, 6, (uint32_t)p->H, (uint32_t)p->S);
+}
+int vkc_dsv4_rope(VkcBuf *x, VkcBuf *cs, const VkcDsRope *p) {
+    if (p->nseg < 0 || p->per_row < 1 || p->rd < 2 || (p->rd & 1)) return 0;
+    if (p->nseg == 0) return open_frame() && !K.lost;
+    VkcBind bd[6] = {B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(cs, 0), B(x, 1)};
+    uint32_t gx, gy; grid(((uint64_t)p->nseg * (p->rd / 2) + 255) / 256, &gx, &gy);
+    return dsv4_rec(PK_ROPE, 1, p, sizeof *p, bd, 6, gx, gy);
+}
+int vkc_dsv4_compress(VkcBuf *kv, VkcBuf *sc, VkcBuf *ring, VkcBuf *prm, VkcBuf *out, const VkcDsComp *p) {
+    if (p->S < 0 || p->ratio < 1 || p->P < 1 || p->D < 1 || p->D > p->P || (p->overlap && p->P < 2 * p->D)) return 0;
+    if (p->S == 0) return open_frame() && !K.lost;
+    VkcBind bd[8] = {B(kv, 0), B(sc, 0), B(NULL, 0), B(NULL, 0), B(p->ape_off >= 0 ? prm : NULL, 0), B(out, 1), B(NULL, 0),
+                     B(ring, 1)};
+    return dsv4_rec(PK_DSA, 2, p, sizeof *p, bd, 8, 1, 1);
+}
+int vkc_dsv4_score(VkcBuf *iq, VkcBuf *hw, VkcBuf *keys, VkcBuf *mask, VkcBuf *sc, const VkcDsScore *p) {
+    /* queries above 4096 floats: mode 9, the same sums with the queries read from memory */
+    int wide = p->IH > 64 || p->IH * p->ID > 4096;
+    if (p->S < 1 || p->S > 65535 || p->IH < 1 || p->IH > 4096 || p->ID < 1 || p->ratio < 1 ||
+        p->width < 0 || p->sc_row < p->width || (p->mask_row > 0 && !mask)) return 0;
+    if (p->width == 0) return open_frame() && !K.lost;
+    VkcBind bd[6] = {B(iq, 0), B(hw, 0), B(keys, 0), B(p->mask_row > 0 ? mask : NULL, 0), B(NULL, 0), B(sc, 1)};
+    return dsv4_rec(PK_DSA, wide ? 9 : 3, p, sizeof *p, bd, 6, (uint32_t)p->S, 1);
+}
+int vkc_dsv4_cand(VkcBuf *sc, VkcBuf *mask, const VkcDsCand *p) {
+    if (p->S < 1 || p->S > 65535 || p->block < 1 || p->ratio < 1 || p->width < 0 ||
+        (p->width + p->block - 1) / p->block > 4096 || p->mask_row < p->width) return 0;
+    VkcBind bd[7] = {B(sc, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(mask, 1)};
+    return dsv4_rec(PK_DSA, 4, p, sizeof *p, bd, 7, (uint32_t)p->S, 1);
+}
+int vkc_dsv4_topk(VkcBuf *sc, VkcBuf *list, const VkcDsTopk *p) {
+    if (p->S < 1 || p->S > 65535 || p->topk < 0 || p->width < 0 || (p->order && p->topk > 4096)) return 0;
+    if (p->topk == 0) return open_frame() && !K.lost;
+    VkcBind bd[7] = {B(sc, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(list, 1)};
+    return dsv4_rec(PK_DSA, 5, p, sizeof *p, bd, 7, (uint32_t)p->S, 1);
+}
+int vkc_dsv4_engram(VkcBuf *kv, VkcBuf *prm, VkcBuf *x, const VkcDsEngram *p) {
+    if (p->S < 1 || p->S > 65535 || p->H < 1 || p->D < 1) return 0;
+    VkcBind bd[6] = {B(kv, 0), B(prm, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(x, 1)};
+    return dsv4_rec(PK_EW, 6, p, sizeof *p, bd, 6, (uint32_t)p->H, (uint32_t)p->S);
+}
+int vkc_dsv4_round(VkcBuf *x, VkcBuf *y, const VkcDsRound *p) {
+    if (!x || !y || p->kind < VKC_DS_BF16 || p->kind > VKC_DS_HADAMARD || p->nseg < 0 || p->per_row < 1 || p->len < 1)
+        return 0;
+    if ((p->kind == VKC_DS_E4M3 || p->kind == VKC_DS_E2M1) && (p->block < 1 || p->block > 256)) return 0;
+    if (p->kind == VKC_DS_HADAMARD && (p->len > 4096 || (p->len & (p->len - 1)))) return 0;
+    if (p->nseg == 0) return open_frame() && !K.lost;
+    /* the fields, then whether it runs in place (x is read where y is written), then hscale */
+    int w[14];
+    memcpy(w, p, 12 * sizeof(int));
+    w[12] = x == y;
+    memcpy(&w[13], &p->hscale, sizeof(float));
+    uint64_t groups = p->kind == VKC_DS_BF16 ? ((uint64_t)p->nseg * p->len + 255) / 256
+                    : p->kind == VKC_DS_HADAMARD ? (uint64_t)p->nseg
+                    : (uint64_t)p->nseg * ((p->len + p->block - 1) / p->block);
+    uint32_t gx, gy; grid(groups, &gx, &gy);
+    VkcBind bd[6] = {B(x == y ? NULL : x, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(y, 1)};
+    return dsv4_rec(PK_EW, 7, w, sizeof w, bd, 6, gx, gy);
+}
+int vkc_dsv4_swiglu(VkcBuf *a, VkcBuf *b, VkcBuf *y, const VkcDsSwiglu *p) {
+    if (!a || !b || !y || p->n < 0) return 0;
+    if (p->n == 0) return open_frame() && !K.lost;
+    uint32_t gx, gy; grid(((uint64_t)p->n + 255) / 256, &gx, &gy);
+    VkcBind bd[6] = {B(a, 0), B(b, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(y, 1)};
+    return dsv4_rec(PK_EW, 8, p, sizeof *p, bd, 6, gx, gy);
 }

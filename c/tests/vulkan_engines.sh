@@ -10,6 +10,8 @@
 #   bash tests/vulkan_engines.sh mimo-chain | mimo-chain-sanitize   # MiMo-V2.6's dense chain
 #   bash tests/vulkan_engines.sh inkling-olmoe-chain | inkling-olmoe-chain-sanitize
 #   bash tests/vulkan_engines.sh glm-chain | glm-chain-sanitize     # the same for colibri and glm53
+#   bash tests/vulkan_engines.sh kimi-chain | kimi-chain-sanitize   # the same for Kimi K3
+#   bash tests/vulkan_engines.sh deepseek-chain | deepseek-chain-sanitize   # deepseek_v41 and deepseek_v4
 #   bash tests/vulkan_engines.sh staged    # staged uploads: the same bits as mapped memory, the decision
 #   bash tests/vulkan_engines.sh <family>-staged   # a family with COLI_VK_STAGED=1 (qwen-staged: and
 #                                                  # an engine under an emulated small window)
@@ -1565,7 +1567,7 @@ family_qwen_chain() {
   QWEN36_VL_TINY=qwen38_27b_vl_tiny_c QWEN36_VL_REF=qwen38_27b_vl_tiny/ref.json COLI_VULKAN=1 COLI_VK_CHAIN=1 \
     COLI_USAGE=$PWD/chain.usage $PY -m unittest tests.test_qwen36_vision_serve
   # the device lost mid-decode: the state rebuilt on the CPU, the run finishes there
-  lost_gate qwen36 "chain qwen36 device lost" 40 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
+  lost_late qwen36 "chain qwen36 device lost" 20 rebuild COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
   # the prefix-reuse contract with the state on the device, and a serve session
   QWEN36_TINY=$PWD/qwen36_tiny_c COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_USAGE=$PWD/chain.usage $PY tests/test_qwen36_prefix_serve.py
   $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0
@@ -1600,8 +1602,8 @@ family_qwen_chain() {
     chain_gate qwen38 "chain qwen38 MTP $fx ${f:-drafting}" 1 OMP_NUM_THREADS=2 Q38_MTP=1 Q38_MTP_FORCE=$f SNAP=$fx -- 2 8 $fx/ref.json
   done; done
   # the device lost mid-decode, once between steps and once inside an MTP verify
-  lost_gate qwen38 "chain qwen38 device lost" 20 OMP_NUM_THREADS=2 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
-  lost_gate qwen38 "chain qwen38 device lost in a verify" 45 OMP_NUM_THREADS=2 Q38_MTP=1 Q38_MTP_FORCE=mixed SNAP=qwen38_tiny_mtp -- 2 8 qwen38_tiny_mtp/ref.json
+  lost_late qwen38 "chain qwen38 device lost" 10 rebuild OMP_NUM_THREADS=2 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
+  lost_late qwen38 "chain qwen38 device lost in a verify" 15 rebuild OMP_NUM_THREADS=2 Q38_MTP=1 Q38_MTP_FORCE=mixed SNAP=qwen38_tiny_mtp -- 2 8 qwen38_tiny_mtp/ref.json
   # the oracle targets with the chain on (COLI_VK_TIER_BALANCE=0: the int4 target wants
   # the same last logits from every expert path, and the balancer moves experts between
   # the device and the CPU by measured times); the MTP harness, whose prompt-cache and pin
@@ -2041,6 +2043,631 @@ family_glm_chain_sanitize() {
   make clean >/dev/null 2>&1 || true
 }
 
+# Kimi K3's dense chain (kimi_k3_chain.h). The tolerance: the tiny fixture amplifies
+# rounding at a few positions. The CPU against itself, with only its RMSNorm's sum taken
+# in float instead of double, moves the logits by up to 1.4e-4 of the largest one on the
+# f32 trunk and 1.0e-3 on the 8-bit one, and the served logprobs by up to 4.1e-3 (int4
+# trunk), at the positions where the chain moves them most (measured on Lavapipe: 1.8e-4
+# and 4.5e-4; logprobs 6.1e-3): every logits row is held within 2e-3 of the largest
+# |logit|, the logprobs of the serve sessions within 2e-2, the tokens exactly. With the CPU's int8 expert activations
+# (K3_IDOT=1) a rounding that flips an int8 step moves the logits further (8e-3, the
+# tokens unchanged): that configuration gates on its tokens (TOKENS=1).
+k3c_ids() { $PY -c "import json,sys;print(' '.join(map(str,json.load(open('kimi_k3_tiny/ref.json'))['cases'][sys.argv[1]]['prompt_ids'])))" "$1"; }
+k3c_close() {  # <cpu.f32> <vk.f32>: max |diff| within 2e-3 of the largest |logit|
+  $PY - "$1" "$2" <<'PY'
+import array, sys
+a = array.array("f", open(sys.argv[1], "rb").read()); b = array.array("f", open(sys.argv[2], "rb").read())
+d = max(abs(x - y) for x, y in zip(a, b)) if a and len(a) == len(b) else float("inf")
+m = max(abs(x) for x in a) if a else 0.0
+print(f"max |logit diff| {d / m if m else d:.1e} of the largest")
+sys.exit(0 if d <= 2e-3 * m else 1)
+PY
+}
+# k3c_gate <tag> <env...>: for each of the oracle's prompts (K3C_CASES, default all
+# three), the CPU run's tokens, every logits row (K3_VAL_LOGITS: every prefill row and
+# every decode step) within k3c_close (TOKENS=1: reported, not gated), and the chain
+# ran. EVICT=1: the tier evicted.
+# FAULT_BACK=k: the device is lost k frames before the end of the same run without a
+# fault (counted from that run's frames, so on any device the loss lands in the same
+# forward), and the run must say so; REBUILD=1: and rebuild the KDA state of some
+# positions on the CPU.
+k3c_gate() {
+  local tag=$1 c frames fault; shift
+  for c in ${K3C_CASES:-short chunk long}; do
+    rm -f k3c.usage cpu.f32 vk.f32
+    env "$@" COLI_USAGE=$PWD/k3c.usage USAGE_SAVE=0 K3_VAL_LOGITS=cpu.f32 ./kimi_k3 kimi_k3_tiny --ids "$(k3c_ids $c)" --ngen 8 \
+      2> cpu.log | sed 's/ *TUNE.*//' > cpu.tok
+    fault=""
+    if [ -n "${FAULT_BACK:-}" ]; then
+      env "$@" COLI_USAGE=$PWD/k3c.usage USAGE_SAVE=0 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 \
+        ./kimi_k3 kimi_k3_tiny --ids "$(k3c_ids $c)" --ngen 8 2> vk.log > /dev/null
+      frames=$(sed -n 's/^\[VK\] kimi_k3 chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p' vk.log | tail -1)
+      [ -n "$frames" ] && [ "$frames" -gt "$FAULT_BACK" ] || { cat vk.log; fail "$tag $c: no fault-free run to count frames from"; }
+      fault="COLI_VK_CHAIN_FAULT=$((frames - FAULT_BACK + 1))"
+    fi
+    env "$@" $fault COLI_USAGE=$PWD/k3c.usage USAGE_SAVE=0 K3_VAL_LOGITS=vk.f32 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 \
+      COLI_VK_CHAIN=${CHAINMODE:-1} ./kimi_k3 kimi_k3_tiny --ids "$(k3c_ids $c)" --ngen 8 2> vk.log | sed 's/ *TUNE.*//' > vk.tok
+    { [ -s cpu.tok ] && cmp -s cpu.tok vk.tok; } || { cat cpu.tok vk.tok; tail -20 vk.log; fail "$tag $c: the chain's tokens differ from the CPU"; }
+    if [ -n "$fault" ]; then
+      grep -q "kimi_k3 chain: the device was lost" vk.log || { cat vk.log; fail "$tag $c: no loss was handled"; }
+      if [ "${REBUILD:-0}" = 1 ]; then grep -q "rebuilding the state of [1-9]" vk.log || { cat vk.log; fail "$tag $c: no state was rebuilt"; }; fi
+    else
+      [ "$(chain_count kimi_k3 vk.log)" -gt 0 ] || { cat vk.log; fail "$tag $c: the chain never ran"; }
+    fi
+    if [ "${EVICT:-0}" = 1 ]; then
+      [ "$(tier_evictions kimi_k3 vk.log)" -gt 0 ] || { grep '\[VK\] tier' vk.log; fail "$tag $c: the budget forced no eviction"; }
+      grep -q ' failed 0 ' vk.log || { grep '\[VK\] tier' vk.log; fail "$tag $c: an upload failed"; }
+    fi
+    local lg; lg=$(k3c_close cpu.f32 vk.f32) || { echo "$lg"; [ "${TOKENS:-0}" = 1 ] || fail "$tag $c: logits"; }
+    echo "OK $tag $c: tokens = CPU, $lg, $(chain_count kimi_k3 vk.log) chain forwards$(grep -o 'rebuilding the state of [0-9]* positions\|the host.s state is current' vk.log | sed 's/^/, /')"
+  done
+}
+k3c_serve_fixture() {   # the tiny fixture with the tokenizer the serve tests speak through
+  rm -rf kimi_k3_serve && mkdir kimi_k3_serve
+  cp kimi_k3_tiny/config.json kimi_k3_tiny/model.safetensors kimi_k3_serve/
+  cp tests/tok_kimi_tiny.json kimi_k3_serve/tokenizer.json
+}
+
+# Every configuration the chain takes: Moonshot's oracle with the chain on (the tier on,
+# off, the shared experts on the device), every dense format (f32, int8 rows, int4-g64,
+# mixed), the CPU's int8 expert activations with the tier off, prefill a token at a
+# time and in chain chunks of 3, the tiled GEMM and the per-row GEMV, K3_TOPP, a tier
+# budget that evicts, prompts only (the KDA state crossing between the device and the
+# CPU at every decode), a device lost mid-decode (the KDA state rebuilt on the CPU), in
+# the first prompt chunk (the host's state current) and in a later one (rebuilt); serve
+# sessions frame for frame (pins, the prompt cache, prefix reuse, a prompt that diverges
+# and one that starts over, the prefill read-out), with recurrent-state checkpoints
+# (COLI_K3_CKPT: photos taken from the device's state and restored to it), in chain
+# chunks, on prompts only, with a device lost mid-session; the checkpoint and dashboard
+# harnesses with the chain on.
+family_kimi_chain() {
+  make kimi_k3 tests/test_vk_chain VK=1
+  ./tests/test_vk_chain shaders/qmatmul.spv | tee vk_chain.log
+  tail -1 vk_chain.log | grep -qx PASS || fail "the chain's ops"
+  $PY tools/make_kimi_k3_tiny.py --output ./kimi_k3_tiny --force
+  k3c_serve_fixture
+  export OMP_NUM_THREADS=2
+  local e b out frames
+  for e in COLI_VK_TIER=1 COLI_VK_TIER=0 COLI_VK_DENSE=1; do
+    env $e COLI_USAGE=$PWD/k3c.usage USAGE_SAVE=0 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 \
+      $PY tests/test_kimi_k3_tiny.py --binary ./kimi_k3 --fixture ./kimi_k3_tiny
+    echo "OK chain kimi_k3 vendor oracle ($e)"
+  done
+  local O="K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 COLI_TEMP=0"
+  k3c_gate "chain kimi_k3 f32" $O
+  k3c_gate "chain kimi_k3 f32, tier off" $O COLI_VK_TIER=0
+  k3c_gate "chain kimi_k3 f32, shared experts by COLI_VK_DENSE=1" $O COLI_VK_DENSE=1
+  for b in 8 4; do   # int8 rows (fmt 1); int4-g64 (fmt 4) where a row is whole groups, int8 elsewhere
+    k3c_gate "chain kimi_k3 ${b}-bit trunk" K3_BITS=$b K3_MLA_BITS=$b K3_HEAD_BITS=$b K3_IDOT=0 COLI_TEMP=0
+  done
+  k3c_gate "chain kimi_k3 int4 KDA and MoE, int8 MLA and head" K3_BITS=4 K3_IDOT=0 COLI_TEMP=0
+  TOKENS=1 k3c_gate "chain kimi_k3 int8 expert activations, tier off" K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 COLI_TEMP=0 COLI_VK_TIER=0
+  k3c_gate "chain kimi_k3 prefill one token at a time" $O K3_CHUNK=1
+  k3c_gate "chain kimi_k3 chain chunks of 3" $O COLI_VK_CHAIN_ROWS=3
+  k3c_gate "chain kimi_k3 tiled GEMM from 2 rows" $O COLI_VK_GEMM_MIN_S=2
+  k3c_gate "chain kimi_k3 the per-row GEMV" $O COLI_VK_CHAIN_GEMV=0
+  k3c_gate "chain kimi_k3 K3_TOPP=0.6" $O K3_TOPP=0.6
+  EVICT=1 k3c_gate "chain kimi_k3 a tier budget of two experts" $O COLI_VK_TIER_GB=0.000005
+  CHAINMODE=2 k3c_gate "chain kimi_k3 prompts only" $O
+  # the device lost: 9 frames a forward on this fixture (two per sparse layer and the
+  # head); the long prompt is three forwards (32, 32 and 8 rows), then 7 decode steps
+  FAULT_BACK=3 REBUILD=1 k3c_gate "chain kimi_k3 device lost mid-decode" $O
+  K3C_CASES=long FAULT_BACK=86 k3c_gate "chain kimi_k3 device lost in the first prompt chunk" $O
+  K3C_CASES=long FAULT_BACK=77 REBUILD=1 k3c_gate "chain kimi_k3 device lost in a later prompt chunk" $O
+  # in chain chunks of 5 rows (seven chunks a 32-row forward), the loss in the third
+  # chunk of the second forward: the state its first chunks advanced is not used
+  K3C_CASES=long FAULT_BACK=124 REBUILD=1 k3c_gate "chain kimi_k3 device lost inside a chunked forward" $O COLI_VK_CHAIN_ROWS=5
+  # serve sessions frame for frame, the KDA state across turns
+  local S="K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 K3_PREFIX_LOG=1 USAGE_SAVE=0"
+  export CHAIN_SERVE_TOL=2e-2
+  rm -rf k3c_photos && mkdir k3c_photos
+  # shellcheck disable=SC2086
+  {
+    $PY tests/vulkan_chain_serve.py ./kimi_k3 kimi_k3_serve $S
+    out=$($PY tests/vulkan_chain_serve.py ./kimi_k3 kimi_k3_serve $S COLI_K3_CKPT=4); echo "$out"
+    $PY tests/vulkan_chain_serve.py ./kimi_k3 kimi_k3_serve $S COLI_K3_CKPT=2 COLI_K3_CKPT_DIR=$PWD/k3c_photos
+    $PY tests/vulkan_chain_serve.py ./kimi_k3 kimi_k3_serve K3_BITS=4 K3_IDOT=0 K3_PREFIX_LOG=1 USAGE_SAVE=0 COLI_VK_CHAIN_ROWS=3
+    COLI_VK_CHAIN=2 $PY tests/vulkan_chain_serve.py ./kimi_k3 kimi_k3_serve $S COLI_K3_CKPT=4
+    # a device lost mid-session, 134 frames before the end of the same session without a
+    # fault (on Lavapipe frame 200 of 334: after a photo brought the state to the host,
+    # the state of the 3 positions since then is rebuilt from it)
+    frames=$(echo "$out" | sed -n 's/.*kimi_k3 chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p')
+    [ -n "$frames" ] && [ "$frames" -gt 134 ] || fail "chain kimi_k3 serve: no fault-free session to count frames from"
+    CHAIN_SERVE_EXPECT='kimi_k3 chain: the device was lost' \
+      $PY tests/vulkan_chain_serve.py ./kimi_k3 kimi_k3_serve $S COLI_K3_CKPT=4 COLI_VK_CHAIN_FAULT=$((frames - 134))
+  }
+  unset CHAIN_SERVE_TOL
+  # recurrent-state checkpoints and the dashboard's lines with the chain on
+  COLI_USAGE=$PWD/k3c.usage USAGE_SAVE=0 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 \
+    $PY tests/test_kimi_k3_ckpt.py --binary ./kimi_k3 --fixture ./kimi_k3_tiny
+  COLI_USAGE=$PWD/k3c.usage USAGE_SAVE=0 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 \
+    $PY tests/test_kimi_k3_dashboard.py --binary ./kimi_k3 --fixture ./kimi_k3_tiny
+  unset OMP_NUM_THREADS
+}
+
+# The same chain under ASan and UBSan: memory safety is the gate; each run must have
+# run the chain (or handled the loss).
+family_kimi_chain_sanitize() {
+  make clean >/dev/null 2>&1 || true
+  make kimi_k3 tests/test_vk_chain VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
+  ./tests/test_vk_chain shaders/qmatmul.spv > san.log 2>&1 || true
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log || ! tail -1 san.log | grep -qx PASS; then cat san.log; fail "asan: the chain's ops"; fi
+  echo "OK asan: the chain's ops"
+  $PY tools/make_kimi_k3_tiny.py --output ./kimi_k3_tiny --force
+  k3c_serve_fixture
+  export OMP_NUM_THREADS=2
+  k3san() {  # <tag> <env and argv...>
+    local tag=$1; shift
+    rm -f k3c.usage
+    env COLI_USAGE=$PWD/k3c.usage USAGE_SAVE=0 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 "$@" > san.log 2>&1 || true
+    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    grep -q "kimi_k3 chain: \([1-9][0-9]* forwards\|the device was lost\)" san.log || { cat san.log; fail "$tag: the chain never ran"; }
+    echo "OK $tag: sanitizers clean, $(chain_count kimi_k3 san.log) chain forwards"
+  }
+  local O="K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 COLI_TEMP=0" ids frames
+  ids=$(k3c_ids long)
+  # shellcheck disable=SC2086
+  {
+    k3san "asan chain kimi_k3 f32" env $O ./kimi_k3 kimi_k3_tiny --ids "$ids" --ngen 8
+    frames=$(sed -n 's/^\[VK\] kimi_k3 chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p' san.log | tail -1)
+    k3san "asan chain kimi_k3 int4 trunk, chain chunks of 3" env K3_BITS=4 K3_IDOT=0 COLI_VK_CHAIN_ROWS=3 ./kimi_k3 kimi_k3_tiny --ids "$ids" --ngen 8
+    k3san "asan chain kimi_k3 tier off, every logits row" env $O COLI_VK_TIER=0 K3_VAL_LOGITS=san.f32 ./kimi_k3 kimi_k3_tiny --ids "$ids" --ngen 8
+    k3san "asan chain kimi_k3 prompts only" env $O COLI_VK_CHAIN=2 ./kimi_k3 kimi_k3_tiny --ids "$ids" --ngen 8
+    # the device lost mid-decode: 3 frames before the end of the run above (a fixed frame
+    # number can land in the buffers' setup on a device whose memory is not mapped)
+    k3san "asan chain kimi_k3 device lost, rebuilt" env $O COLI_VK_CHAIN_FAULT=$((frames - 2)) ./kimi_k3 kimi_k3_tiny --ids "$ids" --ngen 8
+    grep -q "rebuilding the state of [1-9]" san.log || { cat san.log; fail "asan chain kimi_k3 device lost: no state was rebuilt"; }
+  }
+  CHAIN_SERVE_TOL=2e-2 $PY tests/vulkan_chain_serve.py ./kimi_k3 kimi_k3_serve K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 \
+    K3_PREFIX_LOG=1 USAGE_SAVE=0 COLI_K3_CKPT=4 > san.log 2>&1 || { cat san.log; fail "asan chain kimi_k3 serve"; }
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan chain kimi_k3 serve: sanitizer diagnostic"; fi
+  echo "OK asan chain kimi_k3 serve: $(tail -1 san.log)"
+  unset OMP_NUM_THREADS
+  make clean >/dev/null 2>&1 || true
+}
+
+# DeepSeek V4.1 Flash (deepseek_v41) and DeepSeek V4 (deepseek_v4) on the dense chain
+# (COLI_VK_CHAIN=1). v41_gate runs the CPU and then the chain with the same settings:
+# the same exit code (the engine fails on a token off its reference), the same printed
+# token stream, every logits row (DUMP) within 1e-4 of the largest, the chain ran (or,
+# with FAULT_BACK=k, the device was lost k frames before the end of a fault-free run and
+# the CPU took over).
+v41_gate() {  # <tag> <env...> -- <argv...>
+  local tag=$1; shift
+  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  local rc_cpu=0 rc_vk=0
+  rm -f chain.usage cpu.f32 vk.f32
+  env "${envs[@]}" DUMP=cpu.f32 ./deepseek_v41 "$@" > cpu.txt 2> cpu.log || rc_cpu=$?
+  if [ -n "${FAULT_BACK:-}" ]; then
+    env "${envs[@]}" COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 \
+      ./deepseek_v41 "$@" > /dev/null 2> vk.log || true
+    local frames; frames=$(sed -n 's/^\[VK\] deepseek_v41 chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p' vk.log | tail -1)
+    [ -n "$frames" ] && [ "$frames" -gt "$FAULT_BACK" ] || { cat vk.log; fail "$tag: no fault-free run to count frames from"; }
+    envs+=("COLI_VK_CHAIN_FAULT=$((frames - FAULT_BACK + 1))")
+    rm -f chain.usage
+  fi
+  env "${envs[@]}" DUMP=vk.f32 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 \
+    COLI_VK_CHAIN=${CHAINMODE:-1} ./deepseek_v41 "$@" > vk.txt 2> vk.log || rc_vk=$?
+  [ "$rc_cpu" = "$rc_vk" ] || { tail -20 vk.log; fail "$tag: exit $rc_vk, the CPU's $rc_cpu"; }
+  { [ -s cpu.txt ] && cmp -s cpu.txt vk.txt; } || { cat cpu.txt vk.txt; tail -20 vk.log; fail "$tag: the chain's tokens differ from the CPU"; }
+  if [ -n "${FAULT_BACK:-}" ]; then
+    grep -q "deepseek_v41 chain: the device was lost" vk.log || { cat vk.log; fail "$tag: no loss was handled"; }
+  else
+    [ "$(chain_count deepseek_v41 vk.log)" -gt 0 ] || { cat vk.log; fail "$tag: the chain never ran"; }
+  fi
+  local lg; lg=$(logits_close cpu.f32 vk.f32) || { echo "$lg"; fail "$tag: logits"; }
+  echo "OK $tag: tokens = CPU (exit $rc_cpu), $lg, $(chain_count deepseek_v41 vk.log) chain forwards$(grep -q 'the device was lost' vk.log && echo ', the device lost and the CPU on')"
+}
+v41_chain_fixtures() {
+  $PY tools/make_dsv41_tiny.py --out dsv41_tiny --emit-ref dsv41_tiny/ref.json > /dev/null
+  $PY tools/make_dsv41_tiny.py --out dsv41_long --emit-ref dsv41_long/ref.json --prompt-len 40 --max-new 6 > /dev/null
+}
+
+# DeepSeek V4 (deepseek_v4) on the dense chain: the deepseek-chain family's V4 half. The
+# functions use $PY, fail and chain_count from tests/vulkan_engines.sh and run from c/.
+#
+# v4_chain_gate <tag> <fixture> <case> <env...>: the CPU run (no COLI_VULKAN) and the
+# chain run of one oracle case of the fixture (or ids:a,b,...:n, those ids and n new
+# tokens), with the same settings and --record-oracle: the generated ids equal to the
+# CPU's (and to the reference's greedy stream), every logits row (DUMP) within
+# V4_CHAIN_TOL (5e-1) of its largest |logit|, the same draft attempts and acceptances as
+# the CPU (V4_DRAFT), the chain ran, and, on the chain throughout, each decode row equal
+# bit for bit to the teacher-forced row at its position. The teacher-forced argmaxes that
+# moved are counted, not gated (the logits bound already covers them). FAULT_BACK=k: the
+# device is lost k frames before the end of a fault-free run (counted without
+# --record-oracle) and the CPU takes over; CHAINMODE=2: prompts only. Each run starts
+# from no expert history (the fixture's .coli_usage removed), the tier's uploads awaited.
+# Why 0.5: DeepSeek V4 rounds to bf16 after nearly every step and the input of every fp8
+# matrix to E4M3 per block; a value the device's sums put on the other side of a bf16
+# boundary can move a whole E4M3 block by a step and the indexer's top-k to another row.
+# Measured worst on Lavapipe and a Radeon 780M: 0.32 (deepseek_v4_tiny_g2, long). The
+# check that no driver blurs is v4_chain_same (and the decode-row check above).
+v4_chain_prompt() {  # <fixture> <case>: the case's prompt as the tiny vocabulary's text (ids:a,b,...: those ids)
+  $PY -c 'import json,sys; c=sys.argv[2]; ids=[int(t) for t in c[4:].split(":")[0].split(",")] if c.startswith("ids:") else json.load(open(sys.argv[1]+"/ref.json"))["cases"][c]["prompt_ids"]; print("".join("<t%03d>" % t for t in ids))' "$1" "$2"
+}
+v4_chain_logits() {  # <cpu.f32> <vk.f32> <vocab>: the worst row's |diff| over its largest |logit|
+  $PY - "$1" "$2" "$3" "${V4_CHAIN_TOL:-5e-1}" <<'PY'
+import array, sys
+a = array.array("f", open(sys.argv[1], "rb").read()); b = array.array("f", open(sys.argv[2], "rb").read())
+V, tol = int(sys.argv[3]), float(sys.argv[4])
+if not a or len(a) != len(b): print(f"logits: {len(a)} and {len(b)} values"); sys.exit(1)
+worst, same = 0.0, 0
+for r in range(len(a) // V):
+    ra, rb = a[r * V:(r + 1) * V], b[r * V:(r + 1) * V]
+    d = max(abs(x - y) for x, y in zip(ra, rb)); m = max(abs(x) for x in ra)
+    same += d == 0
+    worst = max(worst, d / m if m else d)
+print(f"logits: {same} of {len(a) // V} rows identical, worst row {worst:.2e} of its largest")
+sys.exit(0 if worst <= tol else 1)
+PY
+}
+# v4_chain_same <tag> <fixture> <case> <A> <B> <env...>: the chain twice, with the settings
+# A and then B (space-separated KEY=VALUE lists) on top of env: the same ids and every
+# logits row the same bits. The chain's arithmetic does not depend on how the rows are
+# cut (every matrix takes the per-row GEMV, every other op is per row or in the CPU's
+# row order) nor on which side of the tier computed an expert, so chunks of 1 or 3, the
+# tier off or a draft's rows cut differently give the default run's bits; a state the
+# device kept stale across forwards (a rejected draft longer than a chunk) shows here
+# even where its logits stay within the CPU's tolerance.
+v4_chain_same() {
+  local tag=$1 fx=$2 c=$3 A=$4 B=$5; shift 5
+  local p mt side
+  p=$(v4_chain_prompt "$fx" "$c")
+  mt=$($PY -c 'import json,sys; c=sys.argv[2]; print(c.split(":")[2] if c.startswith("ids:") else json.load(open(sys.argv[1]+"/ref.json"))["cases"][c]["max_new_tokens"])' "$fx" "$c")
+  for side in a b; do
+    rm -f "$fx/.coli_usage" "v4-$side.f32"
+    # shellcheck disable=SC2046
+    env "$@" $([ $side = a ] && echo "$A" || echo "$B") DUMP=v4-$side.f32 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 \
+      ./deepseek_v4 "./$fx" "$p" --raw-prompt --max-tokens "$mt" --record-oracle v4-$side.json > /dev/null 2> v4-$side.err ||
+      { tail -20 v4-$side.err; fail "$tag: run $side"; }
+    [ "$(chain_count deepseek_v4 v4-$side.err)" -gt 0 ] || { cat v4-$side.err; fail "$tag: the chain never ran ($side)"; }
+  done
+  rm -f "$fx/.coli_usage"
+  cmp -s v4-a.f32 v4-b.f32 && $PY -c 'import json,sys; sys.exit(json.load(open("v4-a.json"))["full_ids"] != json.load(open("v4-b.json"))["full_ids"])' ||
+    { v4_chain_logits v4-a.f32 v4-b.f32 "$($PY -c 'import json,sys; print(json.load(open(sys.argv[1]+"/config.json"))["vocab_size"])' "$fx")"; fail "$tag: $A and $B give different bits"; }
+  echo "OK $tag (${c%%:*}): $A and $B: the same ids and the same logits bit for bit ($(($(wc -c < v4-a.f32) / 4)) values), $(chain_count deepseek_v4 v4-b.err) chain forwards"
+}
+v4_chain_gate() {
+  local tag=$1 fx=$2 c=$3; shift 3
+  local p mt lg frames fault=()
+  p=$(v4_chain_prompt "$fx" "$c")
+  mt=$($PY -c 'import json,sys; c=sys.argv[2]; print(c.split(":")[2] if c.startswith("ids:") else json.load(open(sys.argv[1]+"/ref.json"))["cases"][c]["max_new_tokens"])' "$fx" "$c")
+  rm -f "$fx/.coli_usage" cpu.f32 vk.f32 v4-cpu.json v4-vk.json
+  env "$@" DUMP=cpu.f32 ./deepseek_v4 "./$fx" "$p" --raw-prompt --max-tokens "$mt" --record-oracle v4-cpu.json > /dev/null 2> v4-cpu.err ||
+    { cat v4-cpu.err; fail "$tag: CPU run"; }
+  if [ -n "${FAULT_BACK:-}" ]; then
+    rm -f "$fx/.coli_usage"
+    env "$@" COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 ./deepseek_v4 "./$fx" "$p" --raw-prompt --max-tokens "$mt" > /dev/null 2> v4-vk.err || true
+    frames=$(sed -n 's/^\[VK\] deepseek_v4 chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p' v4-vk.err | tail -1)
+    [ -n "$frames" ] && [ "$frames" -gt "$FAULT_BACK" ] || { cat v4-vk.err; fail "$tag: no fault-free run to count frames from"; }
+    fault=("COLI_VK_CHAIN_FAULT=$((frames - FAULT_BACK + 1))")
+  fi
+  rm -f "$fx/.coli_usage"
+  env "$@" "${fault[@]}" DUMP=vk.f32 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=${CHAINMODE:-1} \
+    ./deepseek_v4 "./$fx" "$p" --raw-prompt --max-tokens "$mt" --record-oracle v4-vk.json > /dev/null 2> v4-vk.err ||
+    { tail -20 v4-vk.err; fail "$tag: chain run"; }
+  rm -f "$fx/.coli_usage"
+  $PY - "$fx" "$c" <<'PY' || { tail -20 v4-vk.err; fail "$tag: the chain's session differs from the CPU's"; }
+import json, sys
+a, b = json.load(open("v4-cpu.json")), json.load(open("v4-vk.json"))
+ref = a["full_ids"] if sys.argv[2].startswith("ids:") else json.load(open(sys.argv[1] + "/ref.json"))["cases"][sys.argv[2]]["greedy_full_ids"]
+ok = a["full_ids"] == b["full_ids"] == ref and len(a["tf_pred"]) == len(b["tf_pred"])
+if not ok: print("CPU", a["full_ids"], "chain", b["full_ids"], "ref", ref)
+open("v4-tf.txt", "w").write(str(sum(x != y for x, y in zip(a["tf_pred"], b["tf_pred"]))))
+sys.exit(0 if ok else 1)
+PY
+  if [ "${EVICT:-0}" = 1 ]; then   # the budget forced evictions
+    [ "$(tier_evictions deepseek_v4 v4-vk.err)" -gt 0 ] || { grep '\[VK\] tier' v4-vk.err; fail "$tag: the budget forced no eviction"; }
+  fi
+  # drafts (V4_DRAFT): the same attempts, drafted and accepted tokens as the CPU's
+  [ "$(grep -ao 'v4_dspark attempts=[0-9]* drafted=[0-9]* accepted=[0-9]*' v4-cpu.err)" = \
+    "$(grep -ao 'v4_dspark attempts=[0-9]* drafted=[0-9]* accepted=[0-9]*' v4-vk.err)" ] || { grep -a v4_dspark v4-cpu.err v4-vk.err; fail "$tag: the drafts went otherwise"; }
+  if [ -n "${FAULT_BACK:-}" ]; then
+    grep -q "deepseek_v4 chain: the device was lost" v4-vk.err || { cat v4-vk.err; fail "$tag: no loss was handled"; }
+  else
+    [ "$(chain_count deepseek_v4 v4-vk.err)" -gt 0 ] || { cat v4-vk.err; fail "$tag: the chain never ran"; }
+  fi
+  lg=$(v4_chain_logits cpu.f32 vk.f32 "$($PY -c 'import json,sys; print(json.load(open(sys.argv[1]+"/config.json"))["vocab_size"])' "$fx")") ||
+    { echo "$lg"; fail "$tag: logits"; }
+  # an oracle case on the chain throughout: its decode rows are the teacher-forced
+  # forward's rows at the same positions, bit for bit (as on the CPU)
+  if [ "${c#ids:}" = "$c" ] && [ "${CHAINMODE:-1}" = 1 ] && [ -z "${FAULT_BACK:-}" ] && [ "${*#*V4_DRAFT}" = "$*" ]; then
+    $PY - vk.f32 "$fx" "$c" <<'PY' || fail "$tag: a decode row differs from the teacher-forced row at its position"
+import array, json, sys
+v = array.array("f", open(sys.argv[1], "rb").read())
+V = json.load(open(sys.argv[2] + "/config.json"))["vocab_size"]
+case = json.load(open(sys.argv[2] + "/ref.json"))["cases"][sys.argv[3]]
+P, mt = len(case["prompt_ids"]), case["max_new_tokens"]
+row = lambda r: v[r * V:(r + 1) * V]
+for j in range(mt):            # session rows: the prompt's last position, then each decode step
+    if row(j) != row(mt + P - 1 + j): sys.exit(1)
+PY
+    lg="$lg, decode rows = teacher-forced rows"
+  fi
+  echo "OK $tag (${c%%:*}): ids = CPU$(case $c in ids:*) ;; *) echo ' = reference';; esac), $(cat v4-tf.txt) teacher-forced argmaxes moved, $lg, $(chain_count deepseek_v4 v4-vk.err) chain forwards$(grep -q 'the device was lost' v4-vk.err && echo ', the device lost and the CPU on')$(grep -ao 'v4_dspark attempts=[0-9]* drafted=[0-9]* accepted=[0-9]*' v4-vk.err | tail -1 | sed 's/^/, /')$([ "${EVICT:-0}" = 1 ] && grep -ao 'evictions [0-9]*' v4-vk.err | tail -1 | sed 's/^/, /')"
+}
+# v4_chain_fixtures: the 4-expert fixture (a copy), the 8-expert one (pinned rows16
+# experts), and three more geometries: 8 heads in 2 output groups (wo_a per group), a
+# window of 4 with ratios 4 and 2 (the window and the rings roll over more often), and
+# DeepSeek V4's indexer of 64 heads of 128 (the scores past the shared staging).
+v4_chain_fixtures() {
+  $PY tools/make_deepseek_v4_tiny.py --output deepseek_v4_tiny_t --force > /dev/null
+  local spec
+  for spec in "deepseek_v4_tiny_e8 EXPERTS=8" "deepseek_v4_tiny_g2 HEADS=8 O_GROUPS=2" \
+              "deepseek_v4_tiny_w4 SLIDING=4 COMPRESS_RATIOS=[0,4,2] HCA=2" "deepseek_v4_tiny_ix INDEX_HEADS=64 INDEX_DIM=128"; do
+    # shellcheck disable=SC2086
+    $PY - tools/make_deepseek_v4_tiny.py $spec <<'PY' > /dev/null
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("gen", sys.argv[1])
+gen = importlib.util.module_from_spec(spec); spec.loader.exec_module(gen)
+for kv in sys.argv[3:]:
+    k, v = kv.split("=", 1)
+    if k != "HCA": setattr(gen, k, eval(v)); continue
+    hf = gen.make_hf_config                      # the heavily compressed layers' ratio
+    def patched(C, hf=hf, r=int(v)):
+        cfg = hf(C); cfg.compress_rates["heavily_compressed_attention"] = r; return cfg
+    gen.make_hf_config = patched
+sys.argv = ["make_deepseek_v4_tiny.py", "--output", sys.argv[2], "--force"]
+gen.main()
+PY
+  done
+}
+# v4_chain_serve: the brio served prompt's per-position logprob echoes with the chain
+# against the CPU's (pinned, then a prompt that extends the pin, then max_tokens 0),
+# and the prefix-reuse contract (tests/test_deepseek_v4_prefix.py) with the chain on.
+v4_chain_serve() {  # <fixture>
+  $PY - "$1" <<'PY' || fail "deepseek_v4 chain served: the chain's echoes differ from the CPU's"
+import json, os, sys
+from pathlib import Path
+sys.path.insert(0, "tests")
+import test_deepseek_v4_brio as b
+fx = Path(sys.argv[1])
+case = json.load(open(fx / "ref.json"))["cases"]["long"]
+ids = case["prompt_ids"]
+def turns(chain):
+    for k in ("COLI_VULKAN", "COLI_VK_CHAIN", "COLI_VK_TIER_SYNC"): os.environ.pop(k, None)
+    try: os.remove(fx / ".coli_usage")
+    except FileNotFoundError: pass
+    if chain: os.environ.update(COLI_VULKAN="1", COLI_VK_CHAIN=os.environ.get("V4_CHAIN_MODE", "1"), COLI_VK_TIER_SYNC="1")
+    s = b.Serve(Path("deepseek_v4").resolve(), fx)
+    out = []
+    try:
+        out.append(s.submit(b.token_prompt(ids[:40]), 3, logprobs=4, pin=True))
+        out.append(s.submit(b.token_prompt(ids[:40] + ids[40:60]), 4, logprobs=4))
+        out.append(s.submit(b.token_prompt(ids), 0, logprobs=5))
+        out.append(s.submit(b.token_prompt(ids[:30]), 4))
+    finally:
+        s.close()
+        err = s.process.stderr.read().decode(errors="replace")
+    return out, err
+cpu, err_cpu = turns(False)
+dev, err = turns(True)
+for text in (err_cpu, err):   # a sanitized build reports into the engine's stderr
+    if "ERROR: AddressSanitizer" in text or "runtime error:" in text: print(text[-4000:]); sys.exit("sanitizer diagnostic")
+if "deepseek_v4 chain:" not in err or " forwards" not in err:
+    print(err[-3000:]); sys.exit("the chain never ran")
+worst, n, same = 0.0, 0, 0
+for x, y in zip(cpu, dev):
+    if [d[0] for d in x.data] != [d[0] for d in y.data] or sorted(x.echoes) != sorted(y.echoes) or x.reuse != y.reuse:
+        print("CPU", x.data, x.echoes.keys(), x.reuse, "chain", y.data, y.echoes.keys(), y.reuse); sys.exit(1)
+    for p in x.echoes:
+        n += 1; same += x.echoes[p] == y.echoes[p]
+        if x.echoes[p]["token"] != y.echoes[p]["token"]: sys.exit(1)
+        worst = max(worst, abs(x.echoes[p]["lp"] - y.echoes[p]["lp"]))
+fw = [l for l in err.splitlines() if "deepseek_v4 chain:" in l and "forwards" in l][-1]
+print(f"OK deepseek_v4 chain served: the pin, its extension, a read-only prompt and a shorter one: texts and reuse = CPU, "
+      f"{same} of {n} logprob echoes identical, worst |delta| {worst:.2e}; {fw.split('] ', 1)[1][:48]}")
+sys.exit(0 if worst <= 0.5 else 1)
+PY
+}
+# v4_chain_san <tag> <env and argv...>: a sanitized build's chain run (FAULT_BACK=k: the
+# loss k frames before the end of a fault-free run): no sanitizer diagnostic, and the
+# chain ran (or handled the loss).
+v4_chain_san() {
+  local tag=$1; shift
+  local fault=() frames
+  if [ -n "${FAULT_BACK:-}" ]; then
+    rm -f deepseek_v4_tiny_*/.coli_usage
+    env COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 "$@" > san.log 2>&1 || true
+    frames=$(sed -n 's/^\[VK\] deepseek_v4 chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p' san.log | tail -1)
+    [ -n "$frames" ] && [ "$frames" -gt "$FAULT_BACK" ] || { cat san.log; fail "$tag: no fault-free run to count frames from"; }
+    fault=("COLI_VK_CHAIN_FAULT=$((frames - FAULT_BACK + 1))")
+  fi
+  rm -f deepseek_v4_tiny_*/.coli_usage
+  env COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 "${fault[@]}" "$@" > san.log 2>&1 || true
+  rm -f deepseek_v4_tiny_*/.coli_usage
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+  grep -q "deepseek_v4 chain: \([1-9][0-9]* forwards\|the device was lost\)" san.log || { cat san.log; fail "$tag: the chain never ran"; }
+  echo "OK $tag: sanitizers clean, $(chain_count deepseek_v4 san.log) chain forwards$(grep -q 'the device was lost' san.log && echo ', the device lost')"
+}
+
+# The V4 half of the family: the engine, its fixtures, then every configuration: 4 and 8
+# experts (pinned rows16), the three oracle cases (the long one rolls the window of 8 and
+# both compressors over many times), 2 output groups, a window of 4 with ratios 4 and 2,
+# V4's indexer of 64 heads of 128, eviction, the tier off, the per-matrix trunk beside,
+# prefill and chain chunks, the per-row GEMV, V4_IDX_IDENTITY, prompts only, n-gram
+# drafts accepted and rejected (V4_MTP on a one-layer MTP checkpoint runs target-only),
+# the chain against itself, a device lost mid-decode, in the prompt and between drafts,
+# served turns (a pin, its extension, a read-only prompt), and the engine's own serve
+# tests with the chain on.
+v4_chain_family() {
+  make deepseek-v4 VK=1
+  v4_chain_fixtures
+  local c fx
+  for c in short compressed long; do
+    v4_chain_gate "chain deepseek_v4 4 experts" deepseek_v4_tiny_t $c
+    v4_chain_gate "chain deepseek_v4 8 experts, pinned rows16" deepseek_v4_tiny_e8 $c
+  done
+  for c in short long; do
+    v4_chain_gate "chain deepseek_v4 2 output groups" deepseek_v4_tiny_g2 $c
+    v4_chain_gate "chain deepseek_v4 a window of 4, ratios 4 and 2" deepseek_v4_tiny_w4 $c
+    v4_chain_gate "chain deepseek_v4 an indexer of 64 heads of 128" deepseek_v4_tiny_ix $c
+  done
+  EVICT=1 v4_chain_gate "chain deepseek_v4 a budget of three experts" deepseek_v4_tiny_e8 long COLI_VK_TIER_GB=0.00009
+  v4_chain_gate "chain deepseek_v4 tier off" deepseek_v4_tiny_t long COLI_VK_TIER=0 COLI_VK_DENSE=0
+  v4_chain_gate "chain deepseek_v4 beside the per-matrix trunk" deepseek_v4_tiny_t long COLI_VK_DENSE=1
+  v4_chain_gate "chain deepseek_v4 prefill chunks of 7" deepseek_v4_tiny_t long V4_PREFILL_CHUNK=7
+  v4_chain_gate "chain deepseek_v4 chain chunks of 3" deepseek_v4_tiny_e8 long COLI_VK_CHAIN_ROWS=3
+  v4_chain_gate "chain deepseek_v4 chunks of 5, a window of 4" deepseek_v4_tiny_w4 long COLI_VK_CHAIN_ROWS=5
+  v4_chain_gate "chain deepseek_v4 the per-row GEMV" deepseek_v4_tiny_t long COLI_VK_CHAIN_GEMV=0
+  v4_chain_gate "chain deepseek_v4 V4_IDX_IDENTITY=1" deepseek_v4_tiny_t long V4_IDX_IDENTITY=1
+  CHAINMODE=2 v4_chain_gate "chain deepseek_v4 prompts only" deepseek_v4_tiny_t long
+  # n-gram drafts on prompts whose tails repeat: accepted and rejected (A), every one
+  # rejected (R), a mix over three attempts (M)
+  local A=ids:20,21,22,23,24,25,26,27,28,29,20,21,22:12 R=ids:20,21,22,23,50,51,52,20,21,22:12
+  local M=ids:30,31,32,33,34,35,60,61,30,31,32,33,34,35,36,37,38,39,40,41,30,31,32:12
+  v4_chain_gate "chain deepseek_v4 n-gram drafts accepted and rejected" deepseek_v4_tiny_t $A V4_DRAFT=4 V4_NGRAM_PARTIAL_KEEP=1
+  v4_chain_gate "chain deepseek_v4 an n-gram draft rejected" deepseek_v4_tiny_t $R V4_DRAFT=4 V4_NGRAM_PARTIAL_KEEP=1
+  v4_chain_gate "chain deepseek_v4 n-gram drafts, a window of 4" deepseek_v4_tiny_w4 $M V4_DRAFT=4 V4_NGRAM_PARTIAL_KEEP=1
+  v4_chain_gate "chain deepseek_v4 n-gram drafts, 8 experts" deepseek_v4_tiny_e8 $M V4_DRAFT=4 V4_NGRAM_PARTIAL_KEEP=1
+  CHAINMODE=2 v4_chain_gate "chain deepseek_v4 prompts only, drafts" deepseek_v4_tiny_w4 $M V4_DRAFT=4 V4_NGRAM_PARTIAL_KEEP=1
+  v4_chain_gate "chain deepseek_v4 V4_MTP=1 (one MTP layer: target only)" deepseek_v4_tiny_t long V4_MTP=1 V4_DRAFT=3
+  # the chain against itself
+  for fx in deepseek_v4_tiny_t deepseek_v4_tiny_w4 deepseek_v4_tiny_g2; do
+    v4_chain_same "chain deepseek_v4 chunks, $fx" $fx long "X=1" "COLI_VK_CHAIN_ROWS=1"
+    v4_chain_same "chain deepseek_v4 prefill chunks, $fx" $fx long "X=1" "V4_PREFILL_CHUNK=3"
+  done
+  v4_chain_same "chain deepseek_v4 the tier off" deepseek_v4_tiny_e8 long "X=1" "COLI_VK_TIER=0 COLI_VK_DENSE=0"
+  v4_chain_same "chain deepseek_v4 a draft rejected, chunks of 2" deepseek_v4_tiny_w4 $R "X=1" "COLI_VK_CHAIN_ROWS=2" V4_DRAFT=4 V4_NGRAM_PARTIAL_KEEP=1
+  v4_chain_same "chain deepseek_v4 drafts, chunks of 1" deepseek_v4_tiny_w4 $M "X=1" "COLI_VK_CHAIN_ROWS=1" V4_DRAFT=4 V4_NGRAM_PARTIAL_KEEP=1
+  v4_chain_same "chain deepseek_v4 drafts, chunks of 3, 8 experts" deepseek_v4_tiny_e8 $A "X=1" "COLI_VK_CHAIN_ROWS=3" V4_DRAFT=4 V4_NGRAM_PARTIAL_KEEP=1
+  FAULT_BACK=3 v4_chain_gate "chain deepseek_v4 device lost mid-decode" deepseek_v4_tiny_t long
+  FAULT_BACK=40 v4_chain_gate "chain deepseek_v4 device lost in the prompt" deepseek_v4_tiny_t long COLI_VK_CHAIN_ROWS=7
+  FAULT_BACK=10 v4_chain_gate "chain deepseek_v4 device lost between drafts" deepseek_v4_tiny_w4 $M V4_DRAFT=4 V4_NGRAM_PARTIAL_KEEP=1
+  v4_chain_serve deepseek_v4_tiny_t
+  V4_CHAIN_MODE=2 v4_chain_serve deepseek_v4_tiny_t
+  local t
+  for t in test_deepseek_v4_prefix test_deepseek_v4_brio test_deepseek_v4_tiny; do
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_USAGE=$PWD/chain.usage \
+    $PY tests/$t.py --binary "$PWD/deepseek_v4" --fixture "$PWD/deepseek_v4_tiny_t" > v4-test.log 2>&1 ||
+    { cat v4-test.log; fail "deepseek_v4 $t with the chain"; }
+  echo "OK deepseek_v4 $t with the chain: $(tail -1 v4-test.log)"
+  done
+  rm -rf deepseek_v4_tiny_t deepseek_v4_tiny_e8 deepseek_v4_tiny_g2 deepseek_v4_tiny_w4 deepseek_v4_tiny_ix chain.usage
+  rm -f cpu.f32 vk.f32 v4-*.f32 v4-*.json v4-*.err v4-tf.txt v4-test.log
+}
+
+# The same under ASan and UBSan (LTO off, as family_deepseek_sanitize builds it): no
+# diagnostic, and each run ran the chain (or handled the loss); the serve tests with
+# UBSan halting on its first report.
+v4_chain_sanitize_runs() {
+  local p t
+  p=$(v4_chain_prompt deepseek_v4_tiny_t long)
+  mk() { v4_chain_prompt x "ids:$1"; }
+  v4_chain_san "asan chain deepseek_v4 long, 4 experts" ./deepseek_v4 ./deepseek_v4_tiny_t "$p" --raw-prompt --max-tokens 4 --record-oracle san.json
+  v4_chain_san "asan chain deepseek_v4 8 experts, pinned rows16, eviction" COLI_VK_TIER_GB=0.00009 ./deepseek_v4 ./deepseek_v4_tiny_e8 "$p" --raw-prompt --max-tokens 4 --record-oracle san.json
+  v4_chain_san "asan chain deepseek_v4 chunks of 3, a window of 4" COLI_VK_CHAIN_ROWS=3 ./deepseek_v4 ./deepseek_v4_tiny_w4 "$(v4_chain_prompt deepseek_v4_tiny_w4 long)" --raw-prompt --max-tokens 4 --record-oracle san.json
+  v4_chain_san "asan chain deepseek_v4 2 output groups" ./deepseek_v4 ./deepseek_v4_tiny_g2 "$(v4_chain_prompt deepseek_v4_tiny_g2 long)" --raw-prompt --max-tokens 4
+  v4_chain_san "asan chain deepseek_v4 an indexer of 64 heads of 128" ./deepseek_v4 ./deepseek_v4_tiny_ix "$(v4_chain_prompt deepseek_v4_tiny_ix long)" --raw-prompt --max-tokens 4
+  v4_chain_san "asan chain deepseek_v4 drafts rejected, chunks of 2" V4_DRAFT=4 V4_NGRAM_PARTIAL_KEEP=1 COLI_VK_CHAIN_ROWS=2 ./deepseek_v4 ./deepseek_v4_tiny_w4 "$(mk 20,21,22,23,50,51,52,20,21,22)" --raw-prompt --max-tokens 12
+  v4_chain_san "asan chain deepseek_v4 drafts" V4_DRAFT=4 V4_NGRAM_PARTIAL_KEEP=1 ./deepseek_v4 ./deepseek_v4_tiny_w4 "$(mk 30,31,32,33,34,35,60,61,30,31,32,33,34,35,36,37,38,39,40,41,30,31,32)" --raw-prompt --max-tokens 12
+  FAULT_BACK=10 v4_chain_san "asan chain deepseek_v4 device lost" ./deepseek_v4 ./deepseek_v4_tiny_t "$p" --raw-prompt --max-tokens 4
+  v4_chain_serve deepseek_v4_tiny_t > san.log 2>&1 || { cat san.log; fail "asan chain deepseek_v4 served"; }
+  echo "OK asan chain deepseek_v4 served: $(tail -1 san.log | cut -c1-120)"
+  for t in test_deepseek_v4_prefix test_deepseek_v4_brio; do
+    UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 $PY tests/$t.py --binary $PWD/deepseek_v4 --fixture $PWD/deepseek_v4_tiny_t > san.log 2>&1 || { cat san.log; fail "asan $t with the chain"; }
+    echo "OK asan $t with the chain: $(tail -1 san.log)"
+  done
+}
+v4_chain_family_sanitize() {
+  local SAN="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  make deepseek-v4-clean >/dev/null 2>&1 || true
+  make deepseek-v4 VK=1 LTO=0 EXTRA_CFLAGS="$SAN" EXTRA_LDFLAGS="$SAN"
+  v4_chain_fixtures
+  export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
+  v4_chain_sanitize_runs
+  rm -rf deepseek_v4_tiny_t deepseek_v4_tiny_e8 deepseek_v4_tiny_g2 deepseek_v4_tiny_w4 deepseek_v4_tiny_ix san.json san.log
+  make deepseek-v4-clean >/dev/null 2>&1 || true
+}
+
+# deepseek_v41 in every configuration the chain takes: the expert cache from one slot
+# to all (cap 1, 2, 8), the 8-token and the 40-token prompt (the window ring of 8 and
+# the ratio-2 groups roll over many times; the candidate blocks and the published index
+# keys of the ratio-1 group), DSpark drafts accepted (1, 3) and rejected (2, 4, 5:
+# undo rows on the device's copies), prompts in chunks of 3 and 7 (the device's ring
+# wraps), prompts only (decode on the CPU between them), the tier off, the per-matrix
+# trunk beside, the tiled GEMM from two rows, the per-row GEMV, V41_INDEX_OWNER, a
+# device lost mid-decode, in a prompt and between drafts; serve sessions frame for
+# frame (pins, the prompt cache, the prefill read-out, DSpark, prompts only), images
+# on the wire, and the engine's own serve tests with the chain on. Then deepseek_v4
+# (v4_chain_family above).
+family_deepseek_chain() {
+  make deepseek_v41 tests/test_vk_chain VK=1
+  ./tests/test_vk_chain shaders/qmatmul.spv | tee vk_chain.log
+  tail -1 vk_chain.log | grep -qx PASS || fail "the chain's ops"
+  v41_chain_fixtures
+  export OMP_NUM_THREADS=2
+  local cap f
+  for cap in 1 2 8; do v41_gate "chain deepseek_v41 cap=$cap" SNAP=dsv41_tiny -- $cap dsv41_tiny/ref.json; done
+  for cap in 2 8; do v41_gate "chain deepseek_v41 40-token prompt cap=$cap" SNAP=dsv41_long -- $cap dsv41_long/ref.json; done
+  for f in 1 2 3 4 5; do v41_gate "chain deepseek_v41 DSpark spec=$f" SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=$f -- 8 dsv41_tiny/ref.json; done
+  v41_gate "chain deepseek_v41 DSpark spec=5, one cache slot" SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=5 -- 1 dsv41_tiny/ref.json
+  v41_gate "chain deepseek_v41 prompt in chunks of 3" SNAP=dsv41_long COLI_VK_CHAIN_ROWS=3 -- 8 dsv41_long/ref.json
+  v41_gate "chain deepseek_v41 prompt in chunks of 7" SNAP=dsv41_long COLI_VK_CHAIN_ROWS=7 -- 2 dsv41_long/ref.json
+  CHAINMODE=2 v41_gate "chain deepseek_v41 prompts only" SNAP=dsv41_long -- 8 dsv41_long/ref.json
+  CHAINMODE=2 v41_gate "chain deepseek_v41 prompts only, DSpark spec=2" SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=2 -- 8 dsv41_tiny/ref.json
+  v41_gate "chain deepseek_v41 tier off" SNAP=dsv41_long COLI_VK_TIER=0 -- 8 dsv41_long/ref.json
+  v41_gate "chain deepseek_v41 beside the per-matrix trunk" SNAP=dsv41_long COLI_VK_DENSE=1 -- 8 dsv41_long/ref.json
+  v41_gate "chain deepseek_v41 tiled GEMM from 2 rows" SNAP=dsv41_long COLI_VK_GEMM_MIN_S=2 -- 8 dsv41_long/ref.json
+  v41_gate "chain deepseek_v41 the per-row GEMV" SNAP=dsv41_tiny COLI_VK_CHAIN_GEMV=0 -- 8 dsv41_tiny/ref.json
+  v41_gate "chain deepseek_v41 V41_INDEX_OWNER=1" SNAP=dsv41_long V41_INDEX_OWNER=1 -- 8 dsv41_long/ref.json
+  FAULT_BACK=5 v41_gate "chain deepseek_v41 device lost mid-decode" SNAP=dsv41_long -- 8 dsv41_long/ref.json
+  FAULT_BACK=100 v41_gate "chain deepseek_v41 device lost in the prompt" SNAP=dsv41_long COLI_VK_CHAIN_ROWS=7 -- 8 dsv41_long/ref.json
+  FAULT_BACK=8 v41_gate "chain deepseek_v41 device lost between drafts" SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=5 -- 8 dsv41_tiny/ref.json
+  $PY tests/vulkan_chain_serve.py ./deepseek_v41 dsv41_tiny V41_DSPARK=0
+  $PY tests/vulkan_chain_serve.py ./deepseek_v41 dsv41_tiny V41_DSPARK=1
+  COLI_VK_CHAIN=2 $PY tests/vulkan_chain_serve.py ./deepseek_v41 dsv41_tiny V41_DSPARK=1 COLI_VK_CHAIN_ROWS=3
+  $PY tests/vulkan_chain_v41_image.py ./deepseek_v41 dsv41_tiny V41_DSPARK=0
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_USAGE=$PWD/chain.usage \
+    $PY -m unittest tests.test_dsv41_prefix_serve tests.test_dsv41_dspark_serve
+  rm -f chain.usage chain-serve.usage chain-image.usage
+  v4_chain_family
+  unset OMP_NUM_THREADS
+}
+
+# The same chain under ASan and UBSan: memory safety is the gate; each run must have run
+# the chain (or handled the loss), with the ASAN_OPTIONS of every sanitized family.
+family_deepseek_chain_sanitize() {
+  local SAN="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  make clean >/dev/null 2>&1 || true
+  make deepseek_v41 tests/test_vk_chain VK=1 EXTRA_CFLAGS="$SAN"
+  export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
+  ./tests/test_vk_chain shaders/qmatmul.spv > san.log 2>&1 || true
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log || ! tail -1 san.log | grep -qx PASS; then cat san.log; fail "asan: the chain's ops"; fi
+  echo "OK asan: the chain's ops"
+  v41_chain_fixtures
+  export OMP_NUM_THREADS=2
+  dsan() {  # <tag> <env and argv...>   (FAULT_BACK=k: the loss k frames before the end of a fault-free run)
+    local tag=$1; shift
+    local fault=()
+    if [ -n "${FAULT_BACK:-}" ]; then
+      rm -f chain.usage
+      env COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 "$@" > san.log 2>&1 || true
+      local frames; frames=$(sed -n 's/^\[VK\] deepseek_v41 chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p' san.log | tail -1)
+      [ -n "$frames" ] && [ "$frames" -gt "$FAULT_BACK" ] || { cat san.log; fail "$tag: no fault-free run to count frames from"; }
+      fault=("COLI_VK_CHAIN_FAULT=$((frames - FAULT_BACK + 1))")
+    fi
+    rm -f chain.usage
+    env COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 "${fault[@]}" "$@" > san.log 2>&1 || true
+    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    grep -q "deepseek_v41 chain: \([1-9][0-9]* forwards\|the device was lost\)" san.log || { cat san.log; fail "$tag: the chain never ran"; }
+    echo "OK $tag: sanitizers clean, $(chain_count deepseek_v41 san.log) chain forwards"
+  }
+  dsan "asan chain deepseek_v41 40-token prompt" SNAP=dsv41_long ./deepseek_v41 8 dsv41_long/ref.json
+  dsan "asan chain deepseek_v41 DSpark spec=5, one cache slot" SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=5 ./deepseek_v41 1 dsv41_tiny/ref.json
+  dsan "asan chain deepseek_v41 prompt in chunks of 3" SNAP=dsv41_long COLI_VK_CHAIN_ROWS=3 ./deepseek_v41 2 dsv41_long/ref.json
+  FAULT_BACK=20 dsan "asan chain deepseek_v41 device lost" SNAP=dsv41_long ./deepseek_v41 8 dsv41_long/ref.json
+  $PY tests/vulkan_chain_serve.py ./deepseek_v41 dsv41_tiny V41_DSPARK=1 > san.log 2>&1 || { cat san.log; fail "asan chain deepseek_v41 serve"; }
+  echo "OK asan chain serve deepseek_v41: $(tail -1 san.log)"
+  $PY tests/vulkan_chain_v41_image.py ./deepseek_v41 dsv41_tiny V41_DSPARK=0 > san.log 2>&1 || { cat san.log; fail "asan chain deepseek_v41 images"; }
+  echo "OK asan chain images deepseek_v41: $(tail -1 san.log)"
+  rm -f chain.usage chain-serve.usage chain-image.usage
+  v4_chain_family_sanitize
+  unset OMP_NUM_THREADS
+  make clean >/dev/null 2>&1 || true
+}
+
 case "${1:-}" in
   shader)         shader_formats ;;
   qwen)           family_qwen ;;
@@ -2062,6 +2689,10 @@ case "${1:-}" in
   inkling-olmoe-chain-sanitize) family_inkling_olmoe_chain_sanitize ;;
   glm-chain)      family_glm_chain ;;
   glm-chain-sanitize) family_glm_chain_sanitize ;;
+  kimi-chain)     family_kimi_chain ;;
+  kimi-chain-sanitize) family_kimi_chain_sanitize ;;
+  deepseek-chain) family_deepseek_chain ;;
+  deepseek-chain-sanitize) family_deepseek_chain_sanitize ;;
   staged)         family_staged ;;
   *-staged)       # COLI_VK_STAGED unset for the window's run, then the whole family staged
                   if [ "$1" = qwen-staged ]; then env -u COLI_VK_STAGED bash tests/vulkan_engines.sh staged-window; fi
@@ -2069,5 +2700,5 @@ case "${1:-}" in
   staged-window)  staged_window ;;
   staged-faults)  family_staged_faults ;;
   staged-faults-sanitize) SAN=1 family_staged_faults ;;
-  *) echo "usage: $0 staged|<family>-staged|shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize|mimo-chain|mimo-chain-sanitize|inkling-olmoe-chain|inkling-olmoe-chain-sanitize|glm-chain|glm-chain-sanitize" >&2; exit 2 ;;
+  *) echo "usage: $0 staged|<family>-staged|shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize|mimo-chain|mimo-chain-sanitize|inkling-olmoe-chain|inkling-olmoe-chain-sanitize|glm-chain|glm-chain-sanitize|kimi-chain|kimi-chain-sanitize|deepseek-chain|deepseek-chain-sanitize" >&2; exit 2 ;;
 esac

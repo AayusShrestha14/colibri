@@ -66,6 +66,27 @@ def free_port():
         return sock.getsockname()[1]
 
 
+def quiet_port_pair(low=20000, high=30000):
+    """A free port whose next one is free too, below every kernel's ephemeral range
+    (32768 and up on Linux, 49152 and up on Windows and macOS). free_port() lands
+    inside that range, where an outgoing connection can take the next port between
+    pick_port's probe and the server's bind (seen once in CI as EADDRINUSE)."""
+    import random
+    def bindable(port):
+        with socket.socket() as sock:
+            try:
+                sock.bind(("127.0.0.1", port))
+                return True
+            except OSError:
+                return False
+    rng = random.Random()
+    for _ in range(200):
+        port = rng.randrange(low, high)
+        if bindable(port) and bindable(port + 1):
+            return port
+    raise unittest.SkipTest("no two consecutive free ports below the ephemeral range")
+
+
 def hw_report(vulkan=None, nvidia=(), icd=None, os_id="ubuntu"):
     return {
         "os": {"platform": "linux", "machine": "x86_64", "wsl": False, "id": os_id,
@@ -783,6 +804,11 @@ class ServerControl(HomeTestCase):
         self.assertEqual(self.wait_state(self.cfg, "stopped")["state"], "stopped")
 
     def test_a_taken_port_moves_to_the_next_free_one(self):
+        self.port = quiet_port_pair()      # pick_port tries the next one: keep it out of reach
+        args = list(self.cfg["args"])
+        args[args.index("--port") + 1] = str(self.port)
+        self.cfg = setup_flow.save_config(dict(self.cfg, args=args, port=self.port,
+                                               urls=setup_flow.urls("127.0.0.1", self.port)))
         blocker = socket.socket()
         blocker.bind(("127.0.0.1", self.port))
         blocker.listen(1)

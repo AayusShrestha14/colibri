@@ -2446,7 +2446,7 @@ static void moe_vk_cpu(Model *m, LCache *cache, int layer, int topk, const float
 }
 
 static void moe_vk_block(Model *m, Layer *l, LCache *cache, int layer, int topk, const float *xc,
-                         int rows, float *outc, const int *chosen, const float *weights) {
+                         int rows, float *outc, const int *chosen, const float *weights, int with_shared) {
     int dim = m->c.dim, draws = rows * topk;
     uint8_t taken[MOE_ROW_CHUNK * MOE_TOPK_MAX], want[MOE_ROW_CHUNK * MOE_TOPK_MAX];
     const float *dev[MOE_ROW_CHUNK * MOE_TOPK_MAX];
@@ -2456,7 +2456,7 @@ static void moe_vk_block(Model *m, Layer *l, LCache *cache, int layer, int topk,
     float *contrib = xmalloc((size_t)draws * dim * sizeof(float), "expert contributions");
     float *shared = xmalloc((size_t)rows * dim * sizeof(float), "shared expert");
     moe_vk_cpu(m, cache, layer, topk, xc, rows, chosen, weights, want, contrib);
-    shared_ffn_down(m, l, xc, rows, shared);
+    if (with_shared) shared_ffn_down(m, l, xc, rows, shared);
     if (ndev && !vkt_join(dev)) {   /* the batch failed (the tier stops): those draws here */
         moe_vk_cpu(m, cache, layer, topk, xc, rows, chosen, weights, taken, contrib);
         memset(taken, 0, (size_t)draws);
@@ -2476,7 +2476,7 @@ static void moe_vk_block(Model *m, Layer *l, LCache *cache, int layer, int topk,
             }
         }
         const float *sh = shared + (size_t)r * dim;
-        for (int i = 0; i < dim; i++) o[i] += sh[i];
+        if (with_shared) for (int i = 0; i < dim; i++) o[i] += sh[i];
     }
     free(shared); free(contrib);
 }
@@ -2499,8 +2499,10 @@ static void moe_vk_block(Model *m, Layer *l, LCache *cache, int layer, int topk,
  *
  * A cache too small to hold one position's experts keeps the old path: there the
  * slots genuinely cannot all be live at once. */
+/* with_shared 0: the routed experts only (the dense chain runs the shared expert on the
+ * device and adds it there, in the same place of the sum). */
 static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int layer,
-                       int E, int topk, const float *x, int n, float *out) {
+                       int E, int topk, const float *x, int n, float *out, int with_shared) {
     Cfg *c = &m->c;
     int dim = c->dim;
     if (topk > MOE_TOPK_MAX) {
@@ -2520,7 +2522,7 @@ static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int 
         free(scores);
 #ifdef COLI_VULKAN
         if (vkt_ready() && !strcmp(kind, "layers")) {
-            moe_vk_block(m, l, cache, layer, topk, xc, rows, outc, chosen, weights);
+            moe_vk_block(m, l, cache, layer, topk, xc, rows, outc, chosen, weights, with_shared);
             continue;
         }
 #endif
@@ -2541,7 +2543,7 @@ static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int 
                 }
                 free(down);
             }
-            shared_ffn_rows(m, l, xc, rows, outc);
+            if (with_shared) shared_ffn_rows(m, l, xc, rows, outc);
             continue;
         }
 
@@ -2613,7 +2615,7 @@ static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int 
                 for (int i = 0; i < dim; i++) o[i] += cvec[i];
             }
         }
-        shared_ffn_rows(m, l, xc, rows, outc);
+        if (with_shared) shared_ffn_rows(m, l, xc, rows, outc);
         free(down); free(gathered); free(contrib);
         free(next); free(count); free(tail); free(head); free(uniq);
     }
@@ -2621,7 +2623,7 @@ static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int 
 
 static void moe_run(Model *m, int layer, const float *x, int n, float *out) {
     moe_run_at(m, &m->L[layer], &m->cache[layer], "layers", layer,
-               m->c.n_routed, m->c.n_activated, x, n, out);
+               m->c.n_routed, m->c.n_activated, x, n, out, 1);
 }
 
 /* --------------------------------------------------------------- engram ---- */
@@ -3203,7 +3205,7 @@ static int spec_step(Model *m, int token, int start_pos, int main_rows,
             rms_into(branch_in + (size_t)i * dim, collapsed, l->ffn_norm.w, dim, c->norm_eps);
         }
         moe_run_at(m, l, &sp->cache[stage], "mtp", stage, c->spec_routed, c->spec_activated,
-                   branch_in, block, branch_out);
+                   branch_in, block, branch_out, 1);
         for (int i = 0; i < block; i++)
             coli_hc_post(h + (size_t)i * hc * dim, branch_out + (size_t)i * dim,
                          residual + (size_t)i * hc * dim, post + (size_t)i * hc,
@@ -3306,6 +3308,10 @@ static void forward_batch(Model *m, const int *ids, int n, float *logits) {
     forward_full(m, ids, n, logits, 1, NULL, -1, 0, 0, NULL, 0);
 }
 
+#ifdef COLI_VULKAN
+#include "deepseek_v41_chain.h"   /* the layers as a dense chain on the device (COLI_VK_CHAIN) */
+#endif
+
 static void forward_full(Model *m, const int *ids, int n, float *logits, int spec_batch,
                          const float *image_rows, int image_at, int image_h, int image_w,
                          const uint8_t *image_mask, int keep_rows) {
@@ -3406,7 +3412,15 @@ static void forward_full(Model *m, const int *ids, int n, float *logits, int spe
         m->main_hidden_rows = n;
     }
 
-    for (int layer = 0; layer < c->n_layers; layer++) {
+    int rows_out = spec_batch || keep_rows;
+#ifdef COLI_VULKAN
+    /* the dense chain runs every layer on the device; 0: the CPU runs them, as below */
+    int chained = v41c_forward(m, h, pre_mix, n, start_pos, spec_batch, rows_out);
+    if (!chained) v41c_cpu_step(m, start_pos);
+#else
+    int chained = 0;
+#endif
+    for (int layer = 0; layer < c->n_layers && !chained; layer++) {
         Layer *l = &m->L[layer];
         if (l->engram_index >= 0) engram_run(m, layer, h, n, start_pos);
         for (int k = 0; k < targets; k++) {
@@ -3479,7 +3493,6 @@ static void forward_full(Model *m, const int *ids, int n, float *logits, int spe
     }
 
     /* the last block's FFN mix collapses the stream one final time */
-    int rows_out = spec_batch || keep_rows;
     for (int t = rows_out ? 0 : n - 1; t < n; t++) {
         const float *mix = pre_mix + (size_t)t * hc;
         for (int i = 0; i < dim; i++) {
@@ -3493,6 +3506,13 @@ static void forward_full(Model *m, const int *ids, int n, float *logits, int spe
         mvb(logits + (size_t)(rows_out ? t : 0) * c->vocab, &m->head, branch_in);
     }
     trace("logits", -1, logits + (size_t)(rows_out ? n - 1 : 0) * c->vocab, c->vocab);
+#ifdef COLI_VULKAN
+    {   /* DUMP=<path>: every logits row this forward computed, for the Vulkan gates */
+        static FILE *dump; static int dump_init;
+        if (!dump_init) { const char *d = getenv("DUMP"); dump_init = 1; if (d && *d) dump = fopen(d, "wb"); }
+        if (dump) { fwrite(logits, sizeof(float), (size_t)(rows_out ? n : 1) * c->vocab, dump); fflush(dump); }
+    }
+#endif
 
     m->pos += n;
     /* Recorded where the tokens entered the state, and only for the MAIN stream:
@@ -3540,6 +3560,9 @@ static void model_reset(Model *m) {
     m->published_index_k = NULL;
     m->shared_topk_rows = m->shared_topk_width = 0;
     m->pos = 0;
+#ifdef COLI_VULKAN
+    v41c_reset(m);   /* nothing on the device describes the new sequence */
+#endif
     /* Paired with the reset on purpose: whoever drops the state must also forget
      * what it was built from, or the two disagree in favour of the one nobody
      * can check. */
@@ -3639,6 +3662,9 @@ static void spec_rollback(Model *m, int start_pos, int committed, int rows) {
     }
     m->pos = start_pos + committed;
     m->last_rows = committed;
+#ifdef COLI_VULKAN
+    v41c_rollback(m, m->pos);   /* the dense chain's copies of the rejected rows go stale */
+#endif
     if (m->engram.active && m->engram.history_len > m->pos) m->engram.history_len = m->pos;
     /* The record follows the rollback for the same reason the engram history
      * does: the rejected rows are no longer in the state, and a record that
@@ -4158,6 +4184,7 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
                    m->t_engram - engram0, (unsigned long long)(m->forwards - forwards0));
 #ifdef COLI_VULKAN
         if (vkt_ready()) { vkt_report("turn", turn_hits, turn_miss); vk_tier_save(); }
+        v41c_report();   /* the dense chain's line, when it ran */
 #endif
         serve_hits(m);
         serve_emap(m);
@@ -4312,7 +4339,9 @@ int main(int argc, char **argv) {
      * The matrices go up on their first multiply (see vk_mul), from this thread. */
     g_vk_thread = pthread_self();
     g_vk_ready = coli_vk_init_env_tier("deepseek_v41", vkt_wanted() && c->n_routed > 0);
+    v41c_start(&m);              /* COLI_VK_CHAIN: the trunk on the device, before the tier sizes itself */
     vk_tier_start(&m, snap, cap);
+    v41c_atexit();               /* after the tier's: the chain goes before the device */
     if (g_vk_ready && !vkt_ready() && !coli_vk_dense())
         coli_vk_dense_decide("deepseek_v41", 0, 1);   /* no tier after all: the trunk to the device */
 #endif
