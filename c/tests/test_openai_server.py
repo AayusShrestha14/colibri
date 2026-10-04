@@ -3294,6 +3294,39 @@ class HTTPTest(unittest.TestCase):
                                       history({"name": "fn", "arguments": "{}"})) as response:
                         self.assertEqual(response.status, 200)
 
+    def test_past_tool_calls_that_are_not_an_array_are_a_client_error(self):
+        """A replayed assistant turn with `tool_calls: 5` answered HTTP 500 on Qwen and Kimi.
+
+        The other renderers already answer 400 "`tool_calls` must be an array.". The Qwen
+        renderer's _qwen_tool_calls and Kimi's _k3_order_tool_results iterated the value as
+        it came, and the TypeError became do_POST's 500 "The colibri engine failed to process the
+        request."
+        """
+        def history(tool_calls):
+            return {"model": "test-model", "messages": [
+                {"role": "user", "content": "run it"},
+                {"role": "assistant", "content": "", "tool_calls": tool_calls},
+                {"role": "tool", "tool_call_id": "x", "content": "done"},
+                {"role": "user", "content": "and now?"},
+            ]}
+        for arch in ("glm", "glm53", "qwen36", "qwen38", "kimi", "deepseek_v4",
+                     "deepseek_v41", "mimo"):
+            for tool_calls in (5, 1.5, True, "call", {"id": "x"}):
+                with self.subTest(arch=arch, tool_calls=tool_calls):
+                    with patch("openai_server.ARCH", arch):
+                        with self.assertRaises(HTTPError) as caught:
+                            self.request("/v1/chat/completions", history(tool_calls))
+                    self.addCleanup(caught.exception.close)
+                    self.assertEqual(caught.exception.code, 400)
+                    self.assertEqual(json.loads(caught.exception.read())["error"]["param"],
+                                     "messages.1.tool_calls")
+            with self.subTest(arch=arch, tool_calls="well formed"):
+                with patch("openai_server.ARCH", arch):
+                    with self.request("/v1/chat/completions", history([
+                            {"id": "x", "type": "function",
+                             "function": {"name": "fn", "arguments": "{}"}}])) as response:
+                        self.assertEqual(response.status, 200)
+
 
     def test_a_text_part_whose_text_is_not_a_string_is_a_client_error(self):
         """{"type": "text", "text": 5} answered HTTP 500 on GLM-5.3, Qwen3.8 and V4.1.
