@@ -472,14 +472,18 @@ static Q38Chain *q38c_setup(Model *m) {
         for (int k = 0; k < n && ok; k++) ok = q38c_t(w[k]) != NULL;
         if (!ok) q38c_head_off(ch, m);
     }
-    if (!ch->nl) {
+    if (!ch->nl) {   /* nothing of the chain on the device: its own pools go too */
         if (!fit) fprintf(stderr, "[VK] qwen38 chain: a matrix did not reach the device; per-matrix path\n");
+        vkc_shutdown(); g_vk_chain = 0;
         return NULL;
     }
     ch->dn_where = Q38C_HOST;
     ch->ok = 1;
-    fprintf(stderr, "[VK] qwen38 chain: %d layers on the device (%d QSA), %.1f MiB of parameters\n", ch->nl, ch->n_attn,
-            ch->prm_floats * 4 / 1048576.0);
+    size_t wb = 0, wn = 0;
+    coli_vk_mem_info(&wb, &wn);
+    fprintf(stderr, "[VK] qwen38 chain: %d layers on the device (%d QSA), %zu matrices resident, %.1f MiB of parameters%s\n",
+            ch->nl, ch->n_attn, wn, ch->prm_floats * 4 / 1048576.0,
+            ch->head ? "" : "; the CPU runs the other layers, the final mixer and lm_head");
     return ch;
 }
 static int q38c_layers(Model *m) { Q38Chain *ch = (Q38Chain *)m->vkchain; return ch && ch->ok ? ch->nl : 0; }
