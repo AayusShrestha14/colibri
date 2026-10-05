@@ -674,9 +674,18 @@ static void glmc_start(Model *m) {
     vkc_fit_placed("colibri", &g_glmc_fit);
     glm_dho_finish(m);
 }
+/* A partial chain at exit: the matrices the device holds, which must be the ones the
+ * setup placed (the per-matrix path put nothing of a CPU layer or the tail there). */
+static void glmc_held_atexit(void) {
+    size_t w = 0, nt = 0;
+    coli_vk_mem_info(&w, &nt);
+    fprintf(stderr, "[VK] colibri chain: %d of %d layers held at exit: %zu B of matrices on the device\n",
+            g_glmc_fit.n, g_glmc_fit.L, w);
+}
 /* After the tier's: at exit the report runs first, then the chain goes, then the device. */
 static void glmc_atexit(Model *m) {
     if (!g_glmc_inited) return;
     atexit(vkc_shutdown);
     if (g_vk_chain) { g_glmc_model = m; atexit(glmc_report_atexit); }
+    if (g_glmc_fitted && g_glmc_partial) atexit(glmc_held_atexit);
 }

@@ -48,7 +48,20 @@
  * segment), a session above the device's limits, and matrices or a geometry its shaders
  * do not take (kv_lora above 1024, qk_rope above 0 is not GLM-5.3's and is declined too,
  * a KDA head above 256 key or 128 value floats, an indexer above 64 heads, 4096 query
- * floats or k-pooling below 2). */
+ * floats or k-pooling below 2).
+ *
+ * A partial chain (vk_chain.h, vkc_fit; docs/vulkan.md, "A partial chain"): when the
+ * device's free memory does not hold every layer, the chain takes layers 0..N-1 and the
+ * CPU runs N..L-1, the final collapse, norm and head (the head stays on the host unless
+ * the whole chain and the head fit). N is decided at load, once the device is open and
+ * before the expert cache and the tier size themselves (g53c_start, from
+ * model_load_range); with COLI_VK_DENSE_HOST only the N layers give their host copies
+ * back, each once all of it reached the device. A forward runs every chunk of its rows
+ * through the N device layers, then run_layers goes on from layer N with the hc_mult
+ * streams (H x D floats a row, once per chunk). The KDA state and windows on the device,
+ * the MLA mirror, its watermarks and the KV split cover the N layers; the CPU layers'
+ * state is the host's alone, so a lost device rebuilds the device layers' KDA state
+ * only. */
 #include "vk_chain.h"
 #include "vk_kvsplit.h"
 
@@ -782,7 +795,16 @@ static void g53c_start(GModel *m) {
     vkc_fit_placed("glm53", &g_g53c_fit);
     g53_dho_finish(m, g_g53c_fit.n, g_g53c_fit.tail, g_g53_partial);
 }
+/* A partial chain at exit: the matrices the device holds, which must be the ones the
+ * setup placed (the per-matrix path put nothing of a CPU layer or the head there). */
+static void g53c_held_atexit(void) {
+    size_t w = 0, nt = 0;
+    coli_vk_mem_info(&w, &nt);
+    fprintf(stderr, "[VK] glm53 chain: %d of %d layers held at exit: %zu B of matrices on the device\n",
+            g_g53c_fit.n, g_g53c_fit.L, w);
+}
 /* After the tier's: at exit the chain goes before the device. */
 static void g53c_atexit(void) {
     if (g_g53c_inited) atexit(vkc_shutdown);
+    if (g_g53c_fitted && g_g53_partial) atexit(g53c_held_atexit);
 }
