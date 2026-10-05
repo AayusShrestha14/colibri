@@ -268,7 +268,10 @@ dho_family_inkling_mimo_kimi_sanitize() {
     env COLI_USAGE=chain.usage USAGE_SAVE=0 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_DENSE_HOST=0 "$@" > san.log 2>&1 || true
     if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan $tag: sanitizer diagnostic"; fi
     [ "$(dho_dropped san.log)" -gt 0 ] || { cat san.log; fail "asan $tag: nothing on the device only"; }
-    if [ "$lost" = 1 ]; then [ "$(dho_reloaded san.log)" -gt 0 ] || { cat san.log; fail "asan $tag: nothing read back"; }; fi
+    if [ "$lost" = 1 ]; then
+      grep -q 'queue submit (COLI_VK_CHAIN_FAULT)' san.log || { cat san.log; fail "asan $tag: device loss was not injected"; }
+      [ "$(dho_reloaded san.log)" -gt 0 ] || { cat san.log; fail "asan $tag: nothing read back"; }
+    fi
     echo "OK asan $tag: sanitizers clean, $(dho_dropped san.log) matrices on the device only, $(dho_reloaded san.log) read back"
   }
   local R=tiny_inkling/ref_inkling.json
@@ -277,10 +280,14 @@ dho_family_inkling_mimo_kimi_sanitize() {
   dsan_run "dense-only inkling device lost" 1 COLI_VK_CHAIN_FAULT=150 SNAP=tiny_inkling ./inkling 8 0 $R
   dsan_run "dense-only mimo picture" 0 MIMO_DENSE_BITS=0 COLI_VK_DENSE=1 ./mimo mimo_tiny --ids "$(mimo_ids image prompt_ids)" --ngen 4 --image mimo_tiny/patches.f32 --grid $MGRID
   dsan_run "dense-only mimo device lost" 1 MIMO_DENSE_BITS=0 COLI_VK_CHAIN_FAULT=20 ./mimo mimo_tiny --ids "$(mimo_ids long prompt_ids)" --ngen 4
-  local O=(K3_BITS=4 K3_IDOT=0 COLI_TEMP=0)
+  local O=(K3_BITS=4 K3_IDOT=0 COLI_TEMP=0) frames
   dsan_run "dense-only kimi_k3 int4" 0 "${O[@]}" ./kimi_k3 kimi_k3_tiny --ids "$(k3c_ids long)" --ngen 4
+  # Chunk sizing changes the submission count. Inject during the last decode of
+  # this exact configuration instead of assuming it reaches a fixed frame.
+  frames=$(sed -n 's/^\[VK\] kimi_k3 chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p' san.log | tail -1)
+  [ "${frames:-0}" -gt 3 ] || { cat san.log; fail "asan dense-only kimi_k3: too few frames for device-loss test"; }
   dsan_run "dense-only kimi_k3 prompts only" 0 "${O[@]}" COLI_VK_CHAIN=2 ./kimi_k3 kimi_k3_tiny --ids "$(k3c_ids long)" --ngen 4
-  dsan_run "dense-only kimi_k3 device lost" 1 "${O[@]}" COLI_VK_CHAIN_FAULT=40 ./kimi_k3 kimi_k3_tiny --ids "$(k3c_ids long)" --ngen 4
+  dsan_run "dense-only kimi_k3 device lost" 1 "${O[@]}" COLI_VK_CHAIN_FAULT=$((frames - 2)) ./kimi_k3 kimi_k3_tiny --ids "$(k3c_ids long)" --ngen 4
   CHAIN_SERVE_TOL=2e-2 CHAIN_SERVE_EXPECT='dense matrices on the device only' COLI_VK_DENSE_HOST=0 \
     $PY tests/vulkan_chain_serve.py ./kimi_k3 kimi_k3_serve K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 USAGE_SAVE=0 > san.log 2>&1 ||
     { cat san.log; fail "asan dense-only kimi_k3 serve"; }
