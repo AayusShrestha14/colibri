@@ -344,8 +344,11 @@ static void vk_res_free(void **vk) {
     *vk = NULL;
 }
 static void olmoe_vk_report(void) {
-    if (g_vk_ready)
-        fprintf(stderr, "[VK] olmoe: %llu matmuls on the GPU\n", coli_vk_matmul_calls());
+    if (!g_vk_ready) return;
+    size_t bytes = 0, tensors = 0;   /* the dense matrices on the device (a partial chain: its layers' only) */
+    coli_vk_mem_info(&bytes, &tensors);
+    fprintf(stderr, "[VK] olmoe: %llu matmuls on the GPU (%zu matrices resident, %.1f MiB)\n", coli_vk_matmul_calls(),
+            tensors, bytes / 1048576.0);
 }
 #define MATMUL_RES(y, x, W, vk, S, I, O) matmul_res(y, x, W, &(vk), S, I, O)
 #else
