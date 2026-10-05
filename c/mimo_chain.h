@@ -54,7 +54,14 @@
  *
  * The chain declines (the per-matrix path or the CPU runs) when a dense matrix did not
  * reach the device, for geometry outside chain_attn (a head dim above 256) and under
- * MIMO_TRACE (the CPU's per-layer dump). */
+ * MIMO_TRACE (the CPU's per-layer dump).
+ *
+ * A partial chain (vk_chain.h, vkc_fit; mc_fit_start in mimo.c, at start-up): when the
+ * dense layers do not all fit the device, the first nl run here and the CPU runs the
+ * others and the head. Each chunk crosses the nl layers; its residual rows come down with
+ * the frame that ends it, and the CPU runs layers nl.. and the head on them (layers_cpu,
+ * head_cpu) before the next chunk. The device's layers keep their mirrors behind the
+ * watermarks; the CPU's keep their caches on the host only. */
 #include "vk_chain.h"
 #include "vk_kvsplit.h"
 
