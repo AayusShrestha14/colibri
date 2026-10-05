@@ -4490,6 +4490,69 @@ int coli_vk_tensor_info(const ColiVkTensor *t, ColiVkTensorInfo *o) {
 }
 /* A fence the chain waited on failed: the device is gone, everyone falls back. */
 void coli_vk_mark_lost(void) { G.ready = 0; }
+
+/* ---- the dense chain on either device (vk_chain.c keeps a context per device) --------
+ * d = 0 is the primary device, what the calls without _dev answer; d = 1 is COLI_VK_DEV2's
+ * (G2), which until now held only routed experts. The chain's layers on it run the same
+ * shaders: the core below is G2's, with the primary's GEMM tiles (a tile is a speed
+ * choice; every tile computes the same bits). */
+int coli_vk_core_dev(int d, ColiVkCore *o) {
+    if (d == 0) return coli_vk_core(o);
+    if (d != 1 || !G2.ready || !G.ready || !o) return 0;
+    if (!coli_vk_core(o)) return 0;   /* the tiles, the shader path: the primary's */
+    o->phys = (void *)G2.phys; o->device = (void *)G2.dev; o->queue = (void *)G2.queue; o->qfam = G2.qfam;
+    o->memtype_host = g_up[1].on ? g_up[1].mt_stage : G2.memtype;
+    o->memtype_cached = G2.memtype_cached; o->memtype_dev = G2.memtype_dev;
+    o->ssbo_align = G2.ssbo_align; o->ssbo_range = G2.ssbo_range;
+    o->has_prio = 0;
+    o->integrated = G2.integrated; o->shares_ram = G2.shares_ram;
+    return 1;
+}
+int coli_vk_available_dev(int d) { return d == 1 ? G2.ready : G.ready; }
+void coli_vk_mark_lost_dev(int d) { if (d == 1) G2.ready = 0; else G.ready = 0; }
+int coli_vk_queue_submit_dev(int d, void *queue, const void *submit_info, void *fence) {
+    return (int)vk_submit(d == 1 ? 1 : 0, (VkQueue)queue, (const VkSubmitInfo *)submit_info, (VkFence)fence);
+}
+int coli_vk_tensor_info_dev(const ColiVkTensor *t, ColiVkTensorInfo *o, int *dev) {
+    if (!t || !o || t->dev < 0 || t->dev > 1) return 0;
+    o->wbuf = (void *)t->wbuf; o->sbuf = (void *)t->sbuf;
+    o->fmt = t->fmt; o->I = t->I; o->O = t->O; o->rowWords = t->rowWords; o->gs = t->gs;
+    if (dev) *dev = t->dev;
+    return 1;
+}
+int coli_vk_mem_budget_dev(int d, double *used_gb, double *budget_gb) {
+    return d == 1 ? coli_vk_mem_budget2(used_gb, budget_gb) : coli_vk_mem_budget(used_gb, budget_gb);
+}
+size_t coli_vk_device_used_dev(int d) { return (size_t)__atomic_load_n(&g_mem.used[d == 1 ? 1 : 0], __ATOMIC_RELAXED); }
+size_t coli_vk_device_local_bytes_dev(int d) {
+    if (d != 1) return coli_vk_device_local_bytes();
+    if (!G2.phys) return 0;
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(G2.phys, &mp);
+    VkDeviceSize m = 0;
+    for (uint32_t i = 0; i < mp.memoryHeapCount; i++)
+        if ((mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && mp.memoryHeaps[i].size > m) m = mp.memoryHeaps[i].size;
+    if (g_mem.cap[1] && g_mem.cap[1] < m) m = g_mem.cap[1];   /* COLI_VK_DEVICE_CAP_MB */
+    return (size_t)m;
+}
+size_t coli_vk_free_bytes_dev(int d) {
+    if (d != 1) return coli_vk_free_bytes();
+    if (!G2.phys) return 0;
+    if (g_mem.cap[1]) return (size_t)vk_mem_room(1);
+    double used = 0, bud = 0;
+    if (coli_vk_mem_budget2(&used, &bud)) return bud > used ? (size_t)((bud - used) * 1e9) : 0;
+    size_t dl = coli_vk_device_local_bytes_dev(1), u = coli_vk_device_used_dev(1);
+    return dl > u ? dl - u : 0;
+}
+void coli_vk_mem_info_dev(int d, size_t *used, size_t *count) {
+    if (d != 1) { coli_vk_mem_info(used, count); return; }
+    if (used) *used = (size_t)__atomic_load_n(&g_wpool2.bytes, __ATOMIC_RELAXED);
+    if (count) *count = (size_t)__atomic_load_n(&g_wpool2.tensors, __ATOMIC_RELAXED);
+}
+size_t coli_vk_buffer_alignment_dev(int d) {
+    if (d != 1) return coli_vk_buffer_alignment();
+    return G2.buf_align ? G2.buf_align : 256;
+}
 /* The chain's submits: through the lock the staged uploader takes on a shared queue. */
 int coli_vk_queue_submit(void *queue, const void *submit_info, void *fence) {
     return (int)vk_submit(0, (VkQueue)queue, (const VkSubmitInfo *)submit_info, (VkFence)fence);

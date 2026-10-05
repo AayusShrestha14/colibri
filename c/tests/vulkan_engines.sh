@@ -2563,6 +2563,15 @@ v4_chain_gate() {
     frames=$(sed -n 's/^\[VK\] deepseek_v4 chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p' v4-vk.err | tail -1)
     [ -n "$frames" ] && [ "$frames" -gt "$FAULT_BACK" ] || { cat v4-vk.err; fail "$tag: no fault-free run to count frames from"; }
     fault=("COLI_VK_CHAIN_FAULT=$((frames - FAULT_BACK + 1))")
+  elif [ -n "${FAULT2_BACK:-}" ]; then   # the second device's frames (vulkan_layers_dev2.sh); 0: its first, the setup
+    fault=("COLI_VK_CHAIN_FAULT2=1")
+    if [ "$FAULT2_BACK" -gt 0 ]; then
+      rm -f "$fx/.coli_usage"
+      env "$@" COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 ./deepseek_v4 "./$fx" "$p" --raw-prompt --max-tokens "$mt" > /dev/null 2> v4-vk.err || true
+      frames=$(sed -n 's/^\[VK\] deepseek_v4 dev2 chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p' v4-vk.err | tail -1)
+      [ -n "$frames" ] && [ "$frames" -gt "$FAULT2_BACK" ] || { cat v4-vk.err; fail "$tag: no fault-free run to count frames from"; }
+      fault=("COLI_VK_CHAIN_FAULT2=$((frames - FAULT2_BACK + 1))")
+    fi
   fi
   rm -f "$fx/.coli_usage"
   env "$@" "${fault[@]}" DUMP=vk.f32 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=${CHAINMODE:-1} \
@@ -2586,6 +2595,9 @@ PY
     "$(grep -ao 'v4_dspark attempts=[0-9]* drafted=[0-9]* accepted=[0-9]*' v4-vk.err)" ] || { grep -a v4_dspark v4-cpu.err v4-vk.err; fail "$tag: the drafts went otherwise"; }
   if [ -n "${FAULT_BACK:-}" ]; then
     grep -q "deepseek_v4 chain: the device was lost" v4-vk.err || { cat v4-vk.err; fail "$tag: no loss was handled"; }
+  elif [ -n "${FAULT2_BACK:-}" ]; then
+    grep -q "deepseek_v4 dev2 chain: \(0 of [0-9]* layers on the device: the chain stays off (layer 0 did not reach the device: \)\?the device was lost" v4-vk.err ||
+      { cat v4-vk.err; fail "$tag: the second device's loss was not taken over"; }
   else
     [ "$(chain_count deepseek_v4 v4-vk.err)" -gt 0 ] || { cat v4-vk.err; fail "$tag: the chain never ran"; }
   fi
@@ -2593,7 +2605,7 @@ PY
     { echo "$lg"; fail "$tag: logits"; }
   # an oracle case on the chain throughout: its decode rows are the teacher-forced
   # forward's rows at the same positions, bit for bit (as on the CPU)
-  if [ "${c#ids:}" = "$c" ] && [ "${CHAINMODE:-1}" = 1 ] && [ -z "${FAULT_BACK:-}" ] && [ "${*#*V4_DRAFT}" = "$*" ]; then
+  if [ "${c#ids:}" = "$c" ] && [ "${CHAINMODE:-1}" = 1 ] && [ -z "${FAULT_BACK:-}${FAULT2_BACK:-}" ] && [ "${*#*V4_DRAFT}" = "$*" ]; then
     $PY - vk.f32 "$fx" "$c" <<'PY' || fail "$tag: a decode row differs from the teacher-forced row at its position"
 import array, json, sys
 v = array.array("f", open(sys.argv[1], "rb").read())
@@ -2668,6 +2680,9 @@ for text in (err_cpu, err):   # a sanitized build reports into the engine's stde
     if "ERROR: AddressSanitizer" in text or "runtime error:" in text: print(text[-4000:]); sys.exit("sanitizer diagnostic")
 if "deepseek_v4 chain:" not in err or " forwards" not in err:
     print(err[-3000:]); sys.exit("the chain never ran")
+import re
+if os.environ.get("V4_SERVE_EXPECT") and not re.search(os.environ["V4_SERVE_EXPECT"], err):
+    print(err[-3000:]); sys.exit("no line matches V4_SERVE_EXPECT")
 worst, n, same = 0.0, 0, 0
 for x, y in zip(cpu, dev):
     if [d[0] for d in x.data] != [d[0] for d in y.data] or sorted(x.echoes) != sorted(y.echoes) or x.reuse != y.reuse:
@@ -3084,6 +3099,7 @@ for f in tests/vulkan_partial_*.sh; do
   . "$f"
 done
 . tests/vulkan_dev2.sh   # the expert tier on two devices
+. tests/vulkan_layers_dev2.sh   # the chain's layers on two devices
 # ---- big prompt chunks and expert streaming (docs/vulkan.md, "Big prompt chunks and
 # expert streaming") ----
 # Every engine with the chain, on a prompt longer than its usual block, against its CPU
@@ -4180,6 +4196,15 @@ case "${1:-}" in
   prefill-deepseek) family_prefill_deepseek ;;
   kv-split)       family_kv_split ;;
   kv-split-sanitize) family_kv_split_sanitize ;;
+  layers-dev2)    family_layers_dev2 ;;
+  layers-dev2-sanitize) family_layers_dev2_sanitize ;;
+  layers-dev2-mla) family_layers_dev2_mla ;;
+  layers-dev2-mla-sanitize) family_layers_dev2_mla_sanitize ;;
+  layers-dev2-deepseek) family_layers_dev2_deepseek ;;
+  layers-dev2-deepseek-sanitize) family_layers_dev2_deepseek_sanitize ;;
+  layers-dev2-*)  e=${1#layers-dev2-}   # one engine's gates (the engine already built)
+                  declare -F "ld2_$e" >/dev/null || { echo "no layers-dev2 engine $e" >&2; exit 2; }
+                  OMP_NUM_THREADS=2 "ld2_$e" ;;
   kv-split-deepseek) family_kv_split_deepseek ;;
   kv-split-deepseek-sanitize) family_kv_split_deepseek_sanitize ;;
   staged)         family_staged ;;
@@ -4200,5 +4225,5 @@ case "${1:-}" in
   partial-*)      g=${1#partial-}; fn=ptl_family_${g//-/_}
                   declare -F "$fn" >/dev/null || { echo "no partial-chain group ${g}" >&2; exit 2; }
                   "$fn" ;;
-  *) echo "usage: $0 decide|decide-sanitize|staged|<family>-staged|shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize|qwen-spec|qwen-spec-sanitize|mimo-chain|mimo-chain-sanitize|inkling-olmoe-chain|inkling-olmoe-chain-sanitize|glm-chain|glm-chain-sanitize|kimi-chain|kimi-chain-sanitize|deepseek-chain|deepseek-chain-sanitize|dense-only-<group>[-sanitize]|partial-<group>[-sanitize]|prefill-qwen|prefill-qwen-sanitize|prefill-inkling-olmoe|prefill-mimo-kimi|prefill-glm|prefill-deepseek|kv-split|kv-split-sanitize|kv-split-deepseek|kv-split-deepseek-sanitize|dev2|dev2-deepseek-kimi-mimo|dev2-sanitize" >&2; exit 2 ;;
+  *) echo "usage: $0 decide|decide-sanitize|staged|<family>-staged|shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize|qwen-spec|qwen-spec-sanitize|mimo-chain|mimo-chain-sanitize|inkling-olmoe-chain|inkling-olmoe-chain-sanitize|glm-chain|glm-chain-sanitize|kimi-chain|kimi-chain-sanitize|deepseek-chain|deepseek-chain-sanitize|dense-only-<group>[-sanitize]|partial-<group>[-sanitize]|prefill-qwen|prefill-qwen-sanitize|prefill-inkling-olmoe|prefill-mimo-kimi|prefill-glm|prefill-deepseek|kv-split|kv-split-sanitize|layers-dev2[-mla|-deepseek][-sanitize]|layers-dev2-<engine>|kv-split-deepseek|kv-split-deepseek-sanitize|dev2|dev2-deepseek-kimi-mimo|dev2-sanitize" >&2; exit 2 ;;
 esac

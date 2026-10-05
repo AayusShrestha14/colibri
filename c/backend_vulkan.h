@@ -411,6 +411,21 @@ void coli_vk_mark_lost(void);
 /* vkQueueSubmit(queue, 1, submit_info, fence) as the backend submits (a VkResult): the
  * staged uploader may share the main queue from its own thread. */
 int  coli_vk_queue_submit(void *queue, const void *submit_info, void *fence);
+/* The same for either device: d = 0 the primary (as the calls above), d = 1 COLI_VK_DEV2's,
+ * whose context the chain opens for the layers it places there (vk_chain.c). The core of
+ * device 1 carries the primary's shader path and GEMM tiles. coli_vk_tensor_info_dev
+ * reports a tensor on either device and which (coli_vk_tensor_info: device 0's only). */
+int    coli_vk_core_dev(int d, ColiVkCore *out);
+int    coli_vk_available_dev(int d);
+void   coli_vk_mark_lost_dev(int d);
+int    coli_vk_queue_submit_dev(int d, void *queue, const void *submit_info, void *fence);
+int    coli_vk_tensor_info_dev(const ColiVkTensor *t, ColiVkTensorInfo *out, int *dev);
+int    coli_vk_mem_budget_dev(int d, double *used_gb, double *budget_gb);
+size_t coli_vk_device_used_dev(int d);
+size_t coli_vk_device_local_bytes_dev(int d);
+size_t coli_vk_free_bytes_dev(int d);
+size_t coli_vk_buffer_alignment_dev(int d);
+void   coli_vk_mem_info_dev(int d, size_t *used_bytes, size_t *tensor_count);   /* dense weights on device d */
 
 #ifdef __cplusplus
 }

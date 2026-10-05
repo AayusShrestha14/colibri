@@ -131,6 +131,7 @@ typedef struct {
 #ifdef COLI_VULKAN
     void *vk_lm_head;
     void *vkchain;          /* the dense chain's device state (olmoe_chain.h), NULL until it runs */
+    void *vkchain2;         /* its layers on COLI_VK_DEV2's device, after the primary's (olmoe_chain.h) */
 #endif
     Layer *L;
     LCache *cache;          /* [n_layers] */
@@ -345,7 +346,8 @@ static void matmul_res(float *y, const float *x, const float *W, void **vk, int 
     serial = !omp_in_parallel();
 #endif
     /* with the dense weights on the device only the device is the matrix's one home */
-    if (g_vk_ready && serial && *vk != (void *)&g_vk_refused && (coli_vk_dense() || coli_vk_dense_device_only())) {
+    if (g_vk_ready && serial && *vk != (void *)&g_vk_refused && (coli_vk_dense() || coli_vk_dense_device_only()) &&
+        !(*vk && coli_vk_tensor_dev((ColiVkTensor *)*vk))) {   /* a matrix of the second device's layers: only its chain */
         if (coli_vk_matmul((ColiVkTensor **)vk, y, x, W, NULL, 10, S, I, O, 0)) return;
         if (!*vk) *vk = &g_vk_refused;
     }
@@ -1760,6 +1762,9 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         if (!chain_n) {
             free(chain_logit); chain_logit = NULL;
             olc_cpu_step(m, pos_base);
+            /* the primary's layers may have run before the second device's were lost: their
+             * residual is in x, and the CPU redoes the whole step from the embedding */
+            for (int s = 0; s < S; s++) memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
         } else if (rows_only) { free(chain_logit); chain_logit = NULL; }
     }
     if (!chain_logit) layers_forward_range(m, x, S, pos_base, chain_n, c->n_layers, 1);
