@@ -81,8 +81,16 @@
 #include "backend_vulkan.h"
 #include "vk_tier.h"
 #include "route_trace.h"   /* the tier's expert history (.coli_usage), kept while it is on */
+#include "vk_chain.h"      /* vkc_fit: how many layers the dense chain places (a partial chain) */
 /* 1 once COLI_VULKAN=1 opened a device, after the weights load (a VK=1 build). */
 static int g_vk_ready = 0;
+/* The partial chain (deepseek_v41_chain.h, v41c_fit_now): the first g_v41_fit.n layers on
+ * the device, decided once before anything goes up. g_v41_partial: something the full
+ * chain would place stays on the CPU (layers, the head), so the per-matrix path uploads
+ * nothing that is not on the device already. */
+static VkcFit g_v41_fit;
+static int g_v41_fit_done, g_v41_partial;
+static int g_v41_dho_try;   /* the fit runs where the trunk may live on the device only (v41_dho_open) */
 #endif
 
 #define V41_MAX_LAYERS 64
@@ -342,10 +350,15 @@ typedef struct {
     int kind, O, I;                 /* 8: the e4m3 rows of a W8 (tiles below), 16: a WB */
     const uint8_t *tiles;
     int placed, gone;
+    int layer;                      /* the layer it belongs to (its name's), -1 none */
 } V41Home;
 static V41Home *g_v41_home;
 static size_t g_v41_home_n, g_v41_home_cap;
 static int g_v41_dho, g_v41_map, g_vk_opened;
+/* A partial chain: only the first g_v41_dho_layers layers' matrices go to the device only
+ * (the chain's layers); the others load as without Vulkan. g_v41_load_layer: the layer
+ * model_load is reading. */
+static int g_v41_dho_layers = V41_MAX_LAYERS, g_v41_load_layer = -1;
 static shards *g_v41_shards;
 static pthread_mutex_t g_v41_home_mx = PTHREAD_MUTEX_INITIALIZER;
 static size_t v41_map_len(size_t bytes) {
@@ -394,6 +407,7 @@ static void *v41_home_alloc(size_t bytes, const char *name) {
     memset(h, 0, sizeof *h);
     h->base = p; h->bytes = bytes;
     snprintf(h->name, sizeof h->name, "%s", name);
+    if (sscanf(name, "layers.%d.", &h->layer) != 1) h->layer = -1;
     return p;
 }
 static V41Home *v41_home_of(const void *data) {
@@ -556,6 +570,7 @@ static int vk_mul(int fmt, const void *data, const uint8_t *tiles, int O, int I,
 #endif
     VkEntry *e = vk_entry(data, fmt, O, I);
     if (!e || e->refused) return 0;
+    if (!e->t && g_v41_partial) return 0;   /* a partial chain: what is not on the device stays on the CPU */
     if (!e->t) v41_dho_host(data);   /* a view the placement did not make: its rows back first */
     float *scales = NULL;
     if (!e->t && fmt == 12) {
@@ -1733,14 +1748,17 @@ static void attn_project_check(const Cfg *c);
 
 #ifdef COLI_VULKAN
 static int v41c_decide(Model *m);   /* deepseek_v41_chain.h: COLI_VK_CHAIN, decided once */
-/* What the device would hold alone: the trunk matrices model_load reads into mappings. */
-static size_t v41_dho_bytes(Model *m) {
+static int v41c_fit_now(Model *m);  /* deepseek_v41_chain.h: how many layers the chain places, once */
+static void v41c_fit_recount(Model *m);
+/* What the device would hold alone: the trunk matrices model_load reads into mappings,
+ * of the first `layers` layers (a partial chain's; every layer otherwise). */
+static size_t v41_dho_bytes(Model *m, int layers) {
     const Cfg *c = &m->c;
     char name[256];
     size_t total = 0;
     #define B(...) do { snprintf(name, sizeof name, __VA_ARGS__); st_tensor *t = st_find(&m->S, name); \
                         if (t && t->nbytes > 0) total += (size_t)t->nbytes; } while (0)
-    for (int i = 0; i < c->n_layers; i++) {
+    for (int i = 0; i < c->n_layers && i < layers; i++) {
         B("layers.%d.attn.wq_a.weight", i); B("layers.%d.attn.wq_b.weight", i); B("layers.%d.attn.wkv.weight", i);
         B("layers.%d.attn.wo_a.weight", i); B("layers.%d.attn.wo_b.weight", i);
         B("layers.%d.ffn.shared_experts.w1.weight", i); B("layers.%d.ffn.shared_experts.w3.weight", i);
@@ -1752,13 +1770,22 @@ static size_t v41_dho_bytes(Model *m) {
         }
         if (c->index_source[i]) { B("layers.%d.attn.indexer.wq_b.weight", i); B("layers.%d.attn.indexer.weights_proj.weight", i); }
     }
-    for (int t = 0; m->engram.active && t < m->engram.n_layers; t++) B("layers.%d.engram.wkv.weight", m->engram.layer_of[t]);
+    for (int t = 0; m->engram.active && t < m->engram.n_layers; t++)
+        if (m->engram.layer_of[t] < layers) B("layers.%d.engram.wkv.weight", m->engram.layer_of[t]);
     #undef B
     return total;
 }
-/* Before the layers are read: the device, the chain's decision, and whether the trunk
- * lives on the device only. COLI_VK_DENSE_HOST=1 (kept) opens the device after the
- * weights, as before. */
+/* The layers whose matrices go to the device (the chain's first N with a partial chain),
+ * and whether the dense part is on the device at all (N = 0: the chain is off and, the fit
+ * being partial, the per-matrix path uploads nothing either). */
+static int v41_dense_layers(Model *m) { return g_v41_fit.L > 0 ? g_v41_fit.n : m->c.n_layers; }
+static int v41_dense_on(Model *m, int chain) {
+    if (g_v41_fit.L > 0) return g_v41_fit.n > 0 || (coli_vk_dense() && !g_v41_partial);
+    return chain != 0 || coli_vk_dense();
+}
+/* Before the layers are read: the device, the chain's decision, how many layers it
+ * places, and whether the trunk lives on the device only. COLI_VK_DENSE_HOST=1 (kept)
+ * opens the device after the weights, as before. */
 static void v41_dho_open(Model *m) {
     const char *on = getenv("COLI_VULKAN"), *keep = getenv("COLI_VK_DENSE_HOST");
     if (!on || !atoi(on) || (keep && *keep && atoi(keep) != 0)) return;
@@ -1767,7 +1794,13 @@ static void v41_dho_open(Model *m) {
     g_vk_ready = coli_vk_init_env_tier("deepseek_v41", vkt_wanted() && m->c.n_routed > 0);
     if (!g_vk_ready) return;
     int chain = v41c_decide(m);
-    g_v41_dho = coli_vk_dense_host_decide("deepseek_v41", chain != 0 || coli_vk_dense(), v41_dho_bytes(m));
+    g_v41_dho_try = 1;
+    v41c_fit_now(m);   /* before any upload: the first N layers (all when everything fits) */
+    int layers = v41_dense_layers(m);
+    g_v41_dho = coli_vk_dense_host_decide("deepseek_v41", v41_dense_on(m, chain), v41_dho_bytes(m, layers));
+    if (g_v41_fit.L > 0) coli_vk_dense_host_layers(layers, m->c.n_layers);
+    if (!g_v41_dho) v41c_fit_recount(m);   /* the chain's own set goes up after all */
+    g_v41_dho_layers = layers;
     g_v41_shards = &m->S;
 }
 /* One matrix up as a lookup will ask for it, marked as held by the device alone. */
@@ -1789,17 +1822,48 @@ static int v41_dho_up(const void *q, const uint8_t *tiles, int fmt, int O, int I
     e->dho = 1;
     return 1;
 }
+/* Every device copy of the bytes [base, base + bytes) freed (a matrix and the views
+ * inside it, such as wo_a's groups), their entries refused: the CPU multiplies them from
+ * now on. After the chain's frames that may read them. */
+static void v41_vk_forget_range(const void *base, size_t bytes) {
+    uintptr_t b = (uintptr_t)base;
+    for (size_t i = 0; i < g_vk_cap; i++) {
+        VkEntry *e = &g_vk_map[i];
+        if (!e->data || (uintptr_t)e->data < b || (uintptr_t)e->data - b >= bytes) continue;
+        if (e->t) { if (vkc_ready()) vkc_finish(); coli_vk_tensor_free(e->t); e->t = NULL; }
+        e->refused = 1; e->dho = 0;
+    }
+}
+/* Layers k.. off the device again (layer k did not reach it): their device copies freed
+ * and what the device held alone read back from disk; from here on they load and run as
+ * without Vulkan. */
+static void v41_dho_unplace(Model *m, int k) {
+    for (size_t h = 0; h < g_v41_home_n; h++) {
+        V41Home *x = &g_v41_home[h];
+        if (x->layer < k) continue;
+        v41_vk_forget_range(x->base, x->bytes);
+        if (x->gone) v41_dho_host(x->base);
+        x->placed = 1;
+    }
+    if (g_v41_dho_layers > k) g_v41_dho_layers = k;
+    coli_vk_dense_host_layers(k, m->c.n_layers);
+}
 /* The matrices read since the last call: up, then their pages back. wo_a goes up whole
  * for the chain and per output group for the per-matrix path (attention_project's
- * block views), each only where that path runs. */
+ * block views), each only where that path runs. With a partial chain (the fit) a layer
+ * goes up whole or not at all: its pages go back only once all of it is on the device,
+ * and a matrix the device refuses ends the chain before its layer (vkc_fit_shrink). */
 static unsigned g_v41_dho_kept;
-static void v41_dho_place(Model *m) {
+static void v41_dho_place(Model *m, int mark) {   /* mark: the layer just read (its fault count noted), -1 none */
     const Cfg *c = &m->c;
-    int chain = v41c_decide(m);
-    for (size_t k = 0; k < g_v41_home_n; k++) {
+    int chain = v41c_decide(m), fit = g_v41_fit.L > 0, failed = -1;
+    size_t from = g_v41_home_n;
+    for (size_t k = 0; k < g_v41_home_n; k++) if (!g_v41_home[k].placed) { from = k; break; }
+    for (size_t k = from; k < g_v41_home_n; k++) {
         V41Home *h = &g_v41_home[k];
         if (h->placed) continue;
         h->placed = 1;
+        if (failed >= 0) continue;
         int ok;
         size_t n = strlen(h->name), tail = strlen(".attn.wo_a.weight");
         if (h->kind == 8 && n > tail && !strcmp(h->name + n - tail, ".attn.wo_a.weight")) {
@@ -1810,11 +1874,25 @@ static void v41_dho_place(Model *m) {
                 ok = v41_dho_up(h->base + (size_t)g * c->o_lora * h->I,
                                 h->tiles + (size_t)(g * c->o_lora / FP8_TILE) * tiles_i, 12, c->o_lora, h->I);
         } else ok = v41_dho_up(h->base, h->tiles, h->kind == 8 ? 12 : 11, h->O, h->I);
+        if (fit) { if (!ok) failed = h->layer >= 0 ? h->layer : 0; continue; }
         if (ok && !v41_map_drop(h->base, h->bytes)) { h->gone = 1; coli_vk_dense_host_dropped(h->bytes); }
         else g_v41_dho_kept++;
     }
+    if (!fit) return;
+    if (failed >= 0) {   /* everything of that layer and after off the device, the chain cut before it */
+        v41_dho_unplace(m, failed);
+        vkc_fit_shrink("deepseek_v41", &g_v41_fit, failed, "a matrix the device refused");
+        return;
+    }
+    for (size_t k = from; k < g_v41_home_n; k++) {   /* the whole batch is there: its pages back */
+        V41Home *h = &g_v41_home[k];
+        if (h->gone || h->layer >= g_v41_dho_layers) continue;
+        if (!v41_map_drop(h->base, h->bytes)) { h->gone = 1; coli_vk_dense_host_dropped(h->bytes); }
+        else g_v41_dho_kept++;
+    }
+    if (mark >= 0 && mark < g_v41_fit.n) vkc_fit_mark(&g_v41_fit, mark);
 }
-#define V41_DHO(call) do { g_v41_map = g_v41_dho; call; g_v41_map = 0; } while (0)
+#define V41_DHO(call) do { g_v41_map = g_v41_dho && g_v41_load_layer < g_v41_dho_layers; call; g_v41_map = 0; } while (0)
 #else
 #define V41_DHO(call) call
 #endif
@@ -1857,6 +1935,9 @@ static void model_load(Model *m, const char *snap, int ecap, int engram_cache_ro
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
         l->engram_index = -1;
+#ifdef COLI_VULKAN
+        g_v41_load_layer = i;
+#endif
         V41_DHO(w8_load(&m->S, &l->wq_a, NAME("layers.%d.attn.wq_a.weight", i), c->q_lora, dim));
         V41_DHO(w8_load(&m->S, &l->wq_b, NAME("layers.%d.attn.wq_b.weight", i), nh * hd, c->q_lora));
         V41_DHO(w8_load(&m->S, &l->wkv,  NAME("layers.%d.attn.wkv.weight", i), hd, dim));
@@ -1926,7 +2007,7 @@ static void model_load(Model *m, const char *snap, int ecap, int engram_cache_ro
                     c->index_n_heads, dim));
         }
 #ifdef COLI_VULKAN
-        if (g_v41_dho) v41_dho_place(m);   /* one layer in RAM at a time */
+        if (g_v41_dho) v41_dho_place(m, i);   /* one layer in RAM at a time */
 #endif
     }
     if (m->engram.active) {
@@ -1937,10 +2018,13 @@ static void model_load(Model *m, const char *snap, int ecap, int engram_cache_ro
                 fprintf(stderr, "[engram] table %d names layer %d\n", t, layer); exit(1); }
             m->L[layer].engram_index = t;
             engram_table_open(&e->table[t], &m->S, layer, e->head_dim, engram_cache_rows);
+#ifdef COLI_VULKAN
+            g_v41_load_layer = layer;
+#endif
             V41_DHO(w8_load(&m->S, &m->L[layer].eng_wkv, NAME("layers.%d.engram.wkv.weight", layer),
                     dim * (hc + 1), e->cols * e->head_dim));
 #ifdef COLI_VULKAN
-            if (g_v41_dho) v41_dho_place(m);
+            if (g_v41_dho) v41_dho_place(m, -1);
 #endif
             wf_load(&m->S, &m->L[layer].eng_q, NAME("layers.%d.engram.q_weight", layer),
                     (int64_t)hc * dim);
@@ -1948,6 +2032,9 @@ static void model_load(Model *m, const char *snap, int ecap, int engram_cache_ro
                     (int64_t)hc * dim);
         }
     }
+#ifdef COLI_VULKAN
+    g_v41_load_layer = -1;
+#endif
     #undef NAME
 
     /* expert cache: `ecap` slots per layer, each holding one expert's three matrices */
@@ -3673,13 +3760,14 @@ static void forward_full(Model *m, const int *ids, int n, float *logits, int spe
 
     int rows_out = spec_batch || keep_rows;
 #ifdef COLI_VULKAN
-    /* the dense chain runs every layer on the device; 0: the CPU runs them, as below */
+    /* the dense chain runs its layers on the device (every layer, or a partial chain's
+     * first N, the streams of every row then back here); 0: the CPU runs them all */
     int chained = v41c_forward(m, h, pre_mix, n, start_pos, spec_batch, rows_out);
     if (!chained) v41c_cpu_step(m, start_pos);
 #else
     int chained = 0;
 #endif
-    for (int layer = 0; layer < c->n_layers && !chained; layer++) {
+    for (int layer = chained; layer < c->n_layers; layer++) {
         Layer *l = &m->L[layer];
         if (l->engram_index >= 0) engram_run(m, layer, h, n, start_pos);
         for (int k = 0; k < targets; k++) {
@@ -4496,7 +4584,7 @@ static size_t vk_w8_bytes(const W8 *w) {   /* as the device holds it: fmt 12, an
 static size_t vk_wb_bytes(const WB *w) { return w->w && !vk_placed(w->w) ? (size_t)w->O * w->I * 2 : 0; }
 /* The trunk the dense hook would put on the device, for the tier's budget. */
 static size_t vk_dense_bytes(Model *m) {
-    if (!coli_vk_dense()) return 0;
+    if (!coli_vk_dense() || g_v41_partial) return 0;   /* a partial chain: the per-matrix path uploads nothing new */
     size_t b = vk_wb_bytes(&m->head);
     for (int i = 0; i < m->c.n_layers; i++) {
         Layer *L = &m->L[i];
@@ -4606,9 +4694,12 @@ int main(int argc, char **argv) {
     if (!g_vk_opened) {          /* opened while the weights loaded when they may live on the device only */
         g_vk_thread = pthread_self();
         g_vk_ready = coli_vk_init_env_tier("deepseek_v41", vkt_wanted() && c->n_routed > 0);
+        if (g_vk_ready) v41c_fit_now(&m);   /* how many layers the chain places, before any upload */
         const char *keep = getenv("COLI_VK_DENSE_HOST");
-        if (g_vk_ready && keep && *keep && atoi(keep) != 0)
-            coli_vk_dense_host_decide("deepseek_v41", v41c_decide(&m) != 0 || coli_vk_dense(), v41_dho_bytes(&m));
+        if (g_vk_ready && keep && *keep && atoi(keep) != 0) {
+            coli_vk_dense_host_decide("deepseek_v41", v41_dense_on(&m, v41c_decide(&m)), v41_dho_bytes(&m, v41_dense_layers(&m)));
+            if (g_v41_fit.L > 0) coli_vk_dense_host_layers(v41_dense_layers(&m), c->n_layers);
+        }
     }
     if (g_v41_dho)
         coli_vk_dense_host_placed("deepseek_v41", g_v41_dho_kept
