@@ -3,8 +3,11 @@
 # on the same physical one, the test mode); COLI_VK_CHAIN_LAYERS puts the first layers on
 # the primary device, COLI_VK_CHAIN_LAYERS2 the next ones on the second, the CPU the rest.
 #
-#   layers-dev2            every chain engine against its own CPU run
-#   layers-dev2-sanitize   the same paths under ASan and UBSan
+#   layers-dev2                     qwen36, qwen38, olmoe, mimo, inkling against their CPU runs
+#   layers-dev2-mla                 GLM-5.2 (colibri), GLM-5.3, Kimi K3
+#   layers-dev2-deepseek            DeepSeek V4.1 and V4
+#   layers-dev2[-mla|-deepseek]-sanitize   their paths under ASan and UBSan
+#   layers-dev2-<engine>            one engine's gates (the engine built)
 #
 # Each gate (ld2_gate; ld2_mla for the MLA engines) is chain_gate's or mla_gate's (the
 # CPU's tokens, logits within 1e-4 of the largest) with the split forced, and the second
@@ -522,8 +525,7 @@ ld2_deepseek_v4() {
 
 family_layers_dev2() {
   export OMP_NUM_THREADS=2
-  make qwen36 qwen38 olmoe mimo inkling colibri glm53 kimi_k3 deepseek_v41 tests/test_vk_chain VK=1
-  make deepseek-v4 VK=1
+  make qwen36 qwen38 olmoe mimo inkling tests/test_vk_chain VK=1
   COLI_VK_DEV2=0 ./tests/test_vk_chain shaders/qmatmul.spv | tee vk_chain.log
   tail -1 vk_chain.log | grep -qx PASS || fail "the chain's ops on two devices"
   ld2_qwen36
@@ -531,9 +533,20 @@ family_layers_dev2() {
   ld2_olmoe
   ld2_mimo
   ld2_inkling
+  unset OMP_NUM_THREADS
+}
+family_layers_dev2_mla() {
+  export OMP_NUM_THREADS=2
+  make colibri glm53 kimi_k3 VK=1
   ld2_colibri
   ld2_glm53
   ld2_kimi_k3
+  unset OMP_NUM_THREADS CAP_RAISE
+}
+family_layers_dev2_deepseek() {
+  export OMP_NUM_THREADS=2
+  make deepseek_v41 VK=1
+  make deepseek-v4 VK=1
   ld2_deepseek_v41
   ld2_deepseek_v4
   unset OMP_NUM_THREADS
@@ -559,4 +572,79 @@ family_layers_dev2_sanitize() {
     COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 SNAP=tiny_inkling ./inkling 8 0 tiny_inkling/ref_long.json
   [ "$(ld2_forwards inkling san.log)" -gt 0 ] || { cat san.log; fail "asan ld2 inkling: the second device's chain never ran"; }
   make clean >/dev/null 2>&1 || true
+}
+# ld2_san <engine> <tag> <env and argv...>: a sanitized build's run with the split: no
+# sanitizer diagnostic, and the second device's chain ran (LD2_SAN_LOST=1: its loss was
+# taken over)
+ld2_san() {
+  local eng=$1 tag=$2; shift 2
+  rm -f chain.usage
+  env OMP_NUM_THREADS=2 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_DEV2=0 COLI_VK_TIER_BALANCE=0 \
+    "$@" > san.log 2>&1 || true
+  rm -f chain.usage
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+  if [ "${LD2_SAN_LOST:-0}" = 1 ]; then
+    grep -q "COLI_VK_CHAIN_FAULT2" san.log && grep -q "the device was lost" san.log || { cat san.log; fail "$tag: the loss was not taken over"; }
+    echo "OK $tag: sanitizers clean, the second device's loss taken over"
+  else
+    [ "$(ld2_forwards "$eng" san.log)" -gt 0 ] || { cat san.log; fail "$tag: the second device's chain never ran"; }
+    echo "OK $tag: sanitizers clean, the second device's chain ran $(ld2_forwards "$eng" san.log) forwards"
+  fi
+}
+family_layers_dev2_mla_sanitize() {
+  local SAN="-fsanitize=address,undefined -fno-omit-frame-pointer -g" ids
+  make clean >/dev/null 2>&1 || true
+  make colibri glm53 kimi_k3 VK=1 EXTRA_CFLAGS="$SAN"
+  export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1 CAP_RAISE=0
+  [ -f glm_tiny_serve/tokenizer.json ] || glm_chain_fixtures
+  [ -d glm_tiny_shx ] || ptl_glm_shx glm_tiny glm_tiny_shx
+  [ -d glm53_l6s-i4 ] || { ptl_g53_l6 glm53_l6; $PY tools/make_glm53_streaming_pair.py --fixture glm53_l6 --output glm53_l6s > /dev/null; }
+  $PY tools/make_kimi_k3_tiny.py --output ./kimi_k3_tiny --force
+  ids=$($PY -c "print(','.join(str((i*37+5)%120+2) for i in range(100)))")
+  local G=(SNAP=glm_tiny REF=ref_glm.json USAGE_SAVE=0) K=(COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4)
+  ld2_san colibri "asan ld2 colibri KV split on both, DSA top-4" COLI_VK_CHAIN_LAYERS=2 COLI_VK_CHAIN_LAYERS2=3 "${K[@]}" "${G[@]}" DSA_TOPK=4 \
+    ./colibri 64 16 16
+  ld2_san colibri "asan ld2 colibri a shared indexer first on the second device, chunks of 5" COLI_VK_CHAIN_LAYERS=1 COLI_VK_CHAIN_LAYERS2=2 \
+    SNAP=glm_tiny_shx REF=ref_glm.json USAGE_SAVE=0 DSA_TOPK=4 TF=1 COLI_VK_CHAIN_ROWS=5 ./colibri 64 16 16
+  LD2_SAN_LOST=1 ld2_san colibri "asan ld2 colibri second device lost mid-decode" COLI_VK_CHAIN_LAYERS=2 COLI_VK_CHAIN_LAYERS2=2 \
+    COLI_VK_CHAIN_FAULT2=10 "${G[@]}" ./colibri 64 16 16
+  ld2_san glm53 "asan ld2 glm53 KV split on both" COLI_VK_CHAIN_LAYERS=2 COLI_VK_CHAIN_LAYERS2=2 COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 \
+    GLM53_BITS=32 USAGE_SAVE=0 ./glm53 --model glm53_l6s-i4 --ids $ids --greedy 8
+  LD2_SAN_LOST=1 ld2_san glm53 "asan ld2 glm53 second device lost, the KDA state rebuilt" COLI_VK_CHAIN_LAYERS=3 COLI_VK_CHAIN_LAYERS2=3 \
+    COLI_VK_CHAIN_FAULT2=40 GLM53_BITS=32 USAGE_SAVE=0 ./glm53 --model glm53_l6s-i4 --ids $ids --greedy 6
+  local O=(K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 COLI_TEMP=0 USAGE_SAVE=0)
+  ld2_san kimi_k3 "asan ld2 kimi_k3 KV split on both" COLI_VK_CHAIN_LAYERS=3 COLI_VK_CHAIN_LAYERS2=3 COLI_VK_KV_DEVICE_ROWS=16 \
+    COLI_VK_KV_BLOCK=4 "${O[@]}" ./kimi_k3 kimi_k3_tiny --ids "$(k3c_ids long)" --ngen 8
+  LD2_SAN_LOST=1 ld2_san kimi_k3 "asan ld2 kimi_k3 second device lost in a prompt forward" COLI_VK_CHAIN_LAYERS=2 COLI_VK_CHAIN_LAYERS2=4 \
+    COLI_VK_CHAIN_FAULT2=15 K3_CHUNK=32 "${O[@]}" ./kimi_k3 kimi_k3_tiny --ids "$(k3c_ids long)" --ngen 8
+  unset CAP_RAISE
+  make clean >/dev/null 2>&1 || true
+}
+family_layers_dev2_deepseek_sanitize() {
+  local SAN="-fsanitize=address,undefined -fno-omit-frame-pointer -g" p
+  make clean >/dev/null 2>&1 || true
+  make deepseek_v41 VK=1 EXTRA_CFLAGS="$SAN"
+  export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
+  v41_chain_fixtures
+  ld2_san deepseek_v41 "asan ld2 deepseek_v41 DSpark spec=5" COLI_VK_CHAIN_LAYERS=1 COLI_VK_CHAIN_LAYERS2=5 SNAP=dsv41_tiny V41_DSPARK=1 \
+    V41_SPEC_FORCE=5 ./deepseek_v41 8 dsv41_tiny/ref.json
+  ld2_san deepseek_v41 "asan ld2 deepseek_v41 KV split on both, chunks of 3" COLI_VK_CHAIN_LAYERS=3 COLI_VK_CHAIN_LAYERS2=3 \
+    COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=2 COLI_VK_CHAIN_ROWS=3 SNAP=dsv41_long ./deepseek_v41 8 dsv41_long/ref.json
+  LD2_SAN_LOST=1 ld2_san deepseek_v41 "asan ld2 deepseek_v41 second device lost" COLI_VK_CHAIN_LAYERS=1 COLI_VK_CHAIN_LAYERS2=5 \
+    COLI_VK_CHAIN_FAULT2=40 SNAP=dsv41_long ./deepseek_v41 8 dsv41_long/ref.json
+  make clean >/dev/null 2>&1 || true
+  # the V4 sanitized build as its chain family makes it (no LTO, the sanitizers at the link)
+  make deepseek-v4-clean >/dev/null 2>&1 || true
+  make deepseek-v4 VK=1 LTO=0 EXTRA_CFLAGS="$SAN" EXTRA_LDFLAGS="$SAN"
+  v4_chain_fixtures
+  p=$(v4_chain_prompt deepseek_v4_tiny_t long)
+  ld2_san deepseek_v4 "asan ld2 deepseek_v4 KV split on both" COLI_VK_CHAIN_LAYERS=2 COLI_VK_CHAIN_LAYERS2=1 COLI_VK_KV_DEVICE_ROWS=8 \
+    COLI_VK_KV_BLOCK=2 ./deepseek_v4 ./deepseek_v4_tiny_t "$p" --raw-prompt --max-tokens 4
+  ld2_san deepseek_v4 "asan ld2 deepseek_v4 drafts, a window of 4" COLI_VK_CHAIN_LAYERS=1 COLI_VK_CHAIN_LAYERS2=2 V4_DRAFT=4 \
+    V4_NGRAM_PARTIAL_KEEP=1 ./deepseek_v4 ./deepseek_v4_tiny_w4 \
+    "$(v4_chain_prompt x ids:30,31,32,33,34,35,60,61,30,31,32,33,34,35,36,37,38,39,40,41,30,31,32)" --raw-prompt --max-tokens 12
+  LD2_SAN_LOST=1 ld2_san deepseek_v4 "asan ld2 deepseek_v4 second device lost" COLI_VK_CHAIN_LAYERS=1 COLI_VK_CHAIN_LAYERS2=2 \
+    COLI_VK_CHAIN_FAULT2=8 ./deepseek_v4 ./deepseek_v4_tiny_t "$p" --raw-prompt --max-tokens 4
+  rm -rf deepseek_v4_tiny_t deepseek_v4_tiny_e8 deepseek_v4_tiny_g2 deepseek_v4_tiny_w4 deepseek_v4_tiny_ix san.log
+  make deepseek-v4-clean >/dev/null 2>&1 || true
 }
