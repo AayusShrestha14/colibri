@@ -2115,8 +2115,11 @@ tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
 tests/test_compat_direct$(EXE): tests/test_compat_direct.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_compat_prefetch$(EXE): tests/test_compat_prefetch.c
+tests/test_compat_prefetch$(EXE): tests/test_compat_prefetch.c $(if $(IS_WIN),tests/compat_prefetch_module.dll)
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/compat_prefetch_module.dll: tests/compat_prefetch_module.c
+	$(CC) $(CFLAGS) -shared $< -o $@ $(LDFLAGS)
 
 tests/test_expert_store_ops$(EXE): tests/test_expert_store_ops.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -2873,7 +2876,7 @@ AUTODEP_OBJS      = backend_vulkan.o vk_tier.o backend_loader.o backend_xdna.o q
 AUTODEP_BINS      = $(addsuffix $(EXE),$(ENGINE_RULES)) \
 	$(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(AUTODEP_ELSEWHERE) \
 		$(AUTODEP_OWN_FLAGS),$(AUTODEP_TESTS)))) \
-	$(AUTODEP_OBJS)
+	$(AUTODEP_OBJS) $(if $(IS_WIN),tests/compat_prefetch_module.dll)
 AUTODEP_DEPS      = $(addsuffix .d,$(basename $(AUTODEP_BINS)))
 $(foreach b,$(AUTODEP_BINS),$(eval $(b): $(basename $(b)).d))
 $(AUTODEP_DEPS): ;

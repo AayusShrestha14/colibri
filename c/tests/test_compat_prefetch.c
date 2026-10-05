@@ -136,9 +136,31 @@ int main(void) {
     CHECK(!posix_fadvise(-1, 0, 4096, POSIX_FADV_WILLNEED));
     CHECK(!posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED));
     CHECK(submitted == jobs && !reads);
-    _close(fd); CHECK(!remove("test_prefetch_reused.tmp"));
+    _close(fd);
+    /* The helper lives beside this executable, independent of the test CWD. */
+    char library[MAX_PATH];
+    DWORD length = GetModuleFileNameA(NULL, library, sizeof library);
+    CHECK(length && length < sizeof library);
+    char *slash = strrchr(library, '\\'); CHECK(slash);
+    CHECK((size_t)(slash - library) + sizeof("\\compat_prefetch_module.dll") < sizeof library);
+    strcpy(slash + 1, "compat_prefetch_module.dll");
+    HANDLE entered = CreateEventW(NULL, TRUE, FALSE, NULL); CHECK(entered);
+    ResetEvent(gate);
+    HMODULE module = LoadLibraryA(library); CHECK(module);
+    typedef int (*StartPrefetch)(const char *, HANDLE, HANDLE);
+    StartPrefetch start = (StartPrefetch)(void *)GetProcAddress(module, "start_prefetch");
+    CHECK(start && start("test_prefetch_reused.tmp", gate, entered));
+    CHECK(WaitForSingleObject(entered, 10000) == WAIT_OBJECT_0);
+    CHECK(FreeLibrary(module));
+    CHECK(GetModuleHandleA("compat_prefetch_module.dll"));
+    SetEvent(gate);
+    ULONGLONG end = GetTickCount64() + 10000;
+    while (GetModuleHandleA("compat_prefetch_module.dll") && GetTickCount64() < end) Sleep(1);
+    CHECK(!GetModuleHandleA("compat_prefetch_module.dll"));
+    CloseHandle(entered);
+    CHECK(!remove("test_prefetch_reused.tmp"));
     CloseHandle(gate);
-    puts("compat prefetch: PASS (async, bounded, fd reuse, >4 GiB, EOF, failures)");
+    puts("compat prefetch: PASS (async, bounded, fd reuse, >4 GiB, EOF, failures, DLL lifetime)");
     return 0;
 }
 #endif
