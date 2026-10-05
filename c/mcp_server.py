@@ -376,7 +376,7 @@ class Server:
             self.send({"jsonrpc": "2.0", "method": "notifications/progress", "params": payload})
 
         try:
-            args = _check_args(name, params.get("arguments") or {})
+            args = _check_args(name, params.get("arguments", {}))
         except KeyError:
             self.error(msg_id, INVALID_PARAMS, f"unknown tool: {name}")
             return
