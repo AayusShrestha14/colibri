@@ -80,21 +80,62 @@ ld2_qwen36() {
     $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=3 COLI_VK_CHAIN_LAYERS2=5
 }
 
+ld2_qwen38() {
+  [ -d qwen38_tiny ] || $PY tools/make_qwen38_tiny.py --out qwen38_tiny
+  [ -d qwen38_tiny_fp8 ] || $PY tools/make_qwen38_tiny.py --out qwen38_tiny_fp8 --fp8-experts
+  [ -d qwen38_kv_mtp ] || kv_qwen38_fixtures
+  local R=qwen38_tiny/ref.json T="OMP_NUM_THREADS=2 SNAP=qwen38_tiny" f b
+  for b in 0 1; do
+    ld2_gate qwen38 "ld2 qwen38 2 + 2, the head on the second device, batch=$b" 2 2 $T Q38_PREFILL_BATCH=$b -- 4 8 $R
+  done
+  ld2_gate qwen38 "ld2 qwen38 1 + 2, the CPU the rest and the head" 1 2 $T -- 4 8 $R
+  ld2_gate qwen38 "ld2 qwen38 1 + 3, prompt in chunks of 3" 1 3 $T COLI_VK_CHAIN_ROWS=3 -- 4 8 $R
+  ld2_gate qwen38 "ld2 qwen38 bf16 rows" 2 2 $T Q38_NATIVE_BF16=1 -- 4 8 $R
+  ld2_gate qwen38 "ld2 qwen38 fp8 experts" 2 2 OMP_NUM_THREADS=2 SNAP=qwen38_tiny_fp8 -- 2 8 qwen38_tiny_fp8/ref.json
+  ld2_gate qwen38 "ld2 qwen38 experts on both devices too" 2 2 $T COLI_VK_TIER_GB=0.00002 -- 4 8 $R
+  CHAINMODE=2 ld2_gate qwen38 "ld2 qwen38 prompts only" 2 2 $T -- 4 8 $R
+  # MTP drafts verified across both devices (both chains' copies rolled back)
+  for f in "" accept reject mixed; do
+    ld2_gate qwen38 "ld2 qwen38 MTP ${f:-drafting}" 2 2 OMP_NUM_THREADS=2 Q38_MTP=1 Q38_MTP_FORCE=$f SNAP=qwen38_tiny_mtp -- 2 8 qwen38_tiny_mtp/ref.json
+  done
+  # the KV split on both devices' QSA layers (layers 1 and 3), with MTP
+  ld2_gate qwen38 "ld2 qwen38 KV split on both" 2 2 COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 SNAP=qwen38_kv -- 4 8 qwen38_kv/ref.json
+  [ "$(kv_hostparts qwen38 vk.log)" -gt 0 ] && [ "$(kv_hostparts "qwen38 dev2" vk.log)" -gt 0 ] ||
+    { cat vk.log; fail "ld2 qwen38 KV split on both: a device's split ran no host part"; }
+  ld2_gate qwen38 "ld2 qwen38 KV split on both, MTP mixed" 2 2 COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 Q38_MTP=1 \
+    Q38_MTP_FORCE=mixed SNAP=qwen38_kv_mtp -- 4 8 qwen38_kv_mtp/ref.json
+  # the second device lost: at its setup, mid-decode, and in a verify
+  LD2_EXPECT=setup ld2_lost qwen38 "ld2 qwen38 second device lost at its setup" 2 2 1 $T -- 4 8 $R
+  ld2_lost qwen38 "ld2 qwen38 second device lost mid-decode" 2 2 20 $T -- 4 8 $R
+  ld2_lost qwen38 "ld2 qwen38 second device lost in a verify" 2 2 15 OMP_NUM_THREADS=2 Q38_MTP=1 Q38_MTP_FORCE=mixed \
+    SNAP=qwen38_tiny_mtp -- 2 8 qwen38_tiny_mtp/ref.json
+  # serve sessions with MTP and without
+  CHAIN_SERVE_EXPECT='qwen38 dev2 chain: [1-9][0-9]* forwards' \
+    $PY tests/vulkan_chain_serve.py ./qwen38 qwen38_tiny_mtp Q38_MTP=1 COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=2 COLI_VK_CHAIN_LAYERS2=2
+  CHAIN_SERVE_EXPECT='qwen38 dev2 chain: [1-9][0-9]* forwards' \
+    $PY tests/vulkan_chain_serve.py ./qwen38 qwen38_tiny_mtp COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=1 COLI_VK_CHAIN_LAYERS2=2
+}
+
 family_layers_dev2() {
   export OMP_NUM_THREADS=2
-  make qwen36 tests/test_vk_chain VK=1
+  make qwen36 qwen38 tests/test_vk_chain VK=1
   COLI_VK_DEV2=0 ./tests/test_vk_chain shaders/qmatmul.spv | tee vk_chain.log
   tail -1 vk_chain.log | grep -qx PASS || fail "the chain's ops on two devices"
   ld2_qwen36
+  ld2_qwen38
   unset OMP_NUM_THREADS
 }
 family_layers_dev2_sanitize() {
   make clean >/dev/null 2>&1 || true
-  make qwen36 VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  make qwen36 qwen38 VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
   export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
   [ -d qwen36_kv_c ] || kv_qwen36_fixtures
   kv_san qwen36 "asan ld2 qwen36 KV split on both" COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=4 COLI_VK_CHAIN_LAYERS2=4 \
     COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 COLI_DENSE_I8=0 SNAP=qwen36_kv_c ./qwen36 8 8 qwen36_kv/ref_full.json
   [ "$(ld2_forwards qwen36 san.log)" -gt 0 ] || { cat san.log; fail "asan ld2 qwen36: the second device's chain never ran"; }
+  [ -d qwen38_kv_mtp ] || kv_qwen38_fixtures
+  kv_san qwen38 "asan ld2 qwen38 KV split on both, MTP mixed" COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=2 COLI_VK_CHAIN_LAYERS2=2 \
+    COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 Q38_MTP=1 Q38_MTP_FORCE=mixed SNAP=qwen38_kv_mtp ./qwen38 4 8 qwen38_kv_mtp/ref.json
+  [ "$(ld2_forwards qwen38 san.log)" -gt 0 ] || { cat san.log; fail "asan ld2 qwen38: the second device's chain never ran"; }
   make clean >/dev/null 2>&1 || true
 }
