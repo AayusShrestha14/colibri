@@ -1,5 +1,14 @@
 # Windows 11 native install — a complete walkthrough (no WSL)
 
+Expert readahead uses a bounded Windows thread-pool queue. A `WILLNEED` hint
+returns without reading the expert on the inference thread, even when the file
+was opened synchronously. The worker prefetches a read-only file mapping;
+there is no second, temporary copy of the expert. At most four hints per engine
+translation unit are pending, with each window capped at 64 MiB. Excess hints,
+unavailable APIs and failed mappings are safely skipped; ordinary model reads
+still supply the weights. This applies to the common file-advice path used by
+the CPU and GPU engines and does not change their weight formats or arithmetic.
+
 A start-to-finish, reproducible path from a fresh Windows 11 machine to GLM-5.2 generating tokens, with the GPU tier. Every step and every failure mode below was hit and verified on real hardware: Core Ultra 9 285K (AVX-VNNI) / RTX 5080 (sm_120) / 128 GB RAM / Windows 11 24H2 (issue #306). Steps are ordered so the long downloads run while you build.
 
 ---

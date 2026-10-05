@@ -2115,6 +2115,9 @@ tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
 tests/test_compat_direct$(EXE): tests/test_compat_direct.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_compat_prefetch$(EXE): tests/test_compat_prefetch.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_expert_store_ops$(EXE): tests/test_expert_store_ops.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
