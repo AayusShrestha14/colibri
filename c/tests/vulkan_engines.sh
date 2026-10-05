@@ -583,9 +583,11 @@ EOF
   # The warm start: a CPU run writes the history (inkling's PIN=<file>, olmoe's
   # COLI_USAGE), and the tier's run fills the device from it before the first token.
   rm -f tier.hist
-  PIN=tier.hist SNAP=tiny_inkling ./inkling 8 -p "The capital of France is" -n 8 > cpu.log 2>&1
-  PIN=tier.hist COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 SNAP=tiny_inkling ./inkling 8 -p "The capital of France is" -n 8 > vk.log 2>&1
-  $PY - cpu.log vk.log <<'PY' || { cat vk.log; fail "inkling tier warm start: the text differs from the CPU's"; }
+  # Streaming can report its first device batch after the prompt has been printed.
+  # Keep diagnostics separate so the exact text comparison measures stdout alone.
+  PIN=tier.hist SNAP=tiny_inkling ./inkling 8 -p "The capital of France is" -n 8 > cpu.log 2> cpu.err
+  PIN=tier.hist COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 SNAP=tiny_inkling ./inkling 8 -p "The capital of France is" -n 8 > vk.log 2> vk.err
+  $PY - cpu.log vk.log <<'PY' || { cat cpu.log vk.log vk.err; fail "inkling tier warm start: the text differs from the CPU's"; }
 import re, sys
 def text(p):
     m = re.search(rb"\[\d+ prompt tokens\](.*?)\n\[prefill", open(p, "rb").read(), re.S)
@@ -593,9 +595,9 @@ def text(p):
 a, b = text(sys.argv[1]), text(sys.argv[2])
 sys.exit(0 if a is not None and a == b else 1)
 PY
-  grep -qa '^\[VK\] tier inkling: warm start, [1-9]' vk.log || { cat vk.log; fail "inkling tier: no warm start"; }
-  [ "$(tier_count inkling vk.log)" -gt 0 ] || { cat vk.log; fail "inkling tier warm start: no routed expert ran on the device"; }
-  echo "OK inkling tier warm start: text = CPU, $(grep -a -o 'warm start, [0-9]* experts' vk.log), $(grep -a -o 'device [0-9]* of [0-9]* routed experts' vk.log | tail -1)"
+  grep -qa '^\[VK\] tier inkling: warm start, [1-9]' vk.err || { cat vk.err; fail "inkling tier: no warm start"; }
+  [ "$(tier_count inkling vk.err)" -gt 0 ] || { cat vk.err; fail "inkling tier warm start: no routed expert ran on the device"; }
+  echo "OK inkling tier warm start: text = CPU, $(grep -a -o 'warm start, [0-9]* experts' vk.err), $(grep -a -o 'device [0-9]* of [0-9]* routed experts' vk.err | tail -1)"
   rm -f tier.hist
   COLI_USAGE=tier.hist SNAP=olmoe_tiny_c ./olmoe 8 8 $OR > cpu.log 2>&1
   COLI_USAGE=tier.hist COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 SNAP=olmoe_tiny_c ./olmoe 8 8 $OR > vk.log 2>&1

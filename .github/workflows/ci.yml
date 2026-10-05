@@ -275,10 +275,10 @@ jobs:
             req: c/tools/requirements-qwen38-tiny.txt
           - family: dense-only-inkling-mimo-kimi
             req: c/tools/requirements-kimi-k3-tiny.txt
-            extra: pillow
+            extra: -r c/tools/oracle-requirements.txt pillow
           - family: dense-only-inkling-mimo-kimi-sanitize
             req: c/tools/requirements-kimi-k3-tiny.txt
-            extra: pillow
+            extra: -r c/tools/oracle-requirements.txt pillow
           - family: dense-only-glm
             req: c/tools/requirements-qwen38-tiny.txt
             extra: pillow
