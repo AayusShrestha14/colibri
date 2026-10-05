@@ -495,7 +495,15 @@ static InkChain *inkc_setup_dev(Model *m, int d) {
     ch->prm = vkc_buf(n * sizeof(float), VKC_DEV);
     int ok = ch->prm && vkc_begin() && vkc_write(ch->prm, 0, arena, n * sizeof(float)) && vkc_submit(1);
     free(arena);
-    if (!ok) { inkc_free_own(m, ch); return NULL; }
+    if (!ok) {
+        inkc_free_own(m, ch);
+        if (d && fit) {   /* the second device's parameter buffer: its layers stay on the CPU */
+            vkc_fit_shrink(inkc_name(ch), fitp, 0, vkc_lost() ? "the device was lost" : "its parameter buffer was refused");
+            g_inkc_fit2_on = 0;
+            vkc_shutdown();
+        }
+        return NULL;
+    }
     /* geometry of the scratch; the frames: a MoE layer ends one (its host step) */
     inkc_geom(ch, m);
     for (int i = lo; i < lo + nl; i++)
@@ -518,7 +526,7 @@ static InkChain *inkc_setup_dev(Model *m, int d) {
 }
 static InkChain *inkc_setup(Model *m) { return inkc_setup_dev(m, 0); }
 /* The chain declined after its layers went up: the copies only it holds (its own, not the
- * per-matrix path's tables) are freed, with whatever device memory it took. */
+ * per-matrix path's tables; the second device's are all its own) are freed, with whatever device memory it took. */
 static void inkc_free_own(Model *m, InkChain *ch) {
     if (vkc_ready()) vkc_finish();
     int L = m->c.n_layers, nsl = m->c.n_shared > 0 ? m->c.n_shared : 1;
@@ -526,17 +534,17 @@ static void inkc_free_own(Model *m, InkChain *ch) {
         Layer *l = &m->L[i];
         ColiVkTensor **t[] = {&ch->t_q[i], &ch->t_k[i], &ch->t_v[i], &ch->t_r[i], &ch->t_o[i], &ch->t_dg[i], &ch->t_du[i], &ch->t_dd[i]};
         Wt *w[] = {&l->q, &l->k, &l->v, &l->r, &l->o, &l->dg, &l->du, &l->dd};
-        for (size_t k = 0; k < sizeof t / sizeof t[0]; k++) { if (*t[k] && !w[k]->vk) coli_vk_tensor_free(*t[k]); *t[k] = NULL; }
+        for (size_t k = 0; k < sizeof t / sizeof t[0]; k++) { if (*t[k] && (ch->d || !w[k]->vk)) coli_vk_tensor_free(*t[k]); *t[k] = NULL; }
         for (int j = 0; j < nsl; j++) {
             ColiVkTensor **s[3] = {&ch->t_sg[(size_t)i * nsl + j], &ch->t_su[(size_t)i * nsl + j], &ch->t_sd[(size_t)i * nsl + j]};
             Wt *sw[3] = {&l->sh_g, &l->sh_u, &l->sh_d};
-            for (int k = 0; k < 3; k++) { if (*s[k] && !sw[k]->vk) coli_vk_tensor_free(*s[k]); *s[k] = NULL; }
+            for (int k = 0; k < 3; k++) { if (*s[k] && (ch->d || !sw[k]->vk)) coli_vk_tensor_free(*s[k]); *s[k] = NULL; }
         }
         if (ch->t_router[i]) coli_vk_tensor_free(ch->t_router[i]);
         ch->t_router[i] = NULL;
         for (int b = 0; b < 4; b++) { vkc_free(ch->ring[b][i]); ch->ring[b][i] = NULL; }
     }
-    if (ch->t_lm && !m->lm_head.vk) coli_vk_tensor_free(ch->t_lm);
+    if (ch->t_lm && (ch->d || !m->lm_head.vk)) coli_vk_tensor_free(ch->t_lm);
     ch->t_lm = NULL;
     vkc_free(ch->prm); ch->prm = NULL;
 }

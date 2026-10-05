@@ -6,16 +6,28 @@
 #   layers-dev2            every chain engine against its own CPU run
 #   layers-dev2-sanitize   the same paths under ASan and UBSan
 #
-# Each gate (ld2_gate) is chain_gate's (the CPU's tokens, logits within 1e-4 of the
-# largest) with the split forced, and the second device's chain must have run.
+# Each gate (ld2_gate; ld2_mla for the MLA engines) is chain_gate's or mla_gate's (the
+# CPU's tokens, logits within 1e-4 of the largest) with the split forced, and the second
+# device's chain must have run with neither device lost.
 
 # ld2_gate <engine> <tag> <n0> <n1> <env...> -- <argv...>
 ld2_gate() {
   local eng=$1 tag=$2 n0=$3 n1=$4; shift 4
   chain_gate "$eng" "$tag" 1 COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=$n0 COLI_VK_CHAIN_LAYERS2=$n1 COLI_VK_TIER_BALANCE=0 "$@"
-  local f; f=$(ld2_forwards "$eng" vk.log)
-  [ "$f" -gt 0 ] || { cat vk.log; fail "$tag: the second device's chain never ran"; }
-  echo "   $tag: the second device's chain ran $f forwards"
+  ld2_ran "$eng" "$tag" vk.log
+}
+# ld2_mla <engine> <tag> <n0> <n1> <env...> -- <argv...>
+ld2_mla() {
+  local eng=$1 tag=$2 n0=$3 n1=$4; shift 4
+  mla_gate "$eng" "$tag" 1 COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=$n0 COLI_VK_CHAIN_LAYERS2=$n1 COLI_VK_TIER_BALANCE=0 "$@"
+  ld2_ran "$eng" "$tag" vk.log
+}
+# ld2_ran <engine> <tag> <log>: the second device's chain ran, no device was lost
+ld2_ran() {
+  local f; f=$(ld2_forwards "$1" "$3")
+  [ "$f" -gt 0 ] || { cat "$3"; fail "$2: the second device's chain never ran"; }
+  ! grep -qa 'the device is lost\|the device was lost' "$3" || { grep -a 'lost' "$3"; fail "$2: a device was lost"; }
+  echo "   $2: the second device's chain ran $f forwards"
 }
 # ld2_forwards <engine> <log>: N from "[VK] <engine> dev2 chain: N forwards"
 ld2_forwards() {
@@ -34,12 +46,22 @@ ld2_lost() {
   env "${envs[@]}" ./"$eng" "$@" > cpu.log 2>&1 || true
   env "${envs[@]}" COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=$n0 COLI_VK_CHAIN_LAYERS2=$n1 COLI_VK_CHAIN_FAULT2=$k \
     COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 COLI_VULKAN=1 COLI_VK_CHAIN=1 ./"$eng" "$@" > vk.log 2>&1 || true
-  same_tokens cpu.log vk.log "$tag"
+  case $eng in
+    colibri) mla_toks "$eng" cpu.log > cpu.tok; mla_toks "$eng" vk.log > vk.tok
+             { [ -s cpu.tok ] && cmp -s cpu.tok vk.tok; } || { cat cpu.tok vk.tok; tail -20 vk.log; fail "$tag: the tokens differ from the CPU"; } ;;
+    *) same_tokens cpu.log vk.log "$tag" ;;
+  esac
   grep -q "COLI_VK_CHAIN_FAULT2" vk.log || { cat vk.log; fail "$tag: the second device's fault never fired"; }
   if [ "${LD2_EXPECT:-}" = setup ]; then
     grep -q "^\[VK\] $eng dev2 chain: 0 of [0-9]* layers on the device: the chain stays off (layer 0 did not reach the device: the device was lost" vk.log ||
       { cat vk.log; fail "$tag: the second device's layers did not go to the CPU"; }
     echo "OK $tag: tokens = CPU, the second device's layers on the CPU from the start"
+    return 0
+  fi
+  if [ "${LD2_EXPECT:-}" = again ]; then   # the KV cache is the host's: the CPU runs the forward again
+    grep -q "^\[VK\] $eng dev2 chain: the device was lost; the CPU runs this forward again" vk.log ||
+      { cat vk.log; fail "$tag: the CPU did not take the forward over"; }
+    echo "OK $tag: tokens = CPU, the CPU ran the forward again"
     return 0
   fi
   if [ "${LD2_EXPECT:-}" = redo ]; then
@@ -149,9 +171,7 @@ ld2_olmoe() {
 ld2_mimo_gate() {   # <tag> <case> <n0> <n1> <env...>
   local tag=$1 c=$2 n0=$3 n1=$4; shift 4
   mimo_chain_gate "$tag" "$c" COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=$n0 COLI_VK_CHAIN_LAYERS2=$n1 COLI_VK_TIER_BALANCE=0 "$@"
-  local f; f=$(ld2_forwards mimo mimo-vk.err)
-  [ "$f" -gt 0 ] || { cat mimo-vk.err; fail "$tag $c: the second device's chain never ran"; }
-  echo "   $tag $c: the second device's chain ran $f forwards"
+  ld2_ran mimo "$tag $c" mimo-vk.err
 }
 ld2_mimo() {
   $PY tools/make_mimo_tiny.py --output ./mimo_tiny --force --vision
@@ -188,19 +208,65 @@ ld2_inkling() {
   for b in 4 8; do ld2_gate inkling "ld2 inkling runtime int$b" 3 5 $T -- 2 $b $R; done
   ld2_gate inkling "ld2 inkling experts on both devices too" 3 5 $T COLI_VK_TIER_GB=0.00002 -- 8 0 $R
   CHAINMODE=2 ld2_gate inkling "ld2 inkling prompts only" 3 5 $T -- 8 0 $R
-  # the global layers' KV split on both devices
-  ld2_gate inkling "ld2 inkling KV split on both" 4 4 COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 $T -- 8 0 tiny_inkling/ref_long.json
-  [ "$(kv_hostparts inkling vk.log)" -gt 0 ] && [ "$(kv_hostparts "inkling dev2" vk.log)" -gt 0 ] ||
-    { cat vk.log; fail "ld2 inkling KV split on both: a device's split ran no host part"; }
+  # the global layer's KV split (the fixture has one global layer, 5): on the second
+  # device, then on the first
+  ld2_gate inkling "ld2 inkling KV split on the second device" 4 4 COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 $T -- 8 0 tiny_inkling/ref_long.json
+  [ "$(kv_hostparts "inkling dev2" vk.log)" -gt 0 ] || { cat vk.log; fail "ld2 inkling KV split on the second device: no host part"; }
+  ld2_gate inkling "ld2 inkling KV split on the first device" 6 2 COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 $T -- 8 0 tiny_inkling/ref_long.json
+  [ "$(kv_hostparts inkling vk.log)" -gt 0 ] || { cat vk.log; fail "ld2 inkling KV split on the first device: no host part"; }
   LD2_EXPECT=setup ld2_lost inkling "ld2 inkling second device lost at its setup" 3 5 1 $T -- 8 0 $R
   ld2_lost inkling "ld2 inkling second device lost mid-decode" 3 5 30 $T -- 8 0 $R
   CHAIN_SERVE_EXPECT='inkling dev2 chain: [1-9][0-9]* forwards' \
     $PY tests/vulkan_chain_serve.py ./inkling tiny_inkling INK_PREFIX_LOG=1 COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=3 COLI_VK_CHAIN_LAYERS2=5
 }
 
+# colibri (GLM-5.2): the head stays on the host. glm_tiny_shx shares indexers (full,
+# shared, full, shared, shared): with DSA top-4 the selection of the layer before the
+# second device's first one crosses to it.
+ld2_colibri() {
+  [ -f glm_tiny_serve/tokenizer.json ] || glm_chain_fixtures
+  [ -d glm_tiny_shx ] || ptl_glm_shx glm_tiny glm_tiny_shx
+  export CAP_RAISE=0
+  local G="SNAP=glm_tiny REF=ref_glm.json USAGE_SAVE=0" X="SNAP=glm_tiny_shx REF=ref_glm.json USAGE_SAVE=0" s
+  ld2_mla colibri "ld2 colibri 2 + 3, every layer on the devices" 2 3 $G -- 64 16 16
+  ld2_mla colibri "ld2 colibri 1 + 2, the CPU the rest" 1 2 $G -- 64 16 16
+  ld2_mla colibri "ld2 colibri cap 1" 3 2 $G -- 1 16 16
+  ld2_mla colibri "ld2 colibri prefill in chunks of 3" 2 3 $G TF=1 COLI_VK_CHAIN_ROWS=3 -- 64 16 16
+  ld2_mla colibri "ld2 colibri 4-bit trunk and experts" 2 3 $G IDOT=0 -- 2 4 4
+  ld2_mla colibri "ld2 colibri i4 container" 2 3 SNAP=glm_tiny_i4 REF=glm_tiny_i4/ref_glm.json USAGE_SAVE=0 IDOT=0 -- 1 4 4
+  ld2_mla colibri "ld2 colibri DSA top-4" 2 3 $G DSA_TOPK=4 -- 64 16 16
+  ld2_mla colibri "ld2 colibri DSA_FORCE" 2 3 $G DSA_FORCE=1 -- 64 16 16
+  for s in "1 2" "3 2"; do
+    ld2_mla colibri "ld2 colibri DSA top-4, a shared indexer first on the second device, ${s/ / + }" ${s% *} ${s#* } $X DSA_TOPK=4 -- 64 16 16
+    ld2_mla colibri "ld2 colibri DSA top-4, a shared indexer first on the second device, ${s/ / + }, prefill in chunks of 5" \
+      ${s% *} ${s#* } $X DSA_TOPK=4 TF=1 COLI_VK_CHAIN_ROWS=5 -- 64 16 16
+  done
+  ld2_mla colibri "ld2 colibri n-gram drafts" 2 3 $G DRAFT=3 -- 64 16 16
+  ld2_mla colibri "ld2 colibri MTP depth 2" 2 3 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json USAGE_SAVE=0 DRAFT=2 -- 64 16 16
+  ld2_mla colibri "ld2 colibri MTP with DSA top-4" 1 2 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json USAGE_SAVE=0 DSA_TOPK=4 -- 64 16 16
+  ld2_mla colibri "ld2 colibri experts on both devices too" 2 3 $G COLI_VK_TIER_GB=0.00002 -- 64 16 16
+  CHAINMODE=2 ld2_mla colibri "ld2 colibri prompts only, drafts" 2 3 $G DRAFT=3 -- 64 16 16
+  ld2_mla colibri "ld2 colibri KV split on both" 2 3 COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4 $G DSA_TOPK=4 -- 64 16 16
+  [ "$(kv_hostparts colibri vk.log)" -gt 0 ] && [ "$(kv_hostparts "colibri dev2" vk.log)" -gt 0 ] ||
+    { cat vk.log; fail "ld2 colibri KV split on both: a device's split ran no host part"; }
+  # the second device lost: at its setup, in the prompt (one forward), mid-decode
+  LD2_EXPECT=setup ld2_lost colibri "ld2 colibri second device lost at its setup" 2 2 1 $G -- 64 16 16
+  LD2_EXPECT=again ld2_lost colibri "ld2 colibri second device lost in the prompt" 2 2 2 $G TF=1 -- 64 16 16
+  LD2_EXPECT=again ld2_lost colibri "ld2 colibri second device lost mid-decode" 2 2 10 $G -- 64 16 16
+  LD2_EXPECT=again ld2_lost colibri "ld2 colibri second device lost with MTP" 2 2 10 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json \
+    USAGE_SAVE=0 DRAFT=2 -- 64 16 16
+  # serve sessions: pins, the prompt cache, the prefill read-out, two KV slots
+  CHAIN_SERVE_EXPECT='colibri dev2 chain: [1-9][0-9]* forwards' CHAIN_SERVE_DIALECT=colibri \
+    $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=2 COLI_VK_CHAIN_LAYERS2=3
+  CHAIN_SERVE_EXPECT='colibri dev2 chain: [1-9][0-9]* forwards' CHAIN_SERVE_DIALECT=colibri \
+    $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 DSA_TOPK=4 DRAFT=3 COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=1 COLI_VK_CHAIN_LAYERS2=2
+  CHAIN_SERVE_EXPECT='colibri dev2 chain: [1-9][0-9]* forwards' CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=colibri \
+    $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 KV_SLOTS=2 COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=2 COLI_VK_CHAIN_LAYERS2=2
+}
+
 family_layers_dev2() {
   export OMP_NUM_THREADS=2
-  make qwen36 qwen38 olmoe mimo inkling tests/test_vk_chain VK=1
+  make qwen36 qwen38 olmoe mimo inkling colibri tests/test_vk_chain VK=1
   COLI_VK_DEV2=0 ./tests/test_vk_chain shaders/qmatmul.spv | tee vk_chain.log
   tail -1 vk_chain.log | grep -qx PASS || fail "the chain's ops on two devices"
   ld2_qwen36
@@ -208,6 +274,7 @@ family_layers_dev2() {
   ld2_olmoe
   ld2_mimo
   ld2_inkling
+  ld2_colibri
   unset OMP_NUM_THREADS
 }
 family_layers_dev2_sanitize() {
@@ -227,7 +294,7 @@ family_layers_dev2_sanitize() {
     COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 PILOT=1 WIDE=2 SNAP=olmoe_tiny_c ./olmoe 2 8 olmoe_tiny/ref_olmoe_long.json
   [ "$(ld2_forwards olmoe san.log)" -gt 0 ] || { cat san.log; fail "asan ld2 olmoe: the second device's chain never ran"; }
   [ -f tiny_inkling/ref_long.json ] || kv_inkling_fixtures
-  kv_san inkling "asan ld2 inkling KV split on both" COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=4 COLI_VK_CHAIN_LAYERS2=4 \
+  kv_san inkling "asan ld2 inkling KV split on the second device" COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=4 COLI_VK_CHAIN_LAYERS2=4 \
     COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 SNAP=tiny_inkling ./inkling 8 0 tiny_inkling/ref_long.json
   [ "$(ld2_forwards inkling san.log)" -gt 0 ] || { cat san.log; fail "asan ld2 inkling: the second device's chain never ran"; }
   make clean >/dev/null 2>&1 || true

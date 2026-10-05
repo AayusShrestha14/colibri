@@ -509,6 +509,7 @@ typedef struct {
 #ifdef COLI_VULKAN
     int *vk_kv_valid;                            /* righe [0,v) specchiate nella cache KV Vulkan */
     void *vkchain;                               /* the dense chain's device state (glm_chain.h), NULL until it starts */
+    void *vkchain2;                              /* its layers on COLI_VK_DEV2's device, after the primary's (glm_chain.h) */
 #endif
     ESlot ws[64];                                /* working set del layer corrente (load paralleli) */
     ESlot **pin; int *npin;                      /* HOT-STORE: expert pinnati in RAM (mai evicted) */
@@ -783,16 +784,18 @@ static pthread_t g_dho_thread;
 static int qt_vk_fmt(const QT *t){ return t->fmt==0 ? 10 : t->fmt; }
 static int qt_dho_matmul(QT *t, float *y, const float *x, int S){
     if(omp_in_parallel() || !pthread_equal(pthread_self(), g_dho_thread) || !t->vk) return 0;
+    if(coli_vk_tensor_dev(t->vk)) return 0;   /* a matrix of the second device's layers: only its chain reads it */
     return coli_vk_matmul(&t->vk, y, x, NULL, NULL, qt_vk_fmt(t), S, t->I, t->O, t->fmt==4 ? t->gs : 0);
 }
 static int vk_matmul_qt(QT *t, float *y, const float *x, int S){
-    if(!g_vk_dense || !VK_FMT_OK(t) || !VK_MAY(t)) return 0;
+    if(!g_vk_dense || !VK_FMT_OK(t) || !VK_MAY(t) || (t->vk && coli_vk_tensor_dev(t->vk))) return 0;
     const void *w = t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
     return coli_vk_matmul(&t->vk, y, x, w, t->s, t->fmt, S, t->I, t->O, t->gs);
 }
 /* Two same-input resident matmuls in one submit (q_a + kv_a read the same x). */
 static int vk_matmul_pair_qt(QT *a, float *ya, QT *b, float *yb, const float *x, int S){
     if(!g_vk_dense || a->fmt!=b->fmt || !VK_FMT_OK(a) || a->gs!=b->gs || a->I!=b->I || !VK_MAY(a) || !VK_MAY(b)) return 0;
+    if((a->vk && coli_vk_tensor_dev(a->vk)) || (b->vk && coli_vk_tensor_dev(b->vk))) return 0;
     const void *wa = a->fmt==1 ? (const void*)a->q8 : (const void*)a->q4;
     const void *wb = b->fmt==1 ? (const void*)b->q8 : (const void*)b->q4;
     return coli_vk_matmul_pair(&a->vk, ya, wa, a->s, a->O,

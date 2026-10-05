@@ -4183,6 +4183,9 @@ case "${1:-}" in
   kv-split-sanitize) family_kv_split_sanitize ;;
   layers-dev2)    family_layers_dev2 ;;
   layers-dev2-sanitize) family_layers_dev2_sanitize ;;
+  layers-dev2-*)  e=${1#layers-dev2-}   # one engine's gates (the engine already built)
+                  declare -F "ld2_$e" >/dev/null || { echo "no layers-dev2 engine $e" >&2; exit 2; }
+                  OMP_NUM_THREADS=2 "ld2_$e" ;;
   kv-split-deepseek) family_kv_split_deepseek ;;
   kv-split-deepseek-sanitize) family_kv_split_deepseek_sanitize ;;
   staged)         family_staged ;;
