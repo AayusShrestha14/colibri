@@ -1303,7 +1303,12 @@ on the device only what the chain placed, and the line
 exit. The `partial-glm` and `partial-glm-sanitize` families
 (`tests/vulkan_partial_glm.sh`) check it on the tiny fixtures, with glm_tiny's shared
 indexer layers and a six-layer GLM-5.3 whose KDA and MLA layers alternate, so MLA layers
-run on both sides of the handoff.
+run on both sides of the handoff. On Lavapipe every configuration gives the CPU's tokens,
+every logits row within 6.7e-7 (colibri, 43 configurations) and 7.8e-7 (glm53, 38) of the
+largest logit, and `coli plan` predicts glm53's N, free, per-layer and fixed bytes as the
+engine prints them under the four caps it is aimed with; the sanitized runs report no
+diagnostic. No discrete GPU was available, and the 780M box was busy with other work: the
+fit on a real card's budget is not measured.
 
 **Arithmetic.** f32 activations throughout, as the CPU's f32 paths: colibri's CPU int8
 dot (`IDOT`, on by default for int8 and, from two rows, int4 rows) rounds activations,
