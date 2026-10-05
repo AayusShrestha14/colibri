@@ -448,6 +448,18 @@ static inline void matmul_q_reset_for_test(void) { matmul_q_idot_force = -1; }
 #include "fused_simd.h"   /* FUSED3=1: quant_x_q8_avx2 + matmul_q_idot{,_pair}_v3 (bit-exact) */
 #endif
 
+#if defined(HAVE_FAST_DOT_I8)
+/* IDOT, read once (see matmul_q below for why it is opt-in) */
+static int matmul_q_idot(void) {
+    static int idot = -1;
+    if (idot < 0) { const char *e = getenv("IDOT"); idot = (e && *e == '1'); }
+#ifdef OLMOE_TESTING
+    if (matmul_q_idot_force >= 0) idot = matmul_q_idot_force;
+#endif
+    return idot;
+}
+#endif
+
 static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
 #if defined(HAVE_FAST_DOT_I8)
     /* IDOT is OPT-IN. It quantizes the ACTIVATIONS to Q8_0 per 16-block (below),
@@ -463,12 +475,7 @@ static void matmul_q(float *y, const float *x, const int8_t *q, const float *sca
      * nats/token on GLM, which is why GLM keeps q/k/v off IDOT). On AVX2-only
      * hardware it is also not faster: 11.01 vs 10.67 tok/s measured on an
      * i5-9600K, n=4 interleaved. Set IDOT=1 to opt in knowingly. */
-    static int idot = -1;
-    if (idot < 0) { const char *e = getenv("IDOT"); idot = (e && *e == '1'); }
-#ifdef OLMOE_TESTING
-    if (matmul_q_idot_force >= 0) idot = matmul_q_idot_force;
-#endif
-    if (idot && I % 16 == 0 && I <= 4096) {
+    if (matmul_q_idot() && I % 16 == 0 && I <= 4096) {
         int nb = I / 16; int8_t xi[4096]; float xs[256];
         for (int b = 0; b < nb; b++) {
             const float *xb = x + b*16;
@@ -494,6 +501,32 @@ static void matmul_q(float *y, const float *x, const int8_t *q, const float *sca
         #pragma omp simd reduction(+:acc)
         for (int i = 0; i < I; i++) acc += x[i] * (float)w[i];
         y[o] = acc * scale[o];
+    }
+}
+
+/* matmul_q on n rows against one matrix: y[t] = matmul_q(x[t]) for t < n, the
+ * same bits (each element is the loop above, unchanged), but every weight row is
+ * read once for all n rows and the rows share one parallel region. A prompt's
+ * MoE (moe_by_expert) hands it all the rows routed to one expert. The IDOT branch
+ * quantizes each row on its own, so it keeps the one-row call. */
+static void matmul_q_rows(float *const *y, const float *const *x, int n,
+                          const int8_t *q, const float *scale, int I, int O) {
+#if defined(HAVE_FAST_DOT_I8)
+    if (matmul_q_idot() && I % 16 == 0 && I <= 4096) {
+        for (int t = 0; t < n; t++) matmul_q(y[t], x[t], q, scale, I, O);
+        return;
+    }
+#endif
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const int8_t *w = q + (int64_t)o * I;
+        for (int t = 0; t < n; t++) {
+            const float *xt = x[t];
+            float acc = 0.f;
+            #pragma omp simd reduction(+:acc)
+            for (int i = 0; i < I; i++) acc += xt[i] * (float)w[i];
+            y[t][o] = acc * scale[o];
+        }
     }
 }
 
@@ -1193,18 +1226,23 @@ static void moe_route_row(Model *m, int layer, int s, float *pr, int *idx, float
     if (!m->hot_pinned) rt_route(layer, s, idx, val, K);
 }
 
+#if defined(__AVX2__)
+/* FUSED3: same contract as matmul_q's IDOT fast branch (IDOT env,
+ * dims %16==0, <=4096) — outside it the stock calls run unchanged.
+ * Exact integer arithmetic only: bit-identical output (verified by memcmp
+ * in tests/bench_fused3.c). OFF by default. */
+static int moe_fused3(int D, int I) {
+    static int idot_moe = -1;
+    if (idot_moe < 0) { const char *ie = getenv("IDOT"); idot_moe = !(ie && *ie == '0'); }
+    return g_fused3 && idot_moe && D % 16 == 0 && D <= 4096 && I % 16 == 0 && I <= 4096;
+}
+#endif
 /* One routed expert on one row: hh[D] = down(silu(gate(xs)) * up(xs)); g, u are
  * scratch of I floats. */
 static void moe_expert_row(const Model *m, const Slot *e, const float *xs, float *g, float *u, float *hh) {
     const Cfg *c = &m->c; int D = c->hidden, I = c->inter;
 #if defined(__AVX2__)
-    /* FUSED3: same contract as matmul_q's IDOT fast branch (IDOT env,
-     * dims %16==0, <=4096) — outside it the stock calls below run
-     * unchanged. Exact integer arithmetic only: bit-identical output
-     * (verified by memcmp in tests/bench_fused3.c). OFF by default. */
-    static int idot_moe = -1;
-    if (idot_moe < 0) { const char *ie = getenv("IDOT"); idot_moe = !(ie && *ie == '0'); }
-    if (g_fused3 && idot_moe && D % 16 == 0 && D <= 4096 && I % 16 == 0 && I <= 4096) {
+    if (moe_fused3(D, I)) {
         matmul_q_idot_pair_v3(g, u, xs, e->g, e->gs, e->u, e->us, D, I);   /* gate+up share one quant of xs */
         for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
         matmul_q_idot_v3(hh, g, e->d, e->ds, I, D);                        /* down_proj [D,I] */
@@ -1216,6 +1254,80 @@ static void moe_expert_row(const Model *m, const Slot *e, const float *xs, float
     for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
     matmul_q(hh, g, e->d, e->ds, I, D);     /* down_proj [D,I] */
     }
+}
+/* moe_expert_row on n rows of one expert: hh[t] = expert(xs[t]), the same bits;
+ * g[t], u[t] are scratch of I floats each. */
+static void moe_expert_rows(const Model *m, const Slot *e, const float *const *xs, int n,
+                            float *const *g, float *const *u, float *const *hh) {
+    const Cfg *c = &m->c; int D = c->hidden, I = c->inter;
+#if defined(__AVX2__)
+    if (moe_fused3(D, I)) {
+        for (int t = 0; t < n; t++) moe_expert_row(m, e, xs[t], g[t], u[t], hh[t]);
+        return;
+    }
+#endif
+    matmul_q_rows(g, xs, n, e->g, e->gs, D, I);     /* gate_proj [I,D] */
+    matmul_q_rows(u, xs, n, e->u, e->us, D, I);     /* up_proj   [I,D] */
+    for (int t = 0; t < n; t++) {
+        float *gt = g[t]; const float *ut = u[t];
+        for (int i = 0; i < I; i++) { float gv = gt[i]; gt[i] = (gv / (1.f + expf(-gv))) * ut[i]; }
+    }
+    matmul_q_rows(hh, (const float *const *)g, n, e->d, e->ds, I, D);   /* down_proj [D,I] */
+}
+
+/* A prompt's MoE, expert by expert (S > 1). Per block of OLMOE_PREFILL_ROWS rows:
+ * the rows are routed in order, as the one-row loop routes them; their (row, rank)
+ * pairs are grouped by expert with a counting sort; each expert is fetched once
+ * and multiplies all of its rows (moe_expert_rows) into a row of its own per pair;
+ * then every rank joins its row in rank order, as the one-row loop adds them. So
+ * each expert's weights are read once a block instead of once a row, and the sum's
+ * order, hence the bits, are the one-row loop's. The block's other pairs on an
+ * expert count as hits: they are served by the slot the fetch returned. */
+#define OLMOE_PREFILL_ROWS 128
+static void moe_by_expert(Model *m, int layer, const float *x, int S, float *logits, float *out) {
+    Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
+    int B = S < OLMOE_PREFILL_ROWS ? S : OLMOE_PREFILL_ROWS, P = B * K;
+    int *idx = malloc((size_t)P * sizeof(int)), *pair = malloc((size_t)P * sizeof(int));
+    int *at = malloc(((size_t)E + 1) * sizeof(int));
+    float *val = malloc((size_t)P * sizeof(float));
+    const float **xs = malloc((size_t)B * sizeof(*xs));
+    float **gp = malloc((size_t)B * sizeof(*gp)), **up = malloc((size_t)B * sizeof(*up));
+    float **hp = malloc((size_t)B * sizeof(*hp));
+    float *g = falloc((int64_t)B * I), *u = falloc((int64_t)B * I), *ctb = falloc((int64_t)P * D);
+    if (!idx || !pair || !at || !val || !xs || !gp || !up || !hp) { fprintf(stderr, "OOM moe_by_expert\n"); exit(1); }
+    for (int t = 0; t < B; t++) { gp[t] = g + (int64_t)t * I; up[t] = u + (int64_t)t * I; }
+    for (int s0 = 0; s0 < S; s0 += B) {
+        int rows = S - s0 < B ? S - s0 : B, n = rows * K;
+        for (int s = 0; s < rows; s++)
+            moe_route_row(m, layer, s0 + s, logits + (int64_t)(s0 + s) * E, idx + (int64_t)s * K, val + (int64_t)s * K);
+        memset(at, 0, ((size_t)E + 1) * sizeof(int));
+        for (int i = 0; i < n; i++) at[idx[i] + 1]++;
+        for (int e = 0; e < E; e++) at[e + 1] += at[e];
+        for (int i = 0; i < n; i++) pair[at[idx[i]]++] = i;   /* at[e] ends at expert e's end */
+        for (int e = 0, a = 0; e < E; a = at[e++]) {
+            int cnt = at[e] - a;                               /* a row routes an expert once: cnt <= rows */
+            if (!cnt) continue;
+            for (int t = 0; t < cnt; t++) {
+                int i = pair[a + t];
+                xs[t] = x + (int64_t)(s0 + i / K) * D;
+                hp[t] = ctb + (int64_t)i * D;
+            }
+            Slot *sl; expert_get(m, layer, e, &sl);
+            moe_expert_rows(m, sl, xs, cnt, gp, up, hp);
+            expert_put(sl);
+            if (cnt > 1) { pthread_mutex_lock(&g_pilot_mx); m->hits += cnt - 1; pthread_mutex_unlock(&g_pilot_mx); }
+        }
+        for (int s = 0; s < rows; s++) {
+            float *os = out + (int64_t)(s0 + s) * D;
+            for (int kk = 0; kk < K; kk++) {
+                const float *hh = ctb + ((int64_t)s * K + kk) * D;
+                float w = val[s * K + kk];
+                for (int d = 0; d < D; d++) os[d] += w * hh[d];
+            }
+        }
+    }
+    free(idx); free(pair); free(at); free(val); free(xs); free(gp); free(up); free(hp);
+    free(g); free(u); free(ctb);
 }
 
 #ifdef COLI_VULKAN
@@ -1295,6 +1407,11 @@ static void moe_routed(Model *m, int layer, float *x, int S, float *logits, floa
         return;
     }
 #endif
+    if (S > 1) {   /* a prompt: expert by expert, the same bits as the loop below */
+        moe_by_expert(m, layer, x, S, logits, out);
+        rt_trace_end();
+        return;
+    }
     float *g = falloc(I), *u = falloc(I), *hh = falloc(D);
     for (int s = 0; s < S; s++) {
         int idx[64]; float val[64];
