@@ -949,6 +949,27 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S);
 static void *pilot_worker(void *arg);
 static void ensure_pilot_worker_started(Model *m);
 static void slot_ensure_allocated(Model *m, Slot *s);
+/* The cap main() must hand to qt_init.
+ *
+ * model_init_range resolves the cap<=0 "auto" sentinel into its own local copy
+ * and writes the result to every layer's cache; main()'s variable keeps the
+ * sentinel. qt_init refuses the VRAM expert tier for any cap != n_experts
+ * outside fp8-stream mode (qwen36_tier.c:536), so passing the unresolved 0
+ * switched the tier off under COLI_CUDA=1 even when auto-sizing had picked
+ * every expert. Found by review on #1747, not by a run: the guard sits behind
+ * COLI_CUDA and the CPU build links the inline stub.
+ *
+ * Pure on purpose, same convention as qwen36_cap_for_ram below: no Model
+ * pointer, no globals, no I/O, so test_qwen36_cap_precedence.c can pin it
+ * without a container. */
+static int qwen36_resolved_cap(int cap, const LCache *cache, int n_layers) {
+    if (cap > 0 || !cache || n_layers < 1) return cap;
+    return cache[0].cap;
+}
+
+static int qwen36_cap_for_ram(double resident_gb, double avail_gb, double ram_gb_override,
+                               int hidden, int inter, int n_experts, int n_active_layers,
+                               int is_int4, double *slot_gb_out, double *budget_gb_out);
 
 #ifdef COLI_CACHE_INDEX_TEST
 static uint64_t g_slot_index_probes;
@@ -1038,6 +1059,8 @@ static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return
 #else
 static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0); }
 #endif
+/* same wrapper convention as colibri.c/olmoe.c/inkling.c/kimi_k3.c/deepseek_v4.c */
+static double mem_available_gb(void) { return compat_mem_available_gb(); }
 
 /* ---- M-PROF (R2): per-phase wall-clock accumulators, COLI_TIMERS=1 ---- */
 static int g_timers = -1;
@@ -2394,6 +2417,39 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     if (quantize_dense)
         fprintf(stderr, "[dense-i8] %d matrices %s during load, %.1f GB f32 freed\n", qcount,
                 dense_bits() == 16 ? "kept in f16" : "quantized", qfreed/1073741824.0);
+    if (cap <= 0 && c->n_experts <= 0) {
+        /* Dense checkpoint (#1757): nothing is ever routed, so the per-layer
+         * expert cache is never touched by moe()/expert_get(). Sizing it
+         * from RAM would be meaningless -- n_experts==0 has nothing to clamp
+         * qwen36_cap_for_ram's derived value against, so an unclamped RAM
+         * budget could otherwise calloc an absurd slot count for a cache
+         * that will sit empty. cap=1 is a harmless placeholder. */
+        cap = 1;
+    } else if (cap <= 0) {
+        /* cap<=0 sentinel: derive from host RAM, same "0 = auto" convention as
+         * colibri.c/olmoe.c. rss_gb() here reflects all dense weights resident
+         * (this loop just finished) but not yet DN_rec/DN_conv/m->cache
+         * themselves (allocated below) -- a known, small underestimate left
+         * inside the 12% margin rather than reordering allocation here.
+         * xf_mode(m) is resolvable at this point (st_init/active_of already
+         * ran) but is memoized process-globally, not per-Model* -- a
+         * pre-existing, unrelated bug if this process ever builds two models
+         * with different container formats (out of scope here). */
+        double resident = rss_gb();
+        double avail = mem_available_gb();
+        const char *ram_env = getenv("RAM_GB");
+        double ram_override = ram_env ? atof(ram_env) : 0.0;
+        int n_active = layer_end - layer_begin;
+        double slot_gb = 0.0, budget_gb = 0.0;
+        cap = qwen36_cap_for_ram(resident, avail, ram_override,
+                                  c->hidden, c->inter, c->n_experts, n_active,
+                                  xf_mode(m), &slot_gb, &budget_gb);
+        fprintf(stderr, "[qwen36] cache auto-sized: %d slots/layer of %d experts "
+                        "(%.1f GB budget via %s, %.1f GB dense resident, %.0f MB/slot)\n",
+                cap, c->n_experts, budget_gb,
+                ram_override > 0.0 ? "RAM_GB" : "88% of available RAM",
+                resident, slot_gb * 1000.0);
+    }
     m->cache = calloc((size_t)c->n_layers, sizeof(LCache));
     for (int i = layer_begin; i < layer_end; i++) {
         m->cache[i].cap = cap;
@@ -2441,6 +2497,31 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
 static int64_t scale_count_gu(const Cfg *c){ return c->expert_gs ? (int64_t)c->inter * ((c->hidden + c->expert_gs - 1) / c->expert_gs) : c->inter; }
 static int down_gs_of(const Cfg *c){ return c->expert_down_bits ? c->expert_down_gs : c->expert_gs; }
 static int64_t scale_count_d (const Cfg *c){ int gs = down_gs_of(c); return gs ? (int64_t)c->hidden * ((c->inter + gs - 1) / gs) : c->hidden; }
+
+/* Pure: no Model pointer, no globals, no I/O, same testability contract as
+ * coli_resolve_cap / k3_cap_for_ram. cap<=0 sentinel ("auto") resolves to
+ * this. Mirrors olmoe.c's cap<=0 budget block (resident + avail*0.88, same
+ * margin as colibri.c's cap_for_ram), extended with the int4/xf_mode slot-size split that
+ * slot_ensure_allocated() above uses (half the int8 bytes) and with
+ * n_active_layers instead of always c->n_layers, for the Segment/Edge
+ * partial-model layer-range builds. Approximates the scale-float block the
+ * same way olmoe.c does (ignores expert_gs grouping precision) -- this is a
+ * budget estimate under a safety margin, not exact accounting. */
+static int qwen36_cap_for_ram(double resident_gb, double avail_gb, double ram_gb_override,
+                               int hidden, int inter, int n_experts, int n_active_layers,
+                               int is_int4, double *slot_gb_out, double *budget_gb_out) {
+    double budget = ram_gb_override > 0.0 ? ram_gb_override : resident_gb + avail_gb * 0.88;
+    if (budget_gb_out) *budget_gb_out = budget;
+    double room = budget - resident_gb;
+    double per_expert = (double)hidden * inter * (is_int4 ? 1.5 : 3.0);
+    double slot_gb = (per_expert + (double)(inter * 2 + hidden) * sizeof(float)) / 1e9;
+    if (slot_gb_out) *slot_gb_out = slot_gb;
+    int layers = n_active_layers < 1 ? 1 : n_active_layers;
+    int derived = room > 0.0 && slot_gb > 0.0 ? (int)(room / slot_gb / (double)layers) : 0;
+    if (derived < 1) derived = 1;
+    if (n_experts > 0 && derived > n_experts) derived = n_experts;
+    return derived;
+}
 
 static void slot_ensure_allocated(Model *m, Slot *s) {
     if (s->g || s->pw) return;
@@ -2650,6 +2731,43 @@ static void slot_ensure_int8(Model *m, Slot *s) {
     unpack_int4_to_int8(w + ng,      s->u4, ng);
     unpack_int4_to_int8(w + ng + ng, s->d4, nd);
     s->g = w; s->u = w + ng; s->d = w + ng + ng;
+}
+
+/* Experts the VRAM tier evicted since the last token (LFRU and re-plan swaps)
+ * lose their VRAM copy, and on an int4 container their int8 copy went at the
+ * warmstart; the first CPU miss then pays slot_ensure_int8 (a malloc and a
+ * 3 MB unpack) inside the decode step. Rebuilding them here, in parallel and
+ * before the layers run, keeps that out of the miss path: measured on the
+ * 3070, 2,000 re-plan victims cost ~7 ms/token over the next 300 tokens on
+ * the miss path and nothing here. */
+static void expert_get(Model *m, int layer, int eid, Slot **out);
+static void tier_rebuild_evicted(Model *m) {
+    if (!qt_ready()) return;
+    int ls[512], es[512];
+    int n = qt_evicted_take(ls, es, 512);
+    if (n <= 0) return;
+    #pragma omp parallel for schedule(dynamic, 4)
+    for (int i = 0; i < n; i++) {
+        Slot *e; expert_get(m, ls[i], es[i], &e);
+        slot_ensure_int8(m, e);
+    }
+}
+
+/* QT_PREFILL_REPLAN=1: after each prefill layer's routing, hand the tier that
+ * layer's counts over the prompt rows (qt_replan), so residents this prompt
+ * never routes to make way for the ones it routes to most while the rest of
+ * the prefill still computes. Measured on the 3070 (docs/qwen36-cuda-tier.md):
+ * +13..37 points decode hit rate over a heat file from other prompts, at equal
+ * budget, output unchanged (placement never changes routing). */
+static int prefill_replan_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *p = getenv("QT_PREFILL_REPLAN"); on = p && *p == '1'; }
+    return on;
+}
+static int prefill_replan_cap(void) {
+    static int cap = -1;
+    if (cap < 0) { const char *p = getenv("QT_PREFILL_REPLAN_MAX"); cap = p ? atoi(p) : 24; if (cap < 0) cap = 0; }
+    return cap;
 }
 
 /* Segna l'esperto instradato per la bitmap HITS della dashboard. Vive qui,
@@ -2933,7 +3051,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             float *sc = m->attn_sc + (int64_t)tid * m->kv_cap;
             for (int t = 0; t <= qpos; t++) {
                 const float *kv = m->K[layer] + ((int64_t)kvh*m->max_t + t)*kvd;
-                float acc = 0; for (int dd = 0; dd < kvd; dd++) acc += qv[dd]*kv[dd];
+                float acc = dot_f32_lanes(qv, kv, kvd);
                 sc[t] = acc * scale;
             }
             softmax_row(sc, qpos+1);
@@ -3310,6 +3428,8 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
      * (moe_vk_run): the routing is collected first, as for the shared kernel */
     int use_vk = !use_qq && !use_qt && vkt_ready();
     int use_xf = !use_qq && !use_qt && !use_vk && xf_mode(m);
+    /* prefill re-plan: this layer's routing counts over the prompt rows */
+    uint32_t *rp_cnt = (use_qt && S > 1 && prefill_replan_on()) ? calloc((size_t)E, sizeof(uint32_t)) : NULL;
     int *xidx = use_xf || use_vk ? malloc(sizeof(int) * (size_t)S * K) : NULL;
     float *xval = use_xf || use_vk ? falloc((int64_t)S * K) : NULL;
     for (int s = 0; s < S; s++) {
@@ -3387,6 +3507,7 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
             uint32_t *freq_l = m->freq + (int64_t)layer * E;
             for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) freq_l[idx[kk]]++;
         }
+        if (rp_cnt) for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) rp_cnt[idx[kk]]++;
         const float *xs = x + (int64_t)s*D;
         if (use_qq) {
             /* A failed expert is fatal: once the container owns the routed
@@ -3475,6 +3596,7 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
             }
         }
     }
+    if (rp_cnt) { qt_replan(layer, rp_cnt, prefill_replan_cap()); free(rp_cnt); }   /* this layer's swaps upload while the next layers compute */
     if (use_xf) { moe_xf_run(m, layer, x, S, out, xidx, xval); free(xidx); free(xval); }
     if (use_vk) { moe_vk_run(m, l, layer, x, S, out, xidx, xval, routed_only); free(xidx); free(xval); }
     /* The CUDA tier keeps its per-token shared block above because it overlaps
@@ -3999,6 +4121,7 @@ static float *step_ex(Model *m, const int *ids, int S, int pos_base, int nlogits
         }
         q36_embed_row(m, ids[s], pos_base + s, x + (int64_t)s*D);
     }
+    tier_rebuild_evicted(m);
     int chain_n = 0;   /* layers the chain ran (a partial chain: the CPU runs the rest) */
 #ifdef COLI_VULKAN
     /* COLI_VK_CHAIN: the layers, the final norm and lm_head on the device; x comes
@@ -4636,6 +4759,7 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     m->kv_len = 0;
     for (int i = 0; i < np; i++) out[i] = prompt[i];
     float *logit = step(m, prompt, np, 0);
+    qt_stats_mark();   /* [qtier] stats also report the hit rate from here on */
     int len = np;
     Q36Spec *sp = &g_q36_run_spec;
     q36_spec_begin(m, sp, prompt, np);   /* COLI_LOOKUP=1: drafts, every token still the argmax below */
@@ -5061,6 +5185,7 @@ static void serve_one(Model *m, ServeReq *q){
     /* `reuse` is the ABSOLUTE position of the first fresh token: attention and
      * the KV rows are position-indexed, so this has to be the real offset. */
     float *lo = step(m, ids + reuse, np - reuse, reuse);
+    qt_stats_mark();
     if (q->pin) pin_save(m, ids, np, lo);
     int gen=0, limited=1, forwards=1;   /* il prefill e' il primo forward */
     const double s_disk=m->t_disk, s_attn=tm_sum(0)+tm_sum(1), s_moe=tm_sum(2), s_head=tm_sum(5);
@@ -5712,12 +5837,16 @@ int main(int argc, char **argv) {
     if (getenv("OPENAI")) g_openai = 1;                       /* OpenAI-compatible output */
     const char *mv = getenv("MODEL"); if (mv && *mv) g_model = mv;
     int hot_n = getenv("HOT") ? atoi(getenv("HOT")) : 0;
-    int cap   = argc > 1 ? coli_arg_int(argv[1], "cache/layer") : 16;
+    int cap   = argc > 1 ? coli_arg_int(argv[1], "cache/layer") : 0;
     int bits  = argc > 2 ? coli_arg_int(argv[2], "expert bits") : 4;
-    /* cap < 1 leaves every layer cache empty, so expert_get finds no slot to
-     * evict and waits for a publish that can never come. The old lru=0 fallback
-     * turned that into a heap OOB instead; neither is a failure mode to ship. */
-    if (cap < 1) { fprintf(stderr, "cache/layer must be >= 1 (got %d)\n", cap); return 1; }
+    /* cap<=0 (explicit 0, or bare omission above) is the "auto-size from host
+     * RAM" sentinel resolved later in model_init_range, once dense weights are
+     * resident and xf_mode is known -- see qwen36_cap_for_ram(). The invariant
+     * that a cap<1 must never reach the per-layer calloc (expert_get would
+     * then find no slot to evict and wait for a publish that can never come;
+     * the old lru=0 fallback turned that into a heap OOB instead) still holds,
+     * just enforced there instead of only here for the auto path. */
+    if (cap < 0) { fprintf(stderr, "cache/layer must be >= 0 (0 = auto; got %d)\n", cap); return 1; }
     if (bits < 2 || bits > 8) { fprintf(stderr, "quant_bits must be 2..8 (got %d)\n", bits); return 1; }
     const char *refpath = argc > 3 ? argv[3] : "ref.json";
 
@@ -5727,8 +5856,11 @@ int main(int argc, char **argv) {
     /* #1376: every capacity knob announced itself here except the one that
      * refuses requests. The context ceiling surfaced only in the
      * CONTEXT_EXCEEDED line, i.e. after a request had already failed. */
-    fprintf(stderr, "== qwen36 Phase-2 engine | cache=%d/layer bits=%d ctx=%d pilot=%d wide=%d hot=%d smooth=%.2f conf=%.2f ==\n",
-           cap, bits, qwen36_max_ctx(), g_pilot, g_wide, hot_n, smooth, conf);
+    char cap_disp[16];
+    if (cap > 0) snprintf(cap_disp, sizeof cap_disp, "%d", cap);
+    else snprintf(cap_disp, sizeof cap_disp, "auto");
+    fprintf(stderr, "== qwen36 Phase-2 engine | cache=%s/layer bits=%d ctx=%d pilot=%d wide=%d hot=%d smooth=%.2f conf=%.2f ==\n",
+           cap_disp, bits, qwen36_max_ctx(), g_pilot, g_wide, hot_n, smooth, conf);
 
 
     int is_ref = 0;
@@ -5943,6 +6075,8 @@ int main(int argc, char **argv) {
     }
     if (expert_mixed && getenv("COLI_CUDA") && getenv("COLI_CUDA")[0] == '1')
         fprintf(stderr, "[qwen36] COLI_CUDA=1 ignored: the VRAM expert tier does not take the mixed layout yet (one format per expert)\n");
+    /* The sentinel never leaves main() unresolved: see qwen36_resolved_cap. */
+    cap = qwen36_resolved_cap(cap, m.cache, m.c.n_layers);
     if (!qq_active() && !expert_mixed && m.c.n_experts > 0 &&
         qt_init(m.c.n_layers, m.c.n_experts, m.c.hidden, m.c.inter, cap, m.c.topk,
                 m.c.expert_gs, expert_is_int4)) {
@@ -6249,7 +6383,9 @@ static int qwen36_segment_engine_open(
                                            "Qwen3.6 Segment range exceeds model");
     }
     int range_layers = (int)(options->layer_end - options->layer_begin);
-    int cap = 16;
+    int cap = 0; /* sentinel: model_init_range derives it from host RAM,
+                  * honoring memory_limit_bytes==0's own doc comment ("uses
+                  * the adapter's ordinary automatic budget") */
     if (options->memory_limit_bytes) {
         uint64_t weights = (uint64_t)config.hidden * config.inter * 3u;
         uint64_t per_slot = weights +

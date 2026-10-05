@@ -3349,9 +3349,18 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal, int de
 #define COLI_CLUSTER_MAGIC "COLIEX01"
 #define COLI_CLUSTER_VERSION 1u
 static int cluster_io(int fd, void *buf, size_t n, int write_mode){
+    int send_flags=0;
+#ifdef MSG_NOSIGNAL
+    send_flags=MSG_NOSIGNAL;
+#elif defined(SO_NOSIGPIPE)
+    if(write_mode){
+        int enabled=1;
+        if(setsockopt(fd,SOL_SOCKET,SO_NOSIGPIPE,&enabled,sizeof(enabled))!=0) return -1;
+    }
+#endif
     char *p=(char*)buf;
     while(n){
-        ssize_t r=write_mode?send(fd,p,n,0):recv(fd,p,n,MSG_WAITALL);
+        ssize_t r=write_mode?send(fd,p,n,send_flags):recv(fd,p,n,MSG_WAITALL);
         if(r<=0){ if(r<0&&errno==EINTR) continue; return -1; }
         p+=r; n-=(size_t)r;
     }
@@ -3830,7 +3839,9 @@ static int g_pipe=0;      /* PIPE=1: async expert-load pipeline. Default ON for 
                            * Keeps expert pread off the forward-pass thread so loads overlap
                            * the matmul. PIPE=0 opts back into the blocking serial path. */
 static int g_pipe_nw=8;   /* PIPE_WORKERS=n: I/O worker threads (disk-parallel reads) */
+#if defined(__linux__) || !defined(COLIBRI_NO_MAIN)
 static int g_uring=0;     /* URING=1: Linux io_uring load/completion backend; implies PIPE */
+#endif
 static int g_pipe_block=0;/* COLI_PIPE_BLOCK=1: pipe_wait blocca su una condvar invece dello
                            * spin sched_yield (default OFF = spin byte-identico). EN: a yield
                            * storm on the main thread fights the OpenMP team for cycles during
@@ -8341,6 +8352,35 @@ static int forward_all(Model *m, const int *ids, int S, int *pred, const int *re
  * input: file con righe "<ctxlen> <contlen> <id0> .. <id_{T-1}>"  (T=ctxlen+contlen)
  * output: riga "<logprob_continuazione> <contlen> <greedy 0/1>" per richiesta.
  * Un solo forward per richiesta (teacher-forcing): niente generazione -> fattibile a bassa velocita'. */
+/* SCORE rows are a whitespace-separated pair of lengths and exactly that
+ * many vocabulary ids. Check the entire file before allocating inference
+ * buffers or emitting any score; a missing id must not become token zero. */
+static int score_int(char **cursor, int *value){
+    char *p=*cursor, *end;
+    while(isspace((unsigned char)*p)) p++;
+    if(!*p) return 0;
+    errno=0;
+    long n=strtol(p,&end,10);
+    if(p==end || errno==ERANGE || n<0 || n>INT_MAX ||
+       (*end && !isspace((unsigned char)*end))) return 0;
+    *value=(int)n; *cursor=end; return 1;
+}
+static int score_row(char *line, size_t length, int vocab, int reserve,
+                     int *ctx, int *cont, int *ids, int capacity){
+    if(memchr(line,0,length)) return 0;
+    char *p=line;
+    if(!score_int(&p,ctx) || !score_int(&p,cont) || *ctx<1 ||
+       *ctx>INT_MAX-reserve || *cont>INT_MAX-reserve-*ctx) return 0;
+    int total=*ctx+*cont;
+    if(ids && total>capacity-reserve) return 0;
+    for(int i=0;i<total;i++){
+        int id;
+        if(!score_int(&p,&id) || id>=vocab) return 0;
+        if(ids) ids[i]=id;
+    }
+    while(isspace((unsigned char)*p)) p++;
+    return !*p;
+}
 static void run_score(Model *m, const char *snap, const char *path){
     Cfg *c=&m->c; int D=c->hidden;
     /* prefisso GLM (#108): il modello vede [gMASK]<sop> in testa a OGNI sequenza di training —
@@ -8364,18 +8404,29 @@ static void run_score(Model *m, const char *snap, const char *path){
         free(ar);
     }
     FILE *f=fopen(path,"rb"); if(!f){perror(path);exit(1);}
-    int maxT=1; { char *ln=NULL; size_t cp=0;
-        while(getline(&ln,&cp,f)>0){ int a,b; if(sscanf(ln,"%d %d",&a,&b)==2 && a+b>maxT) maxT=a+b; }
+    int maxT=1, reserve=pfx_on?2:0; { char *ln=NULL; size_t cp=0; ssize_t length; size_t lineno=0;
+        while((length=getline(&ln,&cp,f))>0){
+            int ctx,cont; lineno++;
+            if(!score_row(ln,(size_t)length,c->vocab,reserve,&ctx,&cont,NULL,0)){
+                fprintf(stderr,"[SCORE] invalid request at line %zu\n",lineno); exit(1);
+            }
+            if(ctx+cont>maxT) maxT=ctx+cont;
+        }
+        if(ferror(f)){ perror(path); exit(1); }
         free(ln); }
     if(pfx_on) maxT+=2;   /* le richieste senza prefisso crescono di 2 token */
     kv_alloc(m,maxT);
     float *x=falloc((int64_t)maxT*D), *lo=falloc(c->vocab), *row=falloc(D);
-    int *ids=malloc(maxT*sizeof(int));
-    rewind(f); char *ln=NULL; size_t cp=0; int nreq=0; double t0=now_s();
-    while(getline(&ln,&cp,f)>0){
-        char *p=ln; int ctxlen=strtol(p,&p,10), contlen=strtol(p,&p,10), T=ctxlen+contlen;
-        if(T<=0||ctxlen<1){ printf("0 0 0\n"); fflush(stdout); continue; }
-        for(int i=0;i<T;i++) ids[i]=strtol(p,&p,10);
+    int *ids=malloc((size_t)maxT*sizeof(int));
+    if(!ids){ perror("SCORE token buffer"); exit(1); }
+    rewind(f); char *ln=NULL; size_t cp=0; ssize_t length; size_t lineno=0;
+    int nreq=0; double t0=now_s();
+    while((length=getline(&ln,&cp,f))>0){
+        int ctxlen,contlen; lineno++;
+        if(!score_row(ln,(size_t)length,c->vocab,reserve,&ctxlen,&contlen,ids,maxT)){
+            fprintf(stderr,"[SCORE] invalid request at line %zu\n",lineno); exit(1);
+        }
+        int T=ctxlen+contlen;
         if(pfx_on && !(T>=2 && ids[0]==pfx[0] && ids[1]==pfx[1])){   /* gia' prefissato -> intatto */
             memmove(ids+2,ids,(size_t)T*sizeof(int));
             ids[0]=pfx[0]; ids[1]=pfx[1]; ctxlen+=2; T+=2;
@@ -8392,6 +8443,7 @@ static void run_score(Model *m, const char *snap, const char *path){
         if(++nreq%5==0) fprintf(stderr,"[score %d req | %.1fs | RSS %.2f GB | hit %.0f%%]\n",
             nreq, now_s()-t0, rss_gb(), (m->hits+m->miss)?100.0*m->hits/(m->hits+m->miss):0.0);
     }
+    if(ferror(f)){ perror(path); exit(1); }
     free(ln); free(ids); free(x); free(lo); free(row); fclose(f);
 }
 

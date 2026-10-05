@@ -30,12 +30,31 @@ static int64_t kv_rec_bytes(Model *m){
     return rec;
 }
 
+/* Publishing nrec is the commit step: neither a buffered write nor fflush
+ * alone proves the corresponding records reached the persistence layer. */
+static int kv_disk_sync(FILE *f){
+    if(fflush(f)!=0) return 0;
+#ifdef _WIN32
+    return _commit(_fileno(f))==0;
+#else
+    return fsync(fileno(f))==0;
+#endif
+}
+
+static void kv_disk_write_failed(KVState *k){
+    fprintf(stderr,"[KV] save failed: %s (will retry on the next save)\n",strerror(errno));
+    if(k->disk_fp){ fclose(k->disk_fp); k->disk_fp=NULL; }
+}
+
 static int kv_disk_open(Model *m){
     KVState *k=m->kv;
     if(k->disk_fp) return 1;
     k->disk_fp=coli_own_fopen(k->disk_path,"r+b");
-    if(k->disk_fp){ char mg[8];                 /* formato del file != formato attivo -> riscrivi */
-        if(fread(mg,1,8,k->disk_fp)!=8 || memcmp(mg,kv_active_magic(),8)){
+    if(k->disk_fp){ char mg[8]; int32_t h[8], want[8]; kv_hdr(m,want,0);
+        /* A failed initial header write may leave the magic but no valid
+         * dimensions. Do not append rows to that incomplete file. */
+        if(fread(mg,1,8,k->disk_fp)!=8 || memcmp(mg,kv_active_magic(),8) ||
+           fread(h,4,8,k->disk_fp)!=8 || memcmp(h,want,6*sizeof(int32_t)) || h[7]!=want[7]){
             fclose(k->disk_fp); k->disk_fp=NULL; k->disk_nrec=0; }
     }
     if(!k->disk_fp){
@@ -46,9 +65,11 @@ static int kv_disk_open(Model *m){
                                 k->disk_path,strerror(errno));
             return 0;
         }
+        k->disk_nrec=0;  /* a newly created file contains no committed rows */
         int32_t h[8]; kv_hdr(m,h,0);
-        fwrite(kv_active_magic(),1,8,k->disk_fp); fwrite(h,4,8,k->disk_fp);
-        fflush(k->disk_fp);
+        if(fwrite(kv_active_magic(),1,8,k->disk_fp)!=8 ||
+           fwrite(h,4,8,k->disk_fp)!=8 || !kv_disk_sync(k->disk_fp)){
+            kv_disk_write_failed(k); return 0; }
         fclose(k->disk_fp);
         k->disk_fp=coli_own_fopen(k->disk_path,"r+b");
         if(!k->disk_fp) return 0;
@@ -67,9 +88,16 @@ static void kv_disk_truncate(Model *m, int nrec){
     if(k->disk_fp){ fclose(k->disk_fp); k->disk_fp=NULL; }
     FILE *f=coli_own_fopen(k->disk_path,"r+b");
     if(!f){ k->disk_nrec=0; return; }
-    k->disk_nrec=nrec;
-    int32_t nr=nrec; fseek(f,8+6*4,SEEK_SET); fwrite(&nr,4,1,f);
-    fflush(f); fclose(f);
+    int32_t nr=nrec;
+    int ok=fseek(f,8+6*4,SEEK_SET)==0 && fwrite(&nr,4,1,f)==1 && kv_disk_sync(f);
+    if(fclose(f)!=0) ok=0;
+    if(ok) k->disk_nrec=nrec;
+    else {
+        /* The desired prefix is shorter than the saved one: retry every live
+         * row next time, rather than letting the old count suppress a save. */
+        k->disk_nrec=0;
+        fprintf(stderr,"[KV] could not persist the conversation's shorter prefix\n");
+    }
 }
 
 static void kv_disk_reset(Model *m){ kv_disk_truncate(m,0); }
@@ -86,7 +114,7 @@ static void kv_disk_append(Model *m, const int *hist, int len){
         if(!nb) return;
         k->disk_buf=nb; k->disk_buf_cap=rec;
     }
-    fseek(f, 8+8*4 + (int64_t)k->disk_nrec*rec, SEEK_SET);
+    if(fseek(f, 8+8*4 + (int64_t)k->disk_nrec*rec, SEEK_SET)!=0) goto write_failed;
     for(int p=k->disk_nrec;p<len;p++){
         uint8_t *b=k->disk_buf;
         *(int32_t*)b = hist[p]; b+=4;
@@ -110,23 +138,18 @@ static void kv_disk_append(Model *m, const int *hist, int len){
         if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic[i]){
             memcpy(b, m->Ic[i]+(int64_t)p*c->index_hd, (size_t)c->index_hd*4); b+=c->index_hd*4;
         }
-        fwrite(k->disk_buf, 1, (size_t)rec, f);
+        if(fwrite(k->disk_buf, 1, (size_t)rec, f)!=(size_t)rec) goto write_failed;
     }
-    fflush(f);                                   /* dati prima, contatore poi */
-#ifdef _WIN32
-    _commit(_fileno(f));
-#else
-    fsync(fileno(f));                            /* i DATI su disco prima che il contatore li
-                                                  * dichiari: fflush ferma solo alla page cache */
-#endif
-    int32_t nr=len; fseek(f,8+6*4,SEEK_SET); fwrite(&nr,4,1,f);
-    fflush(f);                                   /* persist the counter too */
-#ifdef _WIN32
-    _commit(_fileno(f));
-#else
-    fsync(fileno(f));
-#endif
+    if(!kv_disk_sync(f)) goto write_failed;       /* data before the counter */
+    int32_t nr=len;
+    if(fseek(f,8+6*4,SEEK_SET)!=0 || fwrite(&nr,4,1,f)!=1 || !kv_disk_sync(f))
+        goto write_failed;
     k->disk_nrec=len;
+    return;
+write_failed:
+    /* Keep the committed count. Closing clears the failed stdio stream, so a
+     * later save rewrites the incomplete tail instead of skipping it. */
+    kv_disk_write_failed(k);
 }
 /* Bonifica una riga fp8 letta da disco: l'encoder non emette MAI i codici NaN e4m3
  * (0x7F/0xFF), ma un file corrotto potrebbe — la GPU (__nv_cvt) li decodifica NaN. */
