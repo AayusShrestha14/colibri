@@ -1173,6 +1173,249 @@ _VK_CHAIN_LAYOUT["deepseek_v41"] = _v41_chain_layout
 _VK_CHAIN_LAYOUT["kimi"] = _k3_chain_layout
 
 
+def _env_number(env, name, default):
+    match = re.match(r"\s*([+-]?\d+)", env.get(name) or "")
+    return int(match[1]) if match else default
+
+
+def _vk_fit_rows(env, default):
+    """vkc_fit_rows: COLI_VK_CHAIN_ROWS when it is a number, else the engine's block."""
+    value = (env.get("COLI_VK_CHAIN_ROWS") or "").strip()
+    if value and value != "auto":
+        return min(max(_env_number(env, "COLI_VK_CHAIN_ROWS", 1), 1), 65535)
+    return max(default, 1)
+
+
+def _inkling_chain_layout(info, env, vulkan):
+    """inkling_chain.h inkc_fit_start: each layer's matrices in the form inkling.c holds
+    them (f32 fmt 10, bf16 fmt 11, the dense-int4g64 container's int8 fmt 1 and int4-g64
+    fmt 4), the router's f32 copy, its share of the parameter arena, its convolution rings
+    and its K/V mirror at the window's rows; fixed, inkc_bufs at vkc_fit_rows(256) rows,
+    the residual's read-back and the final norm; the tail, lm_head."""
+    root = info.get("config") or {}
+    c = root.get("text_config") or root
+    try:
+        D, L = int(c.get("hidden_size", 6144)), int(c.get("num_hidden_layers", 66))
+        heads, kvh, hd = int(c.get("num_attention_heads", 64)), int(c.get("num_key_value_heads", 8)), int(c.get("head_dim", 128))
+        sheads = int(c.get("swa_num_attention_heads", heads))
+        skvh, shd = int(c.get("swa_num_key_value_heads", 16)), int(c.get("swa_head_dim", hd))
+        window, dr, ext = int(c.get("sliding_window_size", 512)), int(c.get("d_rel", 16)), int(c.get("rel_extent", 1024))
+        taps = int(c.get("sconv_kernel_size", c.get("conv_kernel_size", 4)))
+        E, ns = int(c.get("n_routed_experts", 256)), int(c.get("n_shared_experts", 2))
+        vocab = int(c.get("vocab_size", 201024))
+        unpad = int(c.get("unpadded_vocab_size", vocab))
+        if "dense_intermediate_size" in c:
+            dense_inter, inter = int(c["dense_intermediate_size"]), int(c.get("intermediate_size", 3072))
+        else:
+            dense_inter, inter = int(c.get("intermediate_size", 24576)), int(c.get("moe_intermediate_size", 3072))
+    except (TypeError, ValueError):
+        return None
+    if L < 1:
+        return None
+    types, ids = c.get("layer_types"), c.get("local_layer_ids")
+    local = []
+    for i in range(L):
+        kind = types[i] if isinstance(types, list) and i < len(types) and isinstance(types[i], str) else None
+        if kind is not None:
+            local.append(kind == "hybrid_sliding")
+        elif isinstance(ids, list):
+            local.append(i in ids)
+        else:
+            local.append((i + 1) % 6 != 0)
+    mlp, first_dense = c.get("mlp_layer_types"), int(c.get("dense_mlp_idx", 0) or 0)
+    sparse = [(mlp[i] == "sparse") if isinstance(mlp, list) and i < len(mlp) and isinstance(mlp[i], str)
+              else i >= first_dense for i in range(L)]
+    # the dense-int4g64 container beside the snapshot (load_w_quant): a byte tensor (U8 or
+    # I8) with its .qs scales replaces the original, int8 rows when it has as many bytes as
+    # the original has weights and few scales, int4-g64 when about half as many; any other
+    # geometry keeps the original
+    container = {}
+    sidecar = Path(info.get("path") or ".") / "dense-int4g64"
+    for shard in sorted(sidecar.glob("*.safetensors")) if sidecar.is_dir() else []:
+        try:
+            for name, size, dtype, _ in _tensor_sizes(shard, with_shape=True):
+                container[name] = (size, dtype)
+        except (OSError, ValueError):
+            return None
+    main = {}
+    for t in info.get("dense_tensors", []):
+        numel = 1
+        for n in t.get("shape") or [0]:
+            numel *= n
+        main[t["name"]] = (t["dtype"], numel)
+
+    def form(name):
+        dtype, numel = main.get(name, (None, 0))
+        q, s = container.get(name), container.get(name + ".qs")
+        if q and s and q[1] in ("U8", "I8"):
+            scales = s[0] // 4
+            if q[0] == numel and scales * 64 < q[0]:
+                return 1, 0
+            if numel <= 2 * q[0] <= numel + 2 * scales:
+                return 4, 64
+        return {"F32": (10, 0), "F16": (10, 0), "BF16": (11, 0)}.get(dtype)
+
+    layers = []
+    for i in range(L):
+        H, KV, d = (sheads, skvh, shd) if local[i] else (heads, kvh, hd)
+        kvo, p = KV * d, f"model.layers.{i}."
+        mats = [("self_attn.q_proj.weight", D, H * d), ("self_attn.k_proj.weight", D, kvo),
+                ("self_attn.v_proj.weight", D, kvo), ("self_attn.r_proj.weight", D, H * dr),
+                ("self_attn.o_proj.weight", H * d, D)]
+        if not sparse[i]:
+            mats += [("mlp.gate_proj.weight", D, dense_inter), ("mlp.up_proj.weight", D, dense_inter),
+                     ("mlp.down_proj.weight", dense_inter, D)]
+        total = 0
+        for suffix, columns, rows in mats:
+            f = form(p + suffix)
+            if f is None:
+                return None   # a form the shaders do not take: the chain declines, N = L as before
+            total += vk_tensor_bytes(f[0], columns, rows, f[1])
+        if sparse[i]:
+            total += vk_tensor_bytes(10, D, E + ns)   # the router's f32 copy
+            for suffix, columns, rows in (("mlp.shared_experts.gate_proj", D, inter),
+                                          ("mlp.shared_experts.up_proj", D, inter),
+                                          ("mlp.shared_experts.down_proj", inter, D)):
+                f = form(p + suffix)
+                if f is None:
+                    return None
+                total += ns * vk_tensor_bytes(f[0], columns, rows, f[1])
+        total += 4 * (2 * D + 2 * d + dr * (window if local[i] else ext) + 2 * kvo * taps + 2 * D * taps)
+        for bank in range(4):
+            cells = (kvo if bank < 2 else D) * (taps - 1)
+            total += vk_buf_bytes(4 * max(cells, 1)) + 4 * cells
+        total += 2 * vk_buf_bytes(4 * KV * max(window, 1) * d)
+        layers.append(total)
+    # inkc_bufs at R rows: the scratch's geometry over every layer and the frames (a MoE
+    # layer ends one)
+    R = _vk_fit_rows(env, 256)
+    kvo_max = max((skvh * shd if local[i] else kvh * hd) for i in range(L))
+    qo_max = max((sheads * shd if local[i] else heads * hd) for i in range(L))
+    ro_max = max((sheads if local[i] else heads) * dr for i in range(L))
+    mi_max = max((inter if sparse[i] else dense_inter) for i in range(L))
+    nslot, frame = 0, 0
+    for i in range(L):
+        frame += 1
+        nslot = max(nslot, frame)
+        if sparse[i]:
+            frame = 0
+    nsl, ET = max(ns, 1), E + ns
+    vs = (R * kvo_max + 63) & ~63
+    counts = [R * D, R * D, R * D, R * qo_max, vs + R * kvo_max, R * ro_max, R * qo_max, R * D, R * ET,
+              R * mi_max, R * mi_max, nsl * R * D, R * D, D, R * D, R * ET, nslot * 2 * R * kvo_max, 0,
+              unpad, R * D, nsl * R, 2 * R]
+    fixed = sum(vk_buf_bytes(4 * max(n, 1)) for n in counts) + vk_buf_bytes(4 * R * D) + vk_buf_bytes(4 * D)
+    head = form("lm_head.weight")
+    if head is None:
+        return None
+    return VkChainLayout(layers, fixed, vk_tensor_bytes(head[0], D, unpad, head[1]))
+
+
+_VK_CHAIN_LAYOUT["inkling"] = _inkling_chain_layout
+
+
+# the tower's matrices vk_dense_upload places (mimo_vision.h): the patch embedding (a
+# Conv3d read as a Linear over the flattened patch), each block's, the merger's two
+_MIMO_TOWER = re.compile(r"visual\.(?:patch_embed\.proj|blocks\.\d+\.(?:attn\.(?:qkv|proj)|mlp\.(?:gate|up|down)_proj)"
+                         r"|merger\.mlp\.[02])\.weight")
+
+
+def _mimo_chain_layout(info, env, vulkan):
+    """mimo.c mc_fit_start: each layer's matrices in their MIMO_DENSE_BITS form (0: the
+    release's FP8 with 128-column block scales, fmt 12, and BF16, fmt 11; 8: int8 rows,
+    fmt 1; 32: f32, fmt 10), its K/V mirror at the size the chain allocates (a sliding
+    layer's ring, a full layer's context or COLI_VK_KV_DEVICE_ROWS when that is fewer) and
+    its norms and sink logits; fixed, mc_scratch at vkc_fit_rows(MIMO_CHUNK) rows and the
+    final norm; the tail, the head (and the vision tower the per-matrix path takes)."""
+    c = info.get("config") or {}
+    try:
+        L, H, V = int(c["num_hidden_layers"]), int(c["hidden_size"]), int(c["vocab_size"])
+        dense_inter = int(c.get("intermediate_size") or 0)
+        heads = [int(c["num_attention_heads"]), 0]
+        kvh = [int(c["num_key_value_heads"]), 0]
+        hd = [int(c["head_dim"]), 0]
+        vd = [int(c.get("v_head_dim", hd[0])), 0]
+        heads[1] = int(c.get("swa_num_attention_heads", heads[0]))
+        kvh[1] = int(c.get("swa_num_key_value_heads", kvh[0]))
+        hd[1] = int(c.get("swa_head_dim", hd[0]))
+        vd[1] = int(c.get("swa_v_head_dim", vd[0]))
+        window = int(c.get("sliding_window") or 0)
+        prf = float(c.get("partial_rotary_factor", 1.0))
+        max_pos = int(c.get("max_position_embeddings", 32768))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if L < 1 or max(hd + vd) > 256:
+        return None
+    pattern, freq = c.get("hybrid_layer_pattern"), c.get("moe_layer_freq")
+    if not isinstance(pattern, list) or not isinstance(freq, list) or len(pattern) < L or len(freq) < L:
+        return None
+    swa = [pattern[i] == 1 for i in range(L)]
+    moe = [freq[i] != 0 for i in range(L)]
+    sink = [bool(c.get("add_full_attention_sink_bias")), bool(c.get("add_swa_attention_sink_bias"))]
+    bits = _env_number(env, "MIMO_DENSE_BITS", 0)
+
+    def size(fmt_native, columns, rows):
+        if bits == 32:
+            return vk_tensor_bytes(10, columns, rows)
+        if bits == 8:
+            return vk_tensor_bytes(1, columns, rows)
+        return vk_tensor_bytes(fmt_native, columns, rows, 128 if fmt_native == 12 else 0)
+
+    text = env.get("MIMO_CTX") or env.get("CTX") or ""   # mimo.c: MIMO_CTX, else CTX, else 8192
+    ctx = _env_number({"v": text}, "v", 0) if text else 8192
+    ctx = max(16, min(ctx, max_pos))
+    forced = _env_number(env, "COLI_VK_KV_DEVICE_ROWS", 0)
+    layers = []
+    for i in range(L):
+        k = 1 if swa[i] else 0
+        kd, vdd, qd = kvh[k] * hd[k], kvh[k] * vd[k], heads[k] * hd[k]
+        total = size(12, H, qd + kd + vdd) + size(11, heads[k] * vd[k], H)
+        if not moe[i]:
+            total += 2 * size(12, H, dense_inter) + size(12, dense_inter, H)
+        rows = min(window, ctx) if swa[i] and window > 0 else ctx
+        if not swa[i] and 0 < forced < rows:
+            rows = forced
+        total += vk_buf_bytes(4 * rows * kd) + vk_buf_bytes(4 * rows * vdd)
+        total += 4 * (2 * H + (heads[k] if sink[k] else 0))
+        layers.append(total)
+    # mc_scratch at R rows, one row of logits
+    R = _vk_fit_rows(env, _env_number(env, "MIMO_CHUNK", 64) if _env_number(env, "MIMO_CHUNK", 0) > 0 else 64)
+    geo = []
+    for i in range(L):
+        k = 1 if swa[i] else 0
+        rows = min(window, ctx) if swa[i] and window > 0 else ctx
+        geo.append((swa[i], kvh[k] * hd[k], kvh[k] * vd[k], heads[k] * hd[k], heads[k] * vd[k], rows))
+    rw = max(qd + kd + vdd for _, kd, vdd, qd, _, _ in geo)
+    kdm = max(g[1] for g in geo)
+    vdm = max(g[2] for g in geo)
+    ctxw = max(g[4] for g in geo)
+    kvd = sum((rows if s and rows < R else R) * (kd + vdd) for s, kd, vdd, _, _, rows in geo)
+    rope = [int(hd[0] * prf) // 2 * 2, int(hd[1] * prf) // 2 * 2]
+    counts = [R * H, R * H, R * H, R * rw, R * kdm, R * vdm, R * ctxw, H, R * H, kvd, V, R * H,
+              R * 2 * (rope[0] // 2 + rope[1] // 2)]
+    windowed = [g for g in geo if g[0]]
+    if windowed:
+        win = max(g[5] for g in windowed) - 1
+        counts += [(win + R) * max(g[1] for g in windowed), (win + R) * max(g[2] for g in windowed)]
+    if not all(moe):
+        counts += [R * dense_inter, R * dense_inter]
+    fixed = sum(vk_buf_bytes(4 * max(n, 1)) for n in counts) + vk_buf_bytes(4 * H)
+    tail = size(11, H, V)
+    _, dense = _vk_chain_dense("mimo", env, vulkan)
+    if dense:   # the vision tower, on the device through the per-matrix path
+        for tensor in info.get("dense_tensors", []):
+            shape = tensor.get("shape")
+            if _MIMO_TOWER.fullmatch(tensor["name"]) and isinstance(shape, list) and len(shape) >= 2:
+                columns = 1
+                for n in shape[1:]:
+                    columns *= n
+                tail += vk_tensor_bytes(10 if bits == 32 else 11, columns, shape[0])
+    return VkChainLayout(layers, fixed, tail)
+
+
+_VK_CHAIN_LAYOUT["mimo"] = _mimo_chain_layout
+
+
 def _analysis_signature(shards, config_path):
     parts = [f"v{_ANALYSIS_CACHE_VERSION}"]
     st = config_path.stat()
