@@ -3349,9 +3349,18 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal, int de
 #define COLI_CLUSTER_MAGIC "COLIEX01"
 #define COLI_CLUSTER_VERSION 1u
 static int cluster_io(int fd, void *buf, size_t n, int write_mode){
+    int send_flags=0;
+#ifdef MSG_NOSIGNAL
+    send_flags=MSG_NOSIGNAL;
+#elif defined(SO_NOSIGPIPE)
+    if(write_mode){
+        int enabled=1;
+        if(setsockopt(fd,SOL_SOCKET,SO_NOSIGPIPE,&enabled,sizeof(enabled))!=0) return -1;
+    }
+#endif
     char *p=(char*)buf;
     while(n){
-        ssize_t r=write_mode?send(fd,p,n,0):recv(fd,p,n,MSG_WAITALL);
+        ssize_t r=write_mode?send(fd,p,n,send_flags):recv(fd,p,n,MSG_WAITALL);
         if(r<=0){ if(r<0&&errno==EINTR) continue; return -1; }
         p+=r; n-=(size_t)r;
     }
