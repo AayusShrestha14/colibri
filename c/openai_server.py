@@ -1452,7 +1452,11 @@ def _k3_order_tool_results(messages):
         msg = messages[i]
         if isinstance(msg, dict) and msg.get("role") == "assistant":
             index_map = {}
-            for pos, tc in enumerate(msg.get("tool_calls") or [], start=1):
+            calls = msg.get("tool_calls")
+            if calls is not None and not isinstance(calls, list):
+                raise APIError(400, "`tool_calls` must be an array.",
+                               f"messages.{i}.tool_calls")
+            for pos, tc in enumerate(calls or [], start=1):
                 if isinstance(tc, dict) and tc.get("id") is not None:
                     fn = tc.get("function", tc)
                     nm = fn.get("name") if isinstance(fn, dict) else None
@@ -1911,6 +1915,8 @@ def _qwen_tool_calls(tool_calls, has_content, index):
     preceding content with a blank line only when that content is non-empty, and
     every later call with a single newline; getting that wrong changes the prompt
     the model is conditioned on."""
+    if tool_calls is not None and not isinstance(tool_calls, list):
+        raise APIError(400, "`tool_calls` must be an array.", f"messages.{index}.tool_calls")
     out = []
     for position, call in enumerate(tool_calls or []):
         if not isinstance(call, dict):
