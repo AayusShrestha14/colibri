@@ -27,7 +27,7 @@
           },
           {
             "group": "Configure and tune",
-            "pages": ["SETTINGS", "ENVIRONMENT", "tuning", "CACHE_ROUTE"]
+            "pages": ["SETTINGS", "ENVIRONMENT", "tuning", "speculative", "CACHE_ROUTE"]
           },
           {
             "group": "Hardware backends",

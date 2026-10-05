@@ -113,7 +113,7 @@ the shared expert tier ([below](#the-routed-expert-tier-vk_tierc)).
 
 | Engine | On the device | Weight formats | Stays on the CPU |
 |---|---|---|---|
-| qwen36 (Qwen3.6, Qwen3-Coder, Qwen3.8-27B) | the dense trunk; routed experts on the expert tier | int8 rows; int4-g64 with `COLI_DENSE_BITS=4`; f32 with `COLI_DENSE_I8=0`; experts int4-g64, int4 per row, int8 per row or gs64 | DeltaNet `dn_a`/`dn_b`, vision tower, the experts the tier does not hold |
+| qwen36 (Qwen3.6, Qwen3-Coder, Qwen3.8-27B, Clef) | the dense trunk; routed experts on the expert tier | int8 rows; int4-g64 with `COLI_DENSE_BITS=4`; f16 (fmt 14) with `COLI_DENSE_BITS=16`; f32 with `COLI_DENSE_I8=0`; experts int4-g64, int4 per row, int8 per row or gs64 | DeltaNet `dn_a`/`dn_b`, vision tower, Clef's joint head, the experts the tier does not hold |
 | qwen38 (Qwen3.8 Flash Next) | the trunk; routed experts on the expert tier | int8 trunk rows, bf16, f32 (`Q38_NATIVE_BF16=0`); experts int4-g64 (sidecar), FP8 128x128 blocks, bf16 | the MTP head's experts, the experts the tier does not hold |
 | inkling | dense and shared-expert matrices; routed experts on the expert tier | int8 and int4-g64 (dense-int4g64 container), f32, bf16; experts int4 or int8 per row (container or runtime quantization), f32 | embedding and audio lookups, CUDA residents (with CUDA or Metal on, the experts too); bf16 on CPUs with the AVX512-BF16 dot (see below); the experts the tier does not hold |
 | olmoe | attention q/k/v/o, router, lm_head; routed experts on the expert tier | f32; experts int8 per row | embedding, the experts the tier does not hold |
@@ -123,6 +123,8 @@ the shared expert tier ([below](#the-routed-expert-tier-vk_tierc)).
 | deepseek_v4 | resident dense layers, head, router, compressors; routed experts on the expert tier | fp8 in 128x128 blocks, bf16; experts MXFP4 (fp4, a ue8m0 scale per 32) with [an activation of its own](#deepseek-v4s-activation) | the indexer's `weights_proj`, DSpark stages, the `--oracle` path's dense layers, the experts the tier does not hold |
 | glm53 (GLM-5.3 Flash) | the resident matrices (an f32 checkpoint's experts among them); the streaming container's routed experts on the expert tier | int8 and int4-g64 (`GLM53_BITS`); experts int4-gs64 | f32 matrices (`GLM53_BITS=32`), the streamed experts the tier does not hold, all of them when `swiglu_limit` is 0 |
 | qwenimage | the DiT's matrices | int8, bf16, f32 (`COLI_IMG_BITS`) | text encoder, VAE, attention |
+| laya (Laya) | the whole forward: encoder and decision head layers ([below](#the-decision-engines)); with `COLI_VK_CHAIN=0` their matrices | f16 (fmt 14, the release's F16 values), f32 | the scorer and the act head on the marker rows, the tokenizer |
+| gliner_decide (GLiNER2.5-Decide) | the whole encoder ([below](#the-decision-engines)); with `COLI_VK_CHAIN=0` its matrices | f32 | the classifier on the `[L]` rows, the tokenizer |
 
 Each engine ends a run, and each serve turn, with
 `[VK] <engine>: N matmuls on the GPU`. That count is how you tell a path that ran
@@ -265,6 +267,116 @@ The CPU gains too where the block lets a matrix stay in cache across rows (Qwen3
 DeltaNet: 7.1 to 2.5 s). Qwen3.8's block saves its 0.9 s of PLE GEMVs, inside the
 run-to-run spread of its expert reads (cold page cache, about 2 s).
 
+## The decision engines
+
+Laya (`laya.c`), GLiNER2.5-Decide (`gliner_decide.c`) and Clef (`qwen36.c` with
+`clef_head.h`) answer a decision with one forward over the request's rows and
+generate no text. Their encoder work runs as a batch of matrix products.
+Build them with `VK=1` (`make laya gliner_decide qwen36 VK=1`) and set `COLI_VULKAN=1`.
+
+**Laya and GLiNER2.5-Decide** (`decide_vk.h`). The device opens once the weights are
+loaded, and every matrix of the encoder and the head goes up then, so the first request
+pays nothing for it: Laya's as f16 (fmt 14), since the release stores F16 and every value
+is one (the same values in half the bytes), GLiNER2.5-Decide's as f32 (fmt 10). A forward
+then runs one of two ways:
+
+- **On the device** (the default on a GPU, discrete or integrated; `COLI_VK_CHAIN=1`
+  anywhere). The engine records its whole forward as frames of the dense chain, one
+  submission per forward: the embedding rows go up, the encoder (and Laya's two head
+  layers) run in the CPU path's order, and only the rows the scorer reads come back
+  (Laya's markers and each sequence's first row, GLiNER2.5-Decide's `[L]` rows). The
+  scorer, the act head and the classifier, a few rows each, stay on the CPU.
+- **Matrix by matrix** (`COLI_VK_CHAIN=0`): every dense matrix through `coli_vk_matmul`
+  (the tiled GEMM from the backend's threshold), the norms, the attention and the rest
+  on the CPU. `COLI_VK_DENSE=0` as well keeps everything on the CPU.
+
+What runs between the matrices is `chain_enc.comp` (`vkc_enc_*` in `vk_chain.h`):
+
+| Op | What it does |
+|---|---|
+| `vkc_enc_norm` | LayerNorm with weight and bias, the residual add fused (`x += h; h = LN(x)` for ModernBERT's pre-norm layers, `x = LN(h + x)` for DeBERTa's post-norm ones) |
+| `vkc_enc_bias` | a matrix's bias, then GELU (erf or tanh), ReLU or nothing, in place |
+| `vkc_enc_geglu` | ModernBERT's GeGLU: the first half of `Wi`'s row through GELU, times the second |
+| `vkc_enc_rope` | rotate-half RoPE on the query and key heads, positions from each sequence's start, cos and sin from the host's own table (global and local theta) |
+| `vkc_enc_addrow` | a table row per row: Laya's type embedding by the row's question type |
+| `vkc_enc_attn` | bidirectional attention over a range of rows per row: its sequence (a request's questions are separate sequences in one batch), or Laya's +-64 window inside it; DeBERTa's two relative terms added by bucket, an online softmax over tiles of 32 rows, 16 query rows a workgroup |
+| `vkc_enc_rel` | DeBERTa's relative terms as its CPU attention computes them: each row's query against the key projection of the relative embeddings (content to position) and its key against their query projection (position to content), per head, for the buckets the forward can reach |
+
+The arithmetic is the CPU path's in f32: the two differ in the order of the sums, GELU's
+`erf` comes from a fit of `erfc` with a relative error under 1.2e-7, and LayerNorm sums in
+float where the engines sum in double. A device lost in the middle of a forward leaves
+that forward to the CPU, which recomputes it from the ids: a decision has no state to
+rebuild. Each request ends with `[VK] <engine>: N matmuls on the GPU` and
+`[VK] <engine> chain: F forwards on the device ...`.
+
+**Clef** runs through qwen36's own Vulkan paths, which DECIDE now uses: the backbone's
+prefill over the record matrix by matrix (the default on an integrated GPU, where a
+model without routed experts keeps its dense matrices on the device and the chain off)
+or as the dense chain (`COLI_VK_CHAIN=1`; the default on a discrete GPU), whose read-out
+brings back every row's hidden state for the head. The joint head stays on the CPU. A `[clef]` line reports backbone and head
+time separately so an end-to-end measurement can identify the limiting stage. Two things were missing for it:
+
+- **f16 rows.** `COLI_DENSE_BITS=16` keeps the trunk in the container's f16, and
+  qwen36's device path knew the int4, int8 and f32 copies only. The backend now takes f16
+  rows as fmt 14 (no scales, low half the even column, like bf16's 11) in the GEMV, the
+  fp32 tiled GEMM and the chain's decode GEMV; the cooperative-matrix GEMM keeps its
+  formats.
+- **The rows read in place** (`COLI_VK_IMPORT`). A resident copy on a device that shares
+  the CPU's RAM is the matrix held twice: Clef's trunk is 27 GB in int8 and 54 GB in
+  f16, and the f16 one does not fit twice in 61 GB. `coli_vk_tensor_import` hands the
+  device the host's own pages (`VK_EXT_external_memory_host`): qwen36 allocates its int8
+  and f16 rows page-aligned when `COLI_VULKAN` is set, and the device reads them where
+  they are; their scales, a float a row, are copied. On by default for a model without
+  routed experts on an integrated GPU or Lavapipe; every other model copies as before.
+  The harness checks imported rows bit for bit against a copy (int8, f32, f16, the GEMV
+  and the GEMM).
+
+The in-place import falls back to an ordinary resident copy if the extension, alignment
+or buffer requirements cannot be met. It is disabled with staged uploads. The host
+allocation remains alive while the device reads it. This saves the duplicate weight
+storage on a shared-memory GPU; it is not a claim of faster matrix multiplication.
+On an integrated GPU this also applies with `COLI_VK_DENSE_HOST=0`: imported rows
+already have one physical copy. Keeping them in place avoids moving the entire
+trunk into a potentially smaller device-local heap and exhausting its scratch budget.
+`COLI_VK_IMPORT=0` forces independent device copies and permits their host pages to
+be released. Only pages actually released contribute to the host-memory drop counter.
+
+The dense Qwen/Clef backbone submits each layer separately, retaining the residual
+stream on the device. Without routed experts there is no intermediate host readback
+to divide the work; recording all layers of a large prompt in one submission can
+exceed the driver's watchdog. The regression compares CPU answers across repeated
+requests and checks that the submission count grows with the number of layers.
+
+On the real Clef 27B int8 checkpoint, Radeon 780M/RADV completed six requests
+(254–755 tokens) with 401 independent device matrices, 23.86 GiB of host copies
+released and no CPU reloads. The shared-page configuration completed the same six
+requests with 24,412.5 MiB read in place; its maximum absolute logit difference from
+the independent copies was 3.5e-7. Against two CPU references with the same float
+activation arithmetic (`COLI_DENSE_IDOT=0`), the maximum difference was 3.42e-6.
+The shared-page budget selected 3,328 prompt rows automatically. These are correctness
+and memory checks on one integrated GPU; they do not establish throughput on a
+discrete GPU or under Windows.
+
+### Validation and performance
+
+`bash c/tests/vulkan_engines.sh decide` checks all three engines against their CPU
+outputs: identical decisions and refusals, probabilities within 1e-5 and logits within
+1e-4 relative to the largest magnitude (at least 1). It also verifies that work was
+actually dispatched. The matrix and chain paths, f16 and int8 Clef rows, import and
+copy, staged uploads, CPU fallback after a device loss, serve sessions and SDK requests
+are covered. `decide-sanitize` runs the comparison and serve tests under ASan and UBSan.
+With both `COLI_VK_CHAIN=0` and `COLI_VK_DENSE=0`, answers must equal the CPU's byte for
+byte apart from elapsed times. These gates have passed on Lavapipe; they establish
+correctness, not GPU speed.
+
+For latency, measure complete requests after a warm-up in the same running engine,
+using identical records, weight precision and CPU thread count. Compare the CPU with
+`COLI_VULKAN=1 COLI_VK_CHAIN=0` and `COLI_VULKAN=1 COLI_VK_CHAIN=1`, and report the median
+`engine_ms`, input lengths, GPU, available RAM and competing workload. Clef's
+backbone/head timing identifies how much of the request Vulkan can accelerate. No
+end-to-end speedup for all three real checkpoints is established by the fixture gates,
+and no discrete GPU measurement is included here.
+
 ## The routed-expert tier (`vk_tier.c`)
 
 The engines above keep their dense matrices on the device (on a discrete GPU; on
@@ -301,8 +413,9 @@ of them on the device the way a GPU-equipped PC should use its card:
   row in routing (rank) order, the device's and the CPU's alike: the same order as a
   CPU-only run, so the device's experts differ from the CPU's only by their own
   summation order. A device row's bits do not depend on how many rows share its
-  dispatch either (up to 15 rows an expert takes the per-row GEMV route), so an MTP
-  verify's two rows get a decode step's bits. From 16 rows (prefill) an expert takes
+  dispatch either (up to 15 rows an expert takes the per-row GEMV route), so a
+  speculative verify's rows (two to six, [speculative.md](speculative.md)) get a decode
+  step's bits. From 16 rows (prefill) an expert takes
   the tiled GEMM for gate, up and down.
 - **Without `COLI_VULKAN`, nothing changes.** In a `VK=1` build with `COLI_VULKAN`
   unset, and in a build without `VK=1`, the stdout and the last logits of every
@@ -353,6 +466,7 @@ the device, since no Vulkan tier runs.
 | `COLI_VK_TIER_SYNC` | `0` | `1`: each layer step first waits for the uploads staged so far: residency then follows the routing alone (with `COLI_VK_TIER_BALANCE=0`, the run is reproducible). A promotion that displaces a resident while a batch is in flight waits for the join to free it. For tests and debugging. |
 | `COLI_VK_TIER_GEMM_ROWS` | `16` | Rows from which an expert of a step takes the tiled GEMM instead of the per-row GEMV; `0` never. |
 | `COLI_VK_TIER_QUEUE` | a second queue | `0`: the tier shares the main queue (its batches and the dense matmuls then serialize). |
+| `COLI_VK_TIER_STREAM` | on | A prompt step's cold experts streamed to the device ([below](#big-prompt-chunks-and-expert-streaming)); `0` off. `_SLOTS`, `_ROWS`, `_HALF`, `_PAR` there. |
 | `COLI_VK_DENSE` | on, but off on a device sharing the CPU's RAM while the tier is on | `0`: the dense trunk stays on the CPU and the device takes the routed experts only; `1`: the trunk on the device whatever the device. Unset: on a discrete GPU, or with the tier off, on the device; on an integrated GPU or Lavapipe with the tier on, on the CPU. The startup line says which and why. (The GLM engine reads it through the same rule with its own default, off.) |
 | `COLI_USAGE` | `<snap>/.coli_usage` | The history the warm start reads; each engine's is in the table above. qwen36 and deepseek_v41 keep it only while the tier is on, and save it at the end of every run and serve turn. olmoe reads one only when this is set, inkling also takes `PIN=<path>`, deepseek_v4 reads its expert store's own (`<model>/.coli_usage`, always kept) and MiMo none. |
 
@@ -684,7 +798,7 @@ deepseek_v41 and deepseek_v4 with DeepSeek's own ([below](#deepseek-v41-flash-an
 | device, frame A1 | the previous layer's MoE output joining the residual (in the CPU's order: routed experts in rank order, then the gated shared expert, then the add); the input RMSNorm; the gated attention (q/k/v, per-head q/k norm, RoPE, the new K/V rows into the device cache, attention with the output gate, o_proj) or the Gated DeltaNet (qkv/z/b/a, the causal convolution with its ring, the recurrence with its state, the gated norm, out_proj); the residual add; the post-attention norm; the router logits | the four hyper-connection streams: each block's gated-residual read (per-stream norm, the low-rank pair, the stream mix, the inject weights) and its write-back; the PLE layer's projections, gate and dilated convolution (the n-gram table rows come up from the host); QSA with its indexer: each block's pooled key computed once on the device when a step completes it, and the top-k selection per query row |
 | host | the router's softmax and top-k; the routed experts (the expert tier's device batch and the CPU's share, joined in rank order); the new K/V rows copied into the host's cache | the new index-key rows too |
 | device, frame A2 (not waited for) | the shared expert and its gate, while the host computes the routed experts | |
-| last frame | the final norm and lm_head on the last row | the final mixer; lm_head on the last one or two rows (an MTP verify) |
+| last frame | the final norm and lm_head on the last row, or on every row of a speculative verify | the final mixer; lm_head on the last row, or on every row of a verify |
 
 Per layer the host gets the normalized rows the routed experts read (D floats a row)
 and the router logits (E floats a row), and the new K/V (and index-key) rows of an
@@ -697,7 +811,9 @@ routed experts (Qwen3.8-27B) has no host step: its whole forward is one frame.
   as with the GLM engine's KV mirror. The device holds a mirror per layer with a
   watermark: rows below it equal the host's. A step from `pos_base` first uploads
   the rows between the watermark and `pos_base`; a step that runs on the CPU lowers
-  the watermark to its `pos_base`; a cache that grows is mirrored again. Qwen3.8's
+  the watermark to its `pos_base`; a cache that grows is mirrored again. Past the
+  device's budget the mirror keeps part of the cache and the CPU attends over the
+  rest ([below](#a-kv-cache-past-the-devices-budget)). Qwen3.8's
   pooled block keys have a watermark of their own, lowered to the first block a step
   rewrites (a rejected draft's block is recomputed when a step completes it again).
 - The DeltaNet recurrent state and conv rings, and Qwen3.8's PLE ring: on the device
@@ -705,10 +821,16 @@ routed experts (Qwen3.8-27B) has no host step: its whole forward is one frame.
   copy is brought back before anything reads it there (a pinned snapshot, the prompt
   cache, a CPU step) and pushed up after anything writes it there (a reset: a fill
   with zeros on the device; a restored snapshot: an upload).
-- An MTP verify (S = 2) snapshots the DeltaNet states, the conv rings and the PLE ring
-  after its first row on the device (the shaders write the snapshot as they pass
-  that row); a rejected draft swaps the device buffers, as the CPU swaps its own.
-  Its matrices take the per-row GEMV, so its rows get a decode step's bits.
+- A speculative verify (S = 2 to 6: the token and its MTP or prompt-lookup drafts,
+  [speculative.md](speculative.md)) copies the DeltaNet states, the conv rings and the
+  PLE ring on the device after each of its rows but the last, one slot per row. One
+  copy the shaders write as they pass its row; more split the convolution and the
+  recurrence into one dispatch per copy, each ending on its row (the same bits). A draft
+  rejected after row r swaps slot r's device buffers in, as the CPU swaps its own, and
+  the KV and pooled-key watermarks come down to the standing rows. Its matrices take
+  the per-row GEMV, so its rows get a decode step's bits. Slots past the first are
+  allocated the first time a verify that deep runs (113 MiB each on Qwen3.8 Flash Next,
+  63 MiB on Qwen3.6-35B).
 
 Prompt-cache and prefix reuse need nothing else: a reused prefix is rows below the
 watermark and a recurrent state that already sits where the next step expects it.
@@ -716,7 +838,7 @@ The serve and prefix tests run with the chain on (below).
 
 **What stays on the CPU.** The routed experts the tier does not hold, the router's
 top-k, the embedding gather and the vision tower's rows, Qwen3.8's n-gram table reads
-and the MTP head (its experts are FP8 beside the int4 sidecar, two rows per draft).
+and the MTP head (its experts are FP8 beside the int4 sidecar, a few rows per draft).
 The chain declines, and the per-matrix path runs with the state synced first, under
 the CUDA expert tier (CUDA keeps its priority), a qpack container, PILOT prefetch, or
 a geometry outside its shaders (head dim above 256, a DeltaNet value head above 128 or
@@ -742,11 +864,15 @@ f32 throughout, as the CPU's f32 path.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `COLI_VK_CHAIN` | on for a discrete GPU; on an integrated GPU with the expert tier, what the engine measured (qwen36 and olmoe on, qwen38 off; mimo, inkling, colibri, glm53, kimi_k3, deepseek_v41 and deepseek_v4 off: not measured); off on a CPU device | `1`: every layer's dense chain on the device; `2`: prompts only (forwards of more than two rows; decode and MTP verifies on the per-matrix path, the state moving between the two); `0`: the per-matrix path. The `[VK] <engine>: dense chain ...` line says which and why. |
-| `COLI_VK_CHAIN_ROWS` | `512` | Prompt rows per chunk: a longer prompt runs every layer chunk by chunk (the device's scratch is sized for one chunk). |
+| `COLI_VK_CHAIN` | on for a discrete GPU; on an integrated GPU with the expert tier, what the engine measured (qwen36 and olmoe on, qwen38 off; mimo, inkling, colibri, glm53, kimi_k3, deepseek_v41 and deepseek_v4 off: not measured); off on a CPU device | `1`: every layer's dense chain on the device; `2`: prompts only (forwards of more than two rows that are not a speculative verify; decode and verifies on the per-matrix path, the state moving between the two); `0`: the per-matrix path. The `[VK] <engine>: dense chain ...` line says which and why. |
+| `COLI_VK_CHAIN_ROWS` | from the budget, up to 8192 | Prompt rows per chunk: a longer prompt runs every layer chunk by chunk (the device's scratch is sized for one chunk). Unset or `auto`: the most rows whose buffers fit half the free device memory, up to `COLI_VK_CHAIN_ROWS_MAX` (8192); see [big prompt chunks](#big-prompt-chunks-and-expert-streaming). It was 512 before. |
 | `COLI_VK_CHAIN_GEMV` | on | `0`: the decode matrices take `qmatmul.comp`'s GEMV instead of `chain_gemv.comp`'s. |
 | `COLI_VK_CHAIN_SPIN_US` | `2000` | How long a wait on a chain frame polls the fence before blocking. |
 | `COLI_VK_CHAIN_PROF` | off | `1`: one `[VK] chain profile` line of device time per kind of op (timestamps). |
+| `COLI_VK_KV_SPLIT` | on | `0`: never split the KV cache past the device's budget ([below](#a-kv-cache-past-the-devices-budget)); the whole mirrors, and past the budget the chain declines. |
+| `COLI_VK_KV_DEVICE_ROWS` | from the budget | The positions a split layer keeps on the device; set, the cache splits whenever it is longer. |
+| `COLI_VK_KV_BLOCK` | `64` | Positions per block of the split's block table. |
+| `COLI_VK_KV_PIN` | off | `1`: enable read-based block pins; QSA/DSA/pooled MLA rounding can then depend on read history. DeepSeek preserves its sparse arithmetic in either mode. |
 
 Each run and serve turn prints `[VK] <engine> chain: N forwards, F frames (ops,
 matmuls, tiled GEMM), the time spent waiting for the device, the routed experts' host
@@ -1414,6 +1540,383 @@ carried (ratios 1 to 4, the overlapping form with its bias, within 2e-6), the sc
 the candidate mask and the top-k list slot for slot on scores exact in float on both
 sides, ties included, with and without a mask, and the engram gate (within 2e-6).
 
+## Big prompt chunks and expert streaming
+
+A long prompt used to cross the chain in chunks of 512 rows, and a chunk's MoE step reached
+the tier in blocks of 32 to 128 rows (the engines' own prefill blocks): each block re-read
+the experts it routed, and the tier could take only the experts it already held. The CPU
+computed the rest, on a long prompt most of them, for every block. Two changes together:
+
+- **Big chunks.** The chain's chunk now comes from the device's free memory, up to 8192
+  rows, and the engines hand the tier a chunk's whole MoE step at once. One pass over a
+  layer's experts then serves every row of the chunk.
+- **Expert streaming.** In a step that big, a cold expert (not resident) is routed to
+  dozens or hundreds of rows. The tier uploads it into a staging slot on the device and
+  runs its rows as a GEMM there, instead of leaving it to the CPU. The slots are reused,
+  and the resident set and its LFRU are not touched.
+
+### The chunk (`vkc_chunk_rows`)
+
+`COLI_VK_CHAIN_ROWS=n` sets the chunk as before. Unset (or `auto`), each engine counts
+its chain's scratch per row from its own reservations (a counting pass over the same
+`vkc_reserve` calls), adds the simultaneous tier and CPU expert outputs and the
+engines' CPU gather/activation workspaces, and takes the most rows, up to
+`COLI_VK_CHAIN_ROWS_MAX` (8192), whose buffers fit half of the device memory free
+at its first forward. Free memory is
+`VK_EXT_memory_budget`'s budget less its use (without the extension, a quarter of the
+device-local heap). The CPU buffers must fit too: available physical RAM (and
+Windows commit headroom) also caps the budget. Qwen3.8 includes its simultaneous
+CPU expert input, gate, up and output buffers even when all experts run on the
+device. Chunks of at least 256 rows round down to a multiple of 256; tighter
+budgets keep the rows that fit, down to one. The decision
+is taken once per engine, after the tier has filled, so on a discrete card the room the
+tier leaves (`COLI_VK_TIER_RESERVE_GB`) is what the chunk gets. One line says what it
+took:
+
+```
+[VK] qwen36 chain: prompt chunks of up to 8192 rows (325 KiB a row; 7.30 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+```
+
+The engines whose prefill blocks the prompt before the chain hand it the chain's chunk
+when the chunk comes from the budget: MiMo instead of `MIMO_CHUNK`'s 64 rows, GLM-5.3
+instead of `GLM53_PREFILL_CHUNK`'s 128, Kimi K3 instead of `K3_CHUNK`'s 32, DeepSeek V4
+instead of its 128-row CPU block (its chained MoE step, the expert union, takes any
+batch). Each of those variables, when set, keeps its blocks, as before. DeepSeek V4.1
+and V4 grow their window rings to the window plus the chunk. The indexers' score
+scratch keeps its cap (32M floats a forward on DeepSeek V4.1 and GLM-5.2).
+
+**What did not scale, and the fixes.** Every chain op takes up to 65535 rows; the
+dispatches over rows stay within the device limits at 8192. Two things did not scale:
+
+- **Attention reads.** `chain_attn.comp` reads a row's positions once per (head, row), so
+  a chunk of S rows read its KV cache S x H times: 1.2 s a layer for 2048 rows of
+  Qwen3.6 on the 780M. From `COLI_VK_ATTN_BLOCK` rows (16) `vkc_attn` takes
+  `chain_attnb.comp` instead. A workgroup takes the query heads of one KV head for a
+  block of rows (up to 32 (head, row) pairs). It walks the positions in tiles, each
+  tile's K and V rows staged in shared memory once for every pair: tiles of 4 to 16
+  positions, as the device's shared memory allows. It takes every form `chain_attn`
+  takes (a window, a ring, position-major rows, a sink, selection lists). Below 16 rows,
+  so for decode and MTP verifies, `chain_attn` runs as before with the same bits.
+- **Submission length.** The attention's work grows with rows x positions, and one
+  submission of a big chunk ran for seconds. On the 780M a frame of a 5632-row chunk at
+  8192 positions was reset by the driver (`ring comp_1.1.0 timeout` in the kernel log,
+  the device lost). Past `COLI_VK_ATTN_SLICE` (2^32 rows x positions x heads x head
+  dim), `vkc_attn`, `vkc_attn_w`, `vkc_mla_core` and `vkc_relattn` record their rows in
+  slices. Each slice ends its frame, submitted and not waited for, and the next starts a
+  new one, which its first barrier orders after the slice. A slice starts on a multiple
+  of the blocked attention's rows, so no row's arithmetic changes.
+
+### Streaming (`vk_tier.c`)
+
+An engine that gives the tier `VktConfig.load` and `.release` (and `.load_batch` when it
+reads experts in parallel) streams. Those hooks hand the tier an expert's bytes as the
+CPU path would get them: through the engine's RAM cache, else from disk. Every MoE
+engine has them. For a step of at least `COLI_VK_TIER_GEMM_ROWS` rows (16),
+`vkt_step_rows` gives the engine the whole step instead of its usual block, and
+`vkt_issue` runs it as follows:
+
+- **The rule**, per cold expert of the step. Stream it when it has at least R rows:
+  R = max(G, ceil(upload / cpu_row)). G is the rows from which the device takes the
+  tiled GEMM (16; fewer rows would run the per-row GEMV). `upload` is the time one expert
+  takes to reach a slot, its bytes at the bandwidth the uploads so far measured.
+  `cpu_row` is the time the CPU spent per (row, expert) pair it computed in the prefill
+  steps so far, its share of a step between issue and join, loads included. Below R the
+  CPU keeps the expert: its rows cost the CPU less than the upload. Until both are
+  measured, R = G. `COLI_VK_TIER_STREAM_ROWS=n` fixes R at n. One line per forward says
+  what the rule gave:
+
+  ```
+  [VK] tier qwen36 stream: a step of 2560 rows; cold experts with 16 rows or more go to the device (an upload of 1.7 MiB at 8.2 GB/s takes 0.217 ms, the CPU 0.2280 ms a row; the GEMM from 16 rows); layer 0: 245 resident, 11 streamed, 0 kept on the CPU (0 rows)
+  ```
+
+- **Sub-batches** (backend: `coli_vk_xb_sub_*`). The step's device work runs as a
+  sequence of bounded batches: the resident experts first, then the streamed ones, with
+  at most half the slots and `COLI_VK_TIER_STREAM_HALF` rows a batch. That cap keeps a
+  batch's x rows within 32 MiB. Before allocating, the backend can reduce the batch
+  further to fit half the free budget of every affected memory heap and available
+  RAM. This calculation includes both halves, gate/up/hidden/output buffers, the
+  doubled descriptor windows and allocation growth; existing buffers count only
+  their additional bytes. A tight budget therefore reduces rows before an allocation
+  failure could disable the tier. An expert with more rows than a batch holds is cut
+  into parts.
+  Batch k goes to half k % 2 of the scratch, so while the device computes one, the engine
+  thread loads and uploads the experts of the next (double buffering), and a batch's
+  outputs are copied out when it is joined. The recording is the single batch's,
+  through the same `xb_record_submit`.
+- **The staging slots.** `COLI_VK_TIER_STREAM_SLOTS` (64) experts' worth of tensors, made
+  at the first step that streams and filled again for each expert they carry
+  (`coli_vk_tensor_refill`). On mapped memory that is the tensor's own mapping. With
+  staged uploads it is a host image that `coli_vk_tensor_commit` copies over. The slots
+  come out of the tier's budget: the residents give up what the budget cannot hold
+  beside them (64 slots of Qwen3.6's 7200 residents). The conversion into a slot is the
+  tier's own byte work (`convert`). A group the engine loaded together converts in
+  parallel, one expert per thread; a lone one converts with its rows split over the
+  threads (`COLI_VK_TIER_STREAM_PAR=0` keeps it on the engine thread).
+- **Nothing pollutes the resident set.** A streamed expert is not offered for promotion:
+  a prompt's whole working set passes through the slots and would otherwise flush the
+  residents. Its routings count as heat, as every routing does, and the slots are free
+  again when their batch is joined.
+- **Prefetch while attention runs.** The routing of a layer is known only after that
+  layer's attention and router, in every engine here: the router reads the post-attention
+  residual, so neither layer L's nor layer L+1's experts are known while L's attention
+  runs. What is known is a prediction. The chain engines submit the frame that computes
+  a layer's routing without waiting, call `vkt_stream_prefetch(layer, rows)`, then wait.
+  The tier fills its free slots with that layer's likely streamed experts while the
+  device works: the routing of the previous big step at the same layer when there was
+  one (a long prompt's earlier chunk), else the history's heat. A prediction that misses
+  costs an upload; an expert it does not cover is streamed after the routing as usual.
+- **Device work.** Streamed and resident experts use the tiled GEMM. From 64 rows
+  of one expert, devices supporting `VK_KHR_cooperative_matrix` also use its
+  cooperative path for int8, int4, int3, MXFP4 and FP8 projections with compatible
+  group sizes. Eligibility is checked separately for gate, up and down; other
+  formats retain the FP32 GEMM. Activation scales are computed on the device,
+  including the intermediate hidden rows, without a CPU readback. The hi/lo
+  activation split and FP32 accumulators follow the per-matrix path. Decode and
+  small draft-verification batches retain the GEMV. Integer weights use the
+  narrower tile; FP8 and MXFP4 retain the FP32 GEMM when a wider cooperative
+  tile would process extra padded rows. `COLI_VK_TIER_COOP=0` disables
+  this path and `COLI_VK_TIER_COOP_ROWS` changes its row threshold. The tier's
+  `cooperative matmuls` counter counts projections actually submitted.
+
+An isolated Radeon 780M/RADV expert benchmark (D=2560, intermediate=640,
+64 rows, two warmups and the median of nine alternating issue/join measurements)
+measured 1.410→1.153 ms for int8, 0.793→0.644 ms for int4-g64, and
+0.965→0.833 ms for FP8. These are expert-batch times, not model tokens/second.
+The correctness harness exercises mixed projection formats, incomplete tiles,
+zero and widely scaled activations, streaming and DeepSeek V4's rounding path.
+Formats or shapes that do not qualify retain the existing kernels.
+
+The run's line counts what streamed:
+
+```
+[VK] tier qwen36 run: ... | stream: 40 steps, 2188 cold experts (3.61 GiB, 10.72 GB/s) and 796154 rows streamed in 742 sub-batches, prefetched 0 (0 used), 929 cold experts (5548 rows) kept on the CPU
+```
+
+| Engine | Its loads (`load` / `load_batch`) | The step the tier sees |
+|---|---|---|
+| qwen36 | `expert_hold` (and the int8 copy for the int8-slot kernel), one at a time | `moe_vk_run`'s block becomes the chunk |
+| qwen38 | the layer cache, `q38_expert_get_batch` for a group | `q38_moe_prefill`'s rows the chunk |
+| olmoe | `expert_get` / `expert_put` | `moe_vk_run`'s block the chunk |
+| inkling | the slot cache, a group's misses filled in parallel | `ink_vk_moe`'s block the chunk |
+| mimo | `experts_ensure` for a group (parallel reads) | the chain's chunk instead of `MIMO_CHUNK` |
+| colibri | pins, the LRU, the misses read into the working set in parallel and promoted after the copy | `moe_vk`'s block the chunk |
+| glm53 | `expert_block_read` for a group | the chain's chunk instead of `GLM53_PREFILL_CHUNK` |
+| kimi_k3 | the layer cache, the misses read into the working set in parallel and promoted after the copy | the chain's chunk instead of `K3_CHUNK` |
+| deepseek_v41 | `expert_slots_at` for a group | the backbone's MoE takes the chunk (its arrays on the heap) |
+| deepseek_v4 | the store's lease (pinned rows16 experts unpacked as for a promotion) | the chain's chunk instead of the 128-row block |
+
+| Variable | Default | Effect |
+|---|---|---|
+| `COLI_VK_CHAIN_ROWS` | from the budget, up to 8192 | Prompt rows per chain chunk; `auto` as unset. Set, it also keeps the engines' own prompt blocks (above). |
+| `COLI_VK_CHAIN_ROWS_MAX` | `8192` | The most rows the budget's chunk takes. |
+| `COLI_VK_ATTN_BLOCK` | `16` | Rows from which the chain's attention takes `chain_attnb.comp`; `0` never. |
+| `COLI_VK_ATTN_SLICE` | `4294967296` | Rows x positions x heads x head dim past which an attention is cut over several submissions; `0` never. |
+| `COLI_VK_TIER_STREAM` | on | `0`: no streaming; the tier takes a prompt step in the engine's usual blocks and leaves the cold experts to the CPU, as before. |
+| `COLI_VK_TIER_STREAM_SLOTS` | `64` | Staging slots (experts) for streaming, out of the tier's budget. |
+| `COLI_VK_TIER_STREAM_ROWS` | the rule | Fix R, the rows from which a cold expert streams (tests). |
+| `COLI_VK_TIER_STREAM_HALF` | x rows within 32 MiB | Rows of a sub-batch (tests: small ones cut experts into parts). |
+| `COLI_VK_TIER_STREAM_PAR` | on | `0`: a streamed expert's conversion on the engine thread alone. |
+
+### Validation and timing
+
+The `prefill-*` families in `c/tests/vulkan_engines.sh` compare all ten MoE engines
+against their CPU path. They exercise the default chunk, forced small streaming
+slots and sub-batches, staged uploads, prefetch across chunks, and streaming off.
+The streaming cases require device work and streamed experts; a silent CPU fallback
+does not pass. Sanitized cases check the host allocations and lifetime handling.
+Lavapipe checks correctness and cannot establish hardware throughput.
+
+For a timing comparison, use the same model, quantization, prompt IDs, output length,
+RAM cache capacity and usage-history file in each run. Compare the former 512-row
+chain (`COLI_VK_CHAIN_ROWS=512 COLI_VK_ATTN_BLOCK=0 COLI_VK_TIER_STREAM=0`) with the
+default chunk and streaming. Also run the default chunk with only
+`COLI_VK_TIER_STREAM=0` to separate larger chunks from streaming. Record the selected
+chunk, resident and streamed experts, CPU rows, upload bytes, device wait time, peak
+RAM and device memory, time to first token and decode tokens per second. Repeat
+with both cold and warm caches on an otherwise idle machine. A shorter prefill does
+not imply faster decode; staging slots also consume room in the expert tier.
+
+A paired real-model check on Radeon 780M/RADV used Qwen3.8 Flash Next's int4-g64
+expert sidecar, a 2,048-token prompt, one generated token, eight CPU threads,
+16 RAM slots per layer and the same starting usage history. Each checkpoint was
+advised out of the filesystem cache before its run; no other inference process ran.
+
+| Configuration | Prompt plus one token, excluding load | Whole process | Expert assignments on GPU |
+|---|---:|---:|---:|
+| Former 512-row chunks, streaming off, host dense copies retained | 217.9 s | 229.1 s | 27.6% |
+| Automatic chunks, streaming, device-only dense weights; FP32 expert GEMM | 44.8 s | 56.3 s | 96.0% |
+| Same, cooperative expert GEMM enabled | 43.6 s | 55.3 s | 96.0% |
+
+The new budget selected 2,304 rows, released 4.07 GiB of dense host copies, and
+streamed about 21.8 GiB of cold experts. All three runs generated the same token.
+This is one paired prefill measurement per configuration. It measures the combined
+chunk, streaming and memory changes; the small difference between the last two
+rows does not establish an end-to-end cooperative-kernel gain by itself.
+
+For native FP8 decode on the same machine, a separate short prompt with 16
+generated tokens, CAP=16 and three runs per mode (one cold, two warm) produced identical text.
+Median decode speeds were 1.10 tok/s on the CPU, 1.42 with the expert tier and
+CPU dense work, and 1.14 with the full dense chain. The tier-only configuration
+won that workload. These measurements do not predict discrete-GPU or Windows
+performance, and the prefill result uses a different expert quantization.
+
+Performance depends on the device, memory bandwidth, model dimensions, expert
+coverage and prompt length. FP32 tiled GEMM does not imply that the expert batch
+uses matrix acceleration hardware. Measure each model and target GPU before
+choosing nondefault chunk or streaming settings.
+
+Additional real-model checks used the same Radeon 780M, eight threads, 64 generated
+tokens, identical starting expert histories within each comparison, and advisory
+eviction of checkpoint file pages before each process. Each configuration ran once
+with no concurrent inference. The values below are generated tokens divided by
+prompt plus generation time, excluding model load.
+
+| Model and starting history | CPU | Expert tier, CPU dense work | Expert tier and dense chain |
+|---|---:|---:|---:|
+| Qwen3.6-35B-A3B, existing int4-g64 container, cap 64 | 5.37 tok/s | 7.70 tok/s | 10.22 tok/s |
+| OlMoE-1B-7B, existing 8-bit container, cap 64, empty history | 13.30 tok/s | 10.97 tok/s | 9.43 tok/s |
+| Same OlMoE, common history learned from the CPU run | 13.19 tok/s | 11.77 tok/s | 16.35 tok/s |
+
+Qwen3.6's CPU and dense-chain output matched byte for byte; the tier-only output
+differed. Dynamic CPU/GPU expert placement changes reduction order and can change
+a greedy choice between close logits. All OlMoE configurations produced the same
+64 token IDs. Without history, the OlMoE tier uploaded 687 experts (4.03 GiB) during
+generation; with history it could warm the selected experts before the timed prompt.
+That startup distinction reverses which configuration wins. These are workload
+checks, not evidence that enabling every GPU path always improves latency.
+
+The [speculative decoding measurements](speculative.md#measured) also compare
+Qwen3.8's existing int4-g64 sidecar with three MTP drafts, prompt lookup and both
+together, and distinguish prompt time from generation time.
+
+### A KV cache past the device's budget
+
+Every chain engine keeps the host's KV cache canonical and mirrors each attention
+layer's cache on the device. A long context makes those mirrors large (Qwen3.6-35B-A3B's
+ten attention layers hold 40 KiB a position, 2.5 GiB at 64K), and past the device's
+budget the chain could not hold them. Then each split layer keeps only part of its cache
+on the device, the host's RAM holds the rest (it holds every row anyway), and a step's
+attention runs on both at once, the two results merged through their softmax
+statistics. Below the budget nothing changes: the whole mirrors, the same bits as
+before. The pieces are shared (`vk_kvsplit.h`, the `vkc_kvs_*` ops of `vk_chain.h`,
+`shaders/chain_kvs.comp`), so every attention form takes the same path.
+
+**What sits where.** A split layer has `ns` slots of `B` positions on the device (a
+block table, `bt`, maps a block to its slot). `nw` slots are a window over the newest
+blocks: a step's own rows always land there. Where the engine selects positions (Qwen3.8's
+QSA, GLM-5.2's DSA, GLM-5.3's pooled lists, DeepSeek's indexer), with `COLI_VK_KV_PIN=1` the other half of the
+slots holds the blocks the lists read most, counted per step and pinned two at a time
+ahead of pinned blocks read less (hits halve every 128 steps). A step from `pos_base`
+uploads the resident rows below it that the host wrote since (a watermark, as for the
+whole mirrors), and the whole of a block that just got its slot.
+
+**The partition, and why it is the row's own.** A row at position `pos` attends on the
+device over the blocks `pos/B - anchor .. pos/B` (and, from a list, the pinned blocks),
+and on the CPU over the rest. A step writes at most `chunk` rows (an eighth of the
+window), so every block of a row's share is in the window while any step holds the row,
+and the share covers the step's earlier rows, which reach the host's cache only after the
+step. Because the share depends on the row's position only, and the host's part is cut
+into chunks fixed by position and joined in order, a row gets the same bits however a
+forward is cut into steps: a prompt in one chunk or many, a decode step, a verify, a
+resumed prefix or a cold one. Pins follow the history of reads, so a listed row's bits
+can depend on it; pins are therefore off by default and enabled explicitly with
+`COLI_VK_KV_PIN=1`. DeepSeek stages only the missing compressed rows named by its
+selection, then runs the complete sparse attention on the device in the original list
+order. Its arithmetic remains independent of cache residency and pins.
+
+**A step.** One that sees nothing outside the device's share records the attention as
+before, in the layer's frame (`VKC_KVS_FIN`: the device's arithmetic gives the same
+bits as a merge with an empty host part). Otherwise the frame (F1) is submitted with the
+queries (and lists) copied down; the device's part is recorded in a frame of its own
+(F2) and submitted; the host waits for F1 only and computes its part over the host's
+rows while F2 runs (OpenMP over rows, heads and chunks of 2048 positions); a third frame
+(F3) uploads the host's part, merges (`vkc_kvs_merge`: `M = max(m_d, m_c)`, `out =
+(e^(m_d-M) acc_d + e^(m_c-M) acc_c) / (e^(m_d-M) l_d + e^(m_c-M) l_c)`, the gate after,
+DeepSeek V4's bf16 rounding after) and carries the rest of the layer. The extra host
+round trip is paid only on layers with a host part.
+
+| Op | Shader | What it does |
+|---|---|---|
+| `vkc_kvs_attn` | `chain_kvs` (mode 0) | grouped-query attention (chain_attn's arithmetic) over the device's share: head-major or position-major rows, V's own head dim, a window, a sink (the device's part holds it), lists |
+| `vkc_kvs_mla` | `chain_kvs` (mode 1) | the MLA core (chain_mla's) over the device's share of the latent and rope rows, causal or listed |
+| `vkc_kvs_rel` | `chain_kvs` (mode 3) | Inkling's attention (chain_relattn's): the relative-position bias and tau |
+| `vkc_kvs_ds` | `chain_kvs` (mode 4) | DeepSeek's sparse attention with its sink over the window rows and the resident compressed rows; with every listed row resident, `vkc_dsv4_attn`'s bits |
+| `vkc_kvs_merge` | `chain_kvs` (mode 2) | the two parts joined, a gate or V4's bf16 rounding after |
+
+`vk_kvsplit.h` carries the rest: the plan, the tables, the uploads and the stores of a
+step's rows, the host's part (`vkc_kv_host_attn`, with the same bias, tau and V4
+rounding), and one call per form for an engine (`vkc_kv_gqa`, `vkc_kv_mla`,
+`vkc_kv_mla_qkv` and `vkc_kv_mla_attn`, `vkc_kv_rel`, `vkc_kv_ds`).
+
+**The plan** (`vkc_kv_plan`, when an engine makes or grows its mirrors): the whole
+mirrors when they fit four fifths of the device's free budget (`VK_EXT_memory_budget`,
+or the largest device-local heap less what is allocated), else the rows that do, at
+least three blocks. `COLI_VK_KV_DEVICE_ROWS=N` sets the rows itself (the tests' small
+device, a measurement's split), `COLI_VK_KV_BLOCK` the block (64), `COLI_VK_KV_SPLIT=0`
+turns the split off (past the budget the chain declines as before), `COLI_VK_KV_PIN=1`
+enables read-based pins. The line says what was decided:
+
+```
+[VK] qwen36 chain: the KV cache split past the device's budget: 4096 of 65568 positions a layer on the device (64 blocks of 64, 0 for pins by reads; a row's newest 3584 positions on the device), the rest in RAM (160.0 MiB on the device instead of 2561.2)
+```
+
+and each run reports the split's steps: `[VK] <engine> chain: KV split: N layer steps, M
+with a host part (time waiting for the queries, host work over P positions, Q sparse rows staged), K
+blocks pinned by reads`. Sparse staging reuses at most 32 MiB of device scratch per
+query, accounted for by the chain allocator. Allocation or scratch-cap failure takes
+the existing CPU fallback; it never allocates another complete compressed cache.
+
+**What splits, per engine.**
+
+| Engine | Split | Stays whole on the device |
+|---|---|---|
+| qwen36 | the K/V of the attention layers | the DeltaNet state |
+| qwen38 | the K/V of the attention layers; QSA's lists reach both parts, pins follow them | the index keys and pooled block keys (every row scores them every step), the DeltaNet and PLE state |
+| olmoe | every layer's K/V | |
+| mimo | the full-attention layers' K/V (position-major, the sink in the device's part) | the sliding layers' rings (bounded by the window) |
+| inkling | the global layers' K/V (the bias and tau on both sides) | the sliding layers' rings, the convolution states |
+| colibri | the latent and rope rows; DSA's lists reach both parts, pins follow them | the DSA index keys |
+| glm53 | the MLA latent rows; the pooled lists reach both parts, pins follow them | the index keys, pool gates and pooled keys, the KDA state |
+| kimi_k3 | the gated MLA layers' latent rows | the KDA state |
+| deepseek_v41, deepseek_v4 | the compressed rows the sparse attention reads; the indexer's picks pin blocks; each chunk's new compressed rows reach the host's array as the chunk ends | the window ring, the index keys, the compressors' rings |
+
+Every engine's host cache already holds a step's rows before the next step runs, so the
+host's part reads only rows the host has; DeepSeek's chains, which wrote their state
+back at the end of a forward, now copy each chunk's new compressed rows as the chunk
+ends.
+
+**Arithmetic.** f32 throughout: the device and the host sum in other orders than the
+CPU's attention and than each other, so a split row agrees with the CPU's to rounding.
+DeepSeek V4 rounds its attention weights to bf16 against the maximum of the complete
+selection. The split preserves that maximum and the original accumulation order by
+staging missing selected rows. Independent partial bf16 softmaxes are not equivalent
+and are not used. Both DeepSeek variants retain the full-device result bit for bit;
+V4's chunk, decode versus teacher-forced, and draft-rejection checks remain enabled.
+
+**A lost device** is handled as each engine handles it without the split: the KV rows
+are the host's, so the CPU redoes the step (and an engine with a recurrent state
+rebuilds it from the prefix record, as before).
+
+**Tests.** `make vk-chain-check VK=1` runs the ops through the engines' sequence of
+steps (the window placed, the rows below uploaded, the step's rows stored, the parts
+merged), decode and prefill, against a double-precision reference of the full attention:
+GQA with a gate, a sink, position-major rows, a window and lists with pins; MLA (NoPE, a
+nonzero start, lists, latents up to 1024); Inkling's bias and tau; DeepSeek's lists
+(V4's rounding too, both split and whole caches equal `vkc_dsv4_attn` bit for bit); the MLA
+layer test of every geometry over a split cache; the host's cache filled as an engine's
+is (a step's rows only after the step, NaN before); and the same bits for every
+position in steps of 1, 2, 3 and 4. `tests/vulkan_engines.sh kv-split` gates every chain
+engine but DeepSeek's under an emulated small device (`COLI_VK_KV_DEVICE_ROWS` of 8 to 32
+positions in blocks of 2 to 8, contexts of 80 positions and more, most steps with a host
+part): the CPU's tokens, logits within each family's tolerance, chunks of 3, prompts
+only, the split off, a lost device, pins, MTP and n-gram drafts, serve sessions with
+pins, prompt-cache extensions and divergent prompts, and the prefix-reuse tests;
+`kv-split-deepseek` the same for deepseek_v41 and deepseek_v4; `kv-split-sanitize` and
+`kv-split-deepseek-sanitize` a set of each under ASan and UBSan.
+
+Validation on the local Lavapipe device covers numerical correctness, not hardware
+throughput. A discrete GPU has not been measured for this change.
+
 ## Adding an engine to the tier
 
 Every MoE engine here is on the tier ([the table above](#the-routed-expert-tier-vk_tierc));
@@ -1582,6 +2085,88 @@ Resizable BAR**, the case staging is for (none is available); there the copies c
 once per upload and the device then reads VRAM instead of the window or system RAM. The
 contributor who reported the RTX 3070 offered to run it.
 
+## Dense weights on the device only
+
+Without this mode, an engine whose dense part runs on the device (the chain, or the
+per-matrix path with `COLI_VK_DENSE`) keeps the host copy of every resident dense
+matrix as the CPU's fallback. That costs the dense part's RAM twice on an integrated
+GPU (the device's memory is the same RAM), and on any machine it takes from the
+experts' RAM cache: the cap or the plan counts the dense weights in RAM. On a 32 GB
+machine with a 16 GB card the difference decides the plan. DeepSeek V4 Flash there
+(#1852) planned its dense layers as not resident (reloaded from disk every forward),
+so its chain declined and the CPU did the dense work while the GPU sat at 9%.
+
+`COLI_VK_DENSE_HOST=0` puts the dense weights on the device only:
+
+- **At start**, once the device and the chain are decided and before the expert tier
+  sizes its budget, every resident dense matrix goes up (staged or mapped, as
+  [above](#memory-placement-without-resizable-bar)) and its host copy is given back.
+  The per-matrix path and the chain share those tensors. The tier's budget sees them
+  placed.
+- **Every step the chain does not run** (prompts only, a declined step, a head or a
+  draft the engine runs per matrix) takes the device too: the CPU has no copy. In this
+  mode the engine forces the per-matrix path on, whatever `COLI_VK_DENSE` says.
+- **The CPU fallback still works.** When the CPU needs a matrix the device holds alone
+  (a lost device, `COLI_VK_CHAIN_FAULT`, a staged upload that failed), the engine reads
+  it back from the checkpoint, matrix by matrix as each is first needed, with the bytes
+  the load made (the same conversion: Qwen3.8's int8 rows, GLM's quantization, ...),
+  and keeps it from there on. The tokens are the CPU's.
+- **What stays on the host** is what the CPU reads directly every step: the embedding
+  tables (their rows are gathered on the CPU), norms and small vectors, and per engine
+  the pieces listed below. Qwen/Clef's imported weight pages on an integrated GPU
+  also stay alive: those rows are shared with the device and already occupy RAM once.
+- **The RAM goes to the experts.** Each engine that sizes its own expert cache from
+  the RAM it sees counts the dense weights as not in RAM in this mode, and so does
+  `coli plan` (`resource_plan.py`) credits only recognized matrices and formats
+  that the engine can release. It keeps the embedding, CPU-readable vectors,
+  norms and unrecognized components in the RAM reservation. Packed formats whose
+  runtime layout cannot be established from the checkpoint, GLM's CLI-selected
+  QT formats, and Inkling's hardware-dependent BF16 path receive no advance RAM
+  credit; the runtime may release more after successful uploads. Quantized matrices
+  receive a conservative credit for their loaded size, not the larger source
+  tensor. Qwen3.8's CPU-int8 estimate follows `Q38_TRUNK_SKIP` and
+  `Q38_TRUNK_MIN_KB` and includes the float scales per row. On an integrated
+  GPU the device copy still occupies physical RAM: the planner charges it once in
+  `shared_device_dense_bytes`, inside `runtime_bytes`. Dropping the host copy frees
+  one copy of the weights; it does not remove the device's memory from the budget.
+  On a discrete GPU the fit decision uses the device budget minus its current heap
+  usage and a 1 GiB reserve. The shared-device reservation and fit estimate remain
+  conservative when a component's device representation is unknown. The resulting
+  expert capacity depends on that device, context size and available memory.
+
+For GLM-5.3 the RAM estimate applies `GLM53_BITS` to recognized dense matrices
+individually. Int4 requires columns divisible by 64; narrower matrices use int8
+rows with a float scale per row, as in the engine. Embeddings, norms, routers,
+vision weights and unknown floating components retain an F32 reservation. The
+absorbed `kv_b` matrices also retain a conservative F32 reservation. Packed source
+weights and their scales keep their stored size. Cached checkpoint scans do not
+cache environment settings: changing `GLM53_BITS` updates the next plan without
+requiring a rescan.
+
+**The default** (`coli_vk_dense_host_decide`, beside `coli_vk_dense_decide` and
+`coli_vk_chain_decide`): with the dense part on the device, an integrated GPU drops
+the host copies (its memory is the same RAM: the copy would hold the dense part
+twice); a discrete GPU drops them when its free memory (`VK_EXT_memory_budget`), less
+1 GiB, holds them, else keeps them as the fallback; a CPU device (Lavapipe) keeps them.
+`COLI_VK_DENSE_HOST=1` keeps them anywhere. With the dense part on the CPU there is
+nothing to drop. The lines it prints:
+
+```
+[VK] qwen38: dense weights on the device only (an integrated GPU: its memory is the CPU's RAM, the host copy would hold them twice; COLI_VK_DENSE_HOST=1 keeps it)
+[VK] qwen38: 1007 dense matrices on the device only, 4.21 GiB of host RAM given back; kept on the host: the embedding (its rows are gathered on the CPU), the vision tower, norms; RSS now 2.10 GiB
+...
+[VK] qwen38: dense weights at exit: 1007 matrices on the device only (4.21 GiB of host copies dropped), 0 read back from disk for the CPU (0.0 MiB); RSS 24.60 GiB
+```
+
+The `dense-only-*` test families cover Qwen3.6, Qwen3.8, OLMoE, Inkling, MiMo,
+Kimi K3, GLM-5.2, GLM-5.3, DeepSeek V4 and V4.1, including staged uploads,
+device loss and sanitizer variants. On Kimi K3 the generated steps' logits must
+match the run retaining its host copies byte for byte. Earlier prompt logprobs
+use a CPU head with host copies and a GPU head without them, so they retain the
+existing CPU-reference numerical bound; they are not an identical-arithmetic
+comparison. A trace that declines the chain must still exercise the per-matrix
+GPU fallback.
+
 ## Correctness
 
 - `gcc -O3 -DVK_TEST backend_vulkan.c -o test_vk -lvulkan -lm && ./test_vk
@@ -1652,6 +2237,24 @@ contributor who reported the RTX 3070 offered to run it.
   and mid-decode (the KDA state rebuilt), serve sessions with prefix reuse and
   recurrent-state checkpoints in RAM and on disk; `kimi-chain-sanitize` under ASan and
   UBSan.
+- Big prompt chunks and expert streaming: `make vk-tier-check VK=1` (`test_vk_tier`'s
+  `stream` section) runs big steps through the sub-batches against its CPU reference in
+  six source formats and all three activations (DeepSeek V4's roundings bit for bit):
+  experts cut into parts, the staging slots filled through both hooks, prefetch, cold
+  experts below the rule's rows left to the CPU, and the resident set the warm start's
+  before and after. `vk-chain-check` runs the blocked attention against the same cases
+  as `chain_attn` (windows, rings, position-major rows, sinks, lists), and every
+  attention op cut in slices. `tests/vulkan_engines.sh prefill-qwen`,
+  `prefill-inkling-olmoe`, `prefill-mimo-kimi`, `prefill-glm` and `prefill-deepseek`
+  run each chain engine on a prompt past its usual block (110 to 300 tokens), four ways:
+  the chunk from the budget with the rule's streaming; a forced chunk of 40 to 100 rows
+  with a forced threshold of 3 rows, four slots and sub-batches of 24 rows; the same
+  staged; the feature off (`COLI_VK_CHAIN_ROWS=512 COLI_VK_TIER_STREAM=0
+  COLI_VK_ATTN_BLOCK=0`). Each one gives the CPU's tokens and logits, the streamed runs
+  show streamed experts, and a run over several chunks shows prefetched experts used.
+  Also qwen36's device lost while a prompt's sub-batches are in flight (the state
+  rebuilt on the CPU). The forced runs run again under ASan and UBSan, staged and
+  mapped (`prefill-qwen-sanitize` and the families' own sanitized halves).
 - int4 weights decode as offset-binary (nibble−8), byte-identical layout to
   the CPU path — no repacking.
 - Khronos validation layers: the backend never enables them, so the loader
@@ -1710,6 +2313,9 @@ hit-rate line is the tier-effectiveness number.
   expert tier, the KV mirror) goes through staged uploads
   ([above](#memory-placement-without-resizable-bar)); that path is tested by forcing
   it and by emulating the small window, and not yet measured on such a card.
+- Streaming copies each assignment's input row into the scratch and each output row
+  out of it (the expert batch's layout). A gather of the chunk's rows by index in the
+  GEMM shaders would save both copies; it is not written.
 - Without the dense chain, DSA top-k selection, ragged multi-slot serving, and
   quantized-KV caches fall back to the CPU attention path; with it, the DSA selection
   runs on the device.

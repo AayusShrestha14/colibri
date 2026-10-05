@@ -29,6 +29,9 @@
  *     chain_hgemv, chain_dsa, its k-pooled modes included), Kimi Delta Attention
  *     (chain_kda), manifold-constrained hyper-connections (chain_mhc) and Kimi K3's
  *     attention residuals and SiTU-GLU (chain_ares): loaded beside the others but optional.
+ *   - a KV cache past the device's budget (chain_kvs, vkc_kvs_*; vk_kvsplit.h drives it):
+ *     the attention over the part of the cache on the device, merged with the host's
+ *     part; optional too.
  *
  * Threading: the engine thread only (the main queue is the backend's, used from the
  * same thread by coli_vk_matmul; the expert tier submits on its own queue).
@@ -105,6 +108,15 @@ int  vkc_attn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf
 typedef struct { VkcAttn a; int win, ring, vd, kv_pm, sink, sink_off; } VkcAttnW;
 int  vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf *sel, VkcBuf *snk,
                 const VkcAttnW *p);
+/* From this many rows (COLI_VK_ATTN_BLOCK, 16; 0 = never) vkc_attn and vkc_attn_w take
+ * chain_attnb.comp: a workgroup per KV head and block of rows, each K and V row read once
+ * per block instead of once per (head, row); below it chain_attn as before. */
+int  vkc_attn_block_rows(void);
+/* The attention ops (vkc_attn, vkc_attn_w, vkc_mla_core, vkc_relattn) whose rows x positions
+ * x heads x head dim pass COLI_VK_ATTN_SLICE (2^32; 0 = never) record their rows in slices,
+ * each ending its frame (submitted, not waited for) and the next in a new one: no single
+ * submission of a big prompt chunk runs for seconds (a driver resets a job past its
+ * timeout: amdgpu 10 s, Windows 2 s). The rows' arithmetic does not change. */
 /* chain_dnconv.comp */
 typedef struct { int S, CD, CK, in_off, in_row, out_off, out_row, snap_row, order, w_off, ring_off, snap_off; } VkcDnConv;
 int  vkc_dnconv(VkcBuf *in, VkcBuf *w, VkcBuf *ring, VkcBuf *out, VkcBuf *snap, const VkcDnConv *p);
@@ -413,11 +425,160 @@ int vkc_dsv4_round(VkcBuf *x, VkcBuf *y, const VkcDsRound *p);
 typedef struct { int n, a_off, b_off, y_off; float lim; } VkcDsSwiglu;
 int vkc_dsv4_swiglu(VkcBuf *a, VkcBuf *b, VkcBuf *y, const VkcDsSwiglu *p);
 
+/* Big prefill chunks: the prompt rows an engine's chain runs per chunk. COLI_VK_CHAIN_ROWS=n
+ * takes n (1..65535). Unset (or "auto"): the most rows, up to COLI_VK_CHAIN_ROWS_MAX
+ * (8192), whose buffers take at most half of the device memory free at the engine's first
+ * call (VK_EXT_memory_budget, else a quarter of the device-local heap; capped by
+ * available host RAM), row_bytes a row (the engine's chain
+ * scratch plus the routed experts' outputs for that row); a multiple of 256 rows below
+ * the cap; below 256 keep the rows that fit, at least one. Decided once per engine
+ * and printed as a [VK] line. */
+int vkc_chunk_rows(const char *engine, size_t row_bytes);
+/* 1 when the chunk is the budget's (COLI_VK_CHAIN_ROWS unset or "auto"): an engine that
+ * blocks a prompt on the host before the chain (MiMo's MIMO_CHUNK, DeepSeek V4's
+ * V4_PREFILL_CHUNK) then hands the chain blocks of the chain's chunk; with
+ * COLI_VK_CHAIN_ROWS set it keeps its own blocks, as before. */
+int vkc_chunk_auto(void);
+/* ---- a KV cache split between the device and the host (chain_kvs.comp) ----------------
+ * Past the device's budget a layer's cache keeps `ns` blocks of B positions on the
+ * device (the recent window, and where an engine selects positions, the blocks read
+ * most); the rest stays in the host's RAM, which holds the whole cache anyway. The
+ * device attends over its blocks and writes a partial result (the unnormalized value
+ * sum and the softmax statistics m, l), the host attends over the rest (vk_kvsplit.h),
+ * and vkc_kvs_merge joins the two through their statistics: the full attention up to
+ * the order of the sums. The residency is an int buffer `tab`: bt[nblk] at bt_off
+ * (block -> slot, -1 in the host's RAM only; bit 30 set: a block pinned by the reads of
+ * a selection), position t in device row slot*B + t % B. The partition of a row depends
+ * on its position only (the same bits however a forward is cut into steps): the device
+ * takes the blocks pos/B - anchor .. pos/B (all of them on the device while a step
+ * holds the row) and, from a list, the pinned blocks; the host the rest. Optional like
+ * the MLA ops: vkc_kvs_ready() says whether the shader is there.
+ *   vkc_kvs_attn   grouped-query attention (chain_attn's) over the device's rows: K/V
+ *                  head-major (kvh*rows + r)*hd or position-major (kv_pm), a window, a
+ *                  sink (it joins the device's part), a selection list (entries outside
+ *                  the device skipped). VKC_KVS_FIN: every visible position is on the
+ *                  device, the normalized output (VKC_KVS_GATE: times sigmoid(gate)) at
+ *                  o_off + s*o_row + h*vd as vkc_attn writes it; else the value sum there
+ *                  and (m, l) at st_off + (s*H + h)*2. hd, vd <= 256.
+ *   vkc_kvs_mla    the MLA core (vkc_mla_core's) over the device's rows: the latent at
+ *                  lat_off + r*lat_row, the rope key at rope_off + r*rope_row; outputs as
+ *                  above with o_seg per head. K <= 1024, R <= 128.
+ *   vkc_kvs_rel    Inkling's attention (vkc_relattn's) over a global layer's device rows.
+ *   vkc_kvs_ds     DeepSeek's sparse attention (vkc_dsv4_attn's) over its window rows and
+ *                  the compressed rows on the device.
+ *   vkc_kvs_merge  segment g = (s = g / H, h) of d floats: the device's part (dev at
+ *                  a_off + s*a_row + h*a_seg, (m, l) at sa_off + 2g) and the host's
+ *                  (cpu, packed at c_off + g*d, (m, l) at sc_off + 2g) into out at o_off
+ *                  + s*o_row + h*o_seg, VKC_KVS_GATE: times sigmoid(gate[g_off + s*g_row
+ *                  + h*g_seg + i]). */
+int vkc_kvs_ready(void);
+#define VKC_KVS_FIN  1
+#define VKC_KVS_GATE 2
+typedef struct { int S, H, KVH, hd, vd, pos_base, rows, q_off, q_row, q_seg, sel_off, sel_row; float scale;
+                 int k_off, v_off, win, kv_pm, sink, sink_off, B, ns, bt_off, nblk, anchor, o_off, o_row, st_off, flags,
+                 g_off, g_row, g_seg; } VkcKvsAttn;
+int vkc_kvs_attn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *out, VkcBuf *gate, VkcBuf *sel, VkcBuf *snk, VkcBuf *tab,
+                 const VkcKvsAttn *p);
+typedef struct { int S, H, K, R, pos_base, kv_start, qa_off, qa_row, qa_seg, qr_off, qr_row, qr_seg, lat_off, lat_row,
+                 rope_off, rope_row, sel_off, sel_row, o_off, o_row, o_seg; float scale;
+                 int B, ns, bt_off, nblk, anchor, flags, st_off; } VkcKvsMla;
+int vkc_kvs_mla(VkcBuf *qa, VkcBuf *qr, VkcBuf *lat, VkcBuf *rope, VkcBuf *sel, VkcBuf *out, VkcBuf *tab, const VkcKvsMla *p);
+typedef struct { int n, H, d, a_off, a_row, a_seg, sa_off, c_off, sc_off, o_off, o_row, o_seg, flags, g_off, g_row, g_seg; } VkcKvsMerge;
+#define VKC_KVS_BF16 4   /* vkc_kvs_merge: the result rounded to bf16 (DeepSeek V4) */
+int vkc_kvs_merge(VkcBuf *dev, VkcBuf *cpu, VkcBuf *gate, VkcBuf *out, const VkcKvsMerge *p);
+/* Inkling's attention over the device's rows of a global layer (chain_relattn's
+ * arithmetic, causal): score = tau[s] * (q . k * scale + bias(pos - t)), the bias mixed
+ * from r (r_off + s*r_row + h*d_rel) and relp (relp_off, [d_rel][ext]) for distances
+ * below ext, tau[s] at tau_off + s; K/V head-major (kvh*rows + r)*hd; outputs as
+ * vkc_kvs_attn's (VKC_KVS_FIN: normalized at o_off + s*o_row + h*hd). hd <= 256,
+ * d_rel <= 64. */
+typedef struct { int S, H, KVH, hd, pos_base, rows, q_off, q_row; float scale; int k_off, v_off, ext, d_rel, r_off, r_row,
+                 relp_off, tau_off, B, bt_off, nblk, anchor, o_off, o_row, st_off, flags; } VkcKvsRel;
+int vkc_kvs_rel(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *out, VkcBuf *r, VkcBuf *tau, VkcBuf *relp, VkcBuf *tab,
+                const VkcKvsRel *p);
+/* DeepSeek's sparse attention with a sink over the device's rows (vkc_dsv4_attn's
+ * arithmetic): row s's list (l_off + s*l_row, cnt entries) of window rows (e < nwin,
+ * win at w_off + e*hd) and compressed rows c = e - nwin (in a slot: cmp at c_off +
+ * (slot*B + c % B)*hd; a compressed row in the host's RAM only is skipped), the sink at
+ * sink_off + h of prm. VKC_KVS_DSFIN: every listed row is on the device, out = the
+ * attention at o_off + s*o_row + h*hd with vkc_dsv4_attn's bits; else the part (its max
+ * over the sink too). VKC_KVS_V4: the weights and the output rounded to bf16 as
+ * DeepSeek V4. hd <= 1024. */
+#define VKC_KVS_V4    1
+#define VKC_KVS_DSFIN 8
+typedef struct { int S, H, hd, cnt, l_off, l_row, nwin, w_off, c_off, q_off, q_row, sink_off, flags; float scale;
+                 int B, ns, bt_off, nblk, o_off, o_row, st_off; } VkcKvsDs;
+int vkc_kvs_ds(VkcBuf *q, VkcBuf *win, VkcBuf *cmp, VkcBuf *out, VkcBuf *prm, VkcBuf *list, VkcBuf *tab, const VkcKvsDs *p);
+/* Complete sparse attention with selected cold rows staged from canonical RAM.
+ * List entries -2-j address cold row j; -1 still means skipped. This keeps the
+ * original list order and, for V4, one maximum before rounding weights to bf16.
+ * V4 requires DSFIN: independently rounded partials cannot be merged equivalently. */
+#define VKC_KVS_DSCOLD 16
+int vkc_kvs_ds_cold(VkcBuf *q, VkcBuf *win, VkcBuf *cmp, VkcBuf *cold, VkcBuf *out,
+                    VkcBuf *prm, VkcBuf *list, VkcBuf *tab, const VkcKvsDs *p);
+/* Frames by serial: vkc_serial() is the serial of the frame vkc_submit sent last;
+ * vkc_wait_serial(s) waits until that frame has completed while later ones run on
+ * (1; 0 on a lost device). The split's host part starts once the frame holding the
+ * queries is through, while the device runs its own part in the next frame. */
+unsigned long long vkc_serial(void);
+int vkc_wait_serial(unsigned long long serial);
+/* ---- the decision engines' encoders (chain_enc.comp) ---------------------------------
+ * Laya's ModernBERT and decision head (laya.c) and GLiNER2.5-Decide's DeBERTa-v3
+ * (gliner_decide.c) as one recorded forward: no cache, no state, every row of a request
+ * at once, so the attention reads the step's own q, k and v and a row sees a range of
+ * rows (its sequence, a window inside it) instead of a causal prefix. Made on first use
+ * like inkling's ops: vkc_enc_ready() says whether the shader is there. Offsets and
+ * strides in floats; rng, ridx, pos and idx are int32 buffers. The shader's header has
+ * each op's arithmetic.
+ *   vkc_enc_norm   LayerNorm of a (+ b with VKC_ENC_ADD; the sum written back to a with
+ *                  VKC_ENC_SUM) by w at w_off and the bias at bias_off (-1 none) in prm,
+ *                  into y; D <= 4096
+ *   vkc_enc_bias   y = act(y + bias) in place over n = rows*O (b_off -1: no bias)
+ *   vkc_enc_geglu  y = act(u + bu) * (g + bg), u and g the halves of a 2I-wide row
+ *   vkc_enc_rope   rotate-half RoPE in place on the query and key heads (part_off apart),
+ *                  cos and sin from a table at row pos[r]
+ *   vkc_enc_addrow y += a table row picked per row by idx[r]
+ *   vkc_enc_attn   attention over each row's range rng[2r]..rng[2r+1] (inclusive), with
+ *                  DeBERTa's two relative terms (VKC_ENC_C2P, VKC_ENC_P2C: r = ridx[pos[i]
+ *                  - pos[j] + rc] - r0, c2p[h][i][r] at c_off in c2p, p2c[h][j][r] at p_off
+ *                  in p2c, nr buckets a row); hd <= 128
+ *   vkc_enc_rel    those products: y[y_off + (h*S + i)*nr + t] = x_i,h . p[r0 + t],h for
+ *                  every head, row and bucket t < nr (x at x_off + i*x_row + h*hd, p at
+ *                  p_off + r*p_row + h*hd: the relative embeddings through the layer's key
+ *                  or query projection) */
+int vkc_enc_ready(void);
+#define VKC_ENC_ADD 1
+#define VKC_ENC_SUM 2
+#define VKC_ENC_ACT_NONE      0
+#define VKC_ENC_ACT_GELU      1   /* erf */
+#define VKC_ENC_ACT_GELU_TANH 2
+#define VKC_ENC_ACT_RELU      3
+#define VKC_ENC_C2P 1
+#define VKC_ENC_P2C 2
+typedef struct { int mode, rows, D, a_off, a_row, b_off, b_row, y_off, y_row, w_off, bias_off, flags; float eps; } VkcEncNorm;
+int vkc_enc_norm(VkcBuf *a, VkcBuf *b, VkcBuf *prm, VkcBuf *y, const VkcEncNorm *p);
+typedef struct { int mode, n, O, y_off, y_row, b_off, act; } VkcEncBias;
+int vkc_enc_bias(VkcBuf *y, VkcBuf *prm, const VkcEncBias *p);
+typedef struct { int mode, n, I, a_off, a_row, y_off, y_row, b_off, act; } VkcEncGeglu;
+int vkc_enc_geglu(VkcBuf *a, VkcBuf *prm, VkcBuf *y, const VkcEncGeglu *p);
+typedef struct { int mode, n, H, hd, x_off, x_row, part_off, cos_off, sin_off; } VkcEncRope;
+int vkc_enc_rope(VkcBuf *x, VkcBuf *tab, VkcBuf *pos, const VkcEncRope *p);
+typedef struct { int mode, n, D, y_off, y_row, t_off; } VkcEncAddRow;
+int vkc_enc_addrow(VkcBuf *y, VkcBuf *tab, VkcBuf *idx, const VkcEncAddRow *p);
+typedef struct { int mode, S, H, hd, q_off, k_off, v_off, kv_row, o_off, o_row, flags, c_off, p_off, nr, rc;
+                 float scale; int r0; } VkcEncAttn;
+int vkc_enc_attn(VkcBuf *qkv, VkcBuf *c2p, VkcBuf *p2c, VkcBuf *o, VkcBuf *rng, VkcBuf *ridx, VkcBuf *pos,
+                 const VkcEncAttn *p);
+typedef struct { int mode, S, H, hd, x_off, x_row, p_off, p_row, y_off, nr, r0; } VkcEncRel;
+int vkc_enc_rel(VkcBuf *x, VkcBuf *pt, VkcBuf *y, const VkcEncRel *p);
+
 /* counters, for the engines' [VK] lines */
 typedef struct {
     unsigned long long frames, waits, ops, matmuls, gemms, barriers, bytes_up, bytes_down;
     double wait_ms;               /* host time blocked in fence waits */
     size_t dev_bytes;             /* live chain buffers */
+    unsigned long long attn_blocked;   /* attention calls through chain_attnb (blocks of rows) */
+    unsigned long long attn_slices;    /* extra submissions that cut a long attention (COLI_VK_ATTN_SLICE) */
 } VkcStats;
 void vkc_stats(VkcStats *st);
 /* COLI_VK_CHAIN_PROF=1: one stderr line of device time per kind of op */

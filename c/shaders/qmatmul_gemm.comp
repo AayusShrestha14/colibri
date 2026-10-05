@@ -38,7 +38,7 @@ layout(std430, binding = 2) readonly buffer Sc { float scale[]; };
 layout(std430, binding = 3) writeonly buffer Y { float y[]; };
 
 layout(push_constant) uniform P {
-    int fmt;        // as qmatmul.comp: 1, 2, 4, 5, 7, 10, 11, 12, 13
+    int fmt;        // as qmatmul.comp: 1, 2, 4, 5, 7, 10, 11, 12, 13, 14
     int S, I, O;
     int rowWords;   // uint32 words per weight row
     int gs;         // group size of fmt 4/7 (multiple of 8) and 12/13 (multiple of 4)
@@ -98,7 +98,7 @@ void fetch8(int o, int k, out uvec4 lo, out uvec4 hi, out vec2 sc) {
             if (k + j < p.I)     lo[j] = w[rb + uint(k + j)];
             if (k + 4 + j < p.I) hi[j] = w[rb + uint(k + 4 + j)];
         }
-    } else if (p.fmt == 11) {                    // bf16, two per word
+    } else if (p.fmt == 11 || p.fmt == 14) {     // bf16, f16: two per word
         if ((p.I & 7) == 0) lo = w4[(rb + uint(k >> 1)) >> 2];
         else [[unroll]] for (int j = 0; j < 4; j++)
             if (k + 2 * j < p.I) lo[j] = w[rb + uint((k >> 1) + j)];
@@ -132,6 +132,9 @@ void decode8(uvec4 a, uvec4 b, vec2 sc, out vec4 lo, out vec4 hi) {
                   uintBitsToFloat(a.y << 16), uintBitsToFloat(a.y & 0xffff0000u));
         hi = vec4(uintBitsToFloat(a.z << 16), uintBitsToFloat(a.z & 0xffff0000u),
                   uintBitsToFloat(a.w << 16), uintBitsToFloat(a.w & 0xffff0000u));
+    } else if (p.fmt == 14) {                    // f16, low half = even column
+        lo = vec4(unpackHalf2x16(a.x), unpackHalf2x16(a.y));
+        hi = vec4(unpackHalf2x16(a.z), unpackHalf2x16(a.w));
     } else if (p.fmt == 5) {                     // value = 2 low-plane bits | high bit << 2, - 4
         float v[8];
         [[unroll]] for (int t = 0; t < 8; t++)

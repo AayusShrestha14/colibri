@@ -70,8 +70,21 @@ int  coli_vk_expert_group_issue(ColiVkTensor *const *gates, ColiVkTensor *const 
 int  coli_vk_expert_group_take(float *y);
 
 /* Upload a resident tensor without computing (expert tier: gate/up/down uploaded once,
- * then driven by coli_vk_expert_group). Returns 0 on failure/unsupported fmt. */
+ * then driven by coli_vk_expert_group). Returns 0 on failure/unsupported fmt.
+ * fmt 14 = f16 weights (low half = even column), no scales, like 10 and 11. */
 int  coli_vk_tensor_ensure(ColiVkTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int grp);
+/* The same tensor with its rows read where the host keeps them (VK_EXT_external_memory_host),
+ * no device copy: for a device that shares the CPU's RAM, where a copy would hold the
+ * matrix twice. weights must be aligned to coli_vk_import_alignment() and its allocation
+ * (alloc_bytes) must cover the rows rounded up to that alignment; the rows must need no
+ * padding (cpu row bytes a multiple of 4). The host memory must outlive the tensor
+ * (coli_vk_tensor_free first). 0 = not possible here: the caller uploads a copy instead.
+ * coli_vk_import_alignment() is 0 where imports are not possible (no extension, staged
+ * uploads); coli_vk_imported_bytes() the rows read in place now. */
+int    coli_vk_tensor_import(ColiVkTensor **tensor, const void *weights, size_t alloc_bytes, const float *scales,
+                             int fmt, int I, int O, int gs);
+size_t coli_vk_import_alignment(void);
+size_t coli_vk_imported_bytes(void);
 
 /* SECOND DEVICE (COLI_VK_DEV2): a self-contained context on another Vulkan GPU that
  * hosts ONLY tier experts and runs ONLY the async expert-group path. devidx: -1 =
@@ -213,8 +226,31 @@ typedef struct {
     double device_ms;                 /* summed batch device time (timestamps) */
     int timestamps, queue_shared, gemm_rows;
     size_t scratch_bytes;
+    unsigned long long sub_batches, sub_experts, sub_rows, sub_gemm;   /* coli_vk_xb_sub_* */
+    double sub_ms;
+    unsigned long long cooperative_matmuls; /* all projections, including sub-batches */
 } ColiVkXbStats;
 void coli_vk_xb_stats(ColiVkXbStats *st);
+/* Sub-batches, for a prefill step too big for one batch (vk_tier.c's streaming): batch k
+ * of a step goes to half k % 2 of the scratch, so two run at once and the host fills one
+ * while the device computes the other. _reserve sizes each half for a batch of up to
+ * `rows` rows over at most `experts` experts (not while any batch is in flight; it may
+ * move the scratch). _issue submits one into half h and returns (0: nothing submitted);
+ * _join waits for it and copies the D outputs of its row j to yout[j], same order as
+ * xrows; *device_ms its device time when timestamps exist. The single batch above and
+ * the sub-batches do not overlap: neither starts while the other is in flight. */
+/* Largest sub-batch up to rows that can grow all five buffers within extra_budget
+ * and half each heap's free budget; does not allocate. Zero means no row fits. */
+int  coli_vk_xb_sub_fit(int rows, int experts, size_t extra_budget);
+int  coli_vk_xb_sub_reserve(int rows, int experts);
+int  coli_vk_xb_sub_issue(int h, ColiVkExpert *const *ex, const int *rows, int count, const float *const *xrows,
+                          const float *wrows);
+int  coli_vk_xb_sub_join(int h, float *const *yout, double *device_ms);
+int  coli_vk_xb_sub_busy(int h);
+/* A tier tensor (coli_vk_tier_tensor) to fill again in place: rows and scales as
+ * coli_vk_tier_tensor hands them out, then coli_vk_tensor_commit. 0 = no memory. Not
+ * while a batch that reads it is in flight. */
+int  coli_vk_tensor_refill(ColiVkTensor *t, uint8_t **rows, size_t *stride, float **scales);
 
 /* 1 if the selected device is an integrated GPU (shares physical memory with
  * the host), 0 otherwise or when no device is selected. */
@@ -243,6 +279,25 @@ int coli_vk_init_env_tier(const char *engine, int tier_on);
  * an engine name it is printed as a [VK] line when it changes (NULL: silent). */
 int coli_vk_dense_decide(const char *engine, int tier_on, int def);
 int coli_vk_dense(void);   /* the last decision; 1 before any */
+/* Whether the dense weights the device holds keep a host copy (docs/vulkan.md, "Dense
+ * weights on the device only"). With the dense part on the device (dense_on_device: the
+ * chain on, or the per-matrix path on), an engine in this mode uploads each resident
+ * dense matrix once, drops its host copy, and reads it back from disk only when the CPU
+ * needs it (a lost device, a step the device declines). COLI_VK_DENSE_HOST set and
+ * non-empty: 0 device only, any other number keeps the host copies. Unset: device only
+ * on an integrated GPU (its memory is the same RAM) and on a discrete GPU whose free
+ * memory, less 1 GiB, holds dense_bytes; host copies kept on a CPU device (Lavapipe)
+ * and when the dense part runs on the CPU. Printed as a [VK] line with an engine name;
+ * with the dense part on the device, one more at exit: in the mode, what was dropped and
+ * read back, and the resident set either way. Returns 1 for device only. */
+int  coli_vk_dense_host_decide(const char *engine, int dense_on_device, size_t dense_bytes);
+int  coli_vk_dense_device_only(void);          /* the last decision; 0 before any */
+void coli_vk_dense_host_dropped(size_t bytes); /* a host copy given back after its upload */
+void coli_vk_dense_host_reloaded(size_t bytes);/* a host copy read back from disk for the CPU */
+/* One [VK] line once the engine has placed its dense matrices: how many are on the device
+ * only, the RAM given back, and what stays on the host (kept: NULL or a short note). */
+void coli_vk_dense_host_placed(const char *engine, const char *kept);
+unsigned long long coli_vk_dense_host_dropped_bytes(void);
 /* COLI_VK_SHADERS (the .spv or its directory), else shaders/ next to the binary, else
  * shaders/ in the working directory. buf holds the result when it is not a literal. */
 const char *coli_vk_shader_path(char *buf, size_t n);

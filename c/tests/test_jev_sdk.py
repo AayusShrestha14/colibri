@@ -118,6 +118,11 @@ class ColiServe:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait(timeout=10)
+        keep = os.environ.get("JEV_SDK_SERVE_LOG")   # tests/vulkan_engines.sh decide reads the engines' lines
+        if keep:
+            self.log.seek(0)
+            with open(keep, "ab") as f:
+                f.write(self.log.read())
         self.log.close()
 
 

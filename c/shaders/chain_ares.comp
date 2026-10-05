@@ -80,12 +80,15 @@ void mixrow() {
     }
 }
 
+// Preserve small SiTU inputs; tanh(x) rounds to x below 2^-12 in f32.
+float situ_tanh(float x) { return abs(x) < 0.000244140625 ? x : tanh(x); }
+
 void situ() {
     int i = int(gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u);
     if (i >= N_) return;
     float g = xv[X_OFF + i], u = bv[B_OFF + i];
     float sg = 1.0 / (1.0 + exp(-g));
-    yv[Y_OFF + i] = B1 * tanh(g / B1) * sg * B2 * tanh(u / B2);
+    yv[Y_OFF + i] = B1 * situ_tanh(g / B1) * sg * B2 * situ_tanh(u / B2);
 }
 
 void main() {

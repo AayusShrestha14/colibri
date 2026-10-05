@@ -142,6 +142,11 @@ c/qwen38_tiny/
 c/dsv41_tiny/
 c/qwen36_tiny/
 c/qwen36_tiny_c/
+# tests/spec_drafts_harness.py: the ASCII-vocabulary fixture whose replies round-trip as text
+c/qwen36_tiny_v128/
+c/qwen36_tiny_v128_c/
+c/qwen36_tiny64_v128/
+c/qwen36_tiny64_v128_c/
 # tools/make_clef_tiny.py and its container; clef_tiny/ref.json is committed
 c/clef_tiny/*
 !c/clef_tiny/ref.json

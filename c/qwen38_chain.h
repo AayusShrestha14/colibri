@@ -14,11 +14,15 @@
  *     when a step completes the block, and the indexer's top-k selection per query
  *     row on the device (chain_qsa.comp), feeding the attention's selection list;
  *   - the MTP head stays on the CPU (its experts are FP8 beside the int4 sidecar,
- *     and it reads two rows per draft): the chain hands it every row's four streams
- *     when the model has one; a verify forward (S = 2) runs here row-wise (GEMV for
- *     every matrix, so its rows get a decode step's bits) and snapshots the DeltaNet
- *     state, the conv rings and the PLE ring after its first row on the device, so a
- *     rejected draft rolls back by swapping device buffers (q38c_rollback).
+ *     and it reads a few rows per draft): the chain hands it every row's four streams
+ *     when the model has one; a verify forward (S = 2 to Q38_SPEC_ROWS: the token and
+ *     its MTP or prompt-lookup drafts) runs here row-wise (GEMV for every matrix, so its
+ *     rows get a decode step's bits) and snapshots the DeltaNet state, the conv rings
+ *     and the PLE ring after each of its rows but the last on the device, one slot per
+ *     row, so a draft rejected after row r rolls back by swapping slot r's device
+ *     buffers in (q38c_rollback). One snapshot is written by the shaders as they pass
+ *     its row; more split the recurrent ops into one dispatch per snapshot, each ending
+ *     on its row (q38c_deltanet, q38c_ple), which gives the same bits.
  * Per layer the host gets the MoE input rows and the router logits, and the K/V and
  * index-key rows of an attention layer; it sends the routed sum back. The shared
  * expert runs on the device (frame A2) while the host computes the routed experts.
@@ -29,8 +33,18 @@
  * brought back before the host reads them (prefix cache, pins) and pushed up after
  * the host writes them (reset, restore). The CUDA tier keeps its priority: with it
  * on, the chain stays off. A device lost while it holds that state: the engine rebuilds
- * it on the CPU from the prefix record and continues there (q38c_recover). */
+ * it on the CPU from the prefix record and continues there (q38c_recover).
+ *
+ * Past the device's budget (vk_kvsplit.h) each attention layer's K/V keep only some
+ * blocks on the device: a window of the newest, and the blocks QSA's selections read
+ * most (pinned by their counts). The selection list goes to both parts: the device
+ * attends over its listed positions, the CPU over the rest from the host's cache, and
+ * the two merge through their softmax statistics. The index keys and the pooled block
+ * keys stay whole on the device: every row scores every pooled key every step, and an
+ * index-key row is read once, to pool its block (ID floats a position beside K/V's
+ * 2*KVH*D). */
 #include "vk_chain.h"
+#include "vk_kvsplit.h"
 
 #define Q38C_HOST 0
 #define Q38C_DEV  1
@@ -42,26 +56,26 @@ typedef struct {
     size_t *o_an, *o_mn, *o_qn, *o_kn, *o_iqn, *o_ikn, *o_conv, *o_dn;
     size_t o_fn, o_ple, o_pconv;
     ColiVkTensor **t_sg;
-    VkcBuf **rec, **ring, **rec_snap, **ring_snap, **kc, **vc, **ik, **pk;
-    VkcBuf *ple_ring;                 /* [2][W][SL]: current at ple_cur, the verify's snapshot at the other */
-    int ple_cur;
+    VkcBuf **rec, **ring, **kc, **vc, **ik, **pk;
+    VkcBuf **rec_snap[Q38_SPEC_SNAPS], **ring_snap[Q38_SPEC_SNAPS];   /* a verify's copies, slot r after row r */
+    int snap_slots;                   /* slots allocated (1 at setup, more when a deeper verify first runs) */
+    VkcBuf *ple_ring;                 /* [ple_nslots][W][SL]: current at ple_slot[0], the copy after row r at ple_slot[1+r] */
+    int ple_slot[Q38_SPEC_ROWS], ple_nslots;
     int *kv_valid, *pk_valid, *attn_ord, n_attn;
+    int dev_rows;                     /* device K/V rows a layer: cap, or the split's */
+    VkcKvSplit ks;                    /* the K/V split past the device's budget (ks.on) */
     int dn_where, host_zero, snap_valid;
     VkcBuf *hyper, *hn, *low, *mix, *mixed, *inj_a, *inj_m, *blk, *q, *k, *v, *ip, *ctx, *qsc, *sel;
     VkcBuf *qkv, *z, *ab, *cv, *dny, *lg, *gs, *us, *hs, *ds, *sgd, *fin;
     VkcBuf *emb, *keys, *val, *gated, *normv;
     VkcBuf *mixd, *lgd, *kvd, *outd, *hypd, *find, *routed, *cs, *pcs;
+    VkcBuf *gseg, *nseg;              /* a deep verify's PLE rows past its first copy (q38c_ple) */
     float *host_routed, *host_emb;
     unsigned long long forwards;
     double host_ms;
 } Q38Chain;
 
 static int g_vk_chain = 0;
-static int q38c_chunk_rows(void) {
-    const char *e = getenv("COLI_VK_CHAIN_ROWS");
-    int v = e && *e ? atoi(e) : 512;
-    return v < 1 ? 1 : v > 65535 ? 65535 : v;
-}
 static void q38c_fatal(const char *what) {
     fprintf(stderr, "[VK] qwen38 chain: %s -- stopping (COLI_VK_CHAIN=0 keeps the state on the CPU)\n", what);
     exit(1);
@@ -91,8 +105,9 @@ static Q38Chain *q38c_setup(Model *m) {
 #define Q38C_ARR(f, t) if (!(ch->f = (t *)calloc((size_t)L, sizeof(t)))) return NULL
     Q38C_ARR(o_an, size_t); Q38C_ARR(o_mn, size_t); Q38C_ARR(o_qn, size_t); Q38C_ARR(o_kn, size_t);
     Q38C_ARR(o_iqn, size_t); Q38C_ARR(o_ikn, size_t); Q38C_ARR(o_conv, size_t); Q38C_ARR(o_dn, size_t);
-    Q38C_ARR(t_sg, ColiVkTensor *); Q38C_ARR(rec, VkcBuf *); Q38C_ARR(ring, VkcBuf *); Q38C_ARR(rec_snap, VkcBuf *);
-    Q38C_ARR(ring_snap, VkcBuf *); Q38C_ARR(kc, VkcBuf *); Q38C_ARR(vc, VkcBuf *); Q38C_ARR(ik, VkcBuf *); Q38C_ARR(pk, VkcBuf *);
+    Q38C_ARR(t_sg, ColiVkTensor *); Q38C_ARR(rec, VkcBuf *); Q38C_ARR(ring, VkcBuf *); Q38C_ARR(rec_snap[0], VkcBuf *);
+    Q38C_ARR(ring_snap[0], VkcBuf *); Q38C_ARR(kc, VkcBuf *); Q38C_ARR(vc, VkcBuf *); Q38C_ARR(ik, VkcBuf *); Q38C_ARR(pk, VkcBuf *);
+    ch->snap_slots = 1;
     Q38C_ARR(kv_valid, int); Q38C_ARR(pk_valid, int); Q38C_ARR(attn_ord, int);
 #undef Q38C_ARR
     int VH = c->dn_vheads, CD = c->dn_conv_dim, CK = c->dn_convk;
@@ -150,7 +165,7 @@ static Q38Chain *q38c_setup(Model *m) {
         else if (ok) {
             ok = q38c_t(&l->dn_qkv) && q38c_t(&l->dn_z) && q38c_t(&l->dn_b) && q38c_t(&l->dn_a) && q38c_t(&l->dn_out) &&
                  (ch->rec[i] = vkc_buf(nr * 4, VKC_DEV)) && (ch->ring[i] = vkc_buf(nc * 4, VKC_DEV)) &&
-                 (ch->rec_snap[i] = vkc_buf(nr * 4, VKC_DEV)) && (ch->ring_snap[i] = vkc_buf(nc * 4, VKC_DEV));
+                 (ch->rec_snap[0][i] = vkc_buf(nr * 4, VKC_DEV)) && (ch->ring_snap[0][i] = vkc_buf(nc * 4, VKC_DEV));
         }
     }
     ok = ok && q38c_t(&m->final_gr.down) && q38c_t(&m->final_gr.up) && q38c_t(&m->lm_head);
@@ -158,6 +173,7 @@ static Q38Chain *q38c_setup(Model *m) {
         Layer *pl = &m->L[c->ple_layer];
         ok = q38c_t(&pl->ple_key) && q38c_t(&pl->ple_value) &&
              (ch->ple_ring = vkc_buf((size_t)2 * W * (c->ple_convk - 1) * c->ngram_size * 4, VKC_DEV));
+        ch->ple_nslots = 2; ch->ple_slot[0] = 0; ch->ple_slot[1] = 1;
     }
     if (!ok) { fprintf(stderr, "[VK] qwen38 chain: a matrix did not reach the device; per-matrix path\n"); return NULL; }
     ch->dn_where = Q38C_HOST;
@@ -166,19 +182,24 @@ static Q38Chain *q38c_setup(Model *m) {
     return ch;
 }
 
-static int q38c_res(VkcBuf **b, size_t floats, int kind) { return vkc_reserve(b, (floats ? floats : 1) * sizeof(float), kind); }
+/* q38c_res counts instead of reserving while g_q38c_count >= 0 (the chunk's sizing) */
+static long long g_q38c_count = -1;
+static int q38c_res(VkcBuf **b, size_t floats, int kind) {
+    if (g_q38c_count >= 0) { g_q38c_count += (long long)(floats ? floats : 1) * (long long)sizeof(float); return 1; }
+    return vkc_reserve(b, (floats ? floats : 1) * sizeof(float), kind);
+}
+static int q38c_bufs(Q38Chain *ch, Model *m, int rows);
 static int q38c_selrow(const Cfg *c) { return 1 + c->idx_budget + c->idx_ratio - 1; }
 static size_t q38c_kv_stride(Q38Chain *ch, const Cfg *c) {   /* per attention layer in kvd: K, V, IK rows */
     return (size_t)ch->rows * (2 * (size_t)c->kv_heads * c->head_dim + c->idx_dim);
 }
-static int q38c_scratch(Q38Chain *ch, Model *m, int rows) {
+/* the scratch buffers for `rows` rows (kvd's stride is ch->rows') */
+static int q38c_bufs(Q38Chain *ch, Model *m, int rows) {
     Cfg *c = &m->c; int H = c->hidden, W = c->hc_width, C = c->hc_count, R = c->hc_rank;
     int QH = c->q_heads, D = c->head_dim, kvo = c->kv_heads * D, ipw = (c->idx_qheads + 1) * c->idx_dim;
     int V = c->dn_vheads * c->dn_vdim, E = c->experts, SI = c->shared_inter;
     int Ep = c->ngram_heads * c->ngram_head_dim; if (Ep < 1) Ep = 1;
     size_t r = (size_t)rows;
-    int need_rows = ch->rows < rows;
-    if (need_rows) ch->rows = rows;   /* kvd's stride follows */
     int nbmax = m->kv_cap / (c->idx_ratio > 0 ? c->idx_ratio : 1) + 1;
     int ok = q38c_res(&ch->hyper, r * W, VKC_DEV) && q38c_res(&ch->hn, r * W, VKC_DEV) && q38c_res(&ch->low, r * R, VKC_DEV) &&
              q38c_res(&ch->mix, r * W, VKC_DEV) && q38c_res(&ch->mixed, r * H, VKC_DEV) && q38c_res(&ch->inj_a, r * C, VKC_DEV) &&
@@ -197,7 +218,59 @@ static int q38c_scratch(Q38Chain *ch, Model *m, int rows) {
              q38c_res(&ch->outd, 2 * (size_t)c->vocab, VKC_DOWN) && q38c_res(&ch->routed, r * H, VKC_UP) &&
              q38c_res(&ch->emb, r * Ep, VKC_UP) && q38c_res(&ch->cs, r * (c->rotary_dim > 0 ? c->rotary_dim : 2), VKC_UP) &&
              q38c_res(&ch->pcs, (size_t)nbmax * (c->rotary_dim > 0 ? c->rotary_dim : 2), VKC_UP);
-    if (!ok) return 0;
+    return ok;
+}
+/* Prompt rows per chunk (vkc_chunk_rows): the chain's scratch a row, counted from the
+ * reservations themselves (at the cache's capacity: QSA's scores grow with it), and the
+ * routed experts' outputs (the tier's rows and the host's sum) for it. */
+static int q38c_chunk_rows(Q38Chain *ch, Model *m) {
+    int keep = ch->rows;
+    ch->rows = 1; g_q38c_count = 0; q38c_bufs(ch, m, 1); long long b1 = g_q38c_count;
+    ch->rows = 2; g_q38c_count = 0; q38c_bufs(ch, m, 2); long long b2 = g_q38c_count;
+    g_q38c_count = -1; ch->rows = keep;
+    const Cfg *c = &m->c;
+    size_t row = (size_t)(b2 - b1) + (size_t)(c->topk + 1) * c->hidden * sizeof(float);
+    if (ch->ks.on) row += ((long long)m->c.q_heads * (5 * m->c.head_dim + 6) + q38c_selrow(&m->c)) * sizeof(float);
+    /* q38_moe_prefill keeps CPU input, gate, up and routed output buffers even
+     * when the tier takes every expert: all must fit beside the device scratch. */
+    size_t assignment = 2 * ((size_t)c->hidden + c->inter) * sizeof(float)
+                      + sizeof(Q38RouteAssignment) + 4 * sizeof(int) + sizeof(uint8_t) + sizeof(float *);
+    row += (size_t)c->topk * assignment
+         + ((size_t)c->experts + 3 * (size_t)c->shared_inter + c->hidden + 1) * sizeof(float);
+    return vkc_chunk_rows("qwen38", row);
+}
+/* Plan and allocate the KV mirror before sizing a prompt chunk. */
+static int q38c_mirror(Q38Chain *ch, Model *m) {
+    Cfg *c = &m->c; int kvo = c->kv_heads * c->head_dim;
+    int nbmax = m->kv_cap / (c->idx_ratio > 0 ? c->idx_ratio : 1) + 1;
+    if (ch->cap != m->kv_cap) {   /* the host cache is new: mirror it again (K/V whole, or split past the budget) */
+        size_t row = (size_t)kvo * 2 * 4;
+        int plan = ch->n_attn ? vkc_kv_plan(&ch->ks, "qwen38", ch->n_attn, row, m->kv_cap, 1, 1,
+                                            (size_t)ch->n_attn * ch->dev_rows * row) : 1;
+        if (!plan) { ch->cap = 0; return 0; }
+        ch->dev_rows = ch->ks.on ? ch->ks.rows : m->kv_cap;
+        for (int i = 0; i < c->layers; i++) {
+            if (!c->is_attn[i]) continue;
+            vkc_free(ch->kc[i]); vkc_free(ch->vc[i]); vkc_free(ch->ik[i]); vkc_free(ch->pk[i]);
+            ch->kv_valid[i] = ch->pk_valid[i] = 0;
+            ch->kc[i] = vkc_buf((size_t)kvo * ch->dev_rows * 4, VKC_DEV);
+            ch->vc[i] = vkc_buf((size_t)kvo * ch->dev_rows * 4, VKC_DEV);
+            ch->ik[i] = vkc_buf((size_t)c->idx_dim * m->kv_cap * 4, VKC_DEV);
+            ch->pk[i] = vkc_buf((size_t)c->idx_dim * nbmax * 4, VKC_DEV);
+            if (!ch->kc[i] || !ch->vc[i] || !ch->ik[i] || !ch->pk[i]) { ch->cap = 0; return 0; }
+        }
+        ch->cap = m->kv_cap;
+    }
+    return 1;
+}
+
+static int q38c_scratch(Q38Chain *ch, Model *m, int rows) {
+    Cfg *c = &m->c; int H = c->hidden;
+    int Ep = c->ngram_heads * c->ngram_head_dim; if (Ep < 1) Ep = 1;
+    size_t r = (size_t)rows;
+    int need_rows = ch->rows < rows;
+    if (need_rows) ch->rows = rows;   /* kvd's stride follows */
+    if (!q38c_bufs(ch, m, rows)) return 0;
     if (need_rows) {
         float *hr = realloc(ch->host_routed, r * H * sizeof(float)), *he;
         if (!hr) return 0;
@@ -206,19 +279,7 @@ static int q38c_scratch(Q38Chain *ch, Model *m, int rows) {
         if (!he) return 0;
         ch->host_emb = he;
     }
-    if (ch->cap != m->kv_cap) {
-        for (int i = 0; i < c->layers; i++) {
-            if (!c->is_attn[i]) continue;
-            vkc_free(ch->kc[i]); vkc_free(ch->vc[i]); vkc_free(ch->ik[i]); vkc_free(ch->pk[i]);
-            ch->kv_valid[i] = ch->pk_valid[i] = 0;
-            ch->kc[i] = vkc_buf((size_t)kvo * m->kv_cap * 4, VKC_DEV);
-            ch->vc[i] = vkc_buf((size_t)kvo * m->kv_cap * 4, VKC_DEV);
-            ch->ik[i] = vkc_buf((size_t)c->idx_dim * m->kv_cap * 4, VKC_DEV);
-            ch->pk[i] = vkc_buf((size_t)c->idx_dim * nbmax * 4, VKC_DEV);
-            if (!ch->kc[i] || !ch->vc[i] || !ch->ik[i] || !ch->pk[i]) { ch->cap = 0; return 0; }
-        }
-        ch->cap = m->kv_cap;
-    }
+    if (ch->ks.on && !vkc_kv_parts(&ch->ks, r * c->q_heads * (c->head_dim + 2))) return 0;
     return 1;
 }
 
@@ -259,11 +320,11 @@ static void q38c_recover(Model *m, int upto) {
         for (int b = 1; b < C; b++) memcpy(e + (int64_t)b * H, e, (size_t)H * sizeof(float));
     }
     /* the step being run keeps its prefetched n-gram rows and its snapshot request */
-    float *pref = m->ple_pref; int pref_rows = m->ple_pref_rows, snap = m->snap_after, rowwise = g_q38_rowwise;
-    m->ple_pref = NULL; m->ple_pref_rows = 0; m->snap_after = 0; g_q38_rowwise = 0;
+    float *pref = m->ple_pref; int pref_rows = m->ple_pref_rows, snap = m->snap_rows, rowwise = g_q38_rowwise;
+    m->ple_pref = NULL; m->ple_pref_rows = 0; m->snap_rows = 0; g_q38_rowwise = 0;
     for (int i = 0; i < c->layers; i++) q38_layer_forward(m, i, hyper, ids, upto, 0, mixed, inject, block);
     free(m->ple_pref);
-    m->ple_pref = pref; m->ple_pref_rows = pref_rows; m->snap_after = snap; g_q38_rowwise = rowwise;
+    m->ple_pref = pref; m->ple_pref_rows = pref_rows; m->snap_rows = snap; g_q38_rowwise = rowwise;
     free(ids); free(hyper); free(mixed); free(inject); free(block);
 }
 static void q38c_sync_host(Model *m) {
@@ -278,7 +339,7 @@ static void q38c_sync_host(Model *m) {
         }
     }
     if (ch->ple_ring && m->PLE_conv_state &&
-        !vkc_read(ch->ple_ring, (size_t)ch->ple_cur * q38c_ple_cells(c), m->PLE_conv_state, q38c_ple_cells(c) * 4)) {
+        !vkc_read(ch->ple_ring, (size_t)ch->ple_slot[0] * q38c_ple_cells(c), m->PLE_conv_state, q38c_ple_cells(c) * 4)) {
         q38c_recover(m, m->kv_len); return;
     }
     ch->dn_where = Q38C_BOTH;
@@ -295,23 +356,64 @@ static void q38c_cpu_step(Model *m, int pos_base) {
     ch->dn_where = Q38C_HOST; ch->host_zero = 0; ch->snap_valid = 0;
     for (int i = 0; i < m->c.layers; i++) {
         if (ch->kv_valid[i] > pos_base) ch->kv_valid[i] = pos_base;
+        if (m->c.is_attn[i]) vkc_kv_lower(&ch->ks, ch->attn_ord[i], pos_base);
         int R = m->c.idx_ratio > 0 ? m->c.idx_ratio : 1;
         if (ch->pk_valid[i] > pos_base / R) ch->pk_valid[i] = pos_base / R;
     }
 }
-/* A rejected draft: the state after the verify's first row is the device's snapshot. */
-static void q38c_rollback(Model *m) {
+/* A rejected draft: the state after the verify's row `slot` (its first slot+1 rows) is
+ * the device's copy in that slot; `len` positions stand. The KV and pooled-key
+ * watermarks come down to them: the rows past them are the rejected drafts'. */
+static void q38c_rollback(Model *m, int slot, int len) {
     Q38Chain *ch = (Q38Chain *)m->vkchain;
-    if (!ch || !ch->ok || !ch->snap_valid || ch->dn_where != Q38C_DEV) return;
+    if (!ch || !ch->ok) return;
+    int R = m->c.idx_ratio > 0 ? m->c.idx_ratio : 1;
+    for (int i = 0; i < m->c.layers; i++) {
+        if (ch->kv_valid[i] > len) ch->kv_valid[i] = len;
+        if (m->c.is_attn[i]) vkc_kv_lower(&ch->ks, ch->attn_ord[i], len);
+        if (ch->pk_valid[i] > len / R) ch->pk_valid[i] = len / R;
+    }
+    if (slot < 0 || slot >= ch->snap_valid || ch->dn_where != Q38C_DEV) { ch->snap_valid = 0; return; }
     for (int i = 0; i < m->c.layers; i++) {
         if (m->c.is_attn[i]) continue;
-        VkcBuf *t = ch->rec[i]; ch->rec[i] = ch->rec_snap[i]; ch->rec_snap[i] = t;
-        t = ch->ring[i]; ch->ring[i] = ch->ring_snap[i]; ch->ring_snap[i] = t;
+        VkcBuf *t = ch->rec[i]; ch->rec[i] = ch->rec_snap[slot][i]; ch->rec_snap[slot][i] = t;
+        t = ch->ring[i]; ch->ring[i] = ch->ring_snap[slot][i]; ch->ring_snap[slot][i] = t;
     }
-    if (ch->ple_ring) ch->ple_cur ^= 1;
+    if (ch->ple_ring) { int t = ch->ple_slot[0]; ch->ple_slot[0] = ch->ple_slot[1 + slot]; ch->ple_slot[1 + slot] = t; }
     ch->snap_valid = 0;
 }
-static int q38c_push_state(Q38Chain *ch, Model *m, int pos_base) {
+/* Copy slots on the device for a verify that snapshots `rows` rows: the DeltaNet states
+ * and conv rings (slot 0 since setup), and the PLE ring's slots, all in one buffer since
+ * the shader writes the copy beside the ring (it grows once, keeping the current ring). */
+static int q38c_spec_slots(Q38Chain *ch, Model *m, int rows) {
+    Cfg *c = &m->c; int L = c->layers;
+    if (rows > Q38_SPEC_SNAPS) rows = Q38_SPEC_SNAPS;
+    size_t nr = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
+    for (int sl = ch->snap_slots; sl < rows; sl++) {
+        if (!ch->rec_snap[sl] && !(ch->rec_snap[sl] = (VkcBuf **)calloc((size_t)L, sizeof(VkcBuf *)))) return 0;
+        if (!ch->ring_snap[sl] && !(ch->ring_snap[sl] = (VkcBuf **)calloc((size_t)L, sizeof(VkcBuf *)))) return 0;
+        for (int i = 0; i < L; i++) {
+            if (c->is_attn[i]) continue;
+            if (!ch->rec_snap[sl][i] && !(ch->rec_snap[sl][i] = vkc_buf(nr * 4, VKC_DEV))) return 0;
+            if (!ch->ring_snap[sl][i] && !(ch->ring_snap[sl][i] = vkc_buf(nc * 4, VKC_DEV))) return 0;
+        }
+        ch->snap_slots = sl + 1;
+    }
+    if (ch->ple_ring && ch->ple_nslots < rows + 1) {
+        size_t pc = q38c_ple_cells(c);
+        VkcBuf *nb = vkc_buf((size_t)Q38_SPEC_ROWS * pc * 4, VKC_DEV);
+        if (!nb) return 0;
+        if (!vkc_begin() || !vkc_copy(nb, 0, ch->ple_ring, (size_t)ch->ple_slot[0] * pc, pc) || !vkc_submit(1)) {
+            vkc_free(nb); return 0;
+        }
+        vkc_free(ch->ple_ring);
+        ch->ple_ring = nb; ch->ple_nslots = Q38_SPEC_ROWS;
+        for (int r = 0; r < Q38_SPEC_ROWS; r++) ch->ple_slot[r] = r;
+        ch->snap_valid = 0;
+    }
+    return 1;
+}
+static int q38c_push_state(Q38Chain *ch, Model *m, int pos_base, int n_rows) {
     Cfg *c = &m->c; int ok = 1;
     if (ch->dn_where == Q38C_HOST) {
         size_t nr = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
@@ -321,7 +423,7 @@ static int q38c_push_state(Q38Chain *ch, Model *m, int pos_base) {
             else ok = vkc_write(ch->rec[i], 0, m->DN_rec[i], nr * 4) && vkc_write(ch->ring[i], 0, m->DN_conv[i], nc * 4);
         }
         if (ok && ch->ple_ring && m->PLE_conv_state) {
-            size_t pc = q38c_ple_cells(c), off = (size_t)ch->ple_cur * pc;
+            size_t pc = q38c_ple_cells(c), off = (size_t)ch->ple_slot[0] * pc;
             ok = ch->host_zero ? vkc_zero(ch->ple_ring, off, pc) : vkc_write(ch->ple_ring, off, m->PLE_conv_state, pc * 4);
         }
         ch->dn_where = Q38C_BOTH;
@@ -330,10 +432,16 @@ static int q38c_push_state(Q38Chain *ch, Model *m, int pos_base) {
     for (int i = 0; i < c->layers && ok; i++) {
         if (!c->is_attn[i]) continue;
         if (ch->pk_valid[i] > pos_base / R) ch->pk_valid[i] = pos_base / R;   /* blocks this step rewrites */
+        if (ch->ks.on) {   /* the split: the window placed, the K/V rows below pos_base of its blocks uploaded */
+            VkcKvPart pt[2] = {{KVH, D, m->K[i], (size_t)m->kv_cap * D, ch->kc[i], 0},
+                               {KVH, D, m->V[i], (size_t)m->kv_cap * D, ch->vc[i], 0}};
+            vkc_kv_place(&ch->ks, ch->attn_ord[i], pos_base, n_rows);
+            ok = vkc_kv_push(&ch->ks, ch->attn_ord[i], pt, 2, pos_base);
+        }
         if (ch->kv_valid[i] >= pos_base) continue;
         int t0 = ch->kv_valid[i], n = pos_base - t0;
-        for (int h = 0; h < KVH && ok; h++) {
-            size_t src = ((size_t)h * m->kv_cap + t0) * D, dst = ((size_t)h * ch->cap + t0) * D;
+        for (int h = 0; h < KVH && ok && !ch->ks.on; h++) {
+            size_t src = ((size_t)h * m->kv_cap + t0) * D, dst = ((size_t)h * ch->dev_rows + t0) * D;
             ok = vkc_write(ch->kc[i], dst, m->K[i] + src, (size_t)n * D * 4) && vkc_write(ch->vc[i], dst, m->V[i] + src, (size_t)n * D * 4);
         }
         ok = ok && vkc_write(ch->ik[i], (size_t)t0 * ID, m->IK[i] + (size_t)t0 * ID, (size_t)n * ID * 4);
@@ -386,11 +494,14 @@ static int q38c_attention(Q38Chain *ch, Model *m, Layer *l, int i, int n, int pb
     if (!rg || !ri) { free(rg); free(ri); return 0; }
     for (int s = 0; s < n; s++) {
         for (int h = 0; h < KVH; h++)
-            rg[s * KVH + h] = (VkcRegion){((size_t)h * ch->cap + pb + s) * D, (size_t)s * kvo + (size_t)h * D, (size_t)D};
+            rg[s * KVH + h] = (VkcRegion){((size_t)h * ch->dev_rows + pb + s) * D, (size_t)s * kvo + (size_t)h * D, (size_t)D};
         ri[s] = (VkcRegion){(size_t)(pb + s) * ID, (size_t)s * ipw + (size_t)IQ * ID, (size_t)ID};
     }
     size_t ko = (size_t)ch->attn_ord[i] * q38c_kv_stride(ch, c);
-    ok = vkc_copy_regions(ch->kc[i], ch->k, rg, n * KVH) && vkc_copy_regions(ch->vc[i], ch->v, rg, n * KVH) &&
+    VkcKvPart pk_ = {KVH, D, m->K[i], (size_t)m->kv_cap * D, ch->kc[i], 0}, pv_ = {KVH, D, m->V[i], (size_t)m->kv_cap * D, ch->vc[i], 0};
+    ok = (ch->ks.on ? vkc_kv_store(&ch->ks, ch->attn_ord[i], &pk_, ch->k, 0, (size_t)kvo, (size_t)D, pb, n) &&
+                      vkc_kv_store(&ch->ks, ch->attn_ord[i], &pv_, ch->v, 0, (size_t)kvo, (size_t)D, pb, n)
+                    : vkc_copy_regions(ch->kc[i], ch->k, rg, n * KVH) && vkc_copy_regions(ch->vc[i], ch->v, rg, n * KVH)) &&
          vkc_copy_regions(ch->ik[i], ch->ip, ri, n) &&
          vkc_copy(ch->kvd, ko, ch->k, 0, (size_t)n * kvo) &&
          vkc_copy(ch->kvd, ko + (size_t)ch->rows * kvo, ch->v, 0, (size_t)n * kvo);
@@ -411,24 +522,41 @@ static int q38c_attention(Q38Chain *ch, Model *m, Layer *l, int i, int n, int pb
     }
     int nbmax = (int)(vkc_bytes(ch->qsc) / 4 / (2 * (size_t)ch->rows));
     VkcQsa ps = {1, ID, R, 0, 0, n, pb, c->idx_budget, IQ, 0, ipw, nbmax, q38c_selrow(c), c->eps, 0, 0, 0, 0};
-    VkcAttn at = {n, QH, KVH, D, pb, ch->cap, 0, qo, 2 * D, D, qo, 2 * D, 1, 0, QH * D, 0, q38c_selrow(c),
+    if (ch->ks.on) {   /* the split: the selection's listed positions in two parts */
+        VkcKvGqa a = {&ch->ks, ch->attn_ord[i], ch->q, ch->kc[i], ch->vc[i], ch->q, ch->sel, NULL, ch->ctx, n, QH, KVH, D, D, pb,
+                      0, 0, 0, 0, qo, 2 * D, 1, D, qo, 2 * D, QH * D, 0, q38c_selrow(c), 1.f / sqrtf((float)D),
+                      m->K[i], m->V[i], (size_t)m->kv_cap * D, (size_t)D, (size_t)m->kv_cap * D, (size_t)D};
+        return ok && vkc_qsa(ch->ip, NULL, ch->pk[i], NULL, ch->qsc, ch->sel, &ps) && vkc_kv_gqa(&a) &&
+               vkc_matmul(q38c_t(&l->o), ch->ctx, 0, ch->blk, 0, n);
+    }
+    VkcAttn at = {n, QH, KVH, D, pb, ch->dev_rows, 0, qo, 2 * D, D, qo, 2 * D, 1, 0, QH * D, 0, q38c_selrow(c),
                   1.f / sqrtf((float)D), 0, 0};
     return ok && vkc_qsa(ch->ip, NULL, ch->pk[i], NULL, ch->qsc, ch->sel, &ps) &&
            vkc_attn(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, ch->sel, &at) &&
            vkc_matmul(q38c_t(&l->o), ch->ctx, 0, ch->blk, 0, n);
 }
-static int q38c_deltanet(Q38Chain *ch, Model *m, Layer *l, int i, int n, int snap_row) {
+/* ns: the chunk's rows whose state a verify copies (rows 0..ns-1, into slots c0..c0+ns-1).
+ * One copy rides on the one dispatch, as the shaders pass its row; more split the
+ * convolution and the recurrence into one dispatch per copy, each ending on its row
+ * (the last one takes the chunk's remaining rows): the state crosses between them
+ * through memory in f32, so every row gets the bits of the single dispatch. */
+static int q38c_deltanet(Q38Chain *ch, Model *m, Layer *l, int i, int n, int c0, int ns) {
     Cfg *c = &m->c;
     int VH = c->dn_vheads, CD = c->dn_conv_dim, V = VH * c->dn_vdim;
     int ok = vkc_matmul(q38c_t(&l->dn_qkv), ch->mixed, 0, ch->qkv, 0, n) && vkc_matmul(q38c_t(&l->dn_z), ch->mixed, 0, ch->z, 0, n) &&
              vkc_matmul(q38c_t(&l->dn_b), ch->mixed, 0, ch->ab, 0, n) &&
              vkc_matmul(q38c_t(&l->dn_a), ch->mixed, 0, ch->ab, (size_t)ch->rows * VH, n);
-    VkcDnConv cp = {n, CD, c->dn_convk, 0, CD, 0, CD, snap_row, 1, (int)ch->o_conv[i], 0, 0};
-    VkcDnRec rp = {n, VH, c->dn_kheads, c->dn_vdim, c->dn_kheads * c->dn_kdim, 0, CD, 0, VH, ch->rows * VH, VH,
-                   0, V, 0, V, snap_row, 1, c->eps, 1.f / sqrtf((float)c->dn_kdim), 0, 0, (int)ch->o_dn[i]};
-    return ok && vkc_dnconv(ch->qkv, ch->prm, ch->ring[i], ch->cv, ch->ring_snap[i], &cp) &&
-           vkc_dnrec(c->dn_kdim, ch->cv, ch->ab, ch->z, ch->rec[i], ch->prm, ch->dny, ch->rec_snap[i], &rp) &&
-           vkc_matmul(q38c_t(&l->dn_out), ch->dny, 0, ch->blk, 0, n);
+    int segs = ns > 1 ? ns : 1;
+    for (int r = 0; r < segs && ok; r++) {
+        int s0 = ns > 1 ? r : 0, len = ns > 1 && r < ns - 1 ? 1 : n - s0, snap_row = ns ? 0 : -1, slot = ns ? c0 + r : 0;
+        VkcDnConv cp = {len, CD, c->dn_convk, s0 * CD, CD, s0 * CD, CD, snap_row, 1, (int)ch->o_conv[i], 0, 0};
+        VkcDnRec rp = {len, VH, c->dn_kheads, c->dn_vdim, c->dn_kheads * c->dn_kdim, s0 * CD, CD, s0 * VH, VH,
+                       ch->rows * VH + s0 * VH, VH, s0 * V, V, s0 * V, V, snap_row, 1, c->eps,
+                       1.f / sqrtf((float)c->dn_kdim), 0, 0, (int)ch->o_dn[i]};
+        ok = vkc_dnconv(ch->qkv, ch->prm, ch->ring[i], ch->cv, ch->ring_snap[slot][i], &cp) &&
+             vkc_dnrec(c->dn_kdim, ch->cv, ch->ab, ch->z, ch->rec[i], ch->prm, ch->dny, ch->rec_snap[slot][i], &rp);
+    }
+    return ok && vkc_matmul(q38c_t(&l->dn_out), ch->dny, 0, ch->blk, 0, n);
 }
 /* the n-gram rows of n tokens, in order, as q38_ple fills them (history and the verify's snapshot) */
 static void q38c_ple_rows(Model *m, const int *ids, int c0, int n, float *emb) {
@@ -447,13 +575,17 @@ static void q38c_ple_rows(Model *m, const int *ids, int c0, int n, float *emb) {
         else if (m->ple_history_len == 0) { m->ple_history[0] = ids[s]; m->ple_history_len = 1; }
         else if (m->ple_history_len == 1) { m->ple_history[1] = ids[s]; m->ple_history_len = 2; }
         else { m->ple_history[0] = m->ple_history[1]; m->ple_history[1] = ids[s]; }
-        if (s + 1 == m->snap_after) {
-            memcpy(m->snap_ple_history, m->ple_history, sizeof(m->snap_ple_history));
-            m->snap_ple_history_len = m->ple_history_len;
+        if (s < m->snap_rows) {
+            memcpy(m->snap_ple_history[s], m->ple_history, sizeof(m->snap_ple_history[s]));
+            m->snap_ple_history_len[s] = m->ple_history_len;
         }
     }
 }
-static int q38c_ple(Q38Chain *ch, Model *m, int n, int snap_row) {
+/* ns as q38c_deltanet's: the copies of the PLE ring after rows 0..ns-1 go to the ring
+ * buffer's slots ple_slot[1+c0+r]. The convolution reads a row's gate and norm outputs
+ * from the start of their buffers, so with more than one copy each dispatch past the
+ * first reads its rows from a copy of them at the start of the scratch (gseg, nseg). */
+static int q38c_ple(Q38Chain *ch, Model *m, int n, int c0, int ns) {
     Cfg *c = &m->c; Layer *l = &m->L[c->ple_layer];
     int W = c->hc_width, H = c->hidden, E = c->ngram_heads * c->ngram_head_dim;
     size_t pc = q38c_ple_cells(c);
@@ -461,11 +593,28 @@ static int q38c_ple(Q38Chain *ch, Model *m, int n, int snap_row) {
              vkc_matmul(q38c_t(&l->ple_key), ch->emb, 0, ch->keys, 0, n) &&
              vkc_matmul(q38c_t(&l->ple_value), ch->emb, 0, ch->val, 0, n);
     VkcPle g = {0, n, c->hc_count, H, c->ple_convk, c->ngram_size, 0, 0, 0, -1, 0, c->eps, (int)ch->o_ple, 0, 0};
-    VkcPle cv = {1, n, c->hc_count, H, c->ple_convk, c->ngram_size, 0, 0, 0, snap_row,
-                 (int)((size_t)(ch->ple_cur ^ 1) * pc), c->eps, 0, (int)ch->o_pconv, (int)((size_t)ch->ple_cur * pc)};
-    (void)W;
-    return ok && vkc_ple(ch->keys, ch->hyper, ch->val, ch->prm, ch->gated, ch->normv, NULL, NULL, &g) &&
-           vkc_ple(NULL, ch->hyper, NULL, NULL, ch->gated, ch->normv, ch->prm, ch->ple_ring, &cv);
+    ok = ok && vkc_ple(ch->keys, ch->hyper, ch->val, ch->prm, ch->gated, ch->normv, NULL, NULL, &g);
+    if (ns <= 1) {
+        int snap = ns ? ch->ple_slot[1 + c0] : ch->ple_slot[1];
+        VkcPle cv = {1, n, c->hc_count, H, c->ple_convk, c->ngram_size, 0, 0, 0, ns ? 0 : -1,
+                     (int)((size_t)snap * pc), c->eps, 0, (int)ch->o_pconv, (int)((size_t)ch->ple_slot[0] * pc)};
+        return ok && vkc_ple(NULL, ch->hyper, NULL, NULL, ch->gated, ch->normv, ch->prm, ch->ple_ring, &cv);
+    }
+    ok = ok && q38c_res(&ch->gseg, (size_t)n * W, VKC_DEV) && q38c_res(&ch->nseg, (size_t)n * W, VKC_DEV);
+    for (int r = 0; r < ns && ok; r++) {
+        int len = r < ns - 1 ? 1 : n - r;
+        VkcBuf *gb = ch->gated, *nb = ch->normv;
+        if (r) {
+            ok = vkc_copy(ch->gseg, 0, ch->gated, (size_t)r * W, (size_t)len * W) &&
+                 vkc_copy(ch->nseg, 0, ch->normv, (size_t)r * W, (size_t)len * W);
+            gb = ch->gseg; nb = ch->nseg;
+        }
+        VkcPle cv = {1, len, c->hc_count, H, c->ple_convk, c->ngram_size, 0, r * W, 0, 0,
+                     (int)((size_t)ch->ple_slot[1 + c0 + r] * pc), c->eps, 0, (int)ch->o_pconv,
+                     (int)((size_t)ch->ple_slot[0] * pc)};
+        ok = ok && vkc_ple(NULL, ch->hyper, NULL, NULL, gb, nb, ch->prm, ch->ple_ring, &cv);
+    }
+    return ok;
 }
 static int q38c_shared(Q38Chain *ch, Model *m, Layer *l, int i, int n) {
     Cfg *c = &m->c; int SI = c->shared_inter;
@@ -487,12 +636,21 @@ static int q38c_moe_apply(Q38Chain *ch, Model *m, int n) {
 static int q38c_forward(Model *m, const int *ids, int S, int pos_base, int nlogits, float *hyper_h,
                         int want_streams, float *mixed_h, float *logit) {
     if (!g_vk_chain || qt_ready()) return 0;
-    if (g_vk_chain == COLI_VK_CHAIN_PREFILL && S <= 2) return 0;   /* prompts only: decode and verify on the CPU */
+    /* prompts only: decode and verifies on the CPU */
+    if (g_vk_chain == COLI_VK_CHAIN_PREFILL && (S <= 2 || g_q38_rowwise)) return 0;
     Q38Chain *ch = q38c_setup(m);
     if (!ch || ch->failed) return 0;
     Cfg *c = &m->c; int H = c->hidden, W = c->hc_width, L = c->layers, E = c->experts, V = c->vocab;
-    int rows = S < q38c_chunk_rows() ? S : q38c_chunk_rows();
-    if (!q38c_scratch(ch, m, rows) || (want_streams && !q38c_res(&ch->hypd, (size_t)rows * W, VKC_DOWN)) ||
+    int mirror_ok = q38c_mirror(ch, m);
+    int CH = mirror_ok ? q38c_chunk_rows(ch, m) : 1, rows = S < CH ? S : CH;
+    if (ch->ks.on && rows > ch->ks.chunk) rows = ch->ks.chunk;   /* a step's rows fit the split's window */
+    if (m->snap_rows > 1 && !q38c_spec_slots(ch, m, m->snap_rows)) {
+        fprintf(stderr, "[VK] qwen38 chain: device memory for a verify's %d copies refused; this verify on the CPU\n",
+                m->snap_rows);
+        return 0;
+    }
+    if (!mirror_ok || !q38c_scratch(ch, m, rows) || (want_streams && !q38c_res(&ch->hypd, (size_t)rows * W, VKC_DOWN)) ||
+        (nlogits > 2 && !q38c_res(&ch->outd, (size_t)nlogits * V, VKC_DOWN)) ||
         (mixed_h && !q38c_res(&ch->find, (size_t)rows * H, VKC_DOWN))) {
         fprintf(stderr, "[VK] qwen38 chain: device memory for %d rows refused; per-matrix path\n", rows);
         ch->failed = 1;
@@ -503,10 +661,11 @@ static int q38c_forward(Model *m, const int *ids, int S, int pos_base, int nlogi
     int snapped = 0;
     for (int c0 = 0; c0 < S; c0 += rows) {
         int n = S - c0 < rows ? S - c0 : rows, pb = pos_base + c0;
-        int snap_row = m->snap_after > c0 && m->snap_after <= c0 + n ? m->snap_after - 1 - c0 : -1;
-        if (snap_row >= 0) snapped = 1;
+        int ns = m->snap_rows - c0 < n ? m->snap_rows - c0 : n;   /* the rows of this chunk a verify copies */
+        if (ns < 0) ns = 0;
+        if (ns) snapped = c0 + ns;
         if (!vkc_begin() || !vkc_write(ch->hyper, 0, hyper_h + (size_t)c0 * W, (size_t)n * W * 4) ||
-            !q38c_push_state(ch, m, pb)) goto lost;
+            !q38c_push_state(ch, m, pb, n)) goto lost;
         if (half) {
             float *cs = (float *)vkc_ptr(ch->cs);
             for (int s = 0; s < n; s++) for (int j = 0; j < half; j++) {
@@ -519,15 +678,19 @@ static int q38c_forward(Model *m, const int *ids, int S, int pos_base, int nlogi
         for (int i = 0; i < L && ok; i++) {
             Layer *l = &m->L[i];
             if (pending) ok = q38c_moe_apply(ch, m, n);
-            if (ok && i == c->ple_layer) ok = q38c_ple(ch, m, n, snap_row);
+            if (ok && i == c->ple_layer) ok = q38c_ple(ch, m, n, c0, ns);
             ok = ok && q38c_gr_read(ch, m, &l->attn_gr, ch->o_an[i], n, ch->inj_a);
-            ok = ok && (c->is_attn[i] ? q38c_attention(ch, m, l, i, n, pb) : q38c_deltanet(ch, m, l, i, n, snap_row));
+            ok = ok && (c->is_attn[i] ? q38c_attention(ch, m, l, i, n, pb) : q38c_deltanet(ch, m, l, i, n, c0, ns));
             ok = ok && q38c_gr_apply(ch, m, ch->inj_a, n);
             ok = ok && q38c_gr_read(ch, m, &l->mlp_gr, ch->o_mn[i], n, ch->inj_m);
             ok = ok && vkc_matmul(q38c_t(&l->router), ch->mixed, 0, ch->lg, 0, n) &&
                  vkc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E) && vkc_copy(ch->mixd, 0, ch->mixed, 0, (size_t)n * H);
             double t0 = now_s();
-            ok = ok && vkc_submit(1);                                        /* A1 */
+            /* A1; while it runs, the tier loads the experts this layer will likely
+             * stream (a big prompt chunk only) */
+            ok = ok && vkc_submit(0);
+            if (ok) vkt_stream_prefetch(i, n);
+            ok = ok && vkc_finish();
             m->timers.seconds[Q38_TM_DENSE_MATMUL] += now_s() - t0;
             if (!ok) break;
             if (c->is_attn[i]) {
@@ -567,7 +730,7 @@ static int q38c_forward(Model *m, const int *ids, int S, int pos_base, int nlogi
         if (!ok) goto lost;
         if (want_streams) memcpy(hyper_h + (size_t)c0 * W, vkc_ptr(ch->hypd), (size_t)n * W * 4);
         if (mixed_h) memcpy(mixed_h + (size_t)c0 * H, vkc_ptr(ch->find), (size_t)n * H * 4);
-        for (int i = 0; i < L; i++) if (c->is_attn[i]) ch->kv_valid[i] = pb + n;
+        for (int i = 0; i < L; i++) if (c->is_attn[i]) { ch->kv_valid[i] = pb + n; vkc_kv_done(&ch->ks, ch->attn_ord[i], pb + n); }
         ch->dn_where = Q38C_DEV; ch->host_zero = 0;
     }
     memcpy(logit, vkc_ptr(ch->outd), (size_t)nlogits * V * sizeof(float));
@@ -589,5 +752,6 @@ static void q38c_report(Model *m) {
     fprintf(stderr, "[VK] qwen38 chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
                     "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %.1f MiB on the device\n",
             ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms, st.dev_bytes / 1048576.0);
+    vkc_kv_report(&ch->ks);
     vkc_prof_print();
 }

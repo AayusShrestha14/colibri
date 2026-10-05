@@ -342,6 +342,18 @@ matrices, DeltaNet, attention and `lm_head`. Where the routed experts fit in
 RAM, those disk reads go away and the dense part is a larger share of each
 token, so the gain should be larger. That case has not been measured.
 
+### Deeper verifies and prompt lookup
+
+`Q38_MTP_DRAFTS` lets the head draft up to 3 tokens per verify: each draft past the
+first reads the head's own streams from the row before, with the draft just proposed.
+The verify copies the DeltaNet and PLE state after each of its rows but the last, so a
+rejection after row `k` restores the state after row `k`. `Q38_MTP_DRAFTS=0` lets a gate
+pick the depth per verify from the measured acceptance by position and the measured
+cost of a verify by its rows. `COLI_LOOKUP=1` adds prompt-lookup drafts (up to 5, from
+the context's n-grams), and a verify carries whichever proposal is worth more. The
+output stays that of plain decoding. Measured on the release with the int4-g64 sidecar: 4.94 tok/s at two drafts against 4.71 at one and 4.12 without MTP on the CPU (2.75 tokens per forward), 4.55 against 4.39 and 3.91 with the Vulkan tier and chain on a Radeon 780M, so two drafts is the default. The details, the settings and the
+tests are in [speculative.md](speculative.md).
+
 `make -C c qwen38-tiny-mtp-check` adds a head with random weights under the
 release's names to the three tiny fixtures and gates on the head's draft
 logits against a float32 reference of both wirings

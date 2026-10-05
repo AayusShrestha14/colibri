@@ -324,15 +324,18 @@ static float g_nuc  = 0.95f;  /* NUCLEUS env overrides */
  * COLI_VULKAN it is the plain matmul call it replaces. */
 #ifdef COLI_VULKAN
 static char g_vk_refused;                  /* *vk == &g_vk_refused: stays on the CPU */
+static float *olm_dho_reload(void **vk);   /* below: a dropped host copy read back from disk */
 static void matmul_res(float *y, const float *x, const float *W, void **vk, int S, int I, int O) {
     int serial = 1;
 #ifdef _OPENMP
     serial = !omp_in_parallel();
 #endif
-    if (g_vk_ready && serial && *vk != (void *)&g_vk_refused && coli_vk_dense()) {
+    /* with the dense weights on the device only the device is the matrix's one home */
+    if (g_vk_ready && serial && *vk != (void *)&g_vk_refused && (coli_vk_dense() || coli_vk_dense_device_only())) {
         if (coli_vk_matmul((ColiVkTensor **)vk, y, x, W, NULL, 10, S, I, O, 0)) return;
         if (!*vk) *vk = &g_vk_refused;
     }
+    if (!W) W = olm_dho_reload(vk);   /* the CPU needs a matrix the device holds alone (a lost device) */
     matmul(y, x, W, S, I, O);
 }
 static void vk_res_free(void **vk) {
@@ -535,6 +538,11 @@ static void load_cfg(Cfg *c, const char *snap) {
     free(buf); free(arena);
 }
 
+/* The parameters of an automatic cache size (cap <= 0), for olm_dho_grow_cap: with the
+ * dense weights on the device only, the RAM they held goes to the experts. */
+typedef struct { int on; double ram_arg, resident, kv_gb, slot_gb; int layers; } OlmAutoCap;
+static OlmAutoCap g_olm_auto_cap;
+
 static float *load_t(Model *m, const char *name) {
     int64_t n = st_numel(&m->S, name);
     if (n < 0) { fprintf(stderr, "missing %s\n", name); exit(1); }
@@ -624,6 +632,9 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
             derived = 1;
         }
         if (derived > c->n_experts) derived = c->n_experts;
+        if (load_boundaries) {   /* the standalone engine: kept for olm_dho_grow_cap */
+            g_olm_auto_cap = (OlmAutoCap){1, ram_arg, resident, kv_gb, slot_gb, layers};
+        }
         fprintf(stderr, "[cache] %d slots/layer of %d experts: %.1f GB budget "
                         "(%s), %.1f GB dense resident, %.1f GB projected KV, "
                         "%.0f MB per expert\n",
@@ -722,6 +733,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
 #ifdef COLI_VULKAN
 static void olmoe_vk_tier_start(Model *m);
 static void olc_start(Model *m);
+static void olm_dho_start(Model *m);
 #endif
 static void model_init(Model *m, const char *snap, int cap, int bits) {
     model_init_range(m, snap, cap, bits, 0, 0, 1, 1);
@@ -732,6 +744,7 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
      * the expert tier will be tried (vk_tier.h step 0): on a device sharing the
      * CPU's RAM the dense matrices then stay on the CPU unless COLI_VK_DENSE=1. */
     if (!g_vk_ready) g_vk_ready = coli_vk_init_env_tier("olmoe", vkt_wanted() && m->c.n_experts > 0);
+    if (g_vk_ready) olm_dho_start(m);   /* COLI_VK_DENSE_HOST: the dense matrices on the device only, before the tier sizes its budget */
     if (g_vk_ready) olmoe_vk_tier_start(m);   /* after the history: COLI_USAGE, read above */
     if (g_vk_ready && !vkt_ready() && !coli_vk_dense()) coli_vk_dense_decide("olmoe", 0, 1);   /* no tier after all */
     if (g_vk_ready && coli_vk_dense())
@@ -818,19 +831,32 @@ static int olmoe_vk_in_ram(void *ctx, int layer, int e) {
  * row, gate, up and down as the merged container holds them: fmt 1), after the
  * weights and the history (COLI_USAGE, read by model_init_range), and warm it from
  * that history: the hottest experts first, read from disk in parallel. */
+/* The tier's streaming (a big prompt chunk's cold experts on the device): an expert's
+ * bytes through the layer cache as the CPU path gets them, held until copied. */
+static void expert_get(Model *m, int layer, int eid, Slot **out);
+static void expert_put(Slot *s);
+static int olmoe_vk_load(void *ctx, int layer, int e, VktExpertSrc *src, void **h) {
+    Slot *s = NULL; expert_get((Model *)ctx, layer, e, &s);
+    if (!s) return 0;
+    *src = olmoe_vk_src(s); *h = s;
+    return 1;
+}
+static void olmoe_vk_release(void *ctx, void *h) { (void)ctx; expert_put((Slot *)h); }
 static void olmoe_vk_tier_start(Model *m) {
     Cfg *c = &m->c;
     if (!vkt_wanted() || c->n_experts < 1) return;
     int64_t D = c->hidden, I = c->inter;
     size_t slotb = (size_t)(3 * I * D + (2 * I + D) * 4);
-    size_t dense = coli_vk_dense() ? (size_t)c->n_layers * (size_t)(4 * D * D + (int64_t)c->n_experts * D) * 4 +
-                                     (size_t)c->vocab * (size_t)D * 4 : 0;
+    size_t dense = coli_vk_dense() && !coli_vk_dense_device_only()   /* device only: placed already */
+                 ? (size_t)c->n_layers * (size_t)(4 * D * D + (int64_t)c->n_experts * D) * 4 +
+                   (size_t)c->vocab * (size_t)D * 4 : 0;
     VktConfig vc = {.engine = "olmoe", .layers = c->n_layers, .experts = c->n_experts,
                     .hidden = c->hidden, .inter = c->inter, .topk = c->topk,
                     .gate_up = {VKT_SRC_I8_ROW, 0}, .down = {VKT_SRC_I8_ROW, 0},
                     .act = VKT_ACT_SWIGLU, .max_rows = OLMOE_VK_ROWS * c->topk,
                     .ram_reserve = slotb * (size_t)m->cache[0].cap * (size_t)c->n_layers,
-                    .dense_bytes = dense, .in_ram = olmoe_vk_in_ram, .ram_ctx = m};
+                    .dense_bytes = dense, .in_ram = olmoe_vk_in_ram, .ram_ctx = m,
+                    .load = olmoe_vk_load, .release = olmoe_vk_release, .load_ctx = m};
     atexit(coli_vk_shutdown);   /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
     if (!vkt_init(&vc, m->freq)) return;
     atexit(vkt_shutdown);
@@ -1195,7 +1221,7 @@ static void moe_vk_run(Model *m, int layer, const float *x, int S, float *logits
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
     int *idx = malloc((size_t)S * K * sizeof(int));
     float *val = malloc((size_t)S * K * sizeof(float));
-    int B = S < OLMOE_VK_ROWS ? S : OLMOE_VK_ROWS;
+    int B = vkt_step_rows(S, OLMOE_VK_ROWS);   /* a whole prompt chunk when the tier streams */
     float *ctb = falloc((int64_t)B * K * D), *g = falloc(I), *u = falloc(I);
     uint8_t *taken = malloc((size_t)B * K), *want = malloc((size_t)B * K);
     const float **dev = malloc((size_t)B * K * sizeof(*dev));
@@ -1339,6 +1365,102 @@ static void olmoe_echo(const char *id, int pos, int token, const float *lo, int 
 
 #ifdef COLI_VULKAN
 #include "olmoe_chain.h"   /* COLI_VK_CHAIN: every layer's dense chain on the device */
+
+/* ---- dense weights on the device only (COLI_VK_DENSE_HOST) ------------------------
+ * With the dense part on the device (the chain, or COLI_VK_DENSE), the attention's
+ * q/k/v/o, the router and lm_head go up at start and their f32 host copies are given
+ * back; matmul_res then runs them on the device whatever COLI_VK_DENSE says. The CPU
+ * multiplies by one only after a lost device: matmul_res first reads it back here
+ * (load_t: the same f32 bytes) and keeps it from there on. What keeps its host copy:
+ * the embedding (its rows are gathered on the CPU) and the norms. The chain is decided
+ * after the tier (olc_start); its decision is taken here silently first, from the same
+ * inputs, so the matrices are placed before the tier sizes its budget. */
+typedef struct { void **vk; float **field; int64_t n; char name[96]; } OlmDho;
+static OlmDho *g_olm_dho; static int g_olm_dho_n, g_olm_dho_cap;
+static Model *g_olm_dho_model;
+static pthread_mutex_t g_olm_dho_mx = PTHREAD_MUTEX_INITIALIZER;
+static float *olm_dho_reload(void **vk) {
+    pthread_mutex_lock(&g_olm_dho_mx);
+    OlmDho *e = NULL;
+    for (int i = 0; i < g_olm_dho_n && !e; i++) if (g_olm_dho[i].vk == vk) e = &g_olm_dho[i];
+    if (!e || !g_olm_dho_model) { fprintf(stderr, "[VK] olmoe: a dense matrix the device held alone cannot be read back\n"); exit(1); }
+    if (!*e->field) {
+        *e->field = load_t(g_olm_dho_model, e->name);
+        coli_vk_dense_host_reloaded((size_t)e->n * sizeof(float));
+    }
+    float *w = *e->field;
+    pthread_mutex_unlock(&g_olm_dho_mx);
+    return w;
+}
+static void olm_dho_drop(Model *m, float **field, void **vk, const char *name, int I, int O, size_t *bytes) {
+    if (!*field || *vk == (void *)&g_vk_refused) return;
+    if (!*vk && !coli_vk_tensor_ensure((ColiVkTensor **)vk, *field, NULL, 10, I, O, 0)) { *vk = &g_vk_refused; return; }
+    if (g_olm_dho_n == g_olm_dho_cap) {
+        g_olm_dho_cap = g_olm_dho_cap ? 2 * g_olm_dho_cap : 64;
+        g_olm_dho = realloc(g_olm_dho, (size_t)g_olm_dho_cap * sizeof *g_olm_dho);
+        if (!g_olm_dho) { fprintf(stderr, "OOM dense matrix table\n"); exit(1); }
+    }
+    OlmDho *e = &g_olm_dho[g_olm_dho_n++];
+    e->vk = vk; e->field = field; e->n = (int64_t)I * O;
+    snprintf(e->name, sizeof e->name, "%s", name);
+    free(*field); *field = NULL;
+    size_t b = (size_t)I * O * sizeof(float);
+    coli_vk_dense_host_dropped(b);
+    *bytes += b;
+    (void)m;
+}
+/* An automatic cache (cap <= 0) sized with the dense weights in RAM: give the experts
+ * what they held. With RAM_GB the process's own resident set shrinks by what was
+ * dropped; without it, what the OS offers now is read again (on a discrete GPU it grew
+ * by that much; on a device sharing the RAM the device copy took it back). Slots fill
+ * lazily, so a layer's cache grows by zeroed slots. */
+static void olm_dho_grow_cap(Model *m, size_t dropped) {
+    OlmAutoCap *a = &g_olm_auto_cap;
+    Cfg *c = &m->c;
+    if (!a->on || !m->cache || a->slot_gb <= 0.0) return;
+    double resident = a->resident - dropped / 1e9;
+    double budget = a->ram_arg > 0.0 ? a->ram_arg : resident + mem_available_gb() * 0.88;
+    double room = budget - resident - a->kv_gb - 0.5;
+    int derived = room > 0.0 ? (int)(room / a->slot_gb / (double)a->layers) : 1;
+    if (derived < 1) derived = 1;
+    if (derived > c->n_experts) derived = c->n_experts;
+    int was = m->cache[0].cap;
+    if (derived <= was) return;
+    pthread_mutex_lock(&g_pilot_mx);
+    for (int i = 0; i < c->n_layers; i++) {
+        LCache *lc = &m->cache[i];
+        if (!lc->slots) continue;
+        Slot *s = realloc(lc->slots, (size_t)derived * sizeof(Slot));
+        if (!s) { fprintf(stderr, "OOM growing the expert cache\n"); exit(1); }
+        memset(s + lc->cap, 0, (size_t)(derived - lc->cap) * sizeof(Slot));
+        lc->slots = s; lc->cap = derived;
+    }
+    pthread_mutex_unlock(&g_pilot_mx);
+    fprintf(stderr, "[cache] %d slots/layer of %d experts (was %d): the dense weights on the device only gave "
+                    "%.2f GB back, %.2f GB dense resident now\n", derived, c->n_experts, was, dropped / 1e9, resident);
+}
+static void olm_dho_start(Model *m) {
+    Cfg *c = &m->c;
+    int D = c->hidden, E = c->n_experts;
+    size_t bytes = (size_t)c->n_layers * (size_t)(4 * (int64_t)D * D + (int64_t)E * D) * sizeof(float) +
+                   (size_t)c->vocab * (size_t)D * sizeof(float);
+    int chain = coli_vk_chain_decide(NULL, vkt_wanted() && c->n_experts > 0, OLMOE_CHAIN_IGPU);
+    if (!coli_vk_dense_host_decide("olmoe", (chain || coli_vk_dense()) && m->lm_head, bytes)) return;
+    g_olm_dho_model = m;
+    size_t dropped = 0;
+    char nm[96];
+    for (int i = 0; i < c->n_layers; i++) {
+        Layer *l = &m->L[i];
+        snprintf(nm, sizeof nm, "model.layers.%d.self_attn.q_proj.weight", i); olm_dho_drop(m, &l->q, &l->vk_q, nm, D, D, &dropped);
+        snprintf(nm, sizeof nm, "model.layers.%d.self_attn.k_proj.weight", i); olm_dho_drop(m, &l->k, &l->vk_k, nm, D, D, &dropped);
+        snprintf(nm, sizeof nm, "model.layers.%d.self_attn.v_proj.weight", i); olm_dho_drop(m, &l->v, &l->vk_v, nm, D, D, &dropped);
+        snprintf(nm, sizeof nm, "model.layers.%d.self_attn.o_proj.weight", i); olm_dho_drop(m, &l->o, &l->vk_o, nm, D, D, &dropped);
+        snprintf(nm, sizeof nm, "model.layers.%d.mlp.gate.weight", i); olm_dho_drop(m, &l->gate, &l->vk_gate, nm, D, E, &dropped);
+    }
+    olm_dho_drop(m, &m->lm_head, &m->vk_lm_head, "lm_head.weight", D, c->vocab, &dropped);
+    coli_vk_dense_host_placed("olmoe", "the embedding (its rows are gathered on the CPU), norms");
+    olm_dho_grow_cap(m, dropped);
+}
 #endif
 
 static float *step(Model *m, const int *ids, int S, int pos_base) {

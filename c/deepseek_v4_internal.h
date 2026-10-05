@@ -232,7 +232,39 @@ typedef struct {
     /* Optional per-tensor backend-resident mirrors (Dsv4CudaTensor* on the CUDA
      * tier). Aligned 1:1 with plan.tensors[]; owned by the engine's GPU tier. */
     void *gpu[COLI_V4_MAX_LAYER_TENSORS];
+    /* Dense weights on the Vulkan device only (COLI_VK_DENSE_HOST): mapped = the tensor
+     * sits in an anonymous mapping of its own, whose pages can be given back while the
+     * address stays reserved (the device copies are looked up by it); host_gone = they
+     * were given back, the device holds the tensor alone. */
+    unsigned char mapped[COLI_V4_MAX_LAYER_TENSORS];
+    unsigned char host_gone[COLI_V4_MAX_LAYER_TENSORS];
 } ColiDeepSeekV4LayerWeights;
+
+/* The resident tensors a Vulkan device may hold alone (docs/vulkan.md, "Dense weights on
+ * the device only"): every fp8 matrix, which the CPU reads only through the native_quant
+ * entries, and the compressors' bf16 projections, which it reads only in
+ * coli_v4_compressor_step; both read a dropped tensor back first
+ * (coli_v4_layer_host_restore). Everything else stays in RAM: norms, block scales, sinks,
+ * the compressors' ape, the mHC mixes, the router and the hash router's table, the
+ * indexer's weights_proj (multiplied inline on the CPU). */
+static inline int coli_v4_dense_device_only_tensor(const ColiDeepSeekV4TensorSpec *spec) {
+    if (!spec || spec->rank != 2) return 0;
+    if (spec->dtype == COLI_ST_F8_E4M3) return 1;
+    if (spec->dtype != COLI_ST_BF16) return 0;
+    size_t n = strlen(spec->name);
+    static const char *const tail[] = {"compressor.wkv.weight", "compressor.wgate.weight"};
+    for (int k = 0; k < 2; k++) {
+        size_t t = strlen(tail[k]);
+        if (n >= t && !strcmp(spec->name + n - t, tail[k])) return 1;
+    }
+    return 0;
+}
+/* Its bytes in RAM (fp8 one a value, bf16 two). */
+static inline uint64_t coli_v4_dense_tensor_bytes(const ColiDeepSeekV4TensorSpec *spec) {
+    uint64_t count = 1;
+    for (int axis = 0; axis < spec->rank; axis++) count *= (uint64_t)spec->shape[axis];
+    return spec->dtype == COLI_ST_BF16 ? count * 2 : count;
+}
 
 int coli_v4_layer_plan(ColiDeepSeekV4LayerPlan *plan,
                        const ColiDeepSeekV4Config *config, int layer,
@@ -251,6 +283,28 @@ void coli_v4_layer_free(ColiV4Engine *engine,
 const void *coli_v4_layer_data(const ColiDeepSeekV4LayerWeights *weights,
                                const char *name,
                                const ColiDeepSeekV4TensorSpec **spec);
+
+/* Dense weights on the Vulkan device only. The engine binary built with VK=1 sets these
+ * pointers; every other link sees NULL and keeps its dense layers in RAM.
+ *   coli_v4_dense_device_decide: asked by the RAM plan (EXPERT_STORE_AUTO) once it has
+ *     measured the memory, with the bytes the device would hold and the RAM it would give
+ *     back; 1 = the dense layers live on the device, their droppable tensors out of RAM.
+ *   coli_v4_dense_place: after a resident layer is read, its tensors to the device and
+ *     the droppable ones' pages given back (coli_v4_layer_host_drop).
+ *   coli_v4_dense_device_lost: 1 once the device is gone; resident layers are then read
+ *     per forward as a low-memory plan reads them. */
+typedef int (*ColiV4DenseDeviceDecide)(ColiV4Engine *engine, uint64_t device_bytes,
+                                       uint64_t host_bytes);
+extern ColiV4DenseDeviceDecide coli_v4_dense_device_decide;
+extern int (*coli_v4_dense_place)(ColiV4Engine *engine, int layer);
+extern int (*coli_v4_dense_device_lost)(void);
+/* A droppable tensor read again from disk per forward after the device was lost (bytes). */
+extern void (*coli_v4_dense_reread)(uint64_t bytes);
+/* Gives back the pages of resident tensor i of a layer (mapped, droppable); 0 on success. */
+int coli_v4_layer_host_drop(ColiV4Engine *engine, int layer, size_t i);
+/* Reads back from disk the dropped tensor that holds `data`, at its own address: 1 and
+ * its bytes when it did, 0 when `data` is in no dropped tensor, -1 on a read failure. */
+int coli_v4_layer_host_restore(ColiV4Engine *engine, const void *data, uint64_t *bytes);
 
 /* Backend-mirror accessors: the gpu handle attached to the tensor named
  * "layers.<N>.<suffix>.weight", or NULL when the tier did not upload it. */
@@ -977,6 +1031,10 @@ struct ColiV4Engine {
         unsigned char ready[COLI_V4_RESIDENT_MAX_LAYERS];
         const ColiSafetensorsIndex *index;
         uint64_t total_bytes;
+        /* COLI_VK_DENSE_HOST: the layers' droppable tensors on the Vulkan device only
+         * (the plan left them out of RAM); what the device holds and what RAM gave back */
+        int device_only;
+        uint64_t device_bytes, dropped_bytes;
     } dense_resident;
     /* Optional CUDA tier (compiled in only when the engine build defines
      * COLI_V4_GPU_TIER on Windows). enabled is 1 only after the loader resolved

@@ -47,6 +47,11 @@
  * Prompt-cache and prefix reuse need nothing more: a reused prefix is rows below the
  * watermark and a KDA state that already sits where the next step expects it.
  *
+ * Past the device's budget (vk_kvsplit.h) each MLA layer keeps only a window of the
+ * newest blocks of its latent and rope rows on the device; the attention core runs
+ * over those on the device and over the older positions on the CPU (from the host's
+ * canonical cache) at once, merged through the softmax statistics.
+ *
  * A device lost while it holds the newest KDA state: the state is rebuilt on the CPU
  * from the host's copy (current at host_pos) and the prefix record's ids up to where
  * the device was (a prefill's worth of CPU work), the forward runs again on the CPU
@@ -59,6 +64,7 @@
  * K3_DEBUG_OUT), without a head (K3_LAYERS), and for a geometry past the ops' limits
  * (a KDA head above 128 floats, kv_lora above 1024, qk_rope above 128 or odd). */
 #include "vk_chain.h"
+#include "vk_kvsplit.h"
 
 #define K3C_HOST 0
 #define K3C_DEV  1
@@ -75,6 +81,9 @@ typedef struct {
     K3cKda *kda; K3cFfn *ffn; VkcMla *mla; ColiVkTensor **mg, *head;
     VkcMlaCache *kv; VkcBuf **win, **st;
     int *kv_valid, *mla_ord, n_mla;
+    int dev_rows;                             /* device latent/rope rows a layer: cap, or the split's */
+    VkcKvSplit ks;                            /* the split past the device's budget (ks.on) */
+    VkcMlaCache kvtmp;                        /* the split: a step's new rows before their slots */
     int where, host_zero, dev_pos, host_pos;  /* the KDA state: who holds the newest, where each side is */
     VkcMlaScratch sc;
     VkcBuf *x, *bres, *hm, *nrm, *att, *qkv3, *cm, *t1, *kf, *kb, *kg, *ky, *gate, *lg, *z;
@@ -89,13 +98,48 @@ typedef struct {
 static K3Chain *g_k3c;
 static int g_k3c_on;       /* COLI_VK_CHAIN as decided (on, or prompts only), the chain set up */
 static int g_k3c_inited;   /* vkc_init ran: vkc_shutdown goes at exit */
-
-static int k3c_chunk_rows(void) {
-    const char *e = getenv("COLI_VK_CHAIN_ROWS");
-    int v = e && *e ? atoi(e) : 512;
-    return v < 1 ? 1 : v > 65535 ? 65535 : v;
+/* The chain's own f32 tensors (the router, the KDA decay pair, beta): with the dense
+ * weights on the device only (COLI_VK_DENSE_HOST) the per-matrix path multiplies by them
+ * too, and the CPU drops its copies. which: 0 the router, 1 f_a, 2 f_b, 3 b_proj. */
+static ColiVkTensor *k3c_f32_tensor(int li, int which) {
+    K3Chain *ch = g_k3c;
+    if (!ch || !ch->ok || li < 0 || li >= ch->m->c.n_layers) return NULL;
+    switch (which) {
+    case 0: return ch->ffn[li].router;
+    case 1: return ch->kda[li].fa;
+    case 2: return ch->kda[li].fb;
+    case 3: return ch->kda[li].bp;
+    }
+    return NULL;
 }
-static int k3c_res(VkcBuf **b, size_t floats, int kind) { return vkc_reserve(b, (floats ? floats : 1) * sizeof(float), kind); }
+
+/* k3c_res counts instead of reserving while g_k3c_count >= 0 (the chunk's sizing) */
+static long long g_k3c_count = -1;
+static int k3c_res(VkcBuf **b, size_t floats, int kind) {
+    if (g_k3c_count >= 0) { g_k3c_count += (long long)(floats ? floats : 1) * (long long)sizeof(float); return 1; }
+    return vkc_reserve(b, (floats ? floats : 1) * sizeof(float), kind);
+}
+static int k3c_scratch(K3Chain *ch, const Model *m, int rows);
+/* Prompt rows per chunk (vkc_chunk_rows): the chain's scratch a row, counted from the
+ * reservations (the MLA scratch as vkc_mla_scratch sizes it), and the routed experts'
+ * outputs (the tier's rows, the CPU's, the host's sum, in the latent space) for it. */
+static int k3c_chunk_rows(K3Chain *ch, const Model *m) {
+    if (!vkc_chunk_auto()) return vkc_chunk_rows("kimi_k3", 0);
+    const Cfg *c = &m->c;
+    size_t mla = 0;
+    for (int i = 0; i < c->n_layers; i++) if (!m->L[i].kda) {
+        const VkcMla *a = &ch->mla[i];
+        mla = (size_t)(a->q_lora > 0 ? a->q_lora : 1) + (size_t)a->H * (a->Q + a->R) + (size_t)(a->K + a->R) +
+              2 * (size_t)a->H * a->K + (size_t)a->H * a->V;
+        break;
+    }
+    size_t ksz = ch->kvd_layer;
+    g_k3c_count = 0; k3c_scratch(ch, m, 1); long long b1 = g_k3c_count;
+    g_k3c_count = 0; k3c_scratch(ch, m, 2); long long b2 = g_k3c_count;
+    g_k3c_count = -1; ch->kvd_layer = ksz;
+    size_t row = (size_t)(b2 - b1) + mla * sizeof(float) + (size_t)(2 * c->topk + 1) * c->latent * sizeof(float);
+    return vkc_chunk_rows("kimi_k3", row);
+}
 
 /* A W's device copy into *t: the per-matrix path's own where it made one (the shared
  * experts under COLI_VK_DENSE), else one of the chain's, which w_matmul never sees (so
@@ -147,7 +191,7 @@ static void k3c_host_wrote(Model *m, int zero) {
     K3Chain *ch = g_k3c;
     if (!ch || !ch->ok || ch->m != m) return;
     ch->where = K3C_HOST; ch->host_zero = zero;
-    if (zero) for (int i = 0; i < m->c.n_layers; i++) ch->kv_valid[i] = 0;
+    if (zero) { for (int i = 0; i < m->c.n_layers; i++) ch->kv_valid[i] = 0; vkc_kv_reset(&ch->ks); }
 }
 /* A CPU forward from pos0: the host's state current before it, the device's stale after
  * (and its MLA rows from pos0 on). */
@@ -156,7 +200,10 @@ static void k3c_cpu_step(Model *m, int pos0) {
     if (!ch || !ch->ok || ch->m != m) return;
     k3c_sync_host(m);
     ch->where = K3C_HOST; ch->host_zero = 0;
-    for (int i = 0; i < m->c.n_layers; i++) if (ch->kv_valid[i] > pos0) ch->kv_valid[i] = pos0;
+    for (int i = 0; i < m->c.n_layers; i++) {
+        if (ch->kv_valid[i] > pos0) ch->kv_valid[i] = pos0;
+        if (!m->L[i].kda) vkc_kv_lower(&ch->ks, ch->mla_ord[i], pos0);
+    }
 }
 
 /* The device was lost. If it held the newest KDA state (dev), the state is rebuilt on
@@ -314,7 +361,7 @@ static int k3c_scratch(K3Chain *ch, const Model *m, int rows) {
     int mfull = -1; for (int i = 0; i < c->n_layers; i++) if (!m->L[i].kda) { mfull = i; break; }
     size_t r = (size_t)rows;
     ch->kvd_layer = r * (c->kv_lora + R);
-    int ok = (mfull < 0 || vkc_mla_scratch(&ch->sc, &ch->mla[mfull], rows)) &&
+    int ok = (mfull < 0 || g_k3c_count >= 0 || vkc_mla_scratch(&ch->sc, &ch->mla[mfull], rows)) &&
              k3c_res(&ch->x, r * D, VKC_DEV) && k3c_res(&ch->bres, r * ch->nbmax * D, VKC_DEV) &&
              k3c_res(&ch->hm, r * D, VKC_DEV) && k3c_res(&ch->nrm, r * D, VKC_DEV) && k3c_res(&ch->att, r * D, VKC_DEV) &&
              k3c_res(&ch->qkv3, 3 * r * P, VKC_DEV) && k3c_res(&ch->cm, r * 3 * P, VKC_DEV) &&
@@ -328,6 +375,12 @@ static int k3c_scratch(K3Chain *ch, const Model *m, int rows) {
              k3c_res(&ch->kvd, (size_t)(ch->n_mla ? ch->n_mla : 1) * ch->kvd_layer, VKC_DOWN) &&
              k3c_res(&ch->find, r * D, VKC_DOWN) && k3c_res(&ch->outd, c->vocab, VKC_DOWN) &&
              k3c_res(&ch->routed, r * LT, VKC_UP);
+    if (g_k3c_count >= 0) {   /* count the split without allocating or changing capacities */
+        if (ch->ks.on && mfull >= 0)
+            g_k3c_count += (long long)r * (3LL * c->n_heads * (c->kv_lora + 2) +
+                              (long long)c->n_heads * (c->kv_lora + R) + c->kv_lora + R) * sizeof(float);
+        return ok && (R <= 0 || k3c_res(&ch->cs, r * R, VKC_UP));
+    }
     if (ok && R > 0) {   /* NoPE: the rope parts pass through a rotation by angle 0 */
         size_t had = vkc_bytes(ch->cs) / sizeof(float);
         ok = k3c_res(&ch->cs, r * R, VKC_UP);
@@ -337,6 +390,10 @@ static int k3c_scratch(K3Chain *ch, const Model *m, int rows) {
             for (size_t i = 0; i + 1 < nf; i += 2) { cs[i] = 1.f; cs[i + 1] = 0.f; }
         }
     }
+    if (ok && ch->ks.on && mfull >= 0)   /* the split: the partial results, a step's new rows before their slots */
+        ok = vkc_kv_parts(&ch->ks, r * c->n_heads * (c->kv_lora + 2)) &&
+             (ch->kvtmp.cap >= rows || (k3c_res(&ch->kvtmp.lat, r * c->kv_lora, VKC_DEV) &&
+                                        (R == 0 || k3c_res(&ch->kvtmp.rope, r * R, VKC_DEV)) && (ch->kvtmp.cap = rows)));
     if (!ok) return 0;
     if (ch->rows < rows) {
         float *hu = realloc(ch->host_u, r * LT * sizeof(float)), *hs = hu ? realloc(ch->host_sco, r * E * sizeof(float)) : NULL;
@@ -348,30 +405,37 @@ static int k3c_scratch(K3Chain *ch, const Model *m, int rows) {
     return 1;
 }
 
-/* The MLA mirror at the host's capacity (m->max_t), filled again when that grows. */
-static int k3c_mirror(K3Chain *ch, const Model *m) {
+/* The MLA mirror at the host's capacity (m->max_t), filled again when that grows, and
+ * planned again then (vkc_kv_plan): whole when it fits the device's budget, else the
+ * split, for steps of `rows` rows. */
+static int k3c_mirror(K3Chain *ch, const Model *m, int rows) {
     const Cfg *c = &m->c;
     if (ch->cap == m->max_t) return 1;
+    size_t row = (size_t)(c->kv_lora + c->qk_rope) * sizeof(float);
+    if (ch->n_mla && !vkc_kv_plan(&ch->ks, "kimi_k3", ch->n_mla, row, m->max_t, rows, 0, (size_t)ch->n_mla * ch->dev_rows * row))
+        return 0;
+    int dr = ch->ks.on ? ch->ks.rows : m->max_t;
     for (int i = 0; i < c->n_layers; i++) {
         if (m->L[i].kda) continue;
         vkc_free(ch->kv[i].lat); vkc_free(ch->kv[i].rope);
         ch->kv[i] = (VkcMlaCache){NULL, NULL, 0};
         ch->kv_valid[i] = 0;
     }
-    ch->cap = 0;
+    ch->cap = 0; ch->dev_rows = 0;
     for (int i = 0; i < c->n_layers; i++) {
         if (m->L[i].kda) continue;
-        ch->kv[i].lat = vkc_buf((size_t)m->max_t * c->kv_lora * sizeof(float), VKC_DEV);
-        if (c->qk_rope > 0) ch->kv[i].rope = vkc_buf((size_t)m->max_t * c->qk_rope * sizeof(float), VKC_DEV);
-        ch->kv[i].cap = m->max_t;
+        ch->kv[i].lat = vkc_buf((size_t)dr * c->kv_lora * sizeof(float), VKC_DEV);
+        if (c->qk_rope > 0) ch->kv[i].rope = vkc_buf((size_t)dr * c->qk_rope * sizeof(float), VKC_DEV);
+        ch->kv[i].cap = dr;
         if (!ch->kv[i].lat || (c->qk_rope > 0 && !ch->kv[i].rope)) return 0;
     }
-    ch->cap = m->max_t;
+    ch->cap = m->max_t; ch->dev_rows = dr;
     return 1;
 }
 
-/* Record the uploads that make the device the host's below pb. */
-static int k3c_push(K3Chain *ch, const Model *m, int pb) {
+/* Record the uploads that make the device the host's below pb, for a step of n_rows
+ * rows (the split: its window placed first). */
+static int k3c_push(K3Chain *ch, const Model *m, int pb, int n_rows) {
     const Cfg *c = &m->c; int ok = 1, K = c->kv_lora, R = c->qk_rope;
     if (ch->where == K3C_HOST) {
         size_t ns = (size_t)c->kda_heads * c->kda_hd * c->kda_hd, nw = (size_t)c->kda_proj * c->conv_k;
@@ -386,6 +450,13 @@ static int k3c_push(K3Chain *ch, const Model *m, int pb) {
         ch->where = K3C_BOTH; ch->host_pos = pb;
     }
     for (int i = 0; i < c->n_layers && ok; i++) {
+        if (!m->L[i].kda && ch->ks.on) {   /* the split: the window placed, its rows below pb uploaded */
+            VkcKvPart pt[2] = {{1, K, m->Lc[i], 0, ch->kv[i].lat, 0}, {1, R, m->Rc[i], 0, ch->kv[i].rope, 0}};
+            vkc_kv_place(&ch->ks, ch->mla_ord[i], pb, n_rows);
+            ok = vkc_kv_push(&ch->ks, ch->mla_ord[i], pt, R ? 2 : 1, pb);
+            ch->kv_valid[i] = pb;
+            continue;
+        }
         if (m->L[i].kda || ch->kv_valid[i] >= pb) continue;
         int t0 = ch->kv_valid[i], n = pb - t0;
         ok = vkc_write(ch->kv[i].lat, (size_t)t0 * K, m->Lc[i] + (size_t)t0 * K, (size_t)n * K * sizeof(float)) &&
@@ -429,6 +500,12 @@ static int k3c_kda(K3Chain *ch, const Model *m, int i, int n) {
 }
 static int k3c_mla(K3Chain *ch, const Model *m, int i, int n, int pb) {
     size_t ko = (size_t)ch->mla_ord[i] * ch->kvd_layer;
+    if (ch->ks.on)   /* the split: the new rows into their slots, the core in two parts */
+        return vkc_kv_mla_qkv(&ch->ks, ch->mla_ord[i], &ch->mla[i], &ch->sc, ch->nrm, 0, n, pb, m->c.qk_rope > 0 ? ch->cs : NULL,
+                              &ch->kv[i], &ch->kvtmp, ch->kvd, ko) &&
+               vkc_matmul(ch->mg[i], ch->nrm, 0, ch->gate, 0, n) &&
+               vkc_kv_mla_attn(&ch->ks, ch->mla_ord[i], &ch->mla[i], &ch->sc, n, pb, 0, &ch->kv[i], NULL, 0, 0, ch->gate, 0,
+                               ch->att, 0, m->Lc[i], m->Rc[i]);
     return vkc_mla_qkv(&ch->mla[i], &ch->sc, ch->nrm, 0, n, pb, m->c.qk_rope > 0 ? ch->cs : NULL, &ch->kv[i], ch->kvd, ko) &&
            vkc_matmul(ch->mg[i], ch->nrm, 0, ch->gate, 0, n) &&
            vkc_mla_attn(&ch->mla[i], &ch->sc, n, pb, 0, &ch->kv[i], NULL, 0, 0, ch->gate, 0, ch->att, 0);
@@ -467,6 +544,16 @@ static void k3c_moe_host(K3Chain *ch, Model *m, int li, int n) {
  * final norm: the rows into *fin (when need_rows), the last row's logits into *last.
  * 0: not taken (the CPU runs the layers; nothing the caller holds changed). On a
  * cancel (poll), 1 with *cancelled set: the state is the caller's to reset. */
+/* The prompt block the engine hands the chain: its chunk, when the chain runs with a
+ * chunk from the budget (vkc_chunk_auto) and K3_CHUNK is not set; 0 = K3_CHUNK's (32). */
+static int k3c_prefill_rows(const Model *m) {
+    K3Chain *ch = g_k3c;
+    if (!g_k3c_on || !ch || !ch->ok || ch->failed || ch->m != m || getenv("K3_CHUNK") || !vkc_chunk_auto()) return 0;
+    if (m->trace || g_k3_val_layer >= 0 || g_k3_dfp) return 0;
+    if (!k3c_mirror(ch, m, 1)) return 0;
+    int rows = k3c_chunk_rows(ch, m);
+    return ch->ks.on && rows > ch->ks.chunk ? ch->ks.chunk : rows;
+}
 static int k3c_forward(Model *m, const float *hidden, int pos0, int C, int need_rows, float **fin_out,
                        float **last_out, K3CancelPoll poll, void *pctx, int *cancelled) {
     K3Chain *ch = g_k3c;
@@ -478,10 +565,12 @@ static int k3c_forward(Model *m, const float *hidden, int pos0, int C, int need_
         return 0;
     }
     const Cfg *c = &m->c; int L = c->n_layers, D = c->hidden, E = c->n_experts, LT = c->latent;
-    int CH = k3c_chunk_rows(), rows = C < CH ? C : CH;
     int dev0 = ch->where == K3C_DEV, dev_start = ch->dev_pos;
     if (vkc_lost()) { k3c_recover(m, dev0, dev_start); return 0; }
-    if (!k3c_mirror(ch, m) || !k3c_scratch(ch, m, rows)) {
+    int mirror_ok = k3c_mirror(ch, m, 1);
+    int CH = mirror_ok ? k3c_chunk_rows(ch, m) : 1, rows = C < CH ? C : CH;
+    if (ch->ks.on && rows > ch->ks.chunk) rows = ch->ks.chunk;   /* a step's rows fit the split's window */
+    if (!mirror_ok || !k3c_scratch(ch, m, rows)) {
         if (vkc_lost()) { k3c_recover(m, dev0, dev_start); return 0; }   /* lost while its buffers were made */
         fprintf(stderr, "[VK] kimi_k3 chain: device memory for %d rows at %d positions refused; the CPU runs the layers\n",
                 rows, m->max_t);
@@ -493,7 +582,7 @@ static int k3c_forward(Model *m, const float *hidden, int pos0, int C, int need_
     vkc_gemm_rows(-1);
     for (int c0 = 0; c0 < C; c0 += rows) {
         int n = C - c0 < rows ? C - c0 : rows, pb = pos0 + c0, end = c0 + n == C;
-        if (!vkc_begin() || !k3c_push(ch, m, pb) || !vkc_write(ch->x, 0, hidden + (size_t)c0 * D, (size_t)n * D * sizeof(float)))
+        if (!vkc_begin() || !k3c_push(ch, m, pb, n) || !vkc_write(ch->x, 0, hidden + (size_t)c0 * D, (size_t)n * D * sizeof(float)))
             goto lost;
         int ok = 1, pending = 0, pulled = 0, nb = 0;
         for (int i = 0; i < L && ok; i++) {
@@ -534,7 +623,11 @@ static int k3c_forward(Model *m, const float *hidden, int pos0, int C, int need_
             }
             ok = vkc_matmul(ch->ffn[i].router, ch->nrm, 0, ch->lg, 0, n) && vkc_matmul(ch->ffn[i].down, ch->nrm, 0, ch->z, 0, n) &&
                  vkc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E) && vkc_copy(ch->zd, 0, ch->z, 0, (size_t)n * LT) &&
-                 vkc_submit(1);                                    /* A1 */
+                 vkc_submit(0);                                    /* A1 */
+            /* while it runs, the tier loads the experts this layer will likely stream (a
+             * big prompt chunk only) */
+            if (ok) vkt_stream_prefetch(i, n);
+            ok = ok && vkc_finish();
             m->t_attn += now_s() - ta;
             if (!ok) break;
             k3c_pull(ch, m, pulled, i + 1, pb, n); pulled = i + 1;
@@ -563,7 +656,7 @@ static int k3c_forward(Model *m, const float *hidden, int pos0, int C, int need_
         if (!ok) goto lost;
         k3c_pull(ch, m, pulled, L, pb, n);
         if (need_rows) memcpy(fin + (size_t)c0 * D, vkc_ptr(ch->find), (size_t)n * D * sizeof(float));
-        for (int i = 0; i < L; i++) if (!m->L[i].kda) ch->kv_valid[i] = pb + n;
+        for (int i = 0; i < L; i++) if (!m->L[i].kda) { ch->kv_valid[i] = pb + n; vkc_kv_done(&ch->ks, ch->mla_ord[i], pb + n); }
         ch->where = K3C_DEV;
         if (end) memcpy(last, vkc_ptr(ch->outd), (size_t)c->vocab * sizeof(float));
     }
@@ -586,6 +679,7 @@ static void k3c_report(void) {
     fprintf(stderr, "[VK] kimi_k3 chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
                     "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %.1f MiB on the device\n",
             ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms, st.dev_bytes / 1048576.0);
+    vkc_kv_report(&ch->ks);
     vkc_prof_print();
 }
 

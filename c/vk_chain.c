@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "compat.h"
 
 static double vkc_now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
 
@@ -249,6 +250,7 @@ static VkPipeline make_pipe(VkShaderModule m, const VkSpecializationInfo *si) {
 
 static void dsv4_init(void);       /* chain_dsv4.comp (DeepSeek V4.1 / V4), below */
 static void dsv4_shutdown(void);
+static void kvs_shutdown(void);    /* chain_kvs.comp (the split KV cache), below */
 int vkc_init(void) {
     if (K.ready) return !K.lost;
     if (!coli_vk_core(&K.core)) return 0;
@@ -662,7 +664,7 @@ static int matmul_aligned(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcB
     struct VkcPC pc = {ti->fmt, S, ti->I, ti->O, ti->rowWords, ti->gs};
     int ok;
     /* the vectorized GEMV where the row is whole 16-byte steps and fits the staging */
-    int per = ti->fmt == 1 ? 16 : ti->fmt == 4 ? 32 : ti->fmt == 11 ? 8 : ti->fmt == 10 ? 4 : 0;
+    int per = ti->fmt == 1 ? 16 : ti->fmt == 4 ? 32 : ti->fmt == 11 || ti->fmt == 14 ? 8 : ti->fmt == 10 ? 4 : 0;
     int v4 = path < 0 && K.gemv4 && per && ti->rowWords % 4 == 0 && ti->I % 4 == 0 &&
              (ti->fmt != 4 || (ti->gs > 0 && ti->gs % 32 == 0)) && (ti->rowWords / 4) * per / 4 <= K.gemv4_xs;
     K.kind = path >= 0 ? PK_GEMM : ti->fmt == 1 ? PK_GEMV8 : PK_GEMV;
@@ -725,6 +727,69 @@ int vkc_attn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf 
     w.a = *p;
     return vkc_attn_w(q, kc, vc, o, gate, sel, NULL, &w);
 }
+/* ---- blocked attention for prompt chunks (chain_attnb.comp), made on first use ----
+ * chain_attn reads a row's positions once per (head, row): a chunk of S rows reads its
+ * KV cache S * H times, which held a 2048-row chunk of Qwen3.6 at 1.2 s a layer on a
+ * Radeon 780M. From COLI_VK_ATTN_BLOCK rows (16; 0 = never) a call takes chain_attnb,
+ * one workgroup per KV head and block of rows: each K and V row read once per block.
+ * Below it, and for decode and an MTP verify, chain_attn's bits as before. */
+static struct { VkShaderModule mod; VkPipeline pipe; int tried, bc; } KAB;
+static VkPipeline kab_pipe(void) {
+    if (KAB.pipe || KAB.tried || !vkc_ready()) return KAB.pipe;
+    KAB.tried = 1;
+    /* the tile of positions as the device's shared memory allows: K and V rows of 256
+     * floats, the partial dots and the scores, about 3.2 KiB a position */
+    VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties((VkPhysicalDevice)K.core.phys, &pp);
+    int bc = 16;
+    while (bc >= 4 && (size_t)bc * (2 * 256 + 32 * 8 + 32 + 1) * 4 > pp.limits.maxComputeSharedMemorySize) bc /= 2;
+    if (bc < 4) return VK_NULL_HANDLE;
+    if ((KAB.mod = load_module(K.core.spv_path, "chain_attnb.spv"))) {
+        int32_t v = bc;
+        VkSpecializationMapEntry me = {0, 0, 4};
+        VkSpecializationInfo si = {1, &me, 4, &v};
+        if ((KAB.pipe = make_pipe(KAB.mod, &si))) KAB.bc = bc;
+    }
+    return KAB.pipe;
+}
+static void kab_shutdown(void) {
+    if (KAB.pipe) vkDestroyPipeline(K.dev, KAB.pipe, NULL);
+    if (KAB.mod) vkDestroyShaderModule(K.dev, KAB.mod, NULL);
+    memset(&KAB, 0, sizeof KAB);
+}
+/* ---- attention over a prompt chunk, cut over several submissions ----------------
+ * The attention ops' work grows with rows x positions: a chunk of thousands of rows makes
+ * one dispatch of seconds (8192 rows of Qwen3.6 at its full context: about 5 s on a Radeon
+ * 780M), past what a driver lets one submission run (amdgpu resets a ring after 10 s;
+ * Windows' TDR after 2 s). An attention whose rows x positions x heads x head dim passes
+ * COLI_VK_ATTN_SLICE (2^32; 0 = never) is recorded in slices of rows, each ending the
+ * frame it is in (submitted, not waited for) and the next opening a frame of its own: the
+ * next frame's first barrier orders it after the slice. A slice starts at a multiple of
+ * `align` (the blocked attention's rows per workgroup), so its blocks are the ones the
+ * whole dispatch would have made, and no row's arithmetic changes. */
+static long long attn_slice_budget(void) {
+    const char *e = getenv("COLI_VK_ATTN_SLICE");
+    long long v = e && *e ? atoll(e) : (1LL << 32);
+    return v < 0 ? 0 : v;
+}
+static int attn_slice_rows(int S, int pos_base, double width, int align) {
+    long long b = attn_slice_budget();
+    if (align < 1) align = 1;
+    if (!b || S <= align) return S;
+    double per_row = (double)(pos_base + S) * (width > 1 ? width : 1);
+    long long rr = (long long)((double)b / per_row);
+    rr = rr / align * align;
+    if (rr < align) rr = align;
+    return rr >= S ? S : (int)rr;
+}
+static int attn_slice_next(void) {   /* the open frame out, a new one in */
+    K.st.attn_slices++;
+    return vkc_submit(0) && vkc_begin();
+}
+int vkc_attn_block_rows(void) {
+    const char *e = getenv("COLI_VK_ATTN_BLOCK");
+    int v = e && *e ? atoi(e) : 16;
+    return v < 0 ? 0 : v;
+}
 int vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf *sel, VkcBuf *snk,
                const VkcAttnW *p) {
     K.kind = PK_ATTN;
@@ -732,7 +797,24 @@ int vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBu
     if (w.vd <= 0) w.vd = w.a.hd;
     if (w.a.hd > 256 || w.vd > 256 || w.a.H % w.a.KVH || w.win < 0 || w.ring < 0 || (w.sink && !snk)) return 0;
     VkcBind bd[7] = {B(q, 0), B(kc, 0), B(vc, 0), B(o, 1), B(gate, 0), B(sel, 0), B(snk, 0)};
-    return record(K.pipe[P_ATTN], bd, 7, &w, sizeof w, (uint32_t)w.a.H, (uint32_t)w.a.S, 1);
+    int G = w.a.H / w.a.KVH, blk = vkc_attn_block_rows();
+    int blocked = blk > 0 && w.a.S >= blk && G <= 32 && kab_pipe(), br = w.a.sel_row > 0 ? 1 : 32 / G;
+    int S = w.a.S, rr = attn_slice_rows(S, w.a.pos_base, (double)w.a.H * (w.a.hd > w.vd ? w.a.hd : w.vd), blocked ? br : 1);
+    int ok = 1;
+    for (int r0 = 0; ok && r0 < S; r0 += rr) {
+        VkcAttnW x = w;
+        int n = S - r0 < rr ? S - r0 : rr;
+        x.a.S = n; x.a.pos_base = w.a.pos_base + r0;
+        x.a.q_off += r0 * w.a.q_row; x.a.g_off += r0 * w.a.g_row; x.a.o_off += r0 * w.a.o_row;
+        if (w.a.sel_row > 0) x.a.sel_off += r0 * w.a.sel_row;
+        if (r0 && !attn_slice_next()) return 0;
+        if (blocked) {
+            struct { VkcAttnW w; int br; } pc = {x, br};
+            ok = record(KAB.pipe, bd, 7, &pc, sizeof pc, (uint32_t)x.a.KVH, (uint32_t)((x.a.S + br - 1) / br), 1);
+            K.st.attn_blocked += ok;
+        } else ok = record(K.pipe[P_ATTN], bd, 7, &x, sizeof x, (uint32_t)x.a.H, (uint32_t)x.a.S, 1);
+    }
+    return ok;
 }
 int vkc_dnconv(VkcBuf *in, VkcBuf *w, VkcBuf *ring, VkcBuf *out, VkcBuf *snap, const VkcDnConv *p) {
     K.kind = PK_DNCONV;
@@ -804,11 +886,22 @@ int vkc_mla_core(VkcBuf *qabs, VkcBuf *qr, VkcBuf *lat, VkcBuf *rope, VkcBuf *se
     K.kind = PK_MLA;
     if (!K.mla_ok || p->S < 1 || p->H < 1 || p->K < 1 || p->K > 1024 || p->R < 0 || p->R > 128 ||
         (p->R > 0 && !rope) || p->pos_base < 0 || p->kv_start < 0 || p->kv_start > p->pos_base) return 0;
-    struct { int mode; VkcMlaCore b; } pc = {0, *p};
+    typedef struct { int mode; VkcMlaCore b; } CorePC;
+    CorePC pc = {0, *p};
     if (!sel) pc.b.sel_row = 0;
     VkcBind bd[6] = {B(qabs, 0), B(qr, 0), B(lat, 0), B(p->R > 0 ? rope : NULL, 0), B(pc.b.sel_row > 0 ? sel : NULL, 0),
                      B(clat, 1)};
-    return record(K.mpipe[PM_MLA], bd, 6, &pc, sizeof pc, (uint32_t)p->H, (uint32_t)p->S, 1);
+    /* a long prompt chunk in slices of rows, a submission each (attn_slice_rows) */
+    int S = p->S, rr = attn_slice_rows(S, p->pos_base, (double)p->H * (p->K + p->R), 1), ok = 1;
+    for (int r0 = 0; ok && r0 < S; r0 += rr) {
+        CorePC x = pc;
+        x.b.S = S - r0 < rr ? S - r0 : rr; x.b.pos_base = p->pos_base + r0;
+        x.b.qa_off += r0 * p->qa_row; x.b.qr_off += r0 * p->qr_row; x.b.o_off += r0 * p->o_row;
+        if (pc.b.sel_row > 0) x.b.sel_off += r0 * pc.b.sel_row;
+        if (r0 && !attn_slice_next()) return 0;
+        ok = record(K.mpipe[PM_MLA], bd, 6, &x, sizeof x, (uint32_t)p->H, (uint32_t)x.b.S, 1);
+    }
+    return ok;
 }
 static int mla_rowop(int mode, VkcBuf *x, VkcBuf *aux, VkcBuf *y, const VkcMlaRow *p) {
     if (!K.mla_ok || !open_frame() || K.lost || p->nseg < 0) return 0;
@@ -1058,10 +1151,136 @@ int vkc_relattn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *kvs, VkcBu
     if (!pipe || p->hd > 256 || p->d_rel > 64 || p->d_rel < 0 || p->KVH < 1 || p->H % p->KVH || p->cap < 1) return 0;
     K.kind = PK_ATTN;
     VkcBind bd[8] = {B(q, 0), B(kc, 0), B(vc, 0), B(o, 1), B(kvs, 0), B(r, 0), B(relp, 0), B(tau, 0)};
-    return record(pipe, bd, 8, p, sizeof *p, (uint32_t)p->H, (uint32_t)p->S, 1);
+    /* a long prompt chunk in slices of rows, a submission each (attn_slice_rows): the
+     * shader's s0 is the slice's first row, pos_base stays the step's */
+    int S = p->S, rr = attn_slice_rows(S, p->pos_base, (double)p->H * p->hd, 1), ok = 1;
+    for (int r0 = 0; ok && r0 < S; r0 += rr) {
+        struct { VkcRelAttn a; int s0; } x = {*p, r0};
+        x.a.S = S - r0 < rr ? S - r0 : rr;
+        x.a.q_off += r0 * p->q_row; x.a.o_off += r0 * p->o_row; x.a.r_off += r0 * p->r_row; x.a.tau_off += r0;
+        if (r0 && !attn_slice_next()) return 0;
+        ok = record(pipe, bd, 8, &x, sizeof x, (uint32_t)p->H, (uint32_t)x.a.S, 1);
+    }
+    return ok;
+}
+
+/* ---- the decision engines' encoders: chain_enc.comp, made on first use ---- */
+static struct { VkShaderModule mod; VkPipeline pipe; int tried; } KE;
+static VkPipeline ke_pipe(void) {
+    if (KE.pipe || KE.tried || !vkc_ready()) return KE.pipe;
+    KE.tried = 1;
+    if ((KE.mod = load_module(K.core.spv_path, "chain_enc.spv"))) KE.pipe = make_pipe(KE.mod, NULL);
+    return KE.pipe;
+}
+static void ke_shutdown(void) {
+    if (KE.pipe) vkDestroyPipeline(K.dev, KE.pipe, NULL);
+    if (KE.mod) vkDestroyShaderModule(K.dev, KE.mod, NULL);
+    memset(&KE, 0, sizeof KE);
+}
+int vkc_enc_ready(void) { return ke_pipe() != VK_NULL_HANDLE; }
+static int ke_ew(int kind, int mode, void *pc, size_t bytes, const VkcBind *bd, int nb, uint64_t n) {
+    VkPipeline pipe = ke_pipe();
+    if (!pipe) return 0;
+    *(int *)pc = mode;
+    K.kind = kind;
+    uint32_t gx, gy; grid((n + 255) / 256, &gx, &gy);
+    return record(pipe, bd, nb, pc, bytes, gx, gy, 1);
+}
+int vkc_enc_norm(VkcBuf *a, VkcBuf *b, VkcBuf *prm, VkcBuf *y, const VkcEncNorm *p) {
+    VkPipeline pipe = ke_pipe();
+    if (!pipe || p->D < 1 || p->D > 4096) return 0;
+    VkcEncNorm c = *p;
+    c.mode = 0;
+    K.kind = PK_NORM;
+    VkcBind bd[4] = {B(a, (p->flags & VKC_ENC_SUM) != 0), B((p->flags & VKC_ENC_ADD) ? b : NULL, 0), B(prm, 0), B(y, 1)};
+    uint32_t gx, gy; grid((uint64_t)p->rows, &gx, &gy);
+    return record(pipe, bd, 4, &c, sizeof c, gx, gy, 1);
+}
+int vkc_enc_bias(VkcBuf *y, VkcBuf *prm, const VkcEncBias *p) {
+    VkcEncBias c = *p;
+    VkcBind bd[4] = {B(NULL, 0), B(NULL, 0), B(prm, 0), B(y, 1)};
+    return ke_ew(PK_EW, 1, &c, sizeof c, bd, 4, (uint64_t)p->n);
+}
+int vkc_enc_geglu(VkcBuf *a, VkcBuf *prm, VkcBuf *y, const VkcEncGeglu *p) {
+    VkcEncGeglu c = *p;
+    VkcBind bd[4] = {B(a, 0), B(NULL, 0), B(prm, 0), B(y, 1)};
+    return ke_ew(PK_EW, 2, &c, sizeof c, bd, 4, (uint64_t)p->n);
+}
+int vkc_enc_rope(VkcBuf *x, VkcBuf *tab, VkcBuf *pos, const VkcEncRope *p) {
+    if (p->hd < 2 || p->hd % 2) return 0;
+    VkcEncRope c = *p;
+    VkcBind bd[5] = {B(x, 1), B(tab, 0), B(NULL, 0), B(NULL, 0), B(pos, 0)};
+    return ke_ew(PK_ROPE, 3, &c, sizeof c, bd, 5, (uint64_t)p->n);
+}
+int vkc_enc_addrow(VkcBuf *y, VkcBuf *tab, VkcBuf *idx, const VkcEncAddRow *p) {
+    VkcEncAddRow c = *p;
+    VkcBind bd[5] = {B(NULL, 0), B(NULL, 0), B(tab, 0), B(y, 1), B(idx, 0)};
+    return ke_ew(PK_EW, 4, &c, sizeof c, bd, 5, (uint64_t)p->n);
+}
+int vkc_enc_attn(VkcBuf *qkv, VkcBuf *c2p, VkcBuf *p2c, VkcBuf *o, VkcBuf *rng, VkcBuf *ridx, VkcBuf *pos,
+                 const VkcEncAttn *p) {
+    VkPipeline pipe = ke_pipe();
+    if (!pipe || p->hd < 1 || p->hd > 128 || p->S < 1 || p->H < 1) return 0;
+    VkcEncAttn c = *p;
+    c.mode = 5;
+    K.kind = PK_ATTN;
+    VkcBind bd[7] = {B(qkv, 0), B(c2p, 0), B(p2c, 0), B(o, 1), B(rng, 0), B(ridx, 0), B(pos, 0)};
+    return record(pipe, bd, 7, &c, sizeof c, (uint32_t)p->H, (uint32_t)((p->S + 15) / 16), 1);
+}
+int vkc_enc_rel(VkcBuf *x, VkcBuf *pt, VkcBuf *y, const VkcEncRel *p) {
+    VkPipeline pipe = ke_pipe();
+    if (!pipe || p->hd < 1 || p->S < 1 || p->H < 1 || p->nr < 1) return 0;
+    VkcEncRel c = *p;
+    c.mode = 6;
+    K.kind = PK_ATTN;
+    VkcBind bd[4] = {B(x, 0), B(pt, 0), B(NULL, 0), B(y, 1)};
+    return record(pipe, bd, 4, &c, sizeof c, (uint32_t)((p->nr + 63) / 64), (uint32_t)((p->S + 15) / 16), (uint32_t)p->H);
 }
 
 void vkc_stats(VkcStats *st) { *st = K.st; }
+
+/* ---- big prefill chunks ------------------------------------------------------------
+ * The rows of a prompt chunk (vk_chain.h, vkc_chunk_rows). The free device memory is
+ * read once, at an engine's first call: a later reading would count the chain's own
+ * scratch as used and shrink the chunk from one forward to the next. */
+int vkc_chunk_auto(void) {
+    const char *e = getenv("COLI_VK_CHAIN_ROWS");
+    return !(e && *e) || !strcmp(e, "auto");
+}
+int vkc_chunk_rows(const char *engine, size_t row_bytes) {
+    const char *e = getenv("COLI_VK_CHAIN_ROWS");
+    if (e && *e && strcmp(e, "auto") != 0) {
+        int v = atoi(e);
+        return v < 1 ? 1 : v > 65535 ? 65535 : v;
+    }
+    static char said[16][24]; static int nsaid, rows_said[16];
+    for (int i = 0; i < nsaid; i++) if (!strcmp(said[i], engine ? engine : "")) return rows_said[i];
+    const char *mx = getenv("COLI_VK_CHAIN_ROWS_MAX");
+    int cap = mx && *mx ? atoi(mx) : 8192;
+    if (cap < 1) cap = 1;
+    if (cap > 65535) cap = 65535;
+    double used = 0, bud = 0, free_b;
+    int have = coli_vk_mem_budget(&used, &bud);
+    free_b = have ? (bud - used) * 1e9 : (double)coli_vk_device_local_bytes() / 4;
+    /* Expert outputs and CPU fallback scratch also grow with the chunk on a
+     * discrete device. Bound both memories, including Windows commit headroom. */
+    double avail = compat_mem_available_gb() * 1e9;
+    if (avail > 0 && avail < free_b) free_b = avail;
+    if (free_b < 0) free_b = 0;
+    double fit = row_bytes ? free_b / 2 / (double)row_bytes : cap;
+    int rows = fit >= cap ? cap : (int)fit;
+    if (rows < cap && rows >= 256) rows = rows / 256 * 256;
+    if (rows < 1) rows = 1;
+    if (nsaid < 16) {
+        snprintf(said[nsaid], sizeof said[nsaid], "%s", engine ? engine : "");
+        rows_said[nsaid++] = rows;
+        fprintf(stderr, "[VK] %s chain: prompt chunks of up to %d rows (%.0f KiB a row; %.2f GiB free on the device%s, "
+                "half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at %d)\n",
+                engine ? engine : "engine", rows, row_bytes / 1024.0, free_b / 1073741824.0,
+                avail > 0 ? " or in RAM" : "", cap);
+    }
+    return rows;
+}
 void vkc_prof_print(void) {
     if (!K.prof) return;
     double tot = 0; for (int k = 0; k < PK_N; k++) tot += K.prof_ms[k];
@@ -1097,6 +1316,8 @@ void vkc_shutdown(void) {
     }
     if (K.cpool) vkDestroyCommandPool(K.dev, K.cpool, NULL);
     kx_shutdown();
+    kab_shutdown();
+    ke_shutdown();
     for (int i = 0; i < P_NPIPE; i++) {
         if (K.pipe[i]) vkDestroyPipeline(K.dev, K.pipe[i], NULL);
         if (K.mod[i]) vkDestroyShaderModule(K.dev, K.mod[i], NULL);
@@ -1115,6 +1336,7 @@ void vkc_shutdown(void) {
     if (K.pl) vkDestroyPipelineLayout(K.dev, K.pl, NULL);
     if (K.dsl) vkDestroyDescriptorSetLayout(K.dev, K.dsl, NULL);
     dsv4_shutdown();
+    kvs_shutdown();
     memset(&K, 0, sizeof K);
     K.cur = -1; K.gemm_rows = -1;
 }
@@ -1221,4 +1443,105 @@ int vkc_dsv4_swiglu(VkcBuf *a, VkcBuf *b, VkcBuf *y, const VkcDsSwiglu *p) {
     uint32_t gx, gy; grid(((uint64_t)p->n + 255) / 256, &gx, &gy);
     VkcBind bd[6] = {B(a, 0), B(b, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(y, 1)};
     return dsv4_rec(PK_EW, 8, p, sizeof *p, bd, 6, gx, gy);
+}
+
+/* ---- a KV cache split between the device and the host (chain_kvs.comp) ------------
+ * Its own optional pipeline, as DeepSeek's: without the shader only these ops decline
+ * (and an engine's split with them: past the budget its chain declines as before). */
+static struct { VkShaderModule mod; VkPipeline pipe; int tried; } KS;
+static VkPipeline kvs_pipe(void) {
+    if (KS.pipe || KS.tried || !vkc_ready()) return KS.pipe;
+    KS.tried = 1;
+    char path[1200];
+    const char *sl = strrchr(K.core.spv_path, '/');
+    size_t pre = sl ? (size_t)(sl - K.core.spv_path) + 1 : 0;
+    const char *file = "chain_kvs.spv";
+    if (pre + strlen(file) + 1 >= sizeof path) return VK_NULL_HANDLE;
+    memcpy(path, K.core.spv_path, pre); strcpy(path + pre, file);
+    FILE *f = fopen(path, "rb");
+    if (!f) return VK_NULL_HANDLE;
+    fclose(f);
+    if ((KS.mod = load_module(K.core.spv_path, file))) KS.pipe = make_pipe(KS.mod, NULL);
+    return KS.pipe;
+}
+static void kvs_shutdown(void) {
+    if (KS.pipe) vkDestroyPipeline(K.dev, KS.pipe, NULL);
+    if (KS.mod) vkDestroyShaderModule(K.dev, KS.mod, NULL);
+    memset(&KS, 0, sizeof KS);
+}
+int vkc_kvs_ready(void) { return kvs_pipe() != VK_NULL_HANDLE; }
+int vkc_kvs_attn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *out, VkcBuf *gate, VkcBuf *sel, VkcBuf *snk, VkcBuf *tab,
+                 const VkcKvsAttn *p) {
+    VkPipeline pipe = kvs_pipe();
+    if (!pipe || !q || !kc || !vc || !out || !tab || p->S < 1 || p->S > 65535 || p->H < 1 || p->H > 65535 ||
+        p->KVH < 1 || p->H % p->KVH || p->hd < 1 || p->hd > 256 || p->vd < 1 || p->vd > 256 || p->B < 1 || p->ns < 1 ||
+        p->nblk < 0 || p->anchor < 0 || p->win < 0 || (p->sink && !snk) || (p->sel_row > 0 && !sel) ||
+        ((p->flags & VKC_KVS_GATE) && (!gate || !(p->flags & VKC_KVS_FIN)))) return 0;
+    struct { int mode; VkcKvsAttn b; } pc = {0, *p};
+    K.kind = PK_ATTN;
+    VkcBind bd[8] = {B(q, 0), B(kc, 0), B(vc, 0), B(out, 1), B(p->flags & VKC_KVS_GATE ? gate : NULL, 0),
+                     B(p->sel_row > 0 ? sel : NULL, 0), B(p->sink ? snk : NULL, 0), B(tab, 0)};
+    return record(pipe, bd, 8, &pc, sizeof pc, (uint32_t)p->H, (uint32_t)p->S, 1);
+}
+int vkc_kvs_mla(VkcBuf *qa, VkcBuf *qr, VkcBuf *lat, VkcBuf *rope, VkcBuf *sel, VkcBuf *out, VkcBuf *tab, const VkcKvsMla *p) {
+    VkPipeline pipe = kvs_pipe();
+    if (!pipe || !qa || !lat || !out || !tab || p->S < 1 || p->S > 65535 || p->H < 1 || p->H > 65535 || p->K < 1 ||
+        p->K > 1024 || p->R < 0 || p->R > 128 || (p->R > 0 && (!rope || !qr)) || p->B < 1 || p->ns < 1 || p->nblk < 0 ||
+        p->anchor < 0 ||
+        p->kv_start < 0 || (p->sel_row > 0 && !sel)) return 0;
+    struct { int mode; VkcKvsMla b; } pc = {1, *p};
+    K.kind = PK_MLA;
+    VkcBind bd[8] = {B(qa, 0), B(p->R > 0 ? qr : NULL, 0), B(lat, 0), B(p->R > 0 ? rope : NULL, 0), B(NULL, 0),
+                     B(p->sel_row > 0 ? sel : NULL, 0), B(out, 1), B(tab, 0)};
+    return record(pipe, bd, 8, &pc, sizeof pc, (uint32_t)p->H, (uint32_t)p->S, 1);
+}
+int vkc_kvs_merge(VkcBuf *dev, VkcBuf *cpu, VkcBuf *gate, VkcBuf *out, const VkcKvsMerge *p) {
+    VkPipeline pipe = kvs_pipe();
+    if (!pipe || !dev || !cpu || !out || p->n < 0 || p->H < 1 || p->d < 1 || ((p->flags & VKC_KVS_GATE) && !gate)) return 0;
+    if (p->n == 0) return open_frame() && !K.lost;
+    struct { int mode; VkcKvsMerge b; } pc = {2, *p};
+    K.kind = PK_ATTN;
+    VkcBind bd[4] = {B(dev, 0), B(cpu, 0), B(p->flags & VKC_KVS_GATE ? gate : NULL, 0), B(out, 1)};
+    uint32_t gx, gy; grid((uint64_t)p->n, &gx, &gy);
+    return record(pipe, bd, 4, &pc, sizeof pc, gx, gy, 1);
+}
+int vkc_kvs_rel(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *out, VkcBuf *r, VkcBuf *tau, VkcBuf *relp, VkcBuf *tab,
+                const VkcKvsRel *p) {
+    VkPipeline pipe = kvs_pipe();
+    if (!pipe || !q || !kc || !vc || !out || !tau || !tab || p->S < 1 || p->S > 65535 || p->H < 1 || p->H > 65535 ||
+        p->KVH < 1 || p->H % p->KVH || p->hd < 1 || p->hd > 256 || p->d_rel < 0 || p->d_rel > 64 ||
+        (p->d_rel > 0 && (!r || !relp)) || p->B < 1 || p->nblk < 0 || p->anchor < 0) return 0;
+    struct { int mode; VkcKvsRel b; } pc = {3, *p};
+    K.kind = PK_ATTN;
+    VkcBind bd[8] = {B(q, 0), B(kc, 0), B(vc, 0), B(out, 1), B(p->d_rel > 0 ? r : NULL, 0), B(tau, 0),
+                     B(p->d_rel > 0 ? relp : NULL, 0), B(tab, 0)};
+    return record(pipe, bd, 8, &pc, sizeof pc, (uint32_t)p->H, (uint32_t)p->S, 1);
+}
+int vkc_kvs_ds_cold(VkcBuf *q, VkcBuf *win, VkcBuf *cmp, VkcBuf *cold, VkcBuf *out, VkcBuf *prm, VkcBuf *list, VkcBuf *tab, const VkcKvsDs *p) {
+    VkPipeline pipe = kvs_pipe();
+    if (!pipe || !q || !win || !out || !prm || !list || !tab || p->S < 1 || p->S > 65535 || p->H < 1 || p->H > 65535 ||
+        p->hd < 1 || p->hd > 1024 || p->cnt < 0 || p->B < 1 || p->ns < 1 || p->nblk < 0 ||
+        ((p->flags & VKC_KVS_DSCOLD) && (!cold || !(p->flags & VKC_KVS_DSFIN))) ||
+        ((p->flags & VKC_KVS_V4) && !(p->flags & VKC_KVS_DSFIN))) return 0;
+    struct { int mode; VkcKvsDs b; } pc = {4, *p};
+    K.kind = PK_ATTN;
+    VkcBind bd[8] = {B(q, 0), B(win, 0), B(cmp ? cmp : win, 0), B(out, 1), B(prm, 0), B(list, 0), B(cold, 0), B(tab, 0)};
+    return record(pipe, bd, 8, &pc, sizeof pc, (uint32_t)p->H, (uint32_t)p->S, 1);
+}
+int vkc_kvs_ds(VkcBuf *q, VkcBuf *win, VkcBuf *cmp, VkcBuf *out, VkcBuf *prm, VkcBuf *list, VkcBuf *tab, const VkcKvsDs *p) {
+    return vkc_kvs_ds_cold(q, win, cmp, NULL, out, prm, list, tab, p);
+}
+unsigned long long vkc_serial(void) {
+    unsigned long long s = 0;
+    for (int i = 0; i < VKC_FRAMES; i++)
+        if (!K.fr[i].open && K.fr[i].serial > s) s = K.fr[i].serial;
+    return s;
+}
+int vkc_wait_serial(unsigned long long serial) {
+    if (!vkc_ready()) return 0;
+    for (int i = 0; i < VKC_FRAMES; i++) {
+        VkcFrame *f = &K.fr[i];
+        if (f->serial == serial && !f->open) return frame_wait(f) && !K.lost;
+    }
+    return !K.lost;   /* reused since: it completed long ago */
 }

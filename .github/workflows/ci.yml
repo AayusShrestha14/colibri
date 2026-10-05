@@ -183,6 +183,13 @@ jobs:
             req: c/tools/requirements-qwen38-tiny.txt
           - family: qwen-chain-sanitize
             req: c/tools/requirements-qwen38-tiny.txt
+          # speculative decoding with deeper verifies (MTP drafts up to 3, prompt-lookup
+          # drafts up to 5) on qwen36 and qwen38: against plain decoding on the CPU and
+          # in the dense chain, and the same under ASan and UBSan
+          - family: qwen-spec
+            req: c/tools/requirements-qwen38-tiny.txt
+          - family: qwen-spec-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
           # staged device-local uploads (COLI_VK_STAGED=1): the tier and the chain of qwen36
           # and qwen38, and an engine choosing staging on its own under an emulated window
           - family: qwen-staged
@@ -253,6 +260,82 @@ jobs:
             req: c/tools/requirements-kimi-k3-tiny.txt
           - family: kimi-chain-sanitize
             req: c/tools/requirements-kimi-k3-tiny.txt
+          # the dense weights on the device only (COLI_VK_DENSE_HOST=0): the host copies
+          # given back, the CPU's tokens, a lost device reading them back from disk;
+          # one leg per engine group, staged, and the same under ASan and UBSan
+          - family: dense-only-qwen38
+            req: c/tools/requirements-qwen38-tiny.txt
+          - family: dense-only-qwen38-staged
+            req: c/tools/requirements-qwen38-tiny.txt
+          - family: dense-only-qwen38-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
+          - family: dense-only-qwen36-olmoe
+            req: c/tools/requirements-qwen38-tiny.txt
+          - family: dense-only-qwen36-olmoe-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
+          - family: dense-only-inkling-mimo-kimi
+            req: c/tools/requirements-kimi-k3-tiny.txt
+            extra: pillow
+          - family: dense-only-inkling-mimo-kimi-sanitize
+            req: c/tools/requirements-kimi-k3-tiny.txt
+            extra: pillow
+          - family: dense-only-glm
+            req: c/tools/requirements-qwen38-tiny.txt
+            extra: pillow
+          - family: dense-only-glm-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
+            extra: pillow
+          - family: dense-only-deepseek
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          - family: dense-only-deepseek-sanitize
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          # big prompt chunks and expert streaming (docs/vulkan.md): every chain engine on a
+          # prompt past its usual block, the chunk from the budget, a forced small chunk and
+          # streaming threshold, staged, the feature off, and the forced runs under ASan
+          # and UBSan
+          - family: prefill-qwen
+            req: c/tools/requirements-qwen38-tiny.txt
+          - family: prefill-qwen-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
+          - family: prefill-inkling-olmoe
+            req: c/tools/oracle-requirements.txt
+          - family: prefill-mimo-kimi
+            req: c/tools/requirements-mimo-tiny.txt
+          - family: prefill-glm
+            req: c/tools/requirements-glm53-tiny.txt
+          - family: prefill-deepseek
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          # the KV cache split between the device and the host past the device's budget
+          # (COLI_VK_KV_DEVICE_ROWS emulates a small device): every chain engine against its
+          # CPU run, prefix reuse, serve sessions and a lost device across the split, and the
+          # same under ASan and UBSan; DeepSeek's in legs of their own (their fixtures pin
+          # another transformers)
+          - family: kv-split
+            req: c/tools/requirements-qwen38-tiny.txt
+            extra: numpy pillow
+          - family: kv-split-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
+            extra: numpy pillow
+          - family: kv-split-deepseek
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          - family: kv-split-deepseek-sanitize
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          # the decision engines: Laya's and GLiNER2.5-Decide's forward on the device and
+          # matrix by matrix, Clef's DECIDE on qwen36's paths in f32, int8 and f16, the
+          # tiny oracles, the serve tests and TypeSafe's SDKs through the device; and the
+          # same (but the SDKs) under ASan and UBSan
+          - family: decide
+            req: c/tools/requirements-jev-sdk.txt
+            extra: -r c/tools/oracle-requirements.txt
+            npm: c/tools/jev-sdk
+          - family: decide-sanitize
+            req: c/tools/requirements-jev-sdk.txt
+            extra: -r c/tools/oracle-requirements.txt
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -266,6 +349,9 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libvulkan-dev glslc mesa-vulkan-drivers
           pip install -r ${{ matrix.req }} ${{ matrix.extra }}
+      - name: The pinned TypeScript SDK
+        if: ${{ matrix.npm }}
+        run: cd ${{ matrix.npm }} && npm ci
       - name: CPU against Vulkan, engine by engine
         run: bash c/tests/vulkan_engines.sh ${{ matrix.family }}
 
