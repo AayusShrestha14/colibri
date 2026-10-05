@@ -28,7 +28,8 @@ class SafetensorsJsonIntegrity(unittest.TestCase):
                           'float x=0; st_read_f32_cap(&s,"tensor",&x,1,0);'
                           'printf("%g\\n",x); return 0;}\n')
         cls.binary = cls.root / ("load.exe" if os.name == "nt" else "load")
-        subprocess.run(cc + ["-O1", "-Wall", "-Wextra", "-Wno-unused-function",
+        # -D_FILE_OFFSET_BITS=64 as the Makefile builds st.h (compat.h requires it on Windows)
+        subprocess.run(cc + ["-D_FILE_OFFSET_BITS=64", "-O1", "-Wall", "-Wextra", "-Wno-unused-function",
                              "-Wno-unused-parameter", "-Wno-misleading-indentation",
                              "-I", str(C_DIR), str(source), "-o", str(cls.binary), "-lm"],
                        check=True, capture_output=True, text=True)
