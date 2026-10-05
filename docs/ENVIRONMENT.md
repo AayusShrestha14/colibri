@@ -526,7 +526,7 @@ checkpoint layout and the text-only capability boundary.
 | `COLI_MAP_EXPERTS` | `0` | Point the native-FP8 routed-expert slots (or the int4-g64 sidecar's records) at a read-only mapping of their shard instead of copying 14 MB per miss into a slab. Same variable as in `glm53`. |
 | `Q38_FP8_KERNEL` | vector | The routed experts' e4m3 blocks are decoded eight at a time in registers and multiplied with FMA (AVX2 builds); `scalar` restores `quant.h`'s table kernel, which differs only by float summation order inside a block. |
 | `COLI_TIMERS` | `0` (off) | Set to `1` for the detailed Qwen3.8 phase breakdown on stderr. The shared per-request `PROF` frame is emitted regardless. |
-| `COLI_VULKAN` | `0` | `VK=1` build: the trunk on the Vulkan device, and the routed experts of the model's layers on the shared expert tier (`COLI_VK_TIER*`, `COLI_VK_DENSE`, see [Vulkan](#vulkan-any-gpu-with-a-vulkan-12-driver)); the MTP head's layer stays on the CPU. |
+| `COLI_VULKAN` | `0` | `VK=1` build: the trunk on the Vulkan device, and the routed experts of the model's layers on the shared expert tier (`COLI_VK_TIER*`, `COLI_VK_DENSE`, see [Vulkan](#vulkan-any-gpu-with-a-vulkan-12-driver)); the MTP head's layer too on a discrete GPU (`COLI_VK_TIER_MTP`). |
 
 ## DeepSeek V4 engine (`deepseek_v4`)
 
