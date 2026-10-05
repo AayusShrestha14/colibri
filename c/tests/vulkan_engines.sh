@@ -2124,8 +2124,9 @@ family_glm_chain() {
   CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=32 KV_SLOTS=2
   COLI_VK_CHAIN=2 CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=32
   # a pin restored over rows another branch rewrote: the KDA state goes up from the pin,
-  # the MLA rows' watermark comes down
-  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_USAGE=$PWD/chain.usage COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 $PY tests/glm53_pin_branch_harness.py --binary ./glm53 --fixture glm53_mm_tiny
+  # the MLA rows' watermark comes down (the tier off and the scores within 1e-5: two
+  # engine processes, see vulkan_partial_glm.sh)
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_USAGE=$PWD/chain.usage COLI_VK_TIER=0 $PY tests/glm53_pin_branch_harness.py --binary ./glm53 --fixture glm53_mm_tiny --tol 1e-5
   unset OMP_NUM_THREADS CAP_RAISE
 }
 
@@ -3724,7 +3725,7 @@ kv_split_glm53() {
     CHAIN_SERVE_EXPECT="$E" CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=32 $K
     CHAIN_SERVE_EXPECT="$E" CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=4 COLI_VK_CHAIN_ROWS=3 $K
     CHAIN_SERVE_EXPECT="$E" CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=32 KV_SLOTS=2 $K
-    env $K COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_USAGE=$PWD/chain.usage COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 $PY tests/glm53_pin_branch_harness.py --binary ./glm53 --fixture glm53_mm_tiny
+    env $K COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_USAGE=$PWD/chain.usage COLI_VK_TIER=0 $PY tests/glm53_pin_branch_harness.py --binary ./glm53 --fixture glm53_mm_tiny --tol 1e-5
   }
 }
 kv_split_glm53_sanitize() {
@@ -4111,5 +4112,5 @@ case "${1:-}" in
   partial-*)      g=${1#partial-}; fn=ptl_family_${g//-/_}
                   declare -F "$fn" >/dev/null || { echo "no partial-chain group ${g}" >&2; exit 2; }
                   "$fn" ;;
-  *) echo "usage: $0 decide|decide-sanitize|staged|<family>-staged|shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize|qwen-spec|qwen-spec-sanitize|mimo-chain|mimo-chain-sanitize|inkling-olmoe-chain|inkling-olmoe-chain-sanitize|glm-chain|glm-chain-sanitize|kimi-chain|kimi-chain-sanitize|deepseek-chain|deepseek-chain-sanitize|dense-only-<group>[-sanitize]|partial-<group>[-sanitize]|prefill-qwen|prefill-qwen-sanitize|prefill-inkling-olmoe|prefill-mimo-kimi|prefill-glm|prefill-deepseek|kv-split|kv-split-sanitize|kv-split-deepseek|kv-split-deepseek-sanitize" >&2; exit 2 ;;
+  *) echo "usage: $0 decide|decide-sanitize|staged|<family>-staged|shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize|qwen-spec|qwen-spec-sanitize|mimo-chain|mimo-chain-sanitize|inkling-olmoe-chain|inkling-olmoe-chain-sanitize|glm-chain|glm-chain-sanitize|kimi-chain|kimi-chain-sanitize|deepseek-chain|deepseek-chain-sanitize|dense-only-<group>[-sanitize]|partial-<group>[-sanitize]|prefill-qwen|prefill-qwen-sanitize|prefill-inkling-olmoe|prefill-mimo-kimi|prefill-glm|prefill-deepseek|kv-split|kv-split-sanitize|kv-split-deepseek|kv-split-deepseek-sanitize|dev2|dev2-deepseek-kimi-mimo|dev2-sanitize" >&2; exit 2 ;;
 esac
