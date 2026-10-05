@@ -135,8 +135,9 @@ d2_colibri() {   # the primary device held at two experts by the engine's own ca
   d2_done glm_tiny_i4r/.coli_usage
   grep -aE '^GLM C engine|^PREFILL|^\[ORACLE\] mismatch' "$log" | sed 's/ | [0-9.]* pos\/s//' > "$tok" || true
 }
-d2_glm53() {
+d2_glm53() {   # its fixture routes four experts in all: the big case's budget twice, not four times
   local tok=$1 log=$2; shift 2; d2_fresh d2.usage
+  local D2_X=$(( ${D2_X:-1} > 2 ? 2 : ${D2_X:-1} ))
   env GLM53_BITS=32 COLI_USAGE=d2.usage USAGE_SAVE=$(d2_save) COLI_VK_TIER_GB=$(d2_gb 0.00006) "$@" \
     ./glm53 --model glm53_stream-i4 --ids "$D2_G53_IDS" --greedy 6 > "$log" 2>&1 || true
   grep -aE '^teacher_forcing|^greedy' "$log" > "$tok" || true
@@ -179,6 +180,7 @@ d2_fixtures_main() {
   $PY tools/make_olmoe_tiny.py --output olmoe_tiny
   $PY tools/convert_olmoe_merged.py --model olmoe_tiny --out olmoe_tiny_c
   $PY tools/make_tiny_inkling.py tiny_inkling
+  $PY -c 'import sys; from pathlib import Path; sys.path.insert(0, "."); from tests.test_inkling_prefix_serve import ensure_tokenizer; ensure_tokenizer(Path("tiny_inkling"))'
   mkdir -p glm_fp8 && (cd glm_fp8 && $PY ../tools/make_glm_oracle.py --fp8 > /dev/null)
   $PY tools/convert_fp8_to_int4.py --indir glm_fp8/glm_tiny --outdir glm_tiny_i4r \
     --ebits 4 --io-bits 4 --n-layers 5 --min-free-gb 0 --group-size 0 > /dev/null
