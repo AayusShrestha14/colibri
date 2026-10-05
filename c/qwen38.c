@@ -2160,7 +2160,7 @@ int main(int argc, char **argv) {
 #ifdef COLI_VULKAN
     q38_vk_tier_start(&m, cap);   /* COLI_VULKAN=1: hot routed experts on the device (vk_tier.c) */
     if(g_vk_ready&&!vkt_ready()&&!g_vk_dense)g_vk_dense=coli_vk_dense_decide("qwen38",0,1);   /* no tier after all */
-    if(g_vk_chain)atexit(vkc_shutdown);   /* registered after the tier's: runs before the device goes */
+    if(g_vk_chain)atexit(vkc_shutdown_all);   /* registered after the tier's: runs before the device goes */
 #endif
     fprintf(stderr, "resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
 

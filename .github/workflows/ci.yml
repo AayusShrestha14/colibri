@@ -380,10 +380,39 @@ jobs:
           - family: kv-split-sanitize
             req: c/tools/requirements-qwen38-tiny.txt
             extra: numpy pillow
+          # the same with the host's part on the device too (COLI_VK_KV_COLD=device)
+          - family: kv-split-cold
+            req: c/tools/requirements-qwen38-tiny.txt
+            extra: numpy pillow
+          - family: kv-split-cold-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
+            extra: numpy pillow
           - family: kv-split-deepseek
             req: c/tools/requirements-deepseek-v4-tiny.txt
             extra: sympy pillow
           - family: kv-split-deepseek-sanitize
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          # the dense chain's layers on two devices (Lavapipe opened twice, COLI_VK_DEV2=0):
+          # every chain engine against its CPU run, split at every kind of layer, the state
+          # crossing between the devices, the second device lost; the same under ASan and
+          # UBSan; GLM and Kimi K3, and DeepSeek, in legs of their own
+          - family: layers-dev2
+            req: c/tools/requirements-qwen38-tiny.txt
+            extra: numpy pillow
+          - family: layers-dev2-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
+            extra: numpy pillow
+          - family: layers-dev2-mla
+            req: c/tools/requirements-qwen38-tiny.txt
+            extra: numpy pillow
+          - family: layers-dev2-mla-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
+            extra: numpy pillow
+          - family: layers-dev2-deepseek
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          - family: layers-dev2-deepseek-sanitize
             req: c/tools/requirements-deepseek-v4-tiny.txt
             extra: sympy pillow
           # the decision engines: Laya's and GLiNER2.5-Decide's forward on the device and

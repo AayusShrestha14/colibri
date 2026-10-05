@@ -634,6 +634,8 @@ one of each.
 
 ### A second device (`COLI_VK_DEV2`)
 
+The dense chain can put layers there too: [Layers on two devices](#layers-on-two-devices).
+
 A machine with two GPUs (a V100 beside a GTX 1070, an RX 9070 beside an RX 580) can
 give the tier the memory of both. `COLI_VK_DEV2=auto` takes the best GPU that is not the
 primary device (a discrete card before an integrated one); `COLI_VK_DEV2=<index>` takes
@@ -1104,6 +1106,7 @@ f32 throughout, as the CPU's f32 path.
 | `COLI_VK_KV_DEVICE_ROWS` | from the budget | The positions a split layer keeps on the device; set, the cache splits whenever it is longer. |
 | `COLI_VK_KV_BLOCK` | `64` | Positions per block of the split's block table. |
 | `COLI_VK_KV_PIN` | off | `1`: enable read-based block pins; QSA/DSA/pooled MLA rounding can then depend on read history. DeepSeek preserves its sparse arithmetic in either mode. |
+| `COLI_VK_KV_COLD` | unset | `device`: a split layer's host part attended on the device too, from a shadow of the host's rows ([below](#a-kv-cache-past-the-devices-budget)); off by default, because on the measured integrated GPU it slowed decode. |
 
 Each run and serve turn prints `[VK] <engine> chain: N forwards, F frames (ops,
 matmuls, tiled GEMM), the time spent waiting for the device, the routed experts' host
@@ -2270,6 +2273,40 @@ round trip is paid only on layers with a host part.
 | `vkc_kvs_ds` | `chain_kvs` (mode 4) | DeepSeek's sparse attention with its sink over the window rows and the resident compressed rows; with every listed row resident, `vkc_dsv4_attn`'s bits |
 | `vkc_kvs_merge` | `chain_kvs` (mode 2) | the two parts joined, a gate or V4's bf16 rounding after |
 
+**The host's part on the device (`COLI_VK_KV_COLD=device`, off by default).** The
+host's rows can also be attended on the device, so a step with a host part runs in one
+frame with no round trip:
+- **The copy.** Each split layer keeps a shadow of the host's rows in page-aligned memory
+  the device reads in place (an imported host allocation, `VK_EXT_external_memory_host`).
+  The shadow follows the host's cache row by row and is lowered with it on a rewind or a
+  rollback.
+- **The ops.** `chain_kvs` reads the shadow with its COLD flag (the GQA, MLA and Inkling
+  forms; position t is row t). The prompt's rows take the blocked attention
+  (`chain_attnb`'s part mode) in chunks of 512 positions, one workgroup each, and mode 5
+  of `chain_kvs` joins them in order.
+- **The bits.** The chunks are fixed by position, so a row's bits do not depend on how a
+  forward is cut into steps, as on the CPU path.
+- **Where it applies.** It needs a device that imports host memory, no read-based pins
+  and no staged uploads. DeepSeek's sparse forms keep the host's part on the CPU, and so
+  does the second device's chain ([Layers on two devices](#layers-on-two-devices)): the
+  import is the primary's. Where it cannot run, the line says so and the CPU computes the
+  host's part.
+
+The run's report adds `| the host's part on the device: N layer steps, R rows copied
+to the shadow in T ms (M MiB held)`.
+
+| Qwen3.6-35B-A3B, 7579-token prompt, Radeon 780M, the chain | first token after | 31 decode tokens |
+|---|---|---|
+| 1024 positions a layer on the device, the host's part on the CPU | 121 s | 3.5 s |
+| the same, the host's part on the device | 114 s | 20 s |
+| 4096 positions a layer, on the CPU | 143 s | |
+| the same, on the device | 137 s | |
+
+The prompt gains 4 to 6%. Decode is 5.7 times slower: with the default, the CPU
+computes the host's part while the device runs its own, and on this integrated GPU the
+decode attention is slower than the CPU's. Hence the default. A dedicated GPU, whose
+attention outruns the CPU's by more, has not been measured.
+
 `vk_kvsplit.h` carries the rest: the plan, the tables, the uploads and the stores of a
 step's rows, the host's part (`vkc_kv_host_attn`, with the same bias, tau and V4
 rounding), and one call per form for an engine (`vkc_kv_gqa`, `vkc_kv_mla`,
@@ -2339,7 +2376,9 @@ part): the CPU's tokens, logits within each family's tolerance, chunks of 3, pro
 only, the split off, a lost device, pins, MTP and n-gram drafts, serve sessions with
 pins, prompt-cache extensions and divergent prompts, and the prefix-reuse tests;
 `kv-split-deepseek` the same for deepseek_v41 and deepseek_v4; `kv-split-sanitize` and
-`kv-split-deepseek-sanitize` a set of each under ASan and UBSan.
+`kv-split-deepseek-sanitize` a set of each under ASan and UBSan. `kv-split-cold` and
+`kv-split-cold-sanitize` run `kv-split` and `kv-split-sanitize` again with
+`COLI_VK_KV_COLD=device`, and every gate must have run the host's part on the device.
 
 Validation on the local Lavapipe device covers numerical correctness, not hardware
 throughput. A discrete GPU has not been measured for this change.
@@ -2747,6 +2786,70 @@ the KV split, a lost device (V4.1: the forward again on the CPU; Kimi K3: the ch
 KDA state rebuilt from the prefix record), serve sessions with prefix reuse, Kimi K3's
 recurrent-state photos and V4.1's images with N < L; the dense weights on the device only
 with N < L.
+
+### Layers on two devices
+
+With a second GPU (`COLI_VK_DEV2`) the layers the primary device leaves do not have to go
+to the CPU: a second chain takes them on that device. The primary keeps its first N
+layers (its fit, as above); the second device's chain takes the layers from N on with a
+fit of its own over that device's free memory (`COLI_VK_CHAIN_LAYERS2` forces how many);
+the CPU runs what is left, and the head stays on the host. Every chain engine does it:
+qwen36, qwen38, OLMoE, MiMo, Inkling, GLM-5.2 (colibri), GLM-5.3, Kimi K3, DeepSeek V4.1
+and DeepSeek V4. It needs a partial chain on the primary: when every layer fits there,
+the second device holds experts only, as before.
+
+A forward runs every row through the primary's layers, brings them back, and runs them
+through the second device's layers from there: what crosses is what the CPU's next layer
+would have read. That is the residual (the hc_mult streams on the mHC engines; Kimi K3's
+AttnRes prefix, block snapshots and their count), and on GLM-5.2 the DSA selection of the
+primary's last full layer when the second device's first layer shares its indexer. The
+second device's matrices are copies of its own, which the per-matrix path never reads.
+Each device's KV mirror, KV split and watermarks are its own.
+
+Recurrent state (qwen36's and qwen38's DeltaNet, Inkling's convolution rings, GLM-5.3's
+and Kimi K3's KDA) stays where its layers run. The host's copy is made current for both
+devices or for neither, the second device's read first, so a read that fails leaves the
+primary's as it was.
+
+DeepSeek V4.1's second device starts only at a layer that reads nothing the layers
+before it make in a forward. Its first compressed layer owns its compressed rows and runs
+its own indexer, and no candidate mask crosses. On V4.1 Flash those are layers 2, 8, 14
+and 20. The fit comes down to the last such layer, with a line that says so; a forced
+`COLI_VK_CHAIN_LAYERS` that is not one stays, and the second device stays off.
+
+The lines (Kimi K3's six-layer fixture, Lavapipe opened twice: `COLI_VK_DEV2=0`):
+
+```
+[VK] kimi_k3 chain: 2 of 6 layers on the device (0.5 MiB), 4 on the CPU, the head and what goes with it (0.2 MiB) on the CPU (COLI_VK_CHAIN_LAYERS=2)
+[VK] kimi_k3 dev2 chain fit: free 23872688128 B, reserve 1073741824 B, fixed 489255168 B (...), tail 0 B, layers 190280 304512 304512 304512 B, ...
+[VK] kimi_k3 dev2 chain: 4 of 4 layers on the device (1.1 MiB), 0 on the CPU (COLI_VK_CHAIN_LAYERS2=4)
+[VK] kimi_k3 chain: layers 2..5 on the second device (1 KDA, 3 MLA, 0 dense MLP), 3 AttnRes blocks, ...
+[VK] kimi_k3 dev2 chain: 8 forwards, 41 frames (...), ...
+```
+
+**A lost second device.** Losing either device turns both chains off. An engine whose
+state is the host's (OLMoE, MiMo, GLM-5.2, DeepSeek V4.1 and V4) has the CPU run the
+forward again, or run the second device's layers from the primary's output. An engine with
+recurrent state rebuilds the state its devices held from its record, as on one device.
+`COLI_VK_CHAIN_FAULT2=n` fakes the loss at the second device's n-th frame; frame 1 is its
+setup, whose layers then stay on the CPU from the start.
+
+`COLI_VK_CHAIN_DEV2=0` keeps the layers off the second device (its experts stay there).
+
+Tested on Lavapipe only, opened twice: every split of every engine's fixtures against its
+own CPU run. The families are `layers-dev2` (qwen36, qwen38, OLMoE, MiMo, Inkling),
+`layers-dev2-mla` (colibri, GLM-5.3, Kimi K3) and `layers-dev2-deepseek`, each also under
+ASan and UBSan. They cover:
+
+- the tokens, and every logits row within each engine's chain tolerance;
+- prompt chunks, drafts and MTP accepted and rejected;
+- prompts only, the KV split on both devices, experts on both devices;
+- the second device lost at its setup, in a prompt and mid-decode;
+- serve sessions with pins and the prompt cache.
+
+Two real GPUs have not been measured: none is available here. So whether a forward is
+faster than the same layers on one device and the CPU depends on the card and the link,
+and is not verified. The rows cross through host memory once per forward, chunk by chunk.
 
 ## Correctness
 

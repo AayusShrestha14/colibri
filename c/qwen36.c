@@ -922,6 +922,7 @@ typedef struct {
     int *mpos, mpos_len, rope_delta;
 #ifdef COLI_VULKAN
     void *vkchain;             /* the dense chain's device state (qwen36_chain.h), NULL until it runs */
+    void *vkchain2;            /* its layers on COLI_VK_DEV2's device, after the primary's (qwen36_chain.h) */
 #endif
     /* A speculative verify (prompt lookup, q36_spec_step) copies the DeltaNet state
      * after each of its first snap_rows rows, row r into slot r (0 = no copy), so a
@@ -1464,6 +1465,8 @@ static void vk_q4_planar_to_fmt4(const QW *w, uint8_t *dst) {
     }
 }
 static unsigned g_vk_placed[4];   /* uploads by format: int8 rows, int4, f32, f16 */
+static int g_q36_vk_dev;          /* the device vk_qw_tensor uploads a new matrix to: 1 for the
+                                   * chain's layers on COLI_VK_DEV2's (qwen36_chain.h) */
 /* The format a matrix goes to the device in: the copy matmul_d reads (int4, int8 rows,
  * f16 with COLI_DENSE_BITS=16, else f32), its rows and its scales. */
 static int vk_qw_fmt(const QW *w, const void **wq, const float **sc) {
@@ -1495,6 +1498,15 @@ static ColiVkTensor *vk_qw_tensor(const QW *w) {
     /* On an integrated device these are already one shared allocation. Retain
      * it instead of moving the same physical bytes into a smaller logical
      * device-local heap. q36_dho_drop keeps imported pages alive. */
+    if (g_q36_vk_dev) {   /* the second device: a copy there (no import, no per-matrix path) */
+        uint8_t *packed = w->q4 ? malloc((size_t)O * (I / 2)) : NULL;
+        if (packed) vk_q4_planar_to_fmt4(w, packed);
+        ok = (!w->q4 || packed) && coli_vk_tensor_ensure2(t, w->q4 ? (const void *)packed : wq, sc, fmt, I, O, gs);
+        free(packed);
+        if (!ok) { mw->vk_off = 1; return NULL; }
+        g_vk_placed[fmt == 1 ? 0 : fmt == 4 ? 1 : fmt == 14 ? 3 : 2]++;
+        return *t;
+    }
     if (g_vk_import && (coli_vk_device_integrated() || !coli_vk_dense_device_only()) &&
         fmt != 4 && w->w != wq) {   /* q36_walloc'd rows (f32 rows are falloc's) */
         size_t rb = fmt == 1 ? (size_t)I : (size_t)I * 2;
@@ -1524,7 +1536,7 @@ static int vk_dense_matmul(float *y, const float *x, const QW *w, int S, int I, 
     int fmt = vk_qw_fmt(w, &wq, &sc), gs = fmt == 4 ? 64 : 0;
     if (!wq && !w->vk_gone) return 0;
     ColiVkTensor *t = vk_qw_tensor(w);
-    if (!t) return 0;
+    if (!t || coli_vk_tensor_dev(t)) return 0;   /* a matrix of the second device's layers: only its chain reads it */
     /* a verify's rows (g_q36_rowwise) one at a time: a decode step's GEMV, not the batch's GEMM */
     if (g_q36_rowwise && S > 1) {
         for (int s = 0; s < S; s++)
@@ -6175,7 +6187,7 @@ int main(int argc, char **argv) {
         g_vk_chain = 0;
     }
     if (g_vk_chain && g_pilot) fprintf(stderr, "[VK] qwen36: PILOT prefetch reads the residual on the host: the dense chain stays off\n");
-    if (g_vk_chain || g_q36c_fit_on) atexit(vkc_shutdown);   /* registered after the tier's: runs before the device goes */
+    if (g_vk_chain || g_q36c_fit_on) atexit(vkc_shutdown_all);   /* registered after the tier's: runs before the device goes */
 #endif
 
     /* coli serve mode: speak the gateway wire protocol instead of argv

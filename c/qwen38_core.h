@@ -236,6 +236,7 @@ typedef struct {
     int snap_ple_history_len[Q38_SPEC_SNAPS];
 #ifdef COLI_VULKAN
     void *vkchain;                 /* the dense chain's device state (qwen38_chain.h), NULL until it runs */
+    void *vkchain2;                /* its layers on COLI_VK_DEV2's device, after the primary's (qwen38_chain.h) */
 #endif
 } Model;
 
@@ -491,6 +492,8 @@ static unsigned g_q38_vk_placed[3];   /* uploads by format: int8 rows, bf16, f32
  * the device, the other layers and the head stay on the CPU, so nothing that is not on
  * the device already goes up any more (docs/vulkan.md, "A partial chain"). */
 static int g_q38_vk_noup;
+static int g_q38_vk_dev;   /* the device q38_vk_tensor uploads a new weight to: 1 for the chain's
+                            * layers on COLI_VK_DEV2's (qwen38_chain.h) */
 static void q38_dho_reload(Q38Weight *w);   /* below, beside the trunk's int8 rows */
 /* The weight's device copy, uploaded on the first call; NULL when it is not eligible
  * or the upload failed (vk_off). The dense chain (qwen38_chain.h) reads the same one. */
@@ -503,7 +506,8 @@ static ColiVkTensor *q38_vk_tensor(const Q38Weight *weight) {
     int fmt=q38_vk_fmt(w);
     const void *wq=w->q8?(const void*)w->q8:(const void*)w->data;
     const float *sc=w->q8?w->q8sc:NULL;   /* fmt 10/11: no scales */
-    if(!coli_vk_tensor_ensure(t,wq,sc,fmt,w->cols,w->rows,0)){w->vk_off=1;return NULL;}
+    if(!(g_q38_vk_dev?coli_vk_tensor_ensure2(t,wq,sc,fmt,w->cols,w->rows,0)
+                     :coli_vk_tensor_ensure(t,wq,sc,fmt,w->cols,w->rows,0))){w->vk_off=1;return NULL;}
     g_q38_vk_placed[fmt==1?0:fmt==11?1:2]++;
     return *t;
 }
@@ -517,7 +521,7 @@ static int q38_vk_matmul(float *y,const float *x,const Q38Weight *weight,int S,i
     const void *wq=w->q8?(const void*)w->q8:(const void*)w->data;
     const float *sc=w->q8?w->q8sc:NULL;   /* fmt 10/11: no scales */
     ColiVkTensor *t=q38_vk_tensor(w);
-    if(!t)return 0;
+    if(!t||coli_vk_tensor_dev(t))return 0;   /* a weight of the second device's layers: only its chain reads it */
     return coli_vk_matmul(&t,y,x,wq,sc,fmt,S,I,O,0);
 }
 /* One line at the end of a run or a serve turn: how many matmuls the device
