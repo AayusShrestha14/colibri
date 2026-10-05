@@ -521,6 +521,38 @@ The dashboard's expert map (`EMAP`) shows a device-resident expert as tier 2 (VR
 the experts a device step served still light up in `HITS`, and qwen36's
 `CACHE_ROUTE` ranks them like CUDA-resident ones.
 
+### RAM and VRAM without the same experts (`COLI_VK_TIER_EXCLUSIVE`)
+
+With RAM short of the working set, the engine's RAM expert cache and the tier would
+otherwise hold many of the same experts: the CPU reads an expert, computes it, the tier
+promotes it, and its RAM copy stays until the LRU reaches it. Exclusive caching (on unless
+`COLI_VK_TIER_EXCLUSIVE=0`) gives that copy up first:
+
+- **When the RAM cache must evict**, it first takes, among the slots it may evict, the
+  least recently used one whose expert the tier holds on a device (`vkt_ram_first`), and
+  only then its usual LRU choice. With RAM to spare nothing is evicted and nothing
+  changes; with little RAM the two caches hold different experts, so together they hold
+  more of them. An expert routed in its layer's current step is never offered, even on a
+  device: the CPU may be computing it from that slot (the balance handed it back, or the
+  batch had no room for its rows).
+- **The prefetchers that read experts into RAM** (the PILOT workers of qwen36, olmoe and
+  colibri) skip what the device holds. qwen38's only advises the page cache, and only of
+  the experts the CPU will compute.
+- Every MoE engine does it in its own cache: qwen36, qwen38, olmoe, inkling, mimo,
+  kimi_k3, deepseek_v41, deepseek_v4's expert store, colibri and glm53. Pinned slots and
+  slots being read or computed are never taken, as before.
+- The run's line says how many RAM copies were given up for it:
+  `| exclusive: N RAM copies of device experts given up first`.
+
+The cost: an expert the device holds is no longer in RAM to hand back to the CPU when the
+device is the slower side of a step (`COLI_VK_TIER_BALANCE`), so on an integrated GPU at its
+floor clock the balance has fewer experts to move. `COLI_VK_TIER_EXCLUSIVE=0` keeps the
+copies.
+
+The `dev2` families' `excl` and `noexcl` cases run every engine with a RAM cache of a slot
+or two against its CPU run. On DeepSeek V4's 16-expert fixture with 6 slots a layer, the
+run with it gave up 21 RAM copies and read 46 experts from disk, against 51 without it.
+
 ### A second device (`COLI_VK_DEV2`)
 
 A machine with two GPUs (a V100 beside a GTX 1070, an RX 9070 beside an RX 580) can
