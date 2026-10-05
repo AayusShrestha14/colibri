@@ -888,8 +888,10 @@ streams come back to the host once per chunk, and the CPU runs layers N.. over a
 rows, the final mixer and lm_head. The device's layers keep their DeltaNet, conv, K/V,
 index-key and pooled-key state on the device. A verify copies their state into the chain's
 slots. The CPU's layers keep theirs on the host, and the CPU's copies roll them back. The PLE
-ring and its n-gram history go with whichever side holds the PLE layer. The MTP head always
-runs on the CPU and reads the final streams from whichever side ran the last layer. A lost
+ring and its n-gram history go with whichever side holds the PLE layer. The MTP head runs
+outside the chain and reads the final streams from whichever side ran the last layer: with a
+partial chain its matrices stay on the CPU, with the full chain and the per-matrix path on
+they answer from the device one at a time, as before. A lost
 device rebuilds only the device's layers from the prefix record. The vision tower's rows and
 the n-gram table stay on the host as before. With `COLI_VK_DENSE_HOST=0` only the N layers'
 host copies go (with the full chain fitted, each layer once all of it is on the device). The
@@ -2362,6 +2364,7 @@ predict a layer more than the engine places.
 | deepseek_v4 | the hc_mult streams; DSpark's taps of the last three layers come from whichever side ran them | yes |
 | qwen36 (Qwen3.6, Qwen3-Coder, Qwen3.8-27B, Clef) | the residual rows alone; a prompt-lookup verify rolls each side back with its own copies (the device's DeltaNet slots, the CPU's snapshots) ([qwen36](#the-dense-chain-vk_chainc)) | yes |
 | olmoe | the residual rows alone; `PILOT` keeps prefetching the next layers from the chain's rows ([olmoe](#olmoe-and-inkling)) | yes |
+| qwen38 | the four hyper-connection streams of every row; the MTP head reads the final streams from whichever side ran the last layer, and the PLE ring and n-gram history stay with the PLE layer's side | yes |
 
 **`COLI_VK_DEVICE_CAP_MB=n`** (tests) makes the device hold at most n MiB of device-local
 memory (a fraction is taken): every allocation of the backend and the chain (tensors, the

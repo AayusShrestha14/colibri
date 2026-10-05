@@ -18,7 +18,9 @@
 #     pins, the KV split, prompts only, and the device lost mid-decode and in a verify;
 #   - COLI_VK_DENSE_HOST=0 with N < L: only the N layers' host copies dropped, none read
 #     back on a healthy run, and after a lost device only theirs;
-#   - nothing forced on a device where everything fits: N = L with the head, as before.
+#   - nothing forced on a device where everything fits: N = L with the head, as before, and
+#     the same logits as with COLI_VK_CHAIN_LAYERS=4; coli plan's N, per-layer, fixed and
+#     tail bytes the engine's (under the caps above).
 # The CPU's tokens everywhere, logits within 1e-4 of the largest (bf16 trunk).
 
 # ptl_q38_res <log>: the matrices the engine holds on the device at exit (the report line)
@@ -74,18 +76,48 @@ ptl_q38_run() {
 }
 # ptl_q38_cap <tag> <k> <env...> -- <argv...>: COLI_VK_DEVICE_CAP_MB from a probe's fit
 # line under which exactly k layers fit; the run's fit gives k by the rule, the final N is
-# k, and the CPU's tokens. The probe runs under a 256 MiB cap: up to there the pools take
-# 64 KiB blocks, so the probe's fixed bytes (the pools' granularity among them) are the
-# run's; a larger probe cap takes larger blocks, and on these layers of tens of KiB that
+# k, the CPU's tokens (logits within 1e-4 of the largest unless PTL_Q38_TOL=0), and coli
+# plan's prediction the same as the engine's. The probe runs under a 256 MiB cap: up to
+# there the pools take 64 KiB blocks, so what the probe held at the fit is what the run
+# holds; a larger probe cap takes larger blocks, and on these layers of tens of KiB that
 # difference alone decides N.
 ptl_q38_cap() {
   local tag=$1 k=$2; shift 2
   local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
   local cap; cap=$(PTL_PROBE_CAP_MB=256 ptl_calc cap qwen38 probe.log "$k") || { grep -a '^\[VK\] qwen38 chain' probe.log; fail "$tag: no cap"; }
-  ptl_q38_gate "$tag" "$k" 1 "${envs[@]}" COLI_VK_DEVICE_CAP_MB="$cap" -- "$@"
+  ptl_q38_gate "$tag" "$k" "${PTL_Q38_TOL:-1}" "${envs[@]}" COLI_VK_DEVICE_CAP_MB="$cap" -- "$@"
   local p; p=$(ptl_calc predict qwen38 vk.log)
   [ "$p" = "$k" ] || { grep -a '^\[VK\] qwen38 chain' vk.log; fail "$tag: the fit line gives $p layers, not $k"; }
   echo "   $tag: COLI_VK_DEVICE_CAP_MB=$cap, the fit's rule gives $p"
+  local snap; snap=$(printf '%s\n' "${envs[@]}" | sed -n 's/^SNAP=//p' | tail -1)
+  ptl_q38_plan "$tag" "$snap" vk.log "${envs[@]}" COLI_VK_DEVICE_CAP_MB="$cap"
+}
+# ptl_q38_plan <tag> <fixture> <log> <env...>: coli plan's prediction (resource_plan.py,
+# vk_chain_fit with qwen38's layout) for the same device and settings: the engine's free
+# bytes, per-layer bytes, fixed bytes, tail and N, from the checkpoint's header and config
+ptl_q38_plan() {
+  local tag=$1 fx=$2 log=$3; shift 3
+  $PY - "$fx" "$log" "$@" <<'PY' || fail "$tag: coli plan predicts otherwise"
+import re, sys
+sys.path.insert(0, ".")
+import resource_plan as rp
+fx, log = sys.argv[1], sys.argv[2]
+env = dict(a.split("=", 1) for a in sys.argv[3:] if "=" in a)
+env.update(COLI_VULKAN="1", COLI_VK_CHAIN="1")
+lines = open(log, errors="replace").read().splitlines()
+f = [l for l in lines if l.startswith("[VK] qwen38 chain fit: ")][-1]
+num = lambda key: int(re.search(key + r" (\d+) B", f)[1])
+layers = [int(x) for x in re.search(r"layers((?: \d+)*) B", f)[1].split()]
+n = int(re.findall(r"\[VK\] qwen38 chain: (\d+) of \d+ layers on the device", "\n".join(lines))[0])
+info = rp.analyze_model(fx)
+fit = rp.vk_chain_fit(info, "qwen38", env, {"type": "cpu"})
+tail = rp._VK_CHAIN_LAYOUT["qwen38"](info, env, {"type": "cpu"}).tail
+ok = (fit["layers"], fit["fixed"], fit["free"], tail, fit["n"]) == (layers, num("fixed"), num("free"), num("tail"), n)
+print(f"   coli plan: N = {fit['n']} of {fit['L']} ({'as the engine' if ok else 'the engine: %d' % n}), "
+      f"layers {'= the engine' if fit['layers'] == layers else fit['layers']}, fixed {fit['fixed']} B, "
+      f"tail {tail} B, free {fit['free']} B")
+sys.exit(0 if ok else 1)
+PY
 }
 # ptl_q38_fault <tag> <k> <probe log> <env...> -- <argv...>: COLI_VK_STAGED_FAULT aimed
 # inside layer k's setup (the probe's marks); the run keeps the k layers before it.
@@ -145,6 +177,10 @@ ptl_family_qwen38() {
   for k in 1 3 4; do
     ptl_q38_cap "partial qwen38 a device holding $k layers" $k $R SNAP=qwen38_tiny -- 4 8 $T
   done
+  # the int8 trunk and the MTP head's tail, in the engine's fit and in coli plan's
+  ptl_q38_run probe.log $R COLI_VK_DEVICE_CAP_MB=256 Q38_TRUNK_MIN_KB=0 Q38_MTP=1 SNAP=qwen38_tiny_mtp -- 2 8 $M
+  PTL_Q38_TOL=0 ptl_q38_cap "partial qwen38 int8 trunk, MTP, a device holding 2 layers" 2 $R Q38_TRUNK_MIN_KB=0 Q38_MTP=1 \
+    SNAP=qwen38_tiny_mtp -- 2 8 $M
 
   # 3. an upload refused inside layer k's setup: on the full chain's first forward (k = 0
   # turns the chain off), at startup for a partial chain, and in the dense-host pass
@@ -213,9 +249,14 @@ ptl_family_qwen38() {
   CHAIN_SERVE_EXPECT="$E" COLI_VK_DENSE_HOST=0 $PY tests/vulkan_chain_serve.py ./qwen38 qwen38_tiny_mtp Q38_MTP=1 $P
 
   # 6. nothing forced on a device where everything fits: every layer and the head, as before
-  ptl_q38_gate "partial qwen38 everything fits" 4 1 SNAP=qwen38_tiny -- 4 8 $T
+  # (the tier's balance off in these two: their logits must be the same bytes)
+  ptl_q38_gate "partial qwen38 everything fits" 4 1 COLI_VK_TIER_BALANCE=0 SNAP=qwen38_tiny -- 4 8 $T
   grep -qa '^\[VK\] qwen38 chain: 4 of 4 layers on the device ([^)]*), 0 on the CPU (free' vk.log ||
     { grep -a '^\[VK\] qwen38 chain' vk.log; fail "partial qwen38 everything fits: not the full chain with its head"; }
+  cp vk.f32 fits.f32
+  ptl_q38_gate "partial qwen38 every layer forced" 4 1 COLI_VK_TIER_BALANCE=0 COLI_VK_CHAIN_LAYERS=4 SNAP=qwen38_tiny -- 4 8 $T
+  cmp -s fits.f32 vk.f32 || fail "partial qwen38: the logits with COLI_VK_CHAIN_LAYERS=4 differ from the fit's full chain"
+  rm -f fits.f32
   dho_gate qwen38 "partial qwen38 everything fits, dense-only" 1 SNAP=qwen38_tiny -- 4 8 $T
   [ "$(dho_dropped vk.log)" = 65 ] || { grep -a '^\[VK\] qwen38' vk.log; fail "partial qwen38 everything fits: $(dho_dropped vk.log) dropped, not 65"; }
   rm -f chain.usage chain-serve.usage probe.log

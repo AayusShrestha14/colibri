@@ -488,10 +488,11 @@ static Q38Chain *q38c_setup(Model *m) {
 }
 static int q38c_layers(Model *m) { Q38Chain *ch = (Q38Chain *)m->vkchain; return ch && ch->ok ? ch->nl : 0; }
 
-/* At startup, with the chain on (before any upload, the dense-host pass and the expert
- * tier): N, and a partial chain placed now. N = 0: the chain off, its device memory given
- * back, nothing more going up (every byte left to the tier). A model the chain declines
- * keeps today's path (the decline at its first forward). */
+/* At startup, with the chain on (before anything of it is on the device, the dense-host
+ * pass and the expert tier): N, the chain's pipelines (vkc_init), and a partial chain
+ * placed now. N = 0: the chain off, nothing of it on the device, nothing more going up
+ * (every byte left to the tier). A model the chain declines keeps today's path (the
+ * caller's vkc_init, the decline at its first forward). */
 static void q38c_start(Model *m) {
     if (!g_vk_chain || qt_ready()) return;
     Cfg *c = &m->c; int L = c->layers;
@@ -503,10 +504,12 @@ static void q38c_start(Model *m) {
     vkc_fit("qwen38", L, lb, mb, q38c_fit_fixed(m, rows), q38c_fit_tail(m), &g_q38c_fit);
     free(lb); free(mb);
     g_q38c_fitted = 1;
-    if (!vkc_fit_partial(&g_q38c_fit)) return;   /* every layer and the head: set up at the first forward, as before */
-    Q38Chain *ch = g_q38c_fit.n ? q38c_setup(m) : NULL;
-    g_q38_vk_noup = 1;
-    if (!ch) { vkc_shutdown(); g_vk_chain = 0; }
+    int partial = vkc_fit_partial(&g_q38c_fit);
+    if (!g_q38c_fit.n) { g_vk_chain = 0; g_q38_vk_noup = 1; return; }   /* the chain off: its pipelines never come up */
+    if (!vkc_init()) { g_vk_chain = 0; g_q38c_fitted = 0; return; }   /* the per-matrix path, as before */
+    if (!partial) return;   /* every layer and the head: set up at the first forward, as before */
+    if (!q38c_setup(m)) { vkc_shutdown(); g_vk_chain = 0; }
+    g_q38_vk_noup = 1;   /* after the setup's own uploads */
 }
 /* The dense-host pass's bound (q38_dho_start): the N layers' matrices of a partial chain,
  * the head's and the MTP head's only with the tail on the device; with N = 0 the dense

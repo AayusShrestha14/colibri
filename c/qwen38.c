@@ -2142,8 +2142,8 @@ int main(int argc, char **argv) {
      * on an integrated GPU (docs/vulkan.md, "The dense chain") */
     if(g_vk_ready&&!qt_ready())
         g_vk_chain=coli_vk_chain_decide("qwen38",vkt_wanted()&&m.c.experts>0,COLI_VK_CHAIN_OFF);
+    q38c_start(&m);      /* the layers that fit the device, before anything of the chain goes up (a partial chain placed now; qwen38_chain.h) */
     if(g_vk_chain&&!vkc_init())g_vk_chain=0;
-    q38c_start(&m);      /* the layers that fit the device (a partial chain placed now; qwen38_chain.h) */
     q38_dho_start(&m);   /* COLI_VK_DENSE_HOST: the trunk on the device only, before the tier sizes its budget */
 #endif
     if(is_ref)ref_logits=read_reference_logits(ref_root,m.c.vocab);
