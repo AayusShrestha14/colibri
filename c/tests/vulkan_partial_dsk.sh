@@ -438,8 +438,19 @@ ptl_k3_cases() {
   ptl_k3_dho "partial kimi_k3 device only, staged" long 3 $O COLI_VK_STAGED=1
   CHAINMODE=2 RELOAD_MLA=1 ptl_k3_dho "partial kimi_k3 device only, prompts only" long 3 $O
   FAULT_BACK=3 REBUILD=1 ptl_k3_dho "partial kimi_k3 device only, device lost mid-decode" long 3 $O
-  ptl_k3_fault "partial kimi_k3 device only, an upload failing in layer 3" long 3 $O COLI_VK_DENSE_HOST=0
-  [ "$(dho_reloaded vk.log)" = 0 ] || { grep '^\[VK\]' vk.log; fail "partial kimi_k3 device only, an upload failing: read back from disk"; }
+  # device only: the dense weights go up through the per-matrix placement before the chain
+  # (k3_dho_place), not with each chain layer as deepseek_v41's; an upload failing there
+  # keeps that matrix's host copy and the chain puts it up itself, so the run keeps every
+  # layer: N = L, one host copy fewer dropped, nothing read back, the CPU's tokens
+  local all fn L
+  ptl_k3_probe ptl-probe.log long COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:1000000 COLI_VK_CHAIN_LAYERS=99 $O COLI_VK_DENSE_HOST=0
+  all=$(dho_dropped ptl-probe.log); L=$(ptl_L kimi_k3 ptl-probe.log)
+  fn=$(ptl_calc fault kimi_k3 ptl-probe.log 3) || { grep '^\[VK\] kimi_k3 chain' ptl-probe.log; fail "partial kimi_k3 device only: no fault count from the probe"; }
+  PTL_WANT=$L ptl_k3 "partial kimi_k3 device only, an upload failing in layer 3's placement (submit #$fn)" long "$L" \
+    COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:"$fn" $O COLI_VK_DENSE_HOST=0
+  grep -q "staged upload failed (submit: .*): a matrix stays on the CPU" vk.log && [ "$(dho_dropped vk.log)" = $((all - 1)) ] &&
+    [ "$(dho_reloaded vk.log)" = 0 ] ||
+    { grep '^\[VK\]' vk.log; fail "partial kimi_k3 device only, an upload failing: not one host copy kept with every layer on the device"; }
   ptl_k3_cap "partial kimi_k3 device only, a device for 3 layers" long 3 $O COLI_VK_DENSE_HOST=0
   [ "$(dho_dropped vk.log)" = "$(ptl_k3_droppable 3)" ] && [ "$(dho_reloaded vk.log)" = 0 ] ||
     { grep -E '^\[VK\]|^\[K3\]' vk.log; fail "partial kimi_k3 device only, a device for 3 layers: the host copies dropped are not the 3 layers'"; }
