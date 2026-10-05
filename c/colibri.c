@@ -70,6 +70,7 @@
 #include "tok.h"
 #include "tier.h"
 #include "grammar.h"                              /* metodo F: draft grammaticali (#48) */
+#include "spec_draft.h"                           /* COLI_LOOKUP=1: the n-gram drafts from spec_draft.h, gated */
 #include "abl.h"                                   /* per-expert causal-ablation harness — inert unless g_abl.mode set (ABLATE_SCORE=<manifest>) */
 #include "evidence_digest.h"                     /* SHA-256 over the bytes an evidence mode consumed */
 #include "schema_gbnf.h"                          /* SCHEMA=: JSON-Schema -> GBNF for method F */
@@ -265,6 +266,10 @@ typedef struct {
 #endif
 #ifdef COLI_VULKAN
     ColiVkTensor *vk; int vk_eligible;   /* resident on the Vulkan expert tier */
+    /* the dense weights on the device only (COLI_VK_DENSE_HOST): the tensor's name and the
+     * bits qt_load quantized it to, to read it back (qt_dho_reload); vk_gone = 1 while the
+     * device holds it alone (no host copy) */
+    char *vk_name; int vk_bits, vk_gone;
 #endif
 #ifdef COLI_XDNA
     /* Derived, disposable BF16 host image for the XDNA lane. NULL for an
@@ -755,6 +760,17 @@ static void qt_vk_reset(QT *t){
  * int8/int4/int3-g64 weight once (t->vk), then reuses it. Returns 0 (caller runs the CPU
  * matmul) when VK-dense is off, the format is unsupported, or upload/compute fails. */
 #define VK_FMT_OK(t) ((t)->fmt==1||(t)->fmt==2||(t)->fmt==5||((t)->fmt==4&&(t)->gs>=8&&(t)->gs%8==0))
+/* The dense weights on the device only (COLI_VK_DENSE_HOST, glm_dho_start below): a QT
+ * whose host copy was given back (vk_gone) is multiplied by its device copy wherever the
+ * CPU would have read it (matmul_qt_ex), from the engine's thread outside any parallel
+ * region; anywhere else, and once the device is lost, it is read back from disk first. */
+static void qt_dho_reload(QT *t);
+static pthread_t g_dho_thread;
+static int qt_vk_fmt(const QT *t){ return t->fmt==0 ? 10 : t->fmt; }
+static int qt_dho_matmul(QT *t, float *y, const float *x, int S){
+    if(omp_in_parallel() || !pthread_equal(pthread_self(), g_dho_thread) || !t->vk) return 0;
+    return coli_vk_matmul(&t->vk, y, x, NULL, NULL, qt_vk_fmt(t), S, t->I, t->O, t->fmt==4 ? t->gs : 0);
+}
 static int vk_matmul_qt(QT *t, float *y, const float *x, int S){
     if(!g_vk_dense || !VK_FMT_OK(t)) return 0;
     const void *w = t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
@@ -1246,6 +1262,12 @@ static inline int pq_want(const QT *g,const QT *u,int nr){
  * projections need it: IDOT's int8 activation quantization costs +0.117 nats/token there
  * (~+12% perplexity), measured. Every other prefill matmul keeps IDOT as before. */
 static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot){
+#ifdef COLI_VULKAN
+    if(__atomic_load_n(&w->vk_gone, __ATOMIC_ACQUIRE)){
+        if(qt_dho_matmul(w, y, x, S)) return;
+        qt_dho_reload(w);
+    }
+#endif
 #ifdef COLI_METAL
     /* fmt=8 (fp8 passthrough) deliberately absent from this allowlist, same as fmt=5/6:
      * the S>=g_metal_gemm_min batched prefill GEMM path (coli_metal_gemm) only knows
@@ -1397,6 +1419,13 @@ static float g_route_alpha=1.f; /* ROUTE_ALPHA: scale gate mass of CACHE_ROUTE s
 static int g_route_agree=0;  /* ROUTE_AGREE=1: footer overlap% + mean KL vs true top-K */
 static int expert_is_resident(Model *m, int layer, int eid); /* pin∪LRU; defined near pilot */
 static int g_spec=1;     /* metodo C: SPEC=0 disabilita il prefetch speculativo cross-layer */
+/* COLI_LOOKUP=1 (no MTP head): the n-gram source proposes from spec_draft.h's prompt
+ * lookup -- the longest suffix of 4 down to 2 tokens found earlier in the context, its
+ * most recent occurrence -- instead of the last bigram, and its gate decides how many of
+ * the DRAFT proposals a verify carries, from the measured acceptance by position and
+ * the measured forward time by rows (COLI_SPEC_GATE=0 drafts every proposal in full).
+ * Unset: the bigram source as before. */
+static int g_lookup=0; static SpecGate g_lookup_gate;
 static int g_draft=0;    /* metodo E: DRAFT=n token auto-speculati per forward via n-gram lookup
                           * (0=off). LOSSLESS: verifica = output identico al greedy. Default OFF:
                           * misurato sul run reale (2026-07-03) acceptance ~5% -> ogni draft
@@ -2295,6 +2324,10 @@ static int qt_load_mmap(Model *m, const char *name, int O, int I, QT *t){
 
 static QT qt_load(Model *m, const char *name, int O, int I, int bits){
     QT t; memset(&t,0,sizeof(t)); qt_from_disk(m,name,O,I,bits,0,&t);
+#ifdef COLI_VULKAN
+    t.vk_bits=bits;   /* to read it back, should the device end up holding it alone */
+    if(!(t.vk_name=strdup(name))){ fprintf(stderr,"OOM tensor name\n"); exit(1); }
+#endif
 #ifdef COLI_CUDA
     if(g_cuda_enabled&&g_cuda_dense){
         t.cuda_eligible=1;
@@ -4001,6 +4034,9 @@ static float fp8_block_scale(float sc, int64_t blkO, int64_t bi, const char *who
 }
 
 static void qt_addrow(const QT *t, int row, float coef, float *acc){
+#ifdef COLI_VULKAN
+    if(__atomic_load_n(&t->vk_gone, __ATOMIC_ACQUIRE)) qt_dho_reload((QT *)t);   /* the CPU's attention reads its rows */
+#endif
     int I=t->I;
     if(t->fmt==0){ const float *w=t->qf+(int64_t)row*I; for(int i=0;i<I;i++) acc[i]+=coef*w[i]; return; }
     /* fmt=4 PRIMA del calcolo di c: s[] e' [O,ng] per-gruppo, s[row] sarebbe la scala
@@ -4074,6 +4110,9 @@ static void qt_addrow(const QT *t, int row, float coef, float *acc){
 }
 /* y[0..n) = W[r0+j,:]·x  (matvec su una FETTA di righe del QT) */
 static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y){
+#ifdef COLI_VULKAN
+    if(__atomic_load_n(&t->vk_gone, __ATOMIC_ACQUIRE)) qt_dho_reload((QT *)t);
+#endif
     int I=t->I;
     for(int j=0;j<n;j++){ int row=r0+j; double a=0;
         if(t->fmt==0){ const float *w=t->qf+(int64_t)row*I; for(int i=0;i<I;i++) a+=(double)w[i]*x[i]; }
@@ -5549,9 +5588,11 @@ static int moe_vk_on(Model *m,int layer){
  * from the pin set, the LRU or a working-set slot loaded from disk (PIPE or the blocking
  * parallel load), computed once for all its rows into ctb[i]; the block's misses then
  * promoted into the LRU. note: offer each computed expert to the tier. */
+static void vk_stream_promote(Model *m);
 static void vk_cpu_pairs(Model *m,int layer,const float *x,int rows,int K,const int *ib,const uint8_t *want,
                          float *ctb,float *xg,float *gg,float *uu,float *hh,int note){
     Cfg *c=&m->c; int D=c->hidden, I=c->moe_inter, E=c->n_experts, n=rows*K;
+    vk_stream_promote(m);   /* the streamed misses still in the working set join the LRU first */
     int *uq=xalloc((size_t)n*sizeof(int),"vk uq"), *rws=xalloc((size_t)rows*sizeof(int),"vk rws"), nu=0;
     unsigned char *seen=xzalloc((size_t)E,"vk seen");
     for(int i=0;i<n;i++) if(want[i] && ib[i]>=0 && !seen[ib[i]]){ seen[ib[i]]=1; uq[nu++]=ib[i]; }
@@ -5604,7 +5645,7 @@ static void vk_cpu_pairs(Model *m,int layer,const float *x,int rows,int K,const 
 static void moe_vk(Model *m,int layer,const float *x,int S,float *out,const int *idxs,const float *ws,
                    const int *keff,float *xg,float *gg,float *uu,float *hh){
     Cfg *c=&m->c; int D=c->hidden, K=c->topk, E=c->n_experts;
-    int B = S<GLM_VK_ROWS ? S : GLM_VK_ROWS, nmax=B*K, dev2=g_vk_reg_n2>0;
+    int B = vkt_step_rows(S,GLM_VK_ROWS), nmax=B*K, dev2=g_vk_reg_n2>0;   /* a whole prompt chunk when the tier streams */
     int *ib=xalloc((size_t)nmax*sizeof(int),"vk ib"), *r2=xalloc((size_t)nmax*sizeof(int),"vk r2");
     uint8_t *taken=xalloc((size_t)nmax,"vk taken"), *want=xalloc((size_t)nmax,"vk want"), *on2=xzalloc((size_t)nmax,"vk on2");
     const float **dev=xalloc((size_t)nmax*sizeof(*dev),"vk dev");
@@ -8134,6 +8175,11 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         }
         if(!g && g_draft>0 && !(m->has_mtp && gd_pause>0)){
             if(m->has_mtp){ g=mtp_draft(m,next,kv,g_draft,draft); m->mtp_prop+=g; if(g)gsrc=2; }
+            else if(g_lookup){
+                int n=spec_lookup(all,kv+1,2,4,g_draft,draft);
+                g=n>0?spec_gate_pick(&g_lookup_gate,SPEC_SRC_LOOKUP,n,NULL):0;
+                if(g)gsrc=4;
+            }
             else { g=ngram_draft(all,kv+1,g_draft,draft); if(g)gsrc=2; }
         }
         if(g>n_new-emitted) g=n_new-emitted;
@@ -8141,9 +8187,11 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         if(g<0) g=0;
         if(gsrc==1) g_grd.prop+=(uint64_t)g;
         int S=1+g; int batch[64]; batch[0]=next; memcpy(batch+1,draft,g*sizeof(int));
-        double tf0=g_prof?now_s():0;
+        int lk=g_lookup&&!m->has_mtp;
+        double tf0=g_prof||lk?now_s():0;
         float *lo=step_all(m,batch,S,kv); m->n_fw++;
         if(g_prof) prof_lat(now_s()-tf0);
+        if(lk) spec_gate_forward(&g_lookup_gate,S,now_s()-tf0);
         int k=0;                                        /* verifica: accetta finche' coincide */
         if(g>0 && getenv("MTP_DEBUG")){ int veri=argmax_v(lo,V);
             fprintf(stderr,"[mtpdbg] draft0=%d verified=%d %s\n", draft[0], veri, draft[0]==veri?"HIT":"miss"); }
@@ -8158,6 +8206,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
             gr_feed(&g_grd,draft[k]); k++;
         }
         if(gsrc==1) g_grd.acc+=(uint64_t)k;
+        else if(gsrc==4) spec_gate_result(&g_lookup_gate,SPEC_SRC_LOOKUP,k<g&&emitted<n_new&&!done?k+1:k,k);
         else if(gsrc==2 && m->has_mtp) m->mtp_acc+=k;
         else if(gsrc==3) g_corp_acc+=(uint64_t)k;
         if(m->has_mtp && k>=1) mtp_absorb(m, all+kv+1, m->h_all, k, kv);   /* KV MTP in sync coi verificati */
@@ -10751,6 +10800,43 @@ static int vk_in_ram(void *ctx,int layer,int eid){
     Model *m=ctx;
     return pin_indexed(m,layer,eid)!=NULL || ecache_indexed(m,layer,eid,0)!=NULL;
 }
+/* The tier's streaming (a big prompt chunk's cold experts on the device): a group of
+ * experts as vk_cpu_pairs resolves them -- the pin set, the LRU, the misses read into
+ * the working-set slots in parallel -- each valid until the tier gives it back. The
+ * misses then join the LRU as vk_cpu_pairs's do, when the group's last one is given
+ * back (before anything else can reuse the working set). */
+static int g_vks_layer=-1, g_vks_nmiss=0, g_vks_held=0;
+static void vk_stream_promote(Model *m){
+    if(g_vks_nmiss>0 && g_vks_layer>=0) ecache_promote_ws(m,g_vks_layer,g_vks_nmiss);
+    g_vks_nmiss=0; g_vks_layer=-1; g_vks_held=0;
+}
+static int vk_load_batch(void *ctx,int layer,const int *e,int n,VktExpertSrc *srcs,void **h){
+    Model *m=ctx;
+    vk_stream_promote(m);
+    if(n<1) return 0;
+    if(n>64) n=64;
+    ESlot *use[64]; int miss[64], nmiss=0;
+    for(int j=0;j<n;j++){
+        use[j]=pin_indexed(m,layer,e[j]);
+        if(use[j]){ m->hits++; m->hit_pin++; continue; }
+        use[j]=ecache_indexed(m,layer,e[j],0);
+        if(use[j]){ m->hits++; m->hit_ecache++; use[j]->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); continue; }
+        use[j]=&m->ws[nmiss]; miss[nmiss++]=j; m->miss++;
+    }
+    if(nmiss){ double t0=now_s();
+        #pragma omp parallel for schedule(dynamic,1)
+        for(int q=0;q<nmiss;q++) expert_load(m,layer,e[miss[q]],&m->ws[q],1,1);
+        m->t_ewait += now_s()-t0; }
+    int k=0;
+    for(;k<n;k++){ if(!vk_slot_src(use[k],&srcs[k])) break; h[k]=m; }
+    g_vks_layer=layer; g_vks_nmiss=nmiss; g_vks_held=k;
+    if(!k) vk_stream_promote(m);
+    return k;
+}
+static int vk_load(void *ctx,int layer,int e,VktExpertSrc *src,void **h){
+    return vk_load_batch(ctx,layer,&e,1,src,h)==1;
+}
+static void vk_unhold(void *ctx,void *h){ (void)h; if(g_vks_held>0 && --g_vks_held==0) vk_stream_promote((Model *)ctx); }
 /* Is this model's expert set quantized at load (no .qs companions: qt_from_disk's
  * qt_alloc buffers, one per tensor) rather than read from a container (a slab, or
  * views of a COLI_MMAP mapping that own nothing)? */
@@ -10805,7 +10891,8 @@ static void vk_tier_start(Model *m){
                   .ram_reserve=(size_t)((double)m->ecap*expert_cache_row_bytes(m,m->ebits)),
                   .dense_bytes=(size_t)dense,
                   .in_ram=vk_in_ram, .ram_ctx=m,
-                  .max_experts=g_vk_experts>0 ? g_vk_experts : 0};
+                  .max_experts=g_vk_experts>0 ? g_vk_experts : 0,
+                  .load=vk_load, .release=vk_unhold, .load_ctx=m, .load_batch=vk_load_batch};
     atexit(coli_vk_shutdown);   /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
     if(!vkt_init(&vc,m->eusage)) return;
     g_vkt.on=1; g_vkt.gu_fmt=f[0]; g_vkt.gu_gs=gs[0]; g_vkt.dn_fmt=f[2]; g_vkt.dn_gs=gs[2];
@@ -12116,6 +12203,121 @@ static double coli_ssd_probe_cached(const char *snap_dir){
 #endif /* __APPLE__ */
 #endif /* (COLI_METAL && __APPLE__) || COLI_SSD_PROBE_TEST */
 
+#ifdef COLI_VULKAN
+/* ---- the dense weights on the device only (COLI_VK_DENSE_HOST; docs/vulkan.md) ------
+ * With the dense part on the device (the chain, or COLI_VK_DENSE=1), every resident dense
+ * QT with a device form is uploaded right after the load, before the pins and the RAM
+ * cap, and its host copy is given back: resident_bytes drops by what went, so autopin and
+ * cap_for_ram give that RAM to the experts. The per-matrix path is forced on (the CPU has
+ * no copy): what the chain does not run (lm_head, the MTP head, eh_proj, a declined step)
+ * multiplies the same device copies, through matmul_qt_ex when no device call was there.
+ * What keeps its host copy:
+ *   - the embedding (its rows are gathered on the CPU), the routers, norms and biases;
+ *   - the MTP layer's kv_b: its attention runs on the CPU (the absorb core takes the main
+ *     layers only);
+ *   - when the chain will not run every forward (COLI_VK_CHAIN=2 or off, KV8, KV_TQ,
+ *     PILOT, LOOKA, COLI_EXACT_VERIFY, a multiplexed serve with KV_SLOTS>1, CUDA on), every
+ *     layer's kv_b and DSA indexer, which the CPU's attention reads row by row; with PILOT
+ *     or LOOKA the shared experts too (the prefetcher and the predictor multiply them);
+ *   - the formats with no device form (int2, E8/IQ3, fp8, planar int4).
+ * A lost device, or a read anywhere else (a parallel region, another thread), reads the QT
+ * back from the checkpoint first (qt_from_disk at the bits qt_load used: the same bytes),
+ * and the copy stays from there on. */
+static Model *g_dho_model;
+static pthread_mutex_t g_dho_mx=PTHREAD_MUTEX_INITIALIZER;
+static void qt_dho_reload(QT *t){
+    pthread_mutex_lock(&g_dho_mx);
+    if(__atomic_load_n(&t->vk_gone,__ATOMIC_ACQUIRE)){
+        if(!g_dho_model||!t->vk_name){
+            fprintf(stderr,"[VK] colibri: a dense matrix the device held alone cannot be read back\n"); exit(1);
+        }
+        QT n; memset(&n,0,sizeof n);
+        qt_from_disk(g_dho_model,t->vk_name,t->O,t->I,t->vk_bits,0,&n);
+        if(n.fmt!=t->fmt||n.gs!=t->gs||n.O!=t->O||n.I!=t->I){
+            fprintf(stderr,"[VK] colibri: %s came back from disk in another form (fmt %d, was %d)\n",t->vk_name,n.fmt,t->fmt);
+            exit(1);
+        }
+        t->qf=n.qf; t->q8=n.q8; t->q4=n.q4; t->s=n.s;
+        __atomic_store_n(&t->vk_gone,0,__ATOMIC_RELEASE);
+        coli_vk_dense_host_reloaded((size_t)qt_bytes(t));
+    }
+    pthread_mutex_unlock(&g_dho_mx);
+}
+/* The device form glm_chain.h's glmc_tensor gives a QT (same fmt and geometry, so the
+ * chain and the per-matrix path find this copy); 0 = none. */
+static int qt_dho_form(const QT *t){
+    if(!t->vk_name||t->mmap_view||t->O<=0||t->I<=0) return 0;
+    switch(t->fmt){
+    case 0: return t->qf!=NULL;
+    case 1: return t->q8!=NULL;
+    case 2: return !t->planar&&t->q4;
+    case 4: return !t->planar&&t->gs>=8&&t->gs%8==0&&t->q4;
+    case 5: return t->q4!=NULL;
+    default: return 0;
+    }
+}
+typedef struct { int keep_kvb, keep_shared, n; int64_t bytes; } DhoPass;
+static void qt_dho_visit(QT *t, int keep, int drop, DhoPass *p){
+    if(keep||!qt_dho_form(t)||t->vk_gone) return;
+    if(!drop){ p->n++; p->bytes+=qt_bytes(t); return; }
+    const void *w=t->fmt==0?(const void*)t->qf:t->fmt==1?(const void*)t->q8:(const void*)t->q4;
+    if(!coli_vk_tensor_ensure(&t->vk,w,t->fmt==0?NULL:t->s,qt_vk_fmt(t),t->I,t->O,t->fmt==4?t->gs:0)) return;
+    int64_t b=qt_bytes(t);
+    free(t->qf); free(t->q8); free(t->q4); free(t->s);
+    t->qf=NULL; t->q8=NULL; t->q4=NULL; t->s=NULL;
+    __atomic_store_n(&t->vk_gone,1,__ATOMIC_RELEASE);
+    coli_vk_dense_host_dropped((size_t)b);
+    p->n++; p->bytes+=b;
+}
+static void glm_dho_pass(Model *m, int drop, DhoPass *p){
+    Cfg *c=&m->c;
+    for(int i=0;i<=c->n_layers;i++){
+        if(i==c->n_layers&&!m->has_mtp) break;
+        Layer *l = i<c->n_layers ? &m->L[i] : &m->mtpL;
+        int mtp = i==c->n_layers;
+        qt_dho_visit(&l->q_a,0,drop,p); qt_dho_visit(&l->q_b,0,drop,p); qt_dho_visit(&l->kv_a,0,drop,p);
+        qt_dho_visit(&l->kv_b,mtp||p->keep_kvb,drop,p); qt_dho_visit(&l->o,0,drop,p);
+        if(l->sparse){ qt_dho_visit(&l->sh_gate,p->keep_shared,drop,p); qt_dho_visit(&l->sh_up,p->keep_shared,drop,p);
+                       qt_dho_visit(&l->sh_down,p->keep_shared,drop,p); }
+        else { qt_dho_visit(&l->gate_proj,0,drop,p); qt_dho_visit(&l->up_proj,0,drop,p); qt_dho_visit(&l->down_proj,0,drop,p); }
+        if(!mtp&&m->ix_wq&&m->has_dsa&&c->idx_type[i]){
+            qt_dho_visit(&m->ix_wq[i],p->keep_kvb,drop,p); qt_dho_visit(&m->ix_wk[i],p->keep_kvb,drop,p);
+            qt_dho_visit(&m->ix_wp[i],p->keep_kvb,drop,p);
+        }
+    }
+    if(m->has_mtp) qt_dho_visit(&m->eh_proj,0,drop,p);
+    qt_dho_visit(&m->lm_head,0,drop,p);
+}
+/* After the load, before the pins and cap_for_ram: the decision (the chain's own, made
+ * silently here and printed by glmc_start), the uploads and the RAM given back. */
+static void glm_dho_start(Model *m){
+    if(!g_vulkan) return;
+    int tier_on = vkt_wanted() && g_vk_experts!=0 && m->c.n_experts>0;
+    int chain = coli_vk_chain_decide(NULL, tier_on, COLI_VK_CHAIN_UNMEASURED), cuda = 0;
+#ifdef COLI_CUDA
+    cuda = g_cuda_enabled;
+#endif
+    if(cuda || g_kv8 || g_tq || g_pilot) chain = COLI_VK_CHAIN_OFF;   /* glmc_start keeps it off */
+    int slots = getenv("KV_SLOTS") ? atoi(getenv("KV_SLOTS")) : 1;
+    DhoPass p = {0};
+    const char *xv = getenv("COLI_EXACT_VERIFY");   /* exact_verify_on() prints its line later, where it always did */
+    p.keep_kvb = chain!=COLI_VK_CHAIN_ON || g_looka || g_pilot || (xv && atoi(xv)) || slots>1;
+    p.keep_shared = g_pilot || g_looka;
+    glm_dho_pass(m, 0, &p);
+    if(!coli_vk_dense_host_decide("colibri", !cuda && (chain!=COLI_VK_CHAIN_OFF || g_vk_dense), (size_t)p.bytes)) return;
+    g_dho_model = m; g_dho_thread = pthread_self();
+    g_vk_dense = 1;   /* the steps the chain does not run take the device too: the CPU has no copy */
+    p.n = 0; p.bytes = 0;
+    glm_dho_pass(m, 1, &p);
+    m->resident_bytes -= p.bytes;   /* what cap_for_ram and autopin count in RAM */
+    char kept[256];
+    snprintf(kept, sizeof kept, "the embedding, routers and norms, the MTP layer's kv_b%s%s",
+             p.keep_kvb ? ", every kv_b and DSA indexer (the chain will not run every forward: the CPU's attention reads them)" : "",
+             p.keep_shared ? ", the shared experts (PILOT/LOOKA multiply them on the host)" : "");
+    coli_vk_dense_host_placed("colibri", kept);
+}
+#endif
+
 /* Expert-cache-cap precedence (#379, S2): explicit CLI positional > explicit
  * CAP env > platform default (Metal + darwin + fast SSD) > historic default.
  * `cli_given` distinguishes a bare invocation (no positional at all -> the
@@ -12366,6 +12568,8 @@ int main(int argc, char **argv){
     g_mlock  = getenv("MLOCK")?atoi(getenv("MLOCK")):-1;   /* -1 auto (ON macOS), 0 off, 1 force / auto (ON macOS), 0 off, 1 force */
     g_spec = getenv("SPEC")?atoi(getenv("SPEC")):1;
     g_draft = getenv("DRAFT")?atoi(getenv("DRAFT")):-1;
+    g_lookup = getenv("COLI_LOOKUP") && getenv("COLI_LOOKUP")[0]=='1';
+    spec_gate_init(&g_lookup_gate, getenv("COLI_SPEC_GATE") && getenv("COLI_SPEC_GATE")[0]=='0');
     g_no_fused_pair = getenv("COLI_NO_FUSED_PAIR")?atoi(getenv("COLI_NO_FUSED_PAIR")):0;   /* -1 = auto: 3 se MTP, 0 senza */
     g_looka = getenv("LOOKA")?atoi(getenv("LOOKA")):0;    /* 1 = misura predicibilita' routing */
     g_pilot = getenv("PILOT")?atoi(getenv("PILOT")):0;    /* 1 = prefetch pilotato dal router */
@@ -12837,8 +13041,12 @@ int main(int argc, char **argv){
 #else
         g_draft = m.has_mtp ? 1 : 0;
 #endif
+        if(!m.has_mtp && g_lookup) g_draft = 5;   /* COLI_LOOKUP=1: up to 5 lookup drafts, the gate picks */
     }
     if(getenv("DSA_TOPK")) m.c.index_topk=atoi(getenv("DSA_TOPK"));   /* override per test */
+#ifdef COLI_VULKAN
+    glm_dho_start(&m);   /* COLI_VK_DENSE_HOST: the trunk on the device only, before the pins and the RAM cap */
+#endif
     /* Il path MUX (SERVE_BATCH=1, cioe' `coli serve`) forza g_draft=0 sotto —
      * la speculazione non e' ragged-safe nel batch multi-slot. Segnalarlo QUI,
      * altrimenti "MTP active (draft=8)" mentirebbe: il messaggio e' stampato
@@ -13108,6 +13316,16 @@ int main(int argc, char **argv){
     double tot=m.hits+m.miss;
     printf("N-gram speculation (DRAFT=%d): %.2f tokens/forward (%llu forwards per %llu tokens)\n",
         g_draft, m.n_fw?(double)m.n_emit/m.n_fw:1.0, (unsigned long long)m.n_fw, (unsigned long long)m.n_emit);
+    if(g_lookup && !m.has_mtp){
+        unsigned long long lp=0, lh=0;
+        for(int j=0;j<SPEC_MAX_DRAFTS;j++){ lp+=g_lookup_gate.prop[SPEC_SRC_LOOKUP][j]; lh+=g_lookup_gate.hit[SPEC_SRC_LOOKUP][j]; }
+        char gd[384]; spec_gate_describe(&g_lookup_gate,SPEC_SRC_LOOKUP,gd,sizeof gd);
+        fprintf(stderr,"[colibri lookup] acceptance %.1f%% (%llu/%llu judged drafts in %llu verifies) | gate %s, "
+                       "%llu declined, %llu probes | %s\n", lp?100.0*lh/lp:0.0, lh, lp,
+                (unsigned long long)g_lookup_gate.verifies[SPEC_SRC_LOOKUP], g_lookup_gate.off?"off":"on",
+                (unsigned long long)g_lookup_gate.declined[SPEC_SRC_LOOKUP],
+                (unsigned long long)g_lookup_gate.probes[SPEC_SRC_LOOKUP], gd);
+    }
     char vkhits[48]="";                         /* experts a Vulkan device served (#336's split) */
     if(m.hit_vk) snprintf(vkhits,sizeof vkhits," + %llu vk",(unsigned long long)m.hit_vk);
     printf("Expert cache hit rate: %.1f%% (%llu pin + %llu lru%s / %llu miss) | RSS: %.2f GB | %.1f tok/s\n",

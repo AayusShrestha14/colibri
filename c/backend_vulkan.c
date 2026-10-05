@@ -34,6 +34,9 @@ struct ColiVkTensor {
     VkaRange wr, sr;       /* where the rows and the scales sit in the pool's blocks */
     struct ColiVkTensor *next_free;   /* deferred-free list (a free while async work is in flight) */
     uint8_t *img;          /* staged uploads: the host image a tier tensor is filled in, until committed */
+    uint8_t *wmap, *smap;  /* mapped memory: the rows' and the scales' mapping (coli_vk_tensor_refill) */
+    VkDeviceMemory imp;    /* coli_vk_tensor_import: the host memory its rows are read from, in place */
+    struct ColiVkTensor *imp_next;   /* the live imports, freed at shutdown */
 };
 
 /* ---- memory placement without Resizable BAR (docs/vulkan.md) ------------------------
@@ -435,7 +438,7 @@ static size_t cpu_row_bytes(int fmt, int I) {
     return fmt == 1 || fmt == 12 || fmt == 13 ? (size_t)I   // int8, fp8: one byte per weight
          : fmt == 5  ? ((size_t)I + 63) / 64 * 24            // int3-g64: 24B per 64-group
          : fmt == 10 ? (size_t)I * 4
-         : fmt == 11 ? (size_t)I * 2
+         : fmt == 11 || fmt == 14 ? (size_t)I * 2            // bf16, f16
          : (size_t)(I + 1) / 2;
 }
 static int rowwords(int fmt, int I) {
@@ -444,7 +447,7 @@ static int rowwords(int fmt, int I) {
 /* Scale floats per tensor: per-row formats carry O, int3-g64 carries O*ceil(I/64)
  * (one f32 per 64-input group). upload_tensor and tensor_free must agree on this. */
 static size_t scale_floats(int fmt, int I, int O, int gs) {
-    if (fmt == 10 || fmt == 11) return 1;                 // unused by the shader; bound anyway
+    if (fmt == 10 || fmt == 11 || fmt == 14) return 1;    // unused by the shader; bound anyway
     if (fmt == 5) return (size_t)O * (((size_t)I + 63) / 64);
     if (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13)
         return (size_t)O * (((size_t)I + gs - 1) / gs);   // per-group [O,ng]
@@ -1302,6 +1305,7 @@ static ColiVkTensor *tensor_alloc(VkWPool *P, int fmt, int I, int O, int gs, voi
     } else {
         *wptr = wp; *sptr = sp;
         memset(*wptr, 0, t->wbytes);
+        t->wmap = wp; t->smap = sp;
     }
     __atomic_add_fetch(&P->bytes, t->wbytes + sbytes, __ATOMIC_RELAXED);
     __atomic_add_fetch(&P->tensors, 1, __ATOMIC_RELAXED);
@@ -1314,7 +1318,7 @@ static ColiVkTensor *tensor_alloc(VkWPool *P, int fmt, int I, int O, int gs, voi
     return t;
 }
 static int fmt_uploadable(int fmt, int gs) {
-    return fmt == 1 || fmt == 2 || fmt == 5 || fmt == 10 || fmt == 11 ||   /* fmt=4/7: word-aligned groups only */
+    return fmt == 1 || fmt == 2 || fmt == 5 || fmt == 10 || fmt == 11 || fmt == 14 ||   /* fmt=4/7: word-aligned groups only */
            ((fmt == 4 || fmt == 7) && gs >= 8 && gs % 8 == 0) ||
            ((fmt == 12 || fmt == 13) && gs >= 4 && gs % 4 == 0);           /* fp8 / int8: 4 per word */
 }
@@ -1333,7 +1337,7 @@ static int upload_tensor_pool(VkWPool *P, ColiVkTensor **out, const void *weight
         VkUp *u = &g_up[P->dev];
         pthread_mutex_lock(&u->mx);
         int ok = up_add(u, P->dev, t->wbuf, 0, t->wbytes, up_fill_rows, &rows) &&
-                 up_add(u, P->dev, t->sbuf, 0, sb, up_fill_bytes, fmt == 10 || fmt == 11 ? (const void *)&one : scales);
+                 up_add(u, P->dev, t->sbuf, 0, sb, up_fill_bytes, fmt == 10 || fmt == 11 || fmt == 14 ? (const void *)&one : scales);
         ok = up_finish(u, P->dev) && ok;
         pthread_mutex_unlock(&u->mx);
         if (!ok) {   /* the matrix stays on the CPU (with the device, if it was lost) */
@@ -1353,7 +1357,7 @@ static int upload_tensor_pool(VkWPool *P, ColiVkTensor **out, const void *weight
         memcpy((uint8_t *)wptr + (size_t)o * stride,
                (const uint8_t *)weights + (size_t)o * cpu_rb, cpu_rb);
     size_t sfl = scale_floats(fmt, I, O, gs);            // fmt=5: O*ceil(I/64) group scales
-    if (fmt == 10 || fmt == 11) ((float *)sptr)[0] = 1.0f;   /* float weights: no scales */
+    if (fmt == 10 || fmt == 11 || fmt == 14) ((float *)sptr)[0] = 1.0f;   /* float weights: no scales */
     else memcpy(sptr, scales, sfl * sizeof(float));
     *out = t;
     return 1;
@@ -1368,6 +1372,99 @@ static int upload_tensor(ColiVkTensor **out, const void *weights, const float *s
 int coli_vk_tensor_ensure(ColiVkTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int grp) {
     if (!G.ready) return 0;
     return upload_tensor(tensor, weights, scales, fmt, I, O, grp);
+}
+
+/* ---- resident rows read in place (VK_EXT_external_memory_host) ----------------------
+ * On a device that shares the CPU's RAM a resident copy is a second copy of the same
+ * bytes: a 27B trunk held twice does not fit beside the host's on a 64 GB box. An import
+ * hands the device the host's own rows instead: the pages are wrapped in a VkDeviceMemory
+ * of the type vkGetMemoryHostPointerPropertiesEXT allows and a buffer is bound to it at
+ * offset 0, so the shaders read the matrix where the engine keeps it. The scales (a few
+ * floats a row) are copied into the weight pool as usual. Only where the rows need no
+ * padding (the shaders read rowWords words a row: the CPU's row length must already be a
+ * whole number of words) and the allocation is aligned to the device's import alignment
+ * and spans whole units of it. Not with staged uploads: those are for a card whose memory
+ * is not the host's. */
+static ColiVkTensor *g_imports;            /* live imports, freed at shutdown */
+static pthread_mutex_t g_imports_mx = PTHREAD_MUTEX_INITIALIZER;
+static size_t g_import_bytes;
+size_t coli_vk_import_alignment(void) {
+#ifdef VK_EXT_external_memory_host
+    if (!G.ready || !G.has_hostmem || g_up[0].on) return 0;
+    static size_t al;
+    if (!al) {
+        VkPhysicalDeviceExternalMemoryHostPropertiesEXT hp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &hp};
+        vkGetPhysicalDeviceProperties2(G.phys, &p2);
+        al = hp.minImportedHostPointerAlignment ? (size_t)hp.minImportedHostPointerAlignment : 4096;
+    }
+    return al;
+#else
+    return 0;
+#endif
+}
+size_t coli_vk_imported_bytes(void) { return __atomic_load_n(&g_import_bytes, __ATOMIC_RELAXED); }
+int coli_vk_tensor_import(ColiVkTensor **tensor, const void *weights, size_t alloc_bytes, const float *scales,
+                          int fmt, int I, int O, int gs) {
+    if (*tensor) return (*tensor)->fmt == fmt && (*tensor)->I == I && (*tensor)->O == O;
+#ifdef VK_EXT_external_memory_host
+    size_t al = coli_vk_import_alignment();
+    if (!al || !fmt_uploadable(fmt, gs) || O < 1 || I < 1) return 0;
+    size_t rb = cpu_row_bytes(fmt, I);
+    if (rb != (size_t)rowwords(fmt, I) * 4) return 0;          /* rows the shaders would read padded */
+    size_t wbytes = rb * (size_t)O, sz = (wbytes + al - 1) / al * al;
+    if ((uintptr_t)weights % al || sz > alloc_bytes || wbytes > G.ssbo_range) return 0;
+    static PFN_vkGetMemoryHostPointerPropertiesEXT gp;
+    if (!gp) gp = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(G.dev, "vkGetMemoryHostPointerPropertiesEXT");
+    VkMemoryHostPointerPropertiesEXT mp = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+    if (!gp || gp(G.dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, weights, &mp) != VK_SUCCESS ||
+        !mp.memoryTypeBits) return 0;
+    VkExternalMemoryBufferCreateInfo eb = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &eb, .size = wbytes,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    VkBuffer buf;
+    if (vkCreateBuffer(G.dev, &bi, NULL, &buf) != VK_SUCCESS) return 0;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(G.dev, buf, &req);
+    uint32_t bits = mp.memoryTypeBits & req.memoryTypeBits, mt = 0;
+    if (!bits) { vkDestroyBuffer(G.dev, buf, NULL); return 0; }
+    while (!(bits & (1u << mt))) mt++;
+    VkImportMemoryHostPointerInfoEXT imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, .pHostPointer = (void *)weights};
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &imp, .allocationSize = sz,
+        .memoryTypeIndex = mt};
+    VkDeviceMemory mem;
+    if (vkAllocateMemory(G.dev, &ai, NULL, &mem) != VK_SUCCESS) { vkDestroyBuffer(G.dev, buf, NULL); return 0; }
+    if (vkBindBufferMemory(G.dev, buf, mem, 0) != VK_SUCCESS) {
+        vkDestroyBuffer(G.dev, buf, NULL); vkFreeMemory(G.dev, mem, NULL); return 0;
+    }
+    ColiVkTensor *t = calloc(1, sizeof(*t));
+    size_t sbytes = scale_floats(fmt, I, O, gs) * sizeof(float);
+    void *sp = NULL;
+    if (!t || !pool_suballoc(&g_wpool, sbytes, &t->sbuf, &sp, &t->sr) || !sp) {
+        if (t && t->sbuf) { vkDestroyBuffer(G.dev, t->sbuf, NULL); pool_free_range(&g_wpool, t->sr); }
+        free(t); vkDestroyBuffer(G.dev, buf, NULL); vkFreeMemory(G.dev, mem, NULL); return 0;
+    }
+    t->fmt = fmt; t->I = I; t->O = O; t->rowWords = rowwords(fmt, I);
+    t->gs = (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13) ? gs : 0;
+    t->dev = 0; t->pool = &g_wpool; t->wbuf = buf; t->wbytes = wbytes; t->imp = mem;
+    if (fmt == 10 || fmt == 11 || fmt == 14) ((float *)sp)[0] = 1.0f;
+    else memcpy(sp, scales, sbytes);
+    __atomic_add_fetch(&g_wpool.bytes, sbytes, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_wpool.tensors, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&G.used_bytes, sbytes, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&G.tensor_count, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_import_bytes, wbytes, __ATOMIC_RELAXED);
+    pthread_mutex_lock(&g_imports_mx);
+    t->imp_next = g_imports; g_imports = t;
+    pthread_mutex_unlock(&g_imports_mx);
+    *tensor = t;
+    return 1;
+#else
+    (void)tensor; (void)weights; (void)alloc_bytes; (void)scales; (void)fmt; (void)I; (void)O; (void)gs;
+    return 0;
+#endif
 }
 
 /* Sync-path fence wait. A blocked vkWaitForFences pays a scheduler wake on
@@ -1607,6 +1704,109 @@ int coli_vk_dense_decide(const char *engine, int tier_on, int def) {
     return g_dense_on;
 }
 int coli_vk_dense(void) { return g_dense_on; }
+
+/* The dense weights' host copies (coli_vk_dense_host_decide): device only or not, and
+ * what the engine dropped and read back since. Counters are touched from parallel
+ * regions (a CPU fallback may reload inside one): atomics. */
+static int g_dho, g_dho_atexit, g_dho_on_device;
+static char g_dho_engine[32];
+static unsigned long long g_dho_drop_n, g_dho_drop_b, g_dho_load_n, g_dho_load_b;
+static double dho_gib(unsigned long long b) { return (double)b / 1073741824.0; }
+/* A size for the [VK] lines: GiB from 1 GiB, MiB below (a test fixture's KiB show as 0.0 MiB). */
+static const char *dho_size(unsigned long long b, char *buf, size_t n) {
+    if (b >= 1073741824ull) snprintf(buf, n, "%.2f GiB", dho_gib(b));
+    else snprintf(buf, n, "%.1f MiB", (double)b / 1048576.0);
+    return buf;
+}
+/* This process's resident set in GiB (Linux; -1 elsewhere). */
+static double dho_rss_gib(void) {
+#ifdef __linux__
+    FILE *f = fopen("/proc/self/statm", "r");
+    long pages = -1, rss = -1;
+    if (f) { if (fscanf(f, "%ld %ld", &pages, &rss) != 2) rss = -1; fclose(f); }
+    long pg = sysconf(_SC_PAGESIZE);
+    return rss >= 0 && pg > 0 ? (double)rss * (double)pg / 1073741824.0 : -1.0;
+#else
+    return -1.0;
+#endif
+}
+static void dho_exit_report(void) {
+    double rss = dho_rss_gib();
+    char r[48] = "";
+    if (rss >= 0) snprintf(r, sizeof r, "; RSS %.2f GiB", rss);
+    if (!g_dho) {   /* the same line with the host copies kept, for a comparison of the two */
+        fprintf(stderr, "[VK] %s: dense weights at exit: on the device and in host RAM%s\n", g_dho_engine, r);
+        return;
+    }
+    char a[32], b[32];
+    fprintf(stderr, "[VK] %s: dense weights at exit: %llu matrices on the device only (%s of host copies "
+            "dropped), %llu read back from disk for the CPU (%s)%s\n", g_dho_engine,
+            __atomic_load_n(&g_dho_drop_n, __ATOMIC_RELAXED), dho_size(__atomic_load_n(&g_dho_drop_b, __ATOMIC_RELAXED), a, sizeof a),
+            __atomic_load_n(&g_dho_load_n, __ATOMIC_RELAXED), dho_size(__atomic_load_n(&g_dho_load_b, __ATOMIC_RELAXED), b, sizeof b), r);
+}
+static int dho_choice(int dense_on_device, size_t dense_bytes, char *why, size_t n) {
+    const char *e = getenv("COLI_VK_DENSE_HOST");
+    if (!dense_on_device) {
+        snprintf(why, n, "the dense part runs on the CPU%s", e && *e && atoi(e) == 0 ? ", so COLI_VK_DENSE_HOST=0 has nothing to drop" : "");
+        return 0;
+    }
+    if (e && *e) { snprintf(why, n, "COLI_VK_DENSE_HOST=%s", e); return atoi(e) == 0; }
+    if (coli_vk_device_integrated()) {
+        snprintf(why, n, "an integrated GPU: its memory is the CPU's RAM, the host copy would hold them twice; "
+                 "COLI_VK_DENSE_HOST=1 keeps it");
+        return 1;
+    }
+    if (coli_vk_device_shares_ram()) {
+        snprintf(why, n, "a CPU device; COLI_VK_DENSE_HOST=0 drops the host copies");
+        return 0;
+    }
+    /* a discrete GPU: device only when the dense weights fit what it has free, with the
+     * expert tier's default reserve (1 GiB) left for scratch, mirrors and the driver */
+    double used = 0, budget = 0, fit;
+    if (coli_vk_mem_budget(&used, &budget)) fit = (budget - used) * 1e9;
+    else fit = (double)coli_vk_device_local_bytes();
+    fit -= 1073741824.0;
+    if ((double)dense_bytes <= fit) {
+        snprintf(why, n, "a discrete GPU with room for them: %.2f of %.2f GiB free; COLI_VK_DENSE_HOST=1 keeps the host copy",
+                 dho_gib(dense_bytes), fit > 0 ? fit / 1073741824.0 : 0.0);
+        return 1;
+    }
+    snprintf(why, n, "a discrete GPU without room for all of them (%.2f GiB, %.2f GiB free): the host copy stays the "
+             "fallback; COLI_VK_DENSE_HOST=0 drops it", dho_gib(dense_bytes), fit > 0 ? fit / 1073741824.0 : 0.0);
+    return 0;
+}
+int coli_vk_dense_host_decide(const char *engine, int dense_on_device, size_t dense_bytes) {
+    char why[256];
+    g_dho = G.ready && dho_choice(dense_on_device, dense_bytes, why, sizeof why);
+    if (!G.ready) snprintf(why, sizeof why, "no device");
+    snprintf(g_dho_engine, sizeof g_dho_engine, "%s", engine ? engine : "engine");
+    if (engine) fprintf(stderr, "[VK] %s: dense weights %s (%s)\n", engine,
+                        g_dho ? "on the device only" : "on the device and in host RAM", why);
+    g_dho_on_device = G.ready && dense_on_device;
+    if (g_dho_on_device && !g_dho_atexit) { g_dho_atexit = 1; atexit(dho_exit_report); }
+    return g_dho;
+}
+int coli_vk_dense_device_only(void) { return g_dho; }
+void coli_vk_dense_host_dropped(size_t bytes) {
+    __atomic_add_fetch(&g_dho_drop_n, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_dho_drop_b, (unsigned long long)bytes, __ATOMIC_RELAXED);
+}
+void coli_vk_dense_host_reloaded(size_t bytes) {
+    __atomic_add_fetch(&g_dho_load_n, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_dho_load_b, (unsigned long long)bytes, __ATOMIC_RELAXED);
+}
+void coli_vk_dense_host_placed(const char *engine, const char *kept) {
+    if (!g_dho) return;
+    double rss = dho_rss_gib();
+    char r[48] = "";
+    if (rss >= 0) snprintf(r, sizeof r, "; RSS now %.2f GiB", rss);
+    char a[32];
+    fprintf(stderr, "[VK] %s: %llu dense matrices on the device only, %s of host RAM given back%s%s%s\n",
+            engine, __atomic_load_n(&g_dho_drop_n, __ATOMIC_RELAXED),
+            dho_size(__atomic_load_n(&g_dho_drop_b, __ATOMIC_RELAXED), a, sizeof a), kept && *kept ? "; kept on the host: " : "",
+            kept && *kept ? kept : "", r);
+}
+unsigned long long coli_vk_dense_host_dropped_bytes(void) { return __atomic_load_n(&g_dho_drop_b, __ATOMIC_RELAXED); }
 
 /* Where a layer's dense chain runs (vk_chain.c): the whole layer recorded into one
  * submission with the residual stream and the recurrent/KV state on the device, the
@@ -2592,6 +2792,25 @@ int coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const fl
  * reclaim the host struct and counters only. */
 static void tensor_release(ColiVkTensor *t) {
     VkWPool *P = t->pool;
+    if (t->imp) {   /* rows imported in place: their memory object, the scales' range */
+        pthread_mutex_lock(&g_imports_mx);
+        for (ColiVkTensor **pp = &g_imports; *pp; pp = &(*pp)->imp_next) if (*pp == t) { *pp = t->imp_next; break; }
+        pthread_mutex_unlock(&g_imports_mx);
+        size_t sb = scale_floats(t->fmt, t->I, t->O, t->gs) * sizeof(float);
+        if (G.ready) {
+            vkDestroyBuffer(G.dev, t->wbuf, NULL);
+            vkFreeMemory(G.dev, t->imp, NULL);
+            if (t->sbuf) vkDestroyBuffer(G.dev, t->sbuf, NULL);
+            pool_free_range(P, t->sr);
+        }
+        __atomic_sub_fetch(&P->bytes, sb, __ATOMIC_RELAXED);
+        __atomic_sub_fetch(&P->tensors, 1, __ATOMIC_RELAXED);
+        __atomic_sub_fetch(&G.tensor_count, 1, __ATOMIC_RELAXED);
+        __atomic_sub_fetch(&G.used_bytes, sb, __ATOMIC_RELAXED);
+        __atomic_sub_fetch(&g_import_bytes, t->wbytes, __ATOMIC_RELAXED);
+        free(t);
+        return;
+    }
     if (t->dev == 1 ? G2.ready : G.ready) {
         VkDevice dev = pool_device(P);
         if (t->wbuf) vkDestroyBuffer(dev, t->wbuf, NULL);
@@ -2748,15 +2967,17 @@ static struct {
     int D, I, act; float limit, a, b;
     VkCommandPool cpool; VkCommandBuffer cmd; VkFence fence;
     VkQueryPool qpool; int has_ts;
-    VkShaderModule sh_act, sh_gu, sh_mv, sh_mm;
+    VkShaderModule sh_act, sh_gu, sh_mv, sh_mm, sh_coop;
     VkDescriptorSetLayout dsl6, dsl4, dsl3;
     VkPipelineLayout pl6, pl4, pl3;
-    VkPipeline p_gu, p_mv, p_act, p_mm[VK_GEMM_SLOTS];
+    VkPipeline p_gu, p_mv, p_act, p_mm[VK_GEMM_SLOTS], p_coop[VK_COOP_SLOTS];
     VkDescriptorPool *dpools; int ndpools;
     VkDescriptorPool act_pool; VkDescriptorSet act_set;
     XbBuf x, g, u, h, y;          /* x host-written, g/u/h device-only, y host-read */
     size_t align;
     int gemm_rows;                /* rows from which an expert takes the GEMM route (0 = never) */
+    int coop_rows;
+    unsigned long long cooperative_matmuls;
     ColiVkExpert *live;
     /* the batch in flight: where each assignment row's output sits */
     size_t *yoff; int nrows, cyoff;
@@ -2766,6 +2987,12 @@ static struct {
      * row weights in the x buffer after each expert's rows (xb_v4_init) */
     VkShaderModule sh_v4; VkDescriptorSetLayout dsl_v4; VkPipelineLayout pl_v4; VkPipeline p_v4;
     VkDescriptorPool v4_pool; VkDescriptorSet v4_set;
+    /* sub-batches (coli_vk_xb_sub_*, the tier's big prefill steps): two halves of the
+     * scratch, each with its own command buffer, fence and timestamps, up to two in flight */
+    struct { VkCommandBuffer cmd; VkFence fence; VkQueryPool qp; int inflight, nrows, cyoff; size_t *yoff; } sub[2];
+    size_t sub_x, sub_i, sub_y;           /* a half's bytes of each scratch (0: not reserved) */
+    unsigned long long sub_batches, sub_experts, sub_rows, sub_gemm;
+    double sub_ms;
 } XB;
 struct PCV4 { int rows, n; };
 
@@ -2833,16 +3060,19 @@ static void xb_write_v4_set(void) {
 /* Make every scratch region hold `xr`/`ir`/`yr` bytes (offsets of a batch stay below
  * its region; the buffer is twice that, so offset + window always fits). Grows by
  * half again at least; rewrites every live expert's sets when a buffer moved. */
+static int xb_sizes(size_t xr, size_t ir, size_t yr, size_t *nx, size_t *ni, size_t *ny) {
+    *nx = xr > XB.x.region ? xb_up(xr + xr / 2, 4096) : XB.x.region;
+    *ni = ir > XB.g.region ? xb_up(ir + ir / 2, 4096) : XB.g.region;
+    *ny = yr > XB.y.region ? xb_up(yr + yr / 2, 4096) : XB.y.region;
+    if (*nx > G.ssbo_range) *nx = G.ssbo_range & ~(size_t)4095;
+    if (*ni > G.ssbo_range) *ni = G.ssbo_range & ~(size_t)4095;
+    if (*ny > G.ssbo_range) *ny = G.ssbo_range & ~(size_t)4095;
+    return xr <= *nx && ir <= *ni && yr <= *ny;
+}
 static int xb_reserve(size_t xr, size_t ir, size_t yr) {
     if (xr <= XB.x.region && ir <= XB.g.region && yr <= XB.y.region) return 1;
-    size_t nx = XB.x.region, ni = XB.g.region, ny = XB.y.region;
-    if (xr > nx) nx = xb_up(xr + xr / 2, 4096);
-    if (ir > ni) ni = xb_up(ir + ir / 2, 4096);
-    if (yr > ny) ny = xb_up(yr + yr / 2, 4096);
-    if (nx > G.ssbo_range) nx = G.ssbo_range & ~(size_t)4095;
-    if (ni > G.ssbo_range) ni = G.ssbo_range & ~(size_t)4095;
-    if (ny > G.ssbo_range) ny = G.ssbo_range & ~(size_t)4095;
-    if (xr > nx || ir > ni || yr > ny) return 0;   /* one window cannot address it */
+    size_t nx, ni, ny;
+    if (!xb_sizes(xr, ir, yr, &nx, &ni, &ny)) return 0;   /* one window cannot address it */
     int ok = 1;
     if (nx != XB.x.region) ok &= xb_buf(&XB.x, nx, G.memtype, 1);
     if (ni != XB.g.region) ok &= xb_buf(&XB.g, ni, G.memtype_dev, 0) && xb_buf(&XB.u, ni, G.memtype_dev, 0) &&
@@ -2882,6 +3112,69 @@ static int xb_pipeline(VkShaderModule sh, VkPipelineLayout pl, const VkSpecializ
     return 1;
 }
 
+static void xb_coop_init(void) {
+#ifdef VK_KHR_cooperative_matrix
+    const char *e = getenv("COLI_VK_TIER_COOP");
+    if (!G.pipe_coop[0] || !XB.p_mm[0] || (e && !atoi(e))) return;
+    char path[1100]; derive_sibling(G.spv_path, "_coop.spv", path, sizeof path);
+    XB.sh_coop = load_spv(G.dev, path);
+    if (!XB.sh_coop) return;
+    VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(G.phys, &pp);
+    for (int k = 0; k < VK_COOP_SLOTS; k++) {
+        if (!G.pipe_coop[k]) continue;
+        VkCoopTile t = G.coop_t[k];
+        int nw = (t.bm / t.wm) * (t.bn / t.wn), nt = nw * G.coop_sg;
+        size_t shared = (size_t)(t.bm + 2 * t.bn) * (t.bk + 8) * 2 +
+                        (size_t)t.bm * 4 + (size_t)nw * 16 * 17 * 4 + (size_t)(nt + t.bn) * 4;
+        if (shared > pp.limits.maxComputeSharedMemorySize || nt % (nt < t.bn ? 1 : nt / t.bn)) continue;
+        int32_t sv[8] = {t.bm, t.bn, t.wm, t.wn, t.bk, G.coop_sg, nt, 1};
+        VkSpecializationMapEntry me[8];
+        for (int i = 0; i < 8; i++) me[i] = (VkSpecializationMapEntry){(uint32_t)i, (uint32_t)(i * 4), 4};
+        VkSpecializationInfo si = {8, me, sizeof sv, sv};
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+            .requiredSubgroupSize = (uint32_t)G.coop_sg};
+        VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = &rss,
+                .flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT,
+                .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = XB.sh_coop, .pName = "main",
+                .pSpecializationInfo = &si}, .layout = XB.pl4};
+        if (vkCreateComputePipelines(G.dev, VK_NULL_HANDLE, 1, &ci, NULL, &XB.p_coop[k]) != VK_SUCCESS)
+            XB.p_coop[k] = VK_NULL_HANDLE;
+    }
+    e = getenv("COLI_VK_TIER_COOP_ROWS");
+    XB.coop_rows = e && *e ? atoi(e) : 64;
+    if (XB.coop_rows < 1) XB.coop_rows = 1;
+#endif
+}
+
+/* The narrow tile wins on per-row and integer-group weights in expert shapes.
+ * FP8/MXFP4 benefit from wider tiles, but rounding an awkward row count up to
+ * another wide tile can cost more than the FP32 GEMM. Keep that fallback when
+ * the cooperative tile would process more padded rows. */
+static int xb_coop_slot(const ColiVkTensor *t, int rows, int gemm) {
+    int k = t->fmt == 1 || t->fmt == 2 || t->fmt == 4 || t->fmt == 5 ? 0 : coop_slot(rows);
+    if (!XB.coop_rows || rows < XB.coop_rows || !XB.p_coop[k] || !coop_fmt(t)) return -1;
+    if (t->fmt == 7 || t->fmt == 12) {
+        int cbn = G.coop_t[k].bn, fbn = G.gemm_t[gemm].bn;
+        if ((rows + cbn - 1) / cbn * cbn > (rows + fbn - 1) / fbn * fbn) return -1;
+    }
+    return k;
+}
+
+/* Keep each projection's format check: mixed gate/up/down quantization may make
+ * only some projections eligible. Small verifies retain their scalar GEMV path. */
+static VkPipeline xb_mm_pipeline(const ColiVkTensor *t, int rows, int slot,
+                                 int *bm, int *bn, int *cooperative) {
+    int k = xb_coop_slot(t, rows, slot);
+    if (k >= 0) {
+        *bm = G.coop_t[k].bm; *bn = G.coop_t[k].bn; (*cooperative)++;
+        return XB.p_coop[k];
+    }
+    *bm = G.gemm_t[slot].bm; *bn = G.gemm_t[slot].bn;
+    return XB.p_mm[slot];
+}
+
 /* COLI_VK_ACT_SWIGLU_V4's pass (expert_act_v4.spv), made the first time that
  * activation is asked for; 0 when its shader is missing. */
 static int xb_v4_init(void) {
@@ -2904,7 +3197,7 @@ static int xb_v4_init(void) {
 
 int coli_vk_xb_init(int D, int I, int act, float limit, float a, float b) {
     if (XB.ready) {   /* the geometry stays; the activation rides the push constants */
-        if (XB.D != D || XB.I != I || XB.inflight) return 0;
+        if (XB.D != D || XB.I != I || XB.inflight || XB.sub[0].inflight || XB.sub[1].inflight) return 0;
         if (act == COLI_VK_ACT_SWIGLU_V4 && !xb_v4_init()) return 0;
         XB.act = act; XB.limit = limit > 0.f ? limit : 0.f; XB.a = a; XB.b = b;
         return 1;
@@ -2944,6 +3237,7 @@ int coli_vk_xb_init(int D, int I, int act, float limit, float a, float b) {
     const char *e = getenv("COLI_VK_TIER_GEMM_ROWS");
     XB.gemm_rows = XB.p_mm[0] && XB.p_act ? (e && *e ? atoi(e) : 16) : 0;
     if (XB.gemm_rows < 0) XB.gemm_rows = 0;
+    xb_coop_init();
     VkCommandPoolCreateInfo cp = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = G.tq_fam};
     VKCHECK(vkCreateCommandPool(G.dev, &cp, NULL, &XB.cpool), "xb cmd pool");
@@ -2974,8 +3268,9 @@ int coli_vk_xb_init(int D, int I, int act, float limit, float a, float b) {
 int coli_vk_xb_ready(void) { return XB.ready && G.ready; }   /* a device lost elsewhere stops the tier too */
 int coli_vk_xb_queue_shared(void) { return G.tq_shared; }
 
+static int xb_busy(void);
 ColiVkExpert *coli_vk_xb_expert(ColiVkTensor *g, ColiVkTensor *u, ColiVkTensor *d) {
-    if (!XB.ready || XB.inflight || !g || !u || !d) return NULL;
+    if (!XB.ready || xb_busy() || !g || !u || !d) return NULL;
     if (g->I != XB.D || g->O != XB.I || u->I != XB.D || u->O != XB.I || g->fmt != u->fmt || g->gs != u->gs ||
         d->I != XB.I || d->O != XB.D) return NULL;
     ColiVkExpert *e = calloc(1, sizeof(*e));
@@ -3031,52 +3326,42 @@ static void xb_barrier(VkCommandBuffer c) {
                          0, 1, &mb, 0, NULL, 0, NULL);
 }
 
-static int xb_issue(ColiVkExpert *const *ex, const int *rows, int count, const float *const *xrows,
-                    const float *wrows) {
-    if (!XB.ready || XB.inflight || count < 1) return 0;
-    const int D = XB.D, I = XB.I;
-    const size_t a = XB.align, dr = (size_t)D * 4, ir = (size_t)I * 4;
-    /* COLI_VK_ACT_SWIGLU_V4: each expert's row weights follow its x rows */
-    const int v4 = XB.act == COLI_VK_ACT_SWIGLU_V4 && XB.p_v4;
-    size_t *off = malloc((size_t)count * 3 * sizeof(size_t));
-    if (!off) return 0;
-    size_t xo = 0, io = 0, yo = 0; int total = 0;
+/* One batch's layout in the scratch: each expert's x, hidden and y offsets from the bases
+ * x0, i0, y0 (its x rows, then with the V4 activation its row weights), the ends and the
+ * row total. 0 when an expert is missing or a row count is out of range. */
+static int xb_plan(ColiVkExpert *const *ex, const int *rows, int count, int v4, size_t x0, size_t i0, size_t y0,
+                   size_t *off, size_t *xe, size_t *ie, size_t *ye, int *total) {
+    const size_t a = XB.align, dr = (size_t)XB.D * 4, ir = (size_t)XB.I * 4;
+    size_t xo = x0, io = i0, yo = y0; int t = 0;
     for (int c = 0; c < count; c++) {
-        if (!ex[c] || rows[c] < 1 || rows[c] > 65535) { free(off); return 0; }
+        if (!ex[c] || rows[c] < 1 || rows[c] > 65535) return 0;
         off[3 * c] = xo; off[3 * c + 1] = io; off[3 * c + 2] = yo;
         xo += xb_up((size_t)rows[c] * dr, a); io += xb_up((size_t)rows[c] * ir, a); yo += xb_up((size_t)rows[c] * dr, a);
         if (v4) xo += xb_up((size_t)rows[c] * 4, a);
-        total += rows[c];
+        t += rows[c];
     }
-    if (!xb_reserve(xo, io, yo)) { free(off); return 0; }
-    if (total > XB.cyoff) {
-        size_t *n = realloc(XB.yoff, (size_t)total * sizeof(*n));
-        if (!n) { free(off); return 0; }
-        XB.yoff = n; XB.cyoff = total;
-    }
-    /* the activation rows, packed per expert; where each output row will be */
-    int j = 0;
-    for (int c = 0; c < count; c++)
-        for (int r = 0; r < rows[c]; r++, j++) {
-            memcpy((uint8_t *)XB.x.ptr + off[3 * c] + (size_t)r * dr, xrows[j], dr);
-            XB.yoff[j] = off[3 * c + 2] + (size_t)r * dr;
-            if (v4) ((float *)((uint8_t *)XB.x.ptr + off[3 * c] + xb_up((size_t)rows[c] * dr, a)))[r] = wrows ? wrows[j] : 1.0f;
-        }
-    XB.nrows = total;
-
-    VkCommandBuffer cmd = XB.cmd;
-    if (vkResetCommandBuffer(cmd, 0) != VK_SUCCESS) { free(off); return 0; }
+    *xe = xo; *ie = io; *ye = yo; *total = t;
+    return 1;
+}
+/* Record one batch laid out at off[] (its x rows already written) into cmd, with its
+ * timestamps in qp when the device has them, and submit it with fence on the tier queue.
+ * *ngemm: how many experts took the GEMM route. 0 = nothing was submitted. */
+static int xb_record_submit(VkCommandBuffer cmd, VkFence fence, VkQueryPool qp, ColiVkExpert *const *ex,
+                            const int *rows, int count, const size_t *off, int v4, int *ngemm_out) {
+    const int D = XB.D, I = XB.I;
+    const size_t a = XB.align, dr = (size_t)D * 4;
+    if (vkResetCommandBuffer(cmd, 0) != VK_SUCCESS) return 0;
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     vkBeginCommandBuffer(cmd, &bi);
     if (XB.has_ts) {
-        vkCmdResetQueryPool(cmd, XB.qpool, 0, 2);
-        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, XB.qpool, 0);
+        vkCmdResetQueryPool(cmd, qp, 0, 2);
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qp, 0);
     }
     /* the route of each expert: its GEMM slot, or -1 for the GEMVs */
     int *route = malloc((size_t)count * sizeof(int));
-    if (!route) { free(off); vkEndCommandBuffer(cmd); return 0; }
-    int ngemm = 0;
+    if (!route) { vkEndCommandBuffer(cmd); return 0; }
+    int ngemm = 0, cooperative = 0;
     for (int c = 0; c < count; c++) {
         int k = XB.gemm_rows && rows[c] >= XB.gemm_rows ? gemm_slot(rows[c]) : -1;
         route[c] = k >= 0 && XB.p_mm[k] ? k : -1;
@@ -3094,21 +3379,22 @@ static int xb_issue(ColiVkExpert *const *ex, const int *rows, int count, const f
         vkCmdDispatch(cmd, (uint32_t)((I + 7) / 8), (uint32_t)rows[c], 1);
     }
     if (ngemm) {
-        int slot = -1;
+        VkPipeline bound = VK_NULL_HANDLE;
         for (int c = 0; c < count; c++) {
             if (route[c] < 0) continue;
             const ColiVkExpert *e = ex[c];
             int k = route[c];
-            if (k != slot) { vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, XB.p_mm[k]); slot = k; }
-            VkGemmTile t = G.gemm_t[k];
             const ColiVkTensor *gu[2] = {e->g, e->u};
             VkDescriptorSet su[2] = {e->s_g, e->s_u};
             for (int q = 0; q < 2; q++) {
+                int bm, bn;
+                VkPipeline pipe = xb_mm_pipeline(gu[q], rows[c], k, &bm, &bn, &cooperative);
+                if (pipe != bound) { vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe); bound = pipe; }
                 uint32_t dyn[2] = {(uint32_t)off[3 * c], (uint32_t)off[3 * c + 1]};
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, XB.pl4, 0, 1, &su[q], 2, dyn);
                 struct PC pc = {gu[q]->fmt, rows[c], D, I, gu[q]->rowWords, gu[q]->gs};
                 vkCmdPushConstants(cmd, XB.pl4, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-                vkCmdDispatch(cmd, (uint32_t)((I + t.bm - 1) / t.bm), (uint32_t)((rows[c] + t.bn - 1) / t.bn), 1);
+                vkCmdDispatch(cmd, (uint32_t)((I + bm - 1) / bm), (uint32_t)((rows[c] + bn - 1) / bn), 1);
             }
         }
         xb_barrier(cmd);
@@ -3138,33 +3424,70 @@ static int xb_issue(ColiVkExpert *const *ex, const int *rows, int count, const f
         xb_barrier(cmd);
     }
     /* phase 3: down of every expert */
-    int bound = -2;
+    VkPipeline bound = VK_NULL_HANDLE;
     for (int c = 0; c < count; c++) {
         const ColiVkExpert *e = ex[c];
         int k = route[c], gemm = k >= 0;
-        if (k != bound) { vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gemm ? XB.p_mm[k] : XB.p_mv); bound = k; }
+        int bm = 8, bn = 1;
+        VkPipeline pipe = gemm ? xb_mm_pipeline(e->d, rows[c], k, &bm, &bn, &cooperative) : XB.p_mv;
+        if (pipe != bound) { vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe); bound = pipe; }
         uint32_t dyn[2] = {(uint32_t)off[3 * c + 1], (uint32_t)off[3 * c + 2]};
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, XB.pl4, 0, 1, &e->s_dn, 2, dyn);
         struct PC pc = {e->d->fmt, rows[c], I, D, e->d->rowWords, e->d->gs};
         vkCmdPushConstants(cmd, XB.pl4, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         if (gemm) {
-            VkGemmTile t = G.gemm_t[k];
-            vkCmdDispatch(cmd, (uint32_t)((D + t.bm - 1) / t.bm), (uint32_t)((rows[c] + t.bn - 1) / t.bn), 1);
+            vkCmdDispatch(cmd, (uint32_t)((D + bm - 1) / bm), (uint32_t)((rows[c] + bn - 1) / bn), 1);
         } else vkCmdDispatch(cmd, (uint32_t)((D + 7) / 8), (uint32_t)rows[c], 1);
     }
     /* the host reads y after the fence */
     VkMemoryBarrier hb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, NULL, 0, NULL);
-    if (XB.has_ts) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, XB.qpool, 1);
-    free(off); free(route);
+    if (XB.has_ts) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 1);
+    free(route);
     if (vkEndCommandBuffer(cmd) != VK_SUCCESS) return 0;
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd};
-    if (vkResetFences(G.dev, 1, &XB.fence) != VK_SUCCESS) return 0;
-    if (vk_submit(0, G.tqueue, &si, XB.fence) != VK_SUCCESS) {
+    if (vkResetFences(G.dev, 1, &fence) != VK_SUCCESS) return 0;
+    if (vk_submit(0, G.tqueue, &si, fence) != VK_SUCCESS) {
         fprintf(stderr, "[VK] expert batch: submit failed, the tier stops\n");
         XB.ready = 0; return 0;
     }
+    *ngemm_out = ngemm;
+    XB.cooperative_matmuls += (unsigned long long)cooperative;
+    return 1;
+}
+/* the single batch or a sub-batch in flight: the scratch and the experts' sets are in use */
+static int xb_busy(void) { return XB.inflight || XB.sub[0].inflight || XB.sub[1].inflight; }
+
+static int xb_issue(ColiVkExpert *const *ex, const int *rows, int count, const float *const *xrows,
+                    const float *wrows) {
+    if (!XB.ready || xb_busy() || count < 1) return 0;
+    const size_t a = XB.align, dr = (size_t)XB.D * 4;
+    /* COLI_VK_ACT_SWIGLU_V4: each expert's row weights follow its x rows */
+    const int v4 = XB.act == COLI_VK_ACT_SWIGLU_V4 && XB.p_v4;
+    size_t *off = malloc((size_t)count * 3 * sizeof(size_t));
+    if (!off) return 0;
+    size_t xo, io, yo; int total;
+    if (!xb_plan(ex, rows, count, v4, 0, 0, 0, off, &xo, &io, &yo, &total)) { free(off); return 0; }
+    if (!xb_reserve(xo, io, yo)) { free(off); return 0; }
+    if (total > XB.cyoff) {
+        size_t *n = realloc(XB.yoff, (size_t)total * sizeof(*n));
+        if (!n) { free(off); return 0; }
+        XB.yoff = n; XB.cyoff = total;
+    }
+    /* the activation rows, packed per expert; where each output row will be */
+    int j = 0;
+    for (int c = 0; c < count; c++)
+        for (int r = 0; r < rows[c]; r++, j++) {
+            memcpy((uint8_t *)XB.x.ptr + off[3 * c] + (size_t)r * dr, xrows[j], dr);
+            XB.yoff[j] = off[3 * c + 2] + (size_t)r * dr;
+            if (v4) ((float *)((uint8_t *)XB.x.ptr + off[3 * c] + xb_up((size_t)rows[c] * dr, a)))[r] = wrows ? wrows[j] : 1.0f;
+        }
+    XB.nrows = total;
+    int ngemm = 0;
+    int ok = xb_record_submit(XB.cmd, XB.fence, XB.qpool, ex, rows, count, off, v4, &ngemm);
+    free(off);
+    if (!ok) return 0;
     XB.inflight = 1; async_begin(0);
     XB.batches++; XB.experts += (unsigned long long)count; XB.rows += (unsigned long long)total;
     XB.gemm_experts += (unsigned long long)ngemm;
@@ -3207,11 +3530,174 @@ void coli_vk_xb_stats(ColiVkXbStats *st) {
     st->device_ms = XB.dev_ms; st->timestamps = XB.has_ts; st->queue_shared = G.tq_shared;
     st->gemm_rows = XB.gemm_rows;
     st->scratch_bytes = 2 * (XB.x.region + 3 * XB.g.region + XB.y.region);
+    st->sub_batches = XB.sub_batches; st->sub_experts = XB.sub_experts; st->sub_rows = XB.sub_rows;
+    st->sub_gemm = XB.sub_gemm; st->sub_ms = XB.sub_ms;
+    st->cooperative_matmuls = XB.cooperative_matmuls;
+}
+
+/* ---- sub-batches: a big prefill step as several batches, two in flight ----------------
+ * The single batch above holds a whole step in the scratch at once. A big prefill step
+ * (vk_tier.c's streaming: thousands of rows, every expert of the layer) instead runs as
+ * a sequence of bounded batches: batch k uses half k % 2 of each scratch, so the host
+ * writes the rows of the next while the device computes the one before, and the scratch
+ * stays the size of two halves whatever the step's size (a card without Resizable BAR
+ * keeps its x rows inside the host-visible window). Each half has its own command buffer,
+ * fence and timestamps on the tier queue; its outputs are copied out when it is joined.
+ * The recording is the single batch's (xb_record_submit). */
+static int xb_sub_make(int h) {
+    if (XB.sub[h].cmd) return 1;
+    VkCommandBufferAllocateInfo cb = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = XB.cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+    VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    if (vkAllocateCommandBuffers(G.dev, &cb, &XB.sub[h].cmd) != VK_SUCCESS) { XB.sub[h].cmd = VK_NULL_HANDLE; return 0; }
+    if (vkCreateFence(G.dev, &fi, NULL, &XB.sub[h].fence) != VK_SUCCESS) {
+        vkFreeCommandBuffers(G.dev, XB.cpool, 1, &XB.sub[h].cmd); XB.sub[h].cmd = VK_NULL_HANDLE; XB.sub[h].fence = VK_NULL_HANDLE;
+        return 0;
+    }
+    if (XB.has_ts) {
+        VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+            .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2};
+        if (vkCreateQueryPool(G.dev, &qi, NULL, &XB.sub[h].qp) != VK_SUCCESS) XB.sub[h].qp = VK_NULL_HANDLE;
+    }
+    return 1;
+}
+/* Logical bytes of one half; xb_reserve adds its descriptor window and growth. */
+static void xb_sub_sizes(int rows, int experts, size_t *hx, size_t *hi, size_t *hy) {
+    const size_t a = XB.align, dr = (size_t)XB.D * 4, ir = (size_t)XB.I * 4, pad = (size_t)experts * a;
+    const int v4 = XB.act == COLI_VK_ACT_SWIGLU_V4 && XB.p_v4;
+    *hx = xb_up((size_t)rows * dr + pad + (v4 ? (size_t)rows * 4 + pad : 0), a);
+    *hi = xb_up((size_t)rows * ir + pad, a);
+    *hy = xb_up((size_t)rows * dr + pad, a);
+}
+/* Choose before allocating: an OOM in xb_reserve disables the batch backend.
+ * Account for both halves, the doubled descriptor windows, growth by 1.5 and
+ * all five buffers. xb_buf frees an old buffer before replacing it, so only
+ * positive growth must fit the remaining budget. Reused scratch costs zero. */
+int coli_vk_xb_sub_fit(int rows, int experts, size_t extra_budget) {
+    if (!XB.ready || xb_busy() || rows < 1 || experts < 1) return 0;
+    if (rows > 65535) rows = 65535;
+    VkPhysicalDeviceMemoryProperties2 mp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+#ifdef VK_EXT_memory_budget
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT bud = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    if (G.has_budget) mp.pNext = &bud;
+#endif
+    vkGetPhysicalDeviceMemoryProperties2(G.phys, &mp);
+    size_t room[VK_MAX_MEMORY_HEAPS];
+    for (uint32_t h = 0; h < mp.memoryProperties.memoryHeapCount; h++) {
+        room[h] = (size_t)mp.memoryProperties.memoryHeaps[h].size / 8;
+#ifdef VK_EXT_memory_budget
+        if (G.has_budget) room[h] = bud.heapBudget[h] > bud.heapUsage[h] ? (size_t)((bud.heapBudget[h] - bud.heapUsage[h]) / 2) : 0;
+#endif
+    }
+    uint32_t xheap = mp.memoryProperties.memoryTypes[G.memtype].heapIndex;
+    uint32_t iheap = mp.memoryProperties.memoryTypes[G.memtype_dev].heapIndex;
+    uint32_t yheap = mp.memoryProperties.memoryTypes[G.memtype_cached].heapIndex;
+    int lo = 0, hi = rows;
+    while (lo < hi) {
+        int mid = lo + (hi - lo + 1) / 2;
+        size_t hx, hh, hy, nx, ni, ny;
+        xb_sub_sizes(mid, experts, &hx, &hh, &hy);
+        int ok = xb_sizes(2 * hx, 2 * hh, 2 * hy, &nx, &ni, &ny);
+        if (ok) {
+            size_t dx = 2 * (nx - XB.x.region), di = 6 * (ni - XB.g.region), dy = 2 * (ny - XB.y.region);
+            size_t need[VK_MAX_MEMORY_HEAPS] = {0};
+            need[xheap] += dx; need[iheap] += di; need[yheap] += dy;
+            ok = dx + di + dy <= extra_budget;
+            for (uint32_t h = 0; ok && h < mp.memoryProperties.memoryHeapCount; h++) ok = need[h] <= room[h];
+        }
+        if (ok) lo = mid; else hi = mid - 1;
+    }
+    return lo;
+}
+int coli_vk_xb_sub_reserve(int rows, int experts) {
+    if (!XB.ready || xb_busy() || rows < 1 || experts < 1) return 0;
+    if (!xb_sub_make(0) || !xb_sub_make(1)) return 0;
+    if (XB.has_ts && (!XB.sub[0].qp || !XB.sub[1].qp)) return 0;
+    size_t hx, hi, hy;
+    xb_sub_sizes(rows, experts, &hx, &hi, &hy);
+    if (!xb_reserve(2 * hx, 2 * hi, 2 * hy)) return 0;
+    XB.sub_x = hx; XB.sub_i = hi; XB.sub_y = hy;
+    return 1;
+}
+int coli_vk_xb_sub_busy(int h) { return h >= 0 && h < 2 && XB.sub[h].inflight; }
+int coli_vk_xb_sub_issue(int h, ColiVkExpert *const *ex, const int *rows, int count, const float *const *xrows,
+                         const float *wrows) {
+    if (!XB.ready || h < 0 || h > 1 || XB.inflight || XB.sub[h].inflight || !XB.sub_x || count < 1) return 0;
+    const size_t a = XB.align, dr = (size_t)XB.D * 4;
+    const int v4 = XB.act == COLI_VK_ACT_SWIGLU_V4 && XB.p_v4;
+    size_t *off = malloc((size_t)count * 3 * sizeof(size_t));
+    if (!off) return 0;
+    size_t x0 = h * XB.sub_x, i0 = h * XB.sub_i, y0 = h * XB.sub_y, xe, ie, ye; int total;
+    if (!xb_plan(ex, rows, count, v4, x0, i0, y0, off, &xe, &ie, &ye, &total) ||
+        xe > x0 + XB.sub_x || ie > i0 + XB.sub_i || ye > y0 + XB.sub_y) { free(off); return 0; }
+    if (total > XB.sub[h].cyoff) {
+        size_t *n = realloc(XB.sub[h].yoff, (size_t)total * sizeof(*n));
+        if (!n) { free(off); return 0; }
+        XB.sub[h].yoff = n; XB.sub[h].cyoff = total;
+    }
+    /* the activation rows, packed per expert (the copies in parallel: thousands of rows) */
+    int *first = malloc((size_t)count * sizeof(int));
+    if (!first) { free(off); return 0; }
+    for (int c = 0, j = 0; c < count; j += rows[c], c++) first[c] = j;
+    size_t *yoff = XB.sub[h].yoff;
+    uint8_t *xp = XB.x.ptr;
+    #pragma omp parallel for schedule(dynamic, 4) if (total >= 256)
+    for (int c = 0; c < count; c++)
+        for (int r = 0; r < rows[c]; r++) {
+            int j = first[c] + r;
+            memcpy(xp + off[3 * c] + (size_t)r * dr, xrows[j], dr);
+            yoff[j] = off[3 * c + 2] + (size_t)r * dr;
+            if (v4) ((float *)(xp + off[3 * c] + xb_up((size_t)rows[c] * dr, a)))[r] = wrows ? wrows[j] : 1.0f;
+        }
+    free(first);
+    XB.sub[h].nrows = total;
+    int ngemm = 0;
+    int ok = xb_record_submit(XB.sub[h].cmd, XB.sub[h].fence, XB.sub[h].qp, ex, rows, count, off, v4, &ngemm);
+    free(off);
+    if (!ok) return 0;
+    XB.sub[h].inflight = 1; async_begin(0);
+    XB.sub_batches++; XB.sub_experts += (unsigned long long)count; XB.sub_rows += (unsigned long long)total;
+    XB.sub_gemm += (unsigned long long)ngemm;
+    return 1;
+}
+int coli_vk_xb_sub_join(int h, float *const *yout, double *device_ms) {
+    if (device_ms) *device_ms = 0;
+    if (h < 0 || h > 1 || !XB.sub[h].inflight) return 0;
+    XB.sub[h].inflight = 0;
+    VkResult r = vk_fence_wait_gemm(G.dev, XB.sub[h].fence);
+    async_end(0);
+    if (r != VK_SUCCESS) {
+        fprintf(stderr, "[VK] expert batch: fence wait failed (%d), the tier stops\n", r);
+        XB.ready = 0; return 0;
+    }
+    double ms = 0;
+    if (XB.has_ts && XB.sub[h].qp) {
+        uint64_t ts[2];
+        if (vkGetQueryPoolResults(G.dev, XB.sub[h].qp, 0, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            uint64_t mask = G.tq_ts >= 64 ? ~0ull : ((1ull << G.tq_ts) - 1);
+            ms = (double)((ts[1] - ts[0]) & mask) * G.ts_period / 1e6;
+        }
+    }
+    XB.sub_ms += ms;
+    if (device_ms) *device_ms = ms;
+    const size_t dr = (size_t)XB.D * 4;
+    const size_t *yoff = XB.sub[h].yoff;
+    const uint8_t *yp = XB.y.ptr;
+    int n = XB.sub[h].nrows;
+    #pragma omp parallel for schedule(static) if (n >= 256)
+    for (int j = 0; j < n; j++) memcpy(yout[j], yp + yoff[j], dr);
+    return 1;
 }
 
 static void xb_shutdown(void) {
     if (!G.dev) return;
     if (XB.inflight) { vk_fence_wait(G.dev, XB.fence); XB.inflight = 0; async_end(0); }
+    for (int h = 0; h < 2; h++) {
+        if (XB.sub[h].inflight) { vk_fence_wait(G.dev, XB.sub[h].fence); XB.sub[h].inflight = 0; async_end(0); }
+        if (XB.sub[h].fence) vkDestroyFence(G.dev, XB.sub[h].fence, NULL);
+        if (XB.sub[h].qp) vkDestroyQueryPool(G.dev, XB.sub[h].qp, NULL);
+        free(XB.sub[h].yoff);
+    }
     while (XB.live) coli_vk_xb_expert_free(XB.live);
     XbBuf *bufs[5] = {&XB.x, &XB.g, &XB.u, &XB.h, &XB.y};
     for (int k = 0; k < 5; k++)
@@ -3226,6 +3712,8 @@ static void xb_shutdown(void) {
     if (XB.sh_gu) vkDestroyShaderModule(G.dev, XB.sh_gu, NULL);
     if (XB.sh_mv) vkDestroyShaderModule(G.dev, XB.sh_mv, NULL);
     if (XB.sh_mm) vkDestroyShaderModule(G.dev, XB.sh_mm, NULL);
+    for (int k = 0; k < VK_COOP_SLOTS; k++) if (XB.p_coop[k]) vkDestroyPipeline(G.dev, XB.p_coop[k], NULL);
+    if (XB.sh_coop) vkDestroyShaderModule(G.dev, XB.sh_coop, NULL);
     if (XB.pl6) vkDestroyPipelineLayout(G.dev, XB.pl6, NULL);
     if (XB.pl4) vkDestroyPipelineLayout(G.dev, XB.pl4, NULL);
     if (XB.pl3) vkDestroyPipelineLayout(G.dev, XB.pl3, NULL);
@@ -3279,6 +3767,24 @@ int coli_vk_tensor_commit(ColiVkTensor *const *t, int n) {
     pthread_mutex_unlock(&u->mx);
     for (int k = 0; k < n; k++) if (t[k]) { free(t[k]->img); t[k]->img = NULL; }
     return ok;
+}
+/* A tier tensor filled again in place (a staging slot of the tier's streaming): mapped
+ * memory hands its mapping back (the padding past each row is still the zeros of its
+ * allocation, and the caller writes the rows only), staged uploads a fresh zeroed host
+ * image that coli_vk_tensor_commit copies over and frees. Not while a batch reads it. */
+int coli_vk_tensor_refill(ColiVkTensor *t, uint8_t **rows, size_t *stride, float **scales) {
+    if (!G.ready || !t || t->pool != &g_tpool) return 0;
+    if (g_up[t->dev].on) {
+        size_t sb = scale_floats(t->fmt, t->I, t->O, t->gs) * sizeof(float);
+        free(t->img);
+        if (!(t->img = calloc(1, t->wbytes + sb))) return 0;
+        *rows = t->img; *scales = (float *)(t->img + t->wbytes);
+    } else {
+        if (!t->wmap || !t->smap) return 0;
+        *rows = t->wmap; *scales = (float *)t->smap;
+    }
+    *stride = (size_t)t->rowWords * 4;
+    return 1;
 }
 int coli_vk_staged(void) { return G.ready && g_up[0].on; }
 size_t coli_vk_tensor_row_bytes(int fmt, int I) { return cpu_row_bytes(fmt, I); }
@@ -3363,6 +3869,13 @@ void coli_vk_shutdown(void) {
     }
     g_async_inflight[0] = 0;   /* idle after vkDeviceWaitIdle: the deferred frees run now */
     tensor_reap(0);
+    pthread_mutex_lock(&g_imports_mx);   /* imported rows: their memory objects go before the device */
+    for (ColiVkTensor *t = g_imports; t; t = t->imp_next) {
+        vkDestroyBuffer(G.dev, t->wbuf, NULL); vkFreeMemory(G.dev, t->imp, NULL);
+        t->wbuf = VK_NULL_HANDLE; t->imp = VK_NULL_HANDLE;
+    }
+    g_imports = NULL;
+    pthread_mutex_unlock(&g_imports_mx);
     pool_destroy(&g_wpool);    /* weight blocks: unmapped/freed with the device */
     pool_destroy(&g_tpool);
     if (PW.buf) { vkDestroyBuffer(G.dev, PW.buf, NULL); vkFreeMemory(G.dev, PW.mem, NULL); }
@@ -3432,10 +3945,10 @@ static void digest(const void *p, size_t n) {
 }
 static size_t ref_rowbytes(int fmt, int I) {
     return fmt == 1 || fmt == 12 || fmt == 13 ? (size_t)I : fmt == 5 ? (size_t)((I + 63) / 64) * 24
-         : fmt == 10 ? (size_t)I * 4 : fmt == 11 ? (size_t)I * 2 : (size_t)(I + 1) / 2;
+         : fmt == 10 ? (size_t)I * 4 : fmt == 11 || fmt == 14 ? (size_t)I * 2 : (size_t)(I + 1) / 2;
 }
 static size_t ref_scales(int fmt, int I, int O) {   // scale COUNT (per-group for fmt 4/5)
-    if (fmt == 10 || fmt == 11) return 1;
+    if (fmt == 10 || fmt == 11 || fmt == 14) return 1;
     if (fmt == 5) return (size_t)O * (size_t)((I + 63) / 64);
     if (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13) return (size_t)O * (size_t)((I + g_ref_gs - 1) / g_ref_gs);
     return (size_t)O;
@@ -3449,6 +3962,10 @@ static float deq(const uint8_t *row, int fmt, int i) {
                      return (b & 0x80) ? -v : v; }
     if (fmt == 11) { uint16_t h; memcpy(&h, row + (size_t)i * 2, 2); uint32_t u = (uint32_t)h << 16;
                      float f; memcpy(&f, &u, 4); return f; }
+    if (fmt == 14) { uint16_t h; memcpy(&h, row + (size_t)i * 2, 2);   /* f16: normals and subnormals */
+                     int e = (h >> 10) & 31, m = h & 1023;
+                     float v = e == 0 ? ldexpf((float)m, -24) : ldexpf(1.0f + m / 1024.0f, e - 15);
+                     return (h & 0x8000) ? -v : v; }
     if (fmt == 5) {   // int3-g64: 16B low plane (2 bits) + 8B high plane (1 bit), v+4
         const uint8_t *lo = row + (size_t)(i >> 6) * 24, *hi = lo + 16; int j = i & 63;
         unsigned u = ((lo[j >> 2] >> ((j & 3) * 2)) & 3u) | (((hi[j >> 3] >> (j & 7)) & 1u) << 2);
@@ -3474,7 +3991,7 @@ static void cpu_ref(float *y, const float *x, const uint8_t *w, const float *sc,
             y[s * O + o] = (float)sum;
         } else {
             for (int i = 0; i < I; i++) sum += x[s * I + i] * deq(row, fmt, i);
-            y[s * O + o] = (float)(fmt == 10 || fmt == 11 ? sum : sum * sc[o]);
+            y[s * O + o] = (float)(fmt == 10 || fmt == 11 || fmt == 14 ? sum : sum * sc[o]);
         }
     }
 }
@@ -3513,6 +4030,19 @@ static void case_fill(int fmt, int S, int I, int O, float **x, uint8_t **w, floa
             float f = (float)((rand() % 2001 - 1000) / 1000.0);
             if (fmt == 10) memcpy(*w + i * 4, &f, 4);
             else { uint32_t u; memcpy(&u, &f, 4); uint16_t h = (uint16_t)(u >> 16); memcpy(*w + i * 2, &h, 2); }
+        }
+    if (fmt == 14)                         /* f16: the same values as 10 and 11, rounded to f16 */
+        for (size_t i = 0; i < (size_t)I * O; i++) {
+            float f = (float)((rand() % 2001 - 1000) / 1000.0), a = fabsf(f);
+            int e; float m = frexpf(a, &e);                 /* a = m 2^e, m in [0.5, 1) */
+            uint16_t h = 0;
+            if (a >= ldexpf(1.0f, -14)) {                   /* normal: 10 bits after the leading one */
+                int q = (int)lrintf(ldexpf(m, 11));        /* in [1024, 2048] */
+                if (q == 2048) { q = 1024; e++; }
+                h = (uint16_t)(((e - 1 + 15) << 10) | (q - 1024));
+            } else h = (uint16_t)lrintf(ldexpf(a, 24));     /* subnormal */
+            if (f < 0) h |= 0x8000;
+            memcpy(*w + i * 2, &h, 2);
         }
     for (size_t o = 0; o < nsc; o++) (*sc)[o] = 0.01f + (rand() % 100) / 10000.0f;
 }
@@ -4009,6 +4539,112 @@ static int run_qprep(int fmt, int S, int I, int Oqa, int Okva, int Oqb) {
     return mq > 1e-2f || mk > 1e-3f;
 }
 
+/* f16 weights (fmt 14) and rows imported in place (coli_vk_tensor_import), after the
+ * digest above, which stays the one of the formats before them (tests/vulkan_engines.sh
+ * staged compares it across builds), with a digest line of their own. The imports: an
+ * int8, an f32 and an f16 matrix in page-aligned host memory, through the GEMV and the
+ * fp32 GEMM, against the reference and bit for bit against the same matrix uploaded as
+ * a copy; a device without the extension (or staged uploads) says so and skips them. */
+static int run_import_case(int fmt, int S, int I, int O) {
+    size_t al = coli_vk_import_alignment();
+    if (!al) { printf("import fmt=%d: not possible on this device, skipped\n", fmt); return 0; }
+    float *x, *sc; uint8_t *w0;
+    case_fill(fmt, S, I, O, &x, &w0, &sc);
+    size_t rb = ref_rowbytes(fmt, I), bytes = rb * O, sz = (bytes + al - 1) / al * al;
+    void *w = NULL;
+    if (posix_memalign(&w, al, sz)) { printf("import: out of memory\n"); return 1; }
+    memset(w, 0, sz); memcpy(w, w0, bytes);
+    float *yi = malloc((size_t)S * O * 4), *yc = malloc((size_t)S * O * 4), *yr = malloc((size_t)S * O * 4);
+    ColiVkTensor *ti = NULL, *tc = NULL;
+    int bad = 0, keep_s = G.gemm_min_s, keep_so = G.gemm_min_so;
+    if (S > 1) { G.gemm_min_s = 2; G.gemm_min_so = 1; }   /* a block of rows: the fp32 GEMM */
+    size_t before = coli_vk_imported_bytes();
+    if (!coli_vk_tensor_import(&ti, w, sz, sc, fmt, I, O, 0)) { printf("import fmt=%d: refused\n", fmt); bad = 1; }
+    else if (coli_vk_imported_bytes() != before + bytes) { printf("import fmt=%d: the bytes were not counted\n", fmt); bad = 1; }
+    else if (!coli_vk_matmul(&ti, yi, x, w, sc, fmt, S, I, O, 0) || !coli_vk_matmul(&tc, yc, x, w0, sc, fmt, S, I, O, 0)) {
+        printf("import fmt=%d: matmul failed\n", fmt); bad = 1;
+    } else {
+        digest(yi, (size_t)S * O * 4);
+        cpu_ref(yr, x, w0, sc, fmt, S, I, O);
+        double maxrel = 0;
+        for (int i = 0; i < S * O; i++)
+            if (fabs(yr[i]) > 1e-2) { double r = fabs(yi[i] - yr[i]) / fabs(yr[i]); if (r > maxrel) maxrel = r; }
+        int same = !memcmp(yi, yc, (size_t)S * O * 4);
+        printf("import fmt=%d S=%d I=%d O=%d %s | maxrel=%.4g | the copy's bits: %s\n", fmt, S, I, O,
+               G.bound_gemm ? "gemm" : "gemv", maxrel, same ? "same" : "DIFFERENT");
+        bad = maxrel > 1e-3 || !same;
+    }
+    G.gemm_min_s = keep_s; G.gemm_min_so = keep_so;
+    coli_vk_tensor_free(ti); coli_vk_tensor_free(tc);
+    if (coli_vk_imported_bytes() != before) { printf("import fmt=%d: the bytes were not given back\n", fmt); bad = 1; }
+    free(w); free(w0); free(x); free(sc); free(yi); free(yc); free(yr);
+    return bad;
+}
+static int run_gemm_case(int fmt, int S, int I, int O, int gs);
+/* COLI_VK_TEST_IMPORT_BENCH=1: one Qwen3.8-27B MLP matrix (I 5120, O 17408) in int8 and
+ * f16, as a copy in the weight pool and imported in place, at S = 1 (the GEMV) and S =
+ * 300 (a decision's prompt, the tiled GEMM): the wall time of a call, best of 5. */
+static void bench_import(void) {
+    size_t al = coli_vk_import_alignment();
+    if (!al) { printf("import bench: imports not possible on this device\n"); return; }
+    const int I = 5120, O = 17408, Ss[2] = {1, 300}, fm[2] = {1, 14};
+    for (int f = 0; f < 2; f++) {
+        int fmt = fm[f];
+        float *x, *sc; uint8_t *w0;
+        case_fill(fmt, 300, I, O, &x, &w0, &sc);
+        size_t bytes = ref_rowbytes(fmt, I) * O, sz = (bytes + al - 1) / al * al;
+        void *w = NULL;
+        if (posix_memalign(&w, al, sz)) return;
+        memcpy(w, w0, bytes);
+        float *y = malloc((size_t)300 * O * 4);
+        ColiVkTensor *tc = NULL, *ti = NULL;
+        if (!coli_vk_tensor_ensure(&tc, w0, sc, fmt, I, O, 0) || !coli_vk_tensor_import(&ti, w, sz, sc, fmt, I, O, 0)) {
+            printf("import bench fmt=%d: no tensor\n", fmt); return;
+        }
+        for (int k = 0; k < 2; k++) {
+            double best[2] = {1e30, 1e30};
+            int keep_s = G.gemm_min_s, keep_so = G.gemm_min_so;
+            if (Ss[k] > 1) { G.gemm_min_s = 2; G.gemm_min_so = 1; }   /* the harness keeps GEMVs; a prompt takes the GEMM */
+            for (int which = 0; which < 2; which++) {
+                ColiVkTensor **t = which ? &ti : &tc;
+                coli_vk_matmul(t, y, x, which ? w : w0, sc, fmt, Ss[k], I, O, 0);
+                for (int r = 0; r < 5; r++) {
+                    double t0 = now();
+                    coli_vk_matmul(t, y, x, which ? w : w0, sc, fmt, Ss[k], I, O, 0);
+                    double ms = (now() - t0) * 1000;
+                    if (ms < best[which]) best[which] = ms;
+                }
+            }
+            printf("import bench fmt=%d S=%d (%s): copy %.2f ms, imported %.2f ms (%.1f MB of rows)\n", fmt, Ss[k],
+                   G.bound_gemm == 2 ? "coop" : G.bound_gemm ? "gemm" : "gemv", best[0], best[1], bytes / 1e6);
+            G.gemm_min_s = keep_s; G.gemm_min_so = keep_so;
+        }
+        coli_vk_tensor_free(tc); coli_vk_tensor_free(ti);
+        free(w); free(w0); free(x); free(sc); free(y);
+    }
+}
+static int run_late_cases(void) {
+    if (getenv("COLI_VK_TEST_IMPORT_BENCH") && atoi(getenv("COLI_VK_TEST_IMPORT_BENCH"))) bench_import();
+    uint64_t keep = g_digest;
+    g_digest = 1469598103934665603ULL;
+    int bad = 0;
+    bad |= run_case(14, 1, 6144, 1536, 20);
+    bad |= run_case(14, 8, 2048, 512, 10);
+    bad |= run_case(14, 1, 16384, 512, 5);
+    bad |= run_case(14, 3, 37, 5, 5);       // odd I: the last word holds one f16
+    bad |= run_gemm_case(14, 16, 1001, 193, 64);
+    bad |= run_gemm_case(14, 64, 1536, 97, 64);
+    bad |= run_gemm_case(14, 512, 520, 131, 64);
+    bad |= run_import_case(1, 1, 2048, 384);
+    bad |= run_import_case(1, 64, 2048, 384);
+    bad |= run_import_case(10, 3, 1024, 100);
+    bad |= run_import_case(14, 1, 4096, 257);
+    bad |= run_import_case(14, 96, 4096, 257);
+    printf("f16 and import digest %016llx\n", (unsigned long long)g_digest);
+    g_digest = keep;
+    return bad;
+}
+
 /* ---- the expert tier's device side: weight pool and async expert batch ----------
  * Reference dot of one weight row in any format, its scales applied the way the
  * shader does (per row for 1/2, per gs-group for 4/7/12/13, per 64 for 5, none for
@@ -4055,7 +4691,9 @@ static void xmat_drop(XMat *m) { free(m->w); free(m->s); m->w = NULL; m->s = NUL
  * experts. */
 static int run_xbatch(int fmt, int dfmt, int gs, int D, int I, int act, float limit) {
     enum { K = 5 };
-    static const int rows[K] = {1, 3, 2, 20, 1};
+    const char *large = getenv("COLI_VK_TEST_XB_LARGE");
+    int rows[K] = {1, 3, 2, 20, 1};
+    if (large && atoi(large)) { rows[2] = 64; rows[3] = 257; rows[4] = 20; }
     XMat mg[K], mu[K], md[K]; ColiVkExpert *ex[K];
     XB.act = act; XB.limit = limit; XB.a = 4.0f; XB.b = 25.0f;
     for (int c = 0; c < K; c++) {
@@ -4072,6 +4710,13 @@ static int run_xbatch(int fmt, int dfmt, int gs, int D, int I, int act, float li
     int j = 0;
     for (int c = 0; c < K; c++)
         for (int r = 0; r < rows[c]; r++, j++) {
+            if (large && atoi(large) && c >= 1) {
+                /* Device-side scaling must preserve zero and tiny rows as well
+                 * as values that would overflow an unscaled fp16 conversion. */
+                static const int powers[] = {-40, 0, 10, 20};
+                for (int d = 0; d < D; d++)
+                    x[(size_t)j * D + d] = r ? ldexpf(x[(size_t)j * D + d], powers[(r + 3) % 4]) : 0;
+            }
             const float *xs = x + (size_t)j * D;
             size_t grb = ref_rowbytes(fmt, D), drb = ref_rowbytes(dfmt, I);
             for (int o = 0; o < I; o++) {
@@ -4082,18 +4727,32 @@ static int run_xbatch(int fmt, int dfmt, int gs, int D, int I, int act, float li
             for (int d = 0; d < D; d++) ref[(size_t)j * D + d] = (float)xref_dot(hid, md[c].w + (size_t)d * drb, md[c].s, d, dfmt, I, gs);
         }
     int bad = 0; double dms = 0;
+    unsigned long long coop_before = XB.cooperative_matmuls, coop_expected = 0;
+    for (int c = 0; c < K; c++) {
+        int slot = gemm_slot(rows[c]);
+        if (XB.gemm_rows && rows[c] >= XB.gemm_rows && XB.p_mm[slot])
+            coop_expected += (xb_coop_slot(mg[c].t, rows[c], slot) >= 0) +
+                             (xb_coop_slot(mu[c].t, rows[c], slot) >= 0) +
+                             (xb_coop_slot(md[c].t, rows[c], slot) >= 0);
+    }
     if (!coli_vk_xb_issue(ex, rows, K, xr) || !coli_vk_xb_join(yr, &dms)) { printf("xbatch fmt=%d/%d: issue/join failed\n", fmt, dfmt); bad = 1; }
+    unsigned long long coop_done = XB.cooperative_matmuls - coop_before;
+    if (coop_done != coop_expected) { printf("xbatch: cooperative matmuls %llu, expected %llu\n", coop_done, coop_expected); bad = 1; }
     for (int jj = 0; !bad && jj < total; jj++) digest(yr[jj], (size_t)D * 4);
-    double maxrel = 0, scale = 0;
-    for (int i = 0; i < total * D; i++) if (fabs(ref[i]) > scale) scale = fabs(ref[i]);
-    for (int jj = 0; !bad && jj < total; jj++)
+    double maxrel = 0;
+    for (int jj = 0; !bad && jj < total; jj++) {
+        double scale = 0;
+        for (int d = 0; d < D; d++) if (fabs(ref[(size_t)jj * D + d]) > scale) scale = fabs(ref[(size_t)jj * D + d]);
         for (int d = 0; d < D; d++) {
             double r = ref[(size_t)jj * D + d], e = fabs(yr[jj][d] - r);
+            if (!isfinite(yr[jj][d])) { bad = 1; break; }
+            if (scale == 0) { if (yr[jj][d] != 0) bad = 1; continue; }
             /* relative to the row's own magnitude where it is not tiny; cancellation-heavy
              * random rows make single elements near zero meaningless */
             double rel = e / (fabs(r) > 1e-2 * scale ? fabs(r) : 1e-2 * scale);
             if (rel > maxrel) maxrel = rel;
         }
+    }
     /* the first expert's row alone, then the same row as the 2nd of 3: same bits */
     float *y1 = malloc((size_t)D * 4);
     int same = 1;
@@ -4107,8 +4766,9 @@ static int run_xbatch(int fmt, int dfmt, int gs, int D, int I, int act, float li
         else if (!bad) same &= !memcmp(y1, yr[1], (size_t)D * 4);
     }
     const char *an = act == COLI_VK_ACT_SITU ? "situ" : limit > 0 ? "swiglu-limit" : "swiglu";
-    printf("xbatch fmt=%d/%d gs=%d D=%d I=%d %s, rows 1/3/2/20/1 (GEMM from %d) | maxrel=%.3g | row bits independent of the batch: %s | device %.3f ms\n",
-           fmt, dfmt, gs, D, I, an, XB.gemm_rows, maxrel, same ? "yes" : "NO", dms);
+    printf("xbatch fmt=%d/%d gs=%d D=%d I=%d %s, rows %d/%d/%d/%d/%d (GEMM from %d, %llu cooperative matmuls) | maxrel=%.3g | row bits independent of the batch: %s | device %.3f ms\n",
+           fmt, dfmt, gs, D, I, an, rows[0], rows[1], rows[2], rows[3], rows[4], XB.gemm_rows,
+           coop_done, maxrel, same ? "yes" : "NO", dms);
     if (maxrel > 3e-3 || !same) bad = 1;
     for (int c = 0; c < K; c++) { coli_vk_xb_expert_free(ex[c]); xmat_drop(&mg[c]); xmat_drop(&mu[c]); xmat_drop(&md[c]); }
     free(x); free(ref); free(hid); free(xr); free(yr); free(y1);
@@ -4336,6 +4996,8 @@ static int run_xbatch_all(void) {
         bad |= run_xbatch(fm[f], fm[f], gs, 320, 160, COLI_VK_ACT_SWIGLU, 0.f);
     }
     bad |= run_xbatch(4, 1, 64, 320, 160, COLI_VK_ACT_SWIGLU, 0.f);      /* int4 gate/up, int8 down */
+    bad |= run_xbatch(4, 10, 64, 320, 160, COLI_VK_ACT_SWIGLU, 0.f);     /* cooperative gate/up, fp32 down */
+    bad |= run_xbatch(10, 1, 64, 320, 160, COLI_VK_ACT_SWIGLU, 0.f);     /* fp32 gate/up, cooperative down */
     bad |= run_xbatch(4, 4, 64, 320, 160, COLI_VK_ACT_SWIGLU, 0.7f);     /* the clamped SwiGLU */
     bad |= run_xbatch(7, 7, 32, 320, 160, COLI_VK_ACT_SITU, 0.f);        /* SiTU-GLU on MXFP4 */
     xb_shutdown();
@@ -4577,6 +5239,7 @@ int main(int argc, char **argv) {
      * take most of the time. */
     if (getenv("COLI_VK_TEST_MATMUL_ONLY") && atoi(getenv("COLI_VK_TEST_MATMUL_ONLY"))) {
         printf("outputs digest %016llx\n", (unsigned long long)g_digest);
+        bad |= run_late_cases();
         printf(bad ? "FAIL\n" : "PASS\n");
         coli_vk_shutdown();
         return bad;
@@ -4697,6 +5360,7 @@ int main(int argc, char **argv) {
         g_absorb_rewind = 0;
     }
     printf("outputs digest %016llx\n", (unsigned long long)g_digest);
+    bad |= run_late_cases();
     printf(bad ? "FAIL\n" : "PASS\n");
     coli_vk_shutdown();
     return bad;

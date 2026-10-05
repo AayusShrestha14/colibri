@@ -728,6 +728,14 @@ VK_SPV   += shaders/chain_ares.spv
 # inkling's chain ops (made on first use): the short convolution and the attention
 # with its relative-position bias
 VK_SPV   += shaders/chain_sconv.spv shaders/chain_relattn.spv
+# blocked attention for prompt chunks (made on first use; vk_chain.c, chain_attnb.comp)
+VK_SPV   += shaders/chain_attnb.spv
+# the KV cache split between the device and the host past the device's budget
+# (vk_chain.h: vkc_kvs_*; vk_kvsplit.h)
+VK_SPV   += shaders/chain_kvs.spv
+# the decision engines' encoders (laya, gliner_decide): bidirectional attention over row
+# ranges with DeBERTa's relative terms, LayerNorm, GeGLU, RoPE (made on first use)
+VK_SPV   += shaders/chain_enc.spv
 endif
 
 # Optional AMD XDNA2 (Ryzen AI NPU) lane, Windows. Same opt-in shape as VK=1:
@@ -1292,8 +1300,8 @@ ifneq ($(EXE),)
 .PHONY: laya
 laya: laya$(EXE)
 endif
-laya$(EXE): laya.c .build-config
-	$(CC) $(CFLAGS) laya.c -o laya$(EXE) $(LDFLAGS)
+laya$(EXE): laya.c $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) laya.c $(VK_OBJ) -o laya$(EXE) $(LDFLAGS)
 
 # GLiNER2.5-Decide (fastino), a decision model: DeBERTa-v3 encoder + GLiNER2's
 # classification head, served on POST /v1/systemone through the DECIDE command
@@ -1303,8 +1311,8 @@ ifneq ($(EXE),)
 .PHONY: gliner_decide
 gliner_decide: gliner_decide$(EXE)
 endif
-gliner_decide$(EXE): gliner_decide.c .build-config
-	$(CC) $(CFLAGS) gliner_decide.c -o gliner_decide$(EXE) $(LDFLAGS)
+gliner_decide$(EXE): gliner_decide.c $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) gliner_decide.c $(VK_OBJ) -o gliner_decide$(EXE) $(LDFLAGS)
 
 # Tiny Laya checkpoint + the laya package's own answers on it. The generator is
 # numpy and deterministic; laya_tiny/ref.json is committed and comes from the
@@ -1532,12 +1540,60 @@ qwen38-tiny-mtp-check: qwen38-tiny-mtp-generate qwen38$(EXE)
 	$(PYTHON) tests/qwen38_mtp_harness.py --engine ./qwen38$(EXE) --bf16 ./qwen38_tiny_mtp \
 		--fp8 ./qwen38_tiny_fp8_mtp --int4 ./qwen38_tiny_int4_mtp
 
+# Speculative decoding with deeper verifies (docs/speculative.md): the MTP head's
+# drafts up to 3 per verify (Q38_MTP_DRAFTS) and prompt-lookup drafts up to 5
+# (COLI_LOOKUP=1, spec_draft.h), on qwen38 and qwen36. tests/test_spec_draft
+# checks the lookup and the gate on their own; tests/spec_drafts_harness.py gates
+# every depth and every rejected row against plain decoding (tokens and last logits
+# byte-identical, the forced modes' counts exact), and serve sessions with prefix
+# reuse, pins and turns that end inside a verify. The qwen36 fixtures have an ASCII
+# vocabulary (--vocab 128), so a reply resent as text reads back as the ids the
+# engine generated. SPEC_ENV passes more settings to every run (the Vulkan family
+# in tests/vulkan_engines.sh runs the same gates in the dense chain).
+.PHONY: qwen36-tiny-v128-generate spec-drafts-check spec-drafts-run
+qwen36-tiny-v128-generate:
+	$(PYTHON) tools/make_qwen36_tiny.py --out ./qwen36_tiny_v128 --ref-mode full --vocab 128 \
+		--emit-ref ./qwen36_tiny_v128/ref_full.json
+	$(PYTHON) tools/convert_qwen36.py --model ./qwen36_tiny_v128 --out ./qwen36_tiny_v128_c --ebits 8
+	$(PYTHON) tools/make_qwen36_tiny.py --out ./qwen36_tiny64_v128 --ref-mode full --vocab 128 --inter 64 \
+		--emit-ref ./qwen36_tiny64_v128/ref_full.json
+	$(PYTHON) tools/convert_qwen36.py --model ./qwen36_tiny64_v128 --out ./qwen36_tiny64_v128_c --ebits 4 --gs 64
+
+tests/test_spec_draft$(EXE): tests/test_spec_draft.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_qwen38_spec_alloc$(EXE): tests/test_qwen38_spec_alloc.c qwen38.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+SPEC_HARNESS = $(PYTHON) tests/spec_drafts_harness.py
+spec-drafts-check: qwen38-tiny-mtp-generate qwen36-tiny-v128-generate
+	$(MAKE) spec-drafts-run
+
+# the gates alone, on fixtures already generated (spec-drafts-check makes them)
+spec-drafts-run: qwen38$(EXE) qwen36$(EXE) tests/test_spec_draft$(EXE) tests/test_qwen38_spec_alloc$(EXE)
+	./tests/test_spec_draft$(EXE)
+	./tests/test_qwen38_spec_alloc$(EXE)
+	$(SPEC_HARNESS) --engine ./qwen38$(EXE) --kind qwen38 --fixture ./qwen38_tiny_mtp --mtp --serve $(SPEC_ENV)
+	$(SPEC_HARNESS) --engine ./qwen38$(EXE) --kind qwen38 --fixture ./qwen38_tiny_fp8_mtp --mtp \
+		--env Q38_PREFILL_BATCH=0 $(SPEC_ENV)
+	$(SPEC_HARNESS) --engine ./qwen38$(EXE) --kind qwen38 --fixture ./qwen38_tiny_int4_mtp \
+		--ref ./qwen38_tiny_int4_mtp/ref_int4.json --mtp --env Q38_EXPERT_INT4=1 --env Q38_TRUNK_MIN_KB=0 $(SPEC_ENV)
+	$(SPEC_HARNESS) --engine ./qwen36$(EXE) --kind qwen36 --fixture ./qwen36_tiny_v128_c \
+		--ref ./qwen36_tiny_v128/ref_full.json --cap 8 --n-new 64 --serve --env COLI_DENSE_I8=0 $(SPEC_ENV)
+	$(SPEC_HARNESS) --engine ./qwen36$(EXE) --kind qwen36 --fixture ./qwen36_tiny_v128_c \
+		--ref ./qwen36_tiny_v128/ref_full.json --cap 1 --n-new 64 $(SPEC_ENV)
+	$(SPEC_HARNESS) --engine ./qwen36$(EXE) --kind qwen36 --fixture ./qwen36_tiny64_v128_c \
+		--ref ./qwen36_tiny64_v128/ref_full.json --cap 8 --n-new 64 $(SPEC_ENV)
+
 # Context-size gates: KV layout, growth across requests, and the attention
 # capacity. Includes qwen36.c directly, so no model file is needed.
 # Same tier objects as the engine: the test includes qwen36.c, so with CUDA=1
 # it links qwen36_tier.o and the backend object too (without CUDA, the header's
 # inline stubs cover it and both are empty).
 tests/test_qwen36_ctx$(EXE): tests/test_qwen36_ctx.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_qwen36_weight_alloc$(EXE): tests/test_qwen36_weight_alloc.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # CACHE_ROUTE: route_select() against a residency table, no model needed.
@@ -2114,6 +2170,12 @@ tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
 
 tests/test_compat_direct$(EXE): tests/test_compat_direct.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_compat_prefetch$(EXE): tests/test_compat_prefetch.c $(if $(IS_WIN),tests/compat_prefetch_module.dll)
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/compat_prefetch_module.dll: tests/compat_prefetch_module.c
+	$(CC) $(CFLAGS) -shared $< -o $@ $(LDFLAGS)
 
 tests/test_expert_store_ops$(EXE): tests/test_expert_store_ops.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -2870,7 +2932,7 @@ AUTODEP_OBJS      = backend_vulkan.o vk_tier.o backend_loader.o backend_xdna.o q
 AUTODEP_BINS      = $(addsuffix $(EXE),$(ENGINE_RULES)) \
 	$(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(AUTODEP_ELSEWHERE) \
 		$(AUTODEP_OWN_FLAGS),$(AUTODEP_TESTS)))) \
-	$(AUTODEP_OBJS)
+	$(AUTODEP_OBJS) $(if $(IS_WIN),tests/compat_prefetch_module.dll)
 AUTODEP_DEPS      = $(addsuffix .d,$(basename $(AUTODEP_BINS)))
 $(foreach b,$(AUTODEP_BINS),$(eval $(b): $(basename $(b)).d))
 $(AUTODEP_DEPS): ;

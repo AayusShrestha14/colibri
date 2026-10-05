@@ -34,12 +34,16 @@ float act_v4(float g, float u, float limit) {
     return g * s * u;
 }
 
+// Below 2^-12 the cubic correction is below half an f32 ULP. Some drivers'
+// tanh lowering loses these values through cancellation around exp(0) == 1.
+float situ_tanh(float x) { return abs(x) < 0.000244140625 ? x : tanh(x); }
+
 void main() {
     int i = int(gl_GlobalInvocationID.x) + int(gl_GlobalInvocationID.y) * int(gl_NumWorkGroups.x) * 256;
     if (i >= p.n) return;
     float gt = gate[i], ut = up[i], h;
     if (p.act == 1) {
-        h = p.a * tanh(gt / p.a) * (1.0 / (1.0 + exp(-gt))) * (p.b * tanh(ut / p.b));
+        h = p.a * situ_tanh(gt / p.a) * (1.0 / (1.0 + exp(-gt))) * (p.b * situ_tanh(ut / p.b));
     } else if (p.act == 2) {
         h = act_v4(gt, ut, p.limit);
     } else {

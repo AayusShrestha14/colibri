@@ -52,6 +52,10 @@
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/resource.h>
 #endif
+#if defined(COLI_VULKAN) && !defined(_WIN32)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -322,6 +326,107 @@ static void *xmalloc(size_t bytes, const char *what) {
     return p;
 }
 
+#ifdef COLI_VULKAN
+/* ---- dense weights on the device only (COLI_VK_DENSE_HOST) -------------------------
+ * With the trunk on the device (the chain, or COLI_VK_DENSE) and this mode on (decided
+ * by v41_dho_open in model_load, before the layers are read), each trunk matrix (the
+ * fp8 rows of every W8 of a layer, the compressor's, indexer's and engram's projections;
+ * not the router, the head, the embedding, the norms, DSpark's stages or the vision
+ * tower) is read into an anonymous mapping of its own, uploaded as every lookup will ask
+ * for it, and its pages given back with the address kept: the device copies are found
+ * by that address (vk_entry), and a matrix the CPU needs again (a lost device, a step
+ * the device declines) is read back from disk at it (v41_dho_host), and stays. */
+typedef struct {
+    unsigned char *base; size_t bytes;
+    char name[256];
+    int kind, O, I;                 /* 8: the e4m3 rows of a W8 (tiles below), 16: a WB */
+    const uint8_t *tiles;
+    int placed, gone;
+} V41Home;
+static V41Home *g_v41_home;
+static size_t g_v41_home_n, g_v41_home_cap;
+static int g_v41_dho, g_v41_map, g_vk_opened;
+static shards *g_v41_shards;
+static pthread_mutex_t g_v41_home_mx = PTHREAD_MUTEX_INITIALIZER;
+static size_t v41_map_len(size_t bytes) {
+#ifdef _WIN32
+    SYSTEM_INFO si; GetSystemInfo(&si);
+    size_t page = si.dwAllocationGranularity ? si.dwAllocationGranularity : 65536;
+#else
+    long ps = sysconf(_SC_PAGESIZE);
+    size_t page = ps > 0 ? (size_t)ps : 4096;
+#endif
+    return ((bytes ? bytes : 1) + page - 1) / page * page;
+}
+/* pages back with the range kept (and unreadable), and back again zeroed */
+static int v41_map_drop(void *p, size_t bytes) {
+#ifdef _WIN32
+    return VirtualFree(p, v41_map_len(bytes), MEM_DECOMMIT) ? 0 : -1;
+#else
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
+#ifdef MAP_NORESERVE
+    flags |= MAP_NORESERVE;
+#endif
+    return mmap(p, v41_map_len(bytes), PROT_NONE, flags, -1, 0) == MAP_FAILED ? -1 : 0;
+#endif
+}
+static int v41_map_restore(void *p, size_t bytes) {
+#ifdef _WIN32
+    return VirtualAlloc(p, v41_map_len(bytes), MEM_COMMIT, PAGE_READWRITE) == p ? 0 : -1;
+#else
+    return mprotect(p, v41_map_len(bytes), PROT_READ | PROT_WRITE);
+#endif
+}
+static void *v41_home_alloc(size_t bytes, const char *name) {
+#ifdef _WIN32
+    void *p = VirtualAlloc(NULL, v41_map_len(bytes), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!p) { fprintf(stderr, "OOM mapping %s (%zu bytes)\n", name, bytes); exit(1); }
+#else
+    void *p = mmap(NULL, v41_map_len(bytes), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) { fprintf(stderr, "OOM mapping %s (%zu bytes)\n", name, bytes); exit(1); }
+#endif
+    if (g_v41_home_n == g_v41_home_cap) {
+        g_v41_home_cap = g_v41_home_cap ? 2 * g_v41_home_cap : 256;
+        g_v41_home = realloc(g_v41_home, g_v41_home_cap * sizeof(*g_v41_home));
+        if (!g_v41_home) { fprintf(stderr, "OOM dense weights table\n"); exit(1); }
+    }
+    V41Home *h = &g_v41_home[g_v41_home_n++];
+    memset(h, 0, sizeof *h);
+    h->base = p; h->bytes = bytes;
+    snprintf(h->name, sizeof h->name, "%s", name);
+    return p;
+}
+static V41Home *v41_home_of(const void *data) {
+    uintptr_t q = (uintptr_t)data;
+    for (size_t i = 0; i < g_v41_home_n; i++)
+        if (q >= (uintptr_t)g_v41_home[i].base && q - (uintptr_t)g_v41_home[i].base < g_v41_home[i].bytes)
+            return &g_v41_home[i];
+    return NULL;
+}
+/* The CPU is about to read the matrix that holds `data`: read back what the device held
+ * alone, at its own address. */
+static void v41_dho_host(const void *data) {
+    if (!g_v41_dho || !data) return;
+    pthread_mutex_lock(&g_v41_home_mx);
+    V41Home *h = v41_home_of(data);
+    if (h && h->gone) {
+        if (v41_map_restore(h->base, h->bytes)) {
+            fprintf(stderr, "[VK] deepseek_v41: %s could not come back into RAM\n", h->name); exit(1);
+        }
+        st_read_raw_cap(g_v41_shards, h->name, h->base, (int64_t)h->bytes, 0);
+        h->gone = 0;
+        coli_vk_dense_host_reloaded(h->bytes);
+    }
+    pthread_mutex_unlock(&g_v41_home_mx);
+}
+#endif
+static void *v41_weight_alloc(size_t bytes, const char *name) {
+#ifdef COLI_VULKAN
+    if (g_v41_map) return v41_home_alloc(bytes, name);
+#endif
+    return xmalloc(bytes, name);
+}
+
 static void w8_load(shards *S, W8 *w, const char *name, int O, int I) {
     char scale_name[512];
     snprintf(scale_name, sizeof(scale_name), "%.*s.scale",
@@ -333,10 +438,13 @@ static void w8_load(shards *S, W8 *w, const char *name, int O, int I) {
                 name, (long long)t->nbytes, (long long)O * I, O, I); exit(1); }
     int tiles = ((O + FP8_TILE - 1) / FP8_TILE) * ((I + FP8_TILE - 1) / FP8_TILE);
     w->O = O; w->I = I;
-    w->q = xmalloc((size_t)O * I, name);
+    w->q = v41_weight_alloc((size_t)O * I, name);
     w->s = xmalloc((size_t)tiles, scale_name);
     st_read_raw_cap(S, name, w->q, (int64_t)O * I, 0);
     st_read_raw_cap(S, scale_name, w->s, tiles, 0);
+#ifdef COLI_VULKAN
+    if (g_v41_map) { V41Home *h = &g_v41_home[g_v41_home_n - 1]; h->kind = 8; h->O = O; h->I = I; h->tiles = w->s; }
+#endif
 }
 
 static void wb_load(shards *S, WB *w, const char *name, int O, int I) {
@@ -346,8 +454,11 @@ static void wb_load(shards *S, WB *w, const char *name, int O, int I) {
         fprintf(stderr, "%s: %lld bytes, expected %lld for [%d, %d] bf16\n",
                 name, (long long)t->nbytes, (long long)O * I * 2, O, I); exit(1); }
     w->O = O; w->I = I;
-    w->w = xmalloc((size_t)O * I * 2, name);
+    w->w = v41_weight_alloc((size_t)O * I * 2, name);
     st_read_raw_cap(S, name, w->w, (int64_t)O * I * 2, 0);
+#ifdef COLI_VULKAN
+    if (g_v41_map) { V41Home *h = &g_v41_home[g_v41_home_n - 1]; h->kind = 16; h->O = O; h->I = I; }
+#endif
 }
 
 static void wf_load(shards *S, WF *w, const char *name, int64_t n) {
@@ -386,7 +497,7 @@ static inline float ue8m0(uint8_t byte) {
  * lives as long as the model, so a pointer names the same bytes for the whole run.
  * One command buffer: calls come from the thread that opened the device and never
  * from inside an OpenMP region; anything else stays on the CPU. */
-typedef struct { const void *data; int fmt, O, I, refused; ColiVkTensor *t; } VkEntry;
+typedef struct { const void *data; int fmt, O, I, refused; ColiVkTensor *t; int dho; } VkEntry;   /* dho: placed, the device holds it alone */
 static VkEntry *g_vk_map;
 static size_t g_vk_cap, g_vk_used;
 static pthread_t g_vk_thread;
@@ -414,10 +525,20 @@ static VkEntry *vk_entry(const void *data, int fmt, int O, int I) {
     for (;; at = (at + 1) & (g_vk_cap - 1)) {
         VkEntry *e = &g_vk_map[at];
         if (!e->data) {
-            *e = (VkEntry){data, fmt, O, I, 0, NULL};
+            *e = (VkEntry){data, fmt, O, I, 0, NULL, 0};
             g_vk_used++;
             return e;
         }
+        if (e->data == data && e->fmt == fmt && e->O == O && e->I == I) return e;
+    }
+}
+
+/* The entry of a matrix, NULL when it has none (no insertion). */
+static VkEntry *vk_find(const void *data, int fmt, int O, int I) {
+    if (!g_vk_cap) return NULL;
+    for (size_t at = vk_hash(data, g_vk_cap);; at = (at + 1) & (g_vk_cap - 1)) {
+        VkEntry *e = &g_vk_map[at];
+        if (!e->data) return NULL;
         if (e->data == data && e->fmt == fmt && e->O == O && e->I == I) return e;
     }
 }
@@ -427,12 +548,15 @@ static VkEntry *vk_entry(const void *data, int fmt, int O, int I) {
  * device wants them packed, so they are packed here. */
 static int vk_mul(int fmt, const void *data, const uint8_t *tiles, int O, int I,
                   float *y, int ystride, const float *x, int xstride, int rows) {
-    if (!g_vk_ready || !coli_vk_dense() || rows < 1 || !pthread_equal(pthread_self(), g_vk_thread)) return 0;
+    if (!g_vk_ready || rows < 1 || !pthread_equal(pthread_self(), g_vk_thread)) return 0;
+    /* COLI_VK_DENSE=0: the CPU, except for a matrix the device holds alone */
+    if (!coli_vk_dense()) { VkEntry *f = vk_find(data, fmt, O, I); if (!f || !f->dho) return 0; }
 #ifdef _OPENMP
     if (omp_in_parallel()) return 0;
 #endif
     VkEntry *e = vk_entry(data, fmt, O, I);
     if (!e || e->refused) return 0;
+    if (!e->t) v41_dho_host(data);   /* a view the placement did not make: its rows back first */
     float *scales = NULL;
     if (!e->t && fmt == 12) {
         int groups = (I + FP8_TILE - 1) / FP8_TILE;
@@ -471,6 +595,7 @@ static int vk_mul(int fmt, const void *data, const uint8_t *tiles, int O, int I,
 static void mv8(float *y, const W8 *w, const float *x) {
 #ifdef COLI_VULKAN
     if (vk_mul(12, w->q, w->s, w->O, w->I, y, w->O, x, w->I, 1)) return;
+    v41_dho_host(w->q);
 #endif
     int I = w->I, tiles_i = (I + FP8_TILE - 1) / FP8_TILE;
     #pragma omp parallel for schedule(static)
@@ -522,6 +647,7 @@ static int mv_block_rows(int I) {
 static void mv8_rows(float *y, int ystride, const W8 *w, const float *x, int xstride, int rows) {
 #ifdef COLI_VULKAN
     if (vk_mul(12, w->q, w->s, w->O, w->I, y, ystride, x, xstride, rows)) return;
+    v41_dho_host(w->q);
 #endif
     int I = w->I, tiles_i = (I + FP8_TILE - 1) / FP8_TILE;
     int block = mv_block_rows(I);
@@ -587,6 +713,7 @@ static void mvb_cpu(float *y, const WB *w, const float *x) {
 static void mvb(float *y, const WB *w, const float *x) {
 #ifdef COLI_VULKAN
     if (vk_mul(11, w->w, NULL, w->O, w->I, y, w->O, x, w->I, 1)) return;
+    v41_dho_host(w->w);
 #endif
     mvb_cpu(y, w, x);
 }
@@ -596,6 +723,7 @@ static void mvb(float *y, const WB *w, const float *x) {
 static void mvb_rows(float *y, int ystride, const WB *w, const float *x, int xstride, int rows) {
 #ifdef COLI_VULKAN
     if (vk_mul(11, w->w, NULL, w->O, w->I, y, ystride, x, xstride, rows)) return;
+    v41_dho_host(w->w);
 #endif
     for (int r = 0; r < rows; r++) mvb_cpu(y + (size_t)r * ystride, w, x + (size_t)r * xstride);
 }
@@ -1603,6 +1731,94 @@ static void cache_init(Model *m, LCache *cache, int ecap) {
 
 static void attn_project_check(const Cfg *c);
 
+#ifdef COLI_VULKAN
+static int v41c_decide(Model *m);   /* deepseek_v41_chain.h: COLI_VK_CHAIN, decided once */
+/* What the device would hold alone: the trunk matrices model_load reads into mappings. */
+static size_t v41_dho_bytes(Model *m) {
+    const Cfg *c = &m->c;
+    char name[256];
+    size_t total = 0;
+    #define B(...) do { snprintf(name, sizeof name, __VA_ARGS__); st_tensor *t = st_find(&m->S, name); \
+                        if (t && t->nbytes > 0) total += (size_t)t->nbytes; } while (0)
+    for (int i = 0; i < c->n_layers; i++) {
+        B("layers.%d.attn.wq_a.weight", i); B("layers.%d.attn.wq_b.weight", i); B("layers.%d.attn.wkv.weight", i);
+        B("layers.%d.attn.wo_a.weight", i); B("layers.%d.attn.wo_b.weight", i);
+        B("layers.%d.ffn.shared_experts.w1.weight", i); B("layers.%d.ffn.shared_experts.w3.weight", i);
+        B("layers.%d.ffn.shared_experts.w2.weight", i);
+        if (c->kv_source[i]) {
+            B("layers.%d.attn.compressor.wkv.weight", i);
+            if (c->compress_ratio[i] > 1) B("layers.%d.attn.compressor.wgate.weight", i);
+            B("layers.%d.attn.indexer.wk.weight", i);
+        }
+        if (c->index_source[i]) { B("layers.%d.attn.indexer.wq_b.weight", i); B("layers.%d.attn.indexer.weights_proj.weight", i); }
+    }
+    for (int t = 0; m->engram.active && t < m->engram.n_layers; t++) B("layers.%d.engram.wkv.weight", m->engram.layer_of[t]);
+    #undef B
+    return total;
+}
+/* Before the layers are read: the device, the chain's decision, and whether the trunk
+ * lives on the device only. COLI_VK_DENSE_HOST=1 (kept) opens the device after the
+ * weights, as before. */
+static void v41_dho_open(Model *m) {
+    const char *on = getenv("COLI_VULKAN"), *keep = getenv("COLI_VK_DENSE_HOST");
+    if (!on || !atoi(on) || (keep && *keep && atoi(keep) != 0)) return;
+    g_vk_opened = 1;
+    g_vk_thread = pthread_self();
+    g_vk_ready = coli_vk_init_env_tier("deepseek_v41", vkt_wanted() && m->c.n_routed > 0);
+    if (!g_vk_ready) return;
+    int chain = v41c_decide(m);
+    g_v41_dho = coli_vk_dense_host_decide("deepseek_v41", chain != 0 || coli_vk_dense(), v41_dho_bytes(m));
+    g_v41_shards = &m->S;
+}
+/* One matrix up as a lookup will ask for it, marked as held by the device alone. */
+static int v41_dho_up(const void *q, const uint8_t *tiles, int fmt, int O, int I) {
+    VkEntry *e = vk_entry(q, fmt, O, I);
+    if (!e || e->refused) return 0;
+    if (!e->t) {
+        float *scales = NULL;
+        if (fmt == 12) {
+            int groups = (I + FP8_TILE - 1) / FP8_TILE;
+            if (!(scales = malloc((size_t)O * groups * sizeof(float)))) return 0;
+            for (int o = 0; o < O; o++)
+                for (int g = 0; g < groups; g++) scales[(size_t)o * groups + g] = ue8m0(tiles[(size_t)(o / FP8_TILE) * groups + g]);
+        }
+        int ok = coli_vk_tensor_ensure(&e->t, q, scales, fmt, I, O, fmt == 12 ? FP8_TILE : 0);
+        free(scales);
+        if (!ok) return 0;
+    }
+    e->dho = 1;
+    return 1;
+}
+/* The matrices read since the last call: up, then their pages back. wo_a goes up whole
+ * for the chain and per output group for the per-matrix path (attention_project's
+ * block views), each only where that path runs. */
+static unsigned g_v41_dho_kept;
+static void v41_dho_place(Model *m) {
+    const Cfg *c = &m->c;
+    int chain = v41c_decide(m);
+    for (size_t k = 0; k < g_v41_home_n; k++) {
+        V41Home *h = &g_v41_home[k];
+        if (h->placed) continue;
+        h->placed = 1;
+        int ok;
+        size_t n = strlen(h->name), tail = strlen(".attn.wo_a.weight");
+        if (h->kind == 8 && n > tail && !strcmp(h->name + n - tail, ".attn.wo_a.weight")) {
+            ok = 1;
+            if (chain) ok = v41_dho_up(h->base, h->tiles, 12, h->O, h->I);
+            int tiles_i = (h->I + FP8_TILE - 1) / FP8_TILE;
+            for (int g = 0; ok && chain != COLI_VK_CHAIN_ON && g < c->o_groups; g++)
+                ok = v41_dho_up(h->base + (size_t)g * c->o_lora * h->I,
+                                h->tiles + (size_t)(g * c->o_lora / FP8_TILE) * tiles_i, 12, c->o_lora, h->I);
+        } else ok = v41_dho_up(h->base, h->tiles, h->kind == 8 ? 12 : 11, h->O, h->I);
+        if (ok && !v41_map_drop(h->base, h->bytes)) { h->gone = 1; coli_vk_dense_host_dropped(h->bytes); }
+        else g_v41_dho_kept++;
+    }
+}
+#define V41_DHO(call) do { g_v41_map = g_v41_dho; call; g_v41_map = 0; } while (0)
+#else
+#define V41_DHO(call) call
+#endif
+
 static void model_load(Model *m, const char *snap, int ecap, int engram_cache_rows) {
     Cfg *c = &m->c;
     cfg_load(c, snap);
@@ -1625,6 +1841,9 @@ static void model_load(Model *m, const char *snap, int ecap, int engram_cache_ro
      * by the time the replicas exist. */
     mirror_setup(&m->S, snap, c->n_routed);
     engram_load_sidecar(&m->engram, snap);
+#ifdef COLI_VULKAN
+    v41_dho_open(m);   /* COLI_VK_DENSE_HOST: the trunk to the device as it is read, its host pages back */
+#endif
 
     int dim = c->dim, hd = c->head_dim, nh = c->n_heads, hc = c->hc_mult;
     m->L = xmalloc((size_t)c->n_layers * sizeof(Layer), "layers");
@@ -1638,12 +1857,12 @@ static void model_load(Model *m, const char *snap, int ecap, int engram_cache_ro
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
         l->engram_index = -1;
-        w8_load(&m->S, &l->wq_a, NAME("layers.%d.attn.wq_a.weight", i), c->q_lora, dim);
-        w8_load(&m->S, &l->wq_b, NAME("layers.%d.attn.wq_b.weight", i), nh * hd, c->q_lora);
-        w8_load(&m->S, &l->wkv,  NAME("layers.%d.attn.wkv.weight", i), hd, dim);
-        w8_load(&m->S, &l->wo_a, NAME("layers.%d.attn.wo_a.weight", i),
-                c->o_groups * c->o_lora, nh * hd / c->o_groups);
-        w8_load(&m->S, &l->wo_b, NAME("layers.%d.attn.wo_b.weight", i), dim, c->o_groups * c->o_lora);
+        V41_DHO(w8_load(&m->S, &l->wq_a, NAME("layers.%d.attn.wq_a.weight", i), c->q_lora, dim));
+        V41_DHO(w8_load(&m->S, &l->wq_b, NAME("layers.%d.attn.wq_b.weight", i), nh * hd, c->q_lora));
+        V41_DHO(w8_load(&m->S, &l->wkv,  NAME("layers.%d.attn.wkv.weight", i), hd, dim));
+        V41_DHO(w8_load(&m->S, &l->wo_a, NAME("layers.%d.attn.wo_a.weight", i),
+                c->o_groups * c->o_lora, nh * hd / c->o_groups));
+        V41_DHO(w8_load(&m->S, &l->wo_b, NAME("layers.%d.attn.wo_b.weight", i), dim, c->o_groups * c->o_lora));
         wf_load(&m->S, &l->q_norm,   NAME("layers.%d.attn.q_norm.weight", i), c->q_lora);
         wf_load(&m->S, &l->kv_norm,  NAME("layers.%d.attn.kv_norm.weight", i), hd);
         wf_load(&m->S, &l->attn_sink,NAME("layers.%d.attn.attn_sink", i), nh);
@@ -1658,9 +1877,9 @@ static void model_load(Model *m, const char *snap, int ecap, int engram_cache_ro
         wf_load(&m->S, &l->hc_ffn_scale, NAME("layers.%d.hc_ffn_scale", i), 3);
         wb_load(&m->S, &l->gate_w, NAME("layers.%d.ffn.gate.weight", i), c->n_routed, dim);
         wf_load(&m->S, &l->gate_bias, NAME("layers.%d.ffn.gate.bias", i), c->n_routed);
-        w8_load(&m->S, &l->sh_w1, NAME("layers.%d.ffn.shared_experts.w1.weight", i), c->moe_inter, dim);
-        w8_load(&m->S, &l->sh_w3, NAME("layers.%d.ffn.shared_experts.w3.weight", i), c->moe_inter, dim);
-        w8_load(&m->S, &l->sh_w2, NAME("layers.%d.ffn.shared_experts.w2.weight", i), dim, c->moe_inter);
+        V41_DHO(w8_load(&m->S, &l->sh_w1, NAME("layers.%d.ffn.shared_experts.w1.weight", i), c->moe_inter, dim));
+        V41_DHO(w8_load(&m->S, &l->sh_w3, NAME("layers.%d.ffn.shared_experts.w3.weight", i), c->moe_inter, dim));
+        V41_DHO(w8_load(&m->S, &l->sh_w2, NAME("layers.%d.ffn.shared_experts.w2.weight", i), dim, c->moe_inter));
 
         l->window = xmalloc((size_t)c->window * hd * sizeof(float), "window ring");
         memset(l->window, 0, (size_t)c->window * hd * sizeof(float));
@@ -1678,10 +1897,10 @@ static void model_load(Model *m, const char *snap, int ecap, int engram_cache_ro
         l->ring_save_pos = xmalloc((size_t)rows * sizeof(int), "displaced ring positions");
         int ratio = c->compress_ratio[i];
         if (c->kv_source[i]) {
-            wb_load(&m->S, &l->comp_wkv, NAME("layers.%d.attn.compressor.wkv.weight", i), hd, dim);
+            V41_DHO(wb_load(&m->S, &l->comp_wkv, NAME("layers.%d.attn.compressor.wkv.weight", i), hd, dim));
             wf_load(&m->S, &l->comp_norm, NAME("layers.%d.attn.compressor.norm.weight", i), hd);
             if (ratio > 1) {
-                wb_load(&m->S, &l->comp_wgate, NAME("layers.%d.attn.compressor.wgate.weight", i), hd, dim);
+                V41_DHO(wb_load(&m->S, &l->comp_wgate, NAME("layers.%d.attn.compressor.wgate.weight", i), hd, dim));
                 l->cstate_kv = xmalloc((size_t)ratio * hd * sizeof(float), "compressor group");
                 l->cstate_score = xmalloc((size_t)ratio * hd * sizeof(float), "compressor scores");
                 l->cstate_save_kv = xmalloc((size_t)rows * hd * sizeof(float), "displaced group");
@@ -1695,17 +1914,20 @@ static void model_load(Model *m, const char *snap, int ecap, int engram_cache_ro
             memset(l->ckv, 0, (size_t)slots * hd * sizeof(float));
             l->ikey = xmalloc((size_t)slots * c->index_head_dim * sizeof(float), "index keys");
             memset(l->ikey, 0, (size_t)slots * c->index_head_dim * sizeof(float));
-            wb_load(&m->S, &l->idx_wk, NAME("layers.%d.attn.indexer.wk.weight", i),
-                    c->index_head_dim, hd);
+            V41_DHO(wb_load(&m->S, &l->idx_wk, NAME("layers.%d.attn.indexer.wk.weight", i),
+                    c->index_head_dim, hd));
             wf_load(&m->S, &l->idx_knorm, NAME("layers.%d.attn.indexer.k_norm.weight", i),
                     c->index_head_dim);
         }
         if (c->index_source[i]) {
-            w8_load(&m->S, &l->idx_wq_b, NAME("layers.%d.attn.indexer.wq_b.weight", i),
-                    c->index_n_heads * c->index_head_dim, c->q_lora);
-            wb_load(&m->S, &l->idx_wproj, NAME("layers.%d.attn.indexer.weights_proj.weight", i),
-                    c->index_n_heads, dim);
+            V41_DHO(w8_load(&m->S, &l->idx_wq_b, NAME("layers.%d.attn.indexer.wq_b.weight", i),
+                    c->index_n_heads * c->index_head_dim, c->q_lora));
+            V41_DHO(wb_load(&m->S, &l->idx_wproj, NAME("layers.%d.attn.indexer.weights_proj.weight", i),
+                    c->index_n_heads, dim));
         }
+#ifdef COLI_VULKAN
+        if (g_v41_dho) v41_dho_place(m);   /* one layer in RAM at a time */
+#endif
     }
     if (m->engram.active) {
         Engram *e = &m->engram;
@@ -1715,8 +1937,11 @@ static void model_load(Model *m, const char *snap, int ecap, int engram_cache_ro
                 fprintf(stderr, "[engram] table %d names layer %d\n", t, layer); exit(1); }
             m->L[layer].engram_index = t;
             engram_table_open(&e->table[t], &m->S, layer, e->head_dim, engram_cache_rows);
-            w8_load(&m->S, &m->L[layer].eng_wkv, NAME("layers.%d.engram.wkv.weight", layer),
-                    dim * (hc + 1), e->cols * e->head_dim);
+            V41_DHO(w8_load(&m->S, &m->L[layer].eng_wkv, NAME("layers.%d.engram.wkv.weight", layer),
+                    dim * (hc + 1), e->cols * e->head_dim));
+#ifdef COLI_VULKAN
+            if (g_v41_dho) v41_dho_place(m);
+#endif
             wf_load(&m->S, &m->L[layer].eng_q, NAME("layers.%d.engram.q_weight", layer),
                     (int64_t)hc * dim);
             wf_load(&m->S, &m->L[layer].eng_k, NAME("layers.%d.engram.k_weight", layer),
@@ -2402,9 +2627,9 @@ static void moe_vk_cpu(Model *m, LCache *cache, int layer, int topk, const float
                        const int *chosen, const float *weights, const uint8_t *want, float *contrib) {
     Cfg *c = &m->c;
     int dim = c->dim, draws = rows * topk;
-    int uniq[MOE_ROW_CHUNK * MOE_TOPK_MAX], head[MOE_ROW_CHUNK * MOE_TOPK_MAX];
-    int tail[MOE_ROW_CHUNK * MOE_TOPK_MAX], count[MOE_ROW_CHUNK * MOE_TOPK_MAX];
-    int next[MOE_ROW_CHUNK * MOE_TOPK_MAX];
+    /* a block of up to MOE_ROW_CHUNK rows, or a streamed prompt chunk (vkt_step_rows) */
+    int *uniq = xmalloc((size_t)draws * 5 * sizeof(int), "expert union");
+    int *head = uniq + draws, *tail = head + draws, *count = tail + draws, *next = count + draws;
     int n_uniq = 0;
     for (int d = 0; d < draws; d++) {
         if (!want[d]) continue;
@@ -2416,7 +2641,7 @@ static void moe_vk_cpu(Model *m, LCache *cache, int layer, int topk, const float
         tail[at] = d;
         count[at]++;
     }
-    if (!n_uniq) return;
+    if (!n_uniq) { free(uniq); return; }
     float *gathered = xmalloc((size_t)rows * dim * sizeof(float), "expert inputs");
     float *down = xmalloc((size_t)rows * dim * sizeof(float), "expert outputs");
     int step = cache->cap < MOE_ROW_CHUNK ? cache->cap : MOE_ROW_CHUNK;
@@ -2442,14 +2667,14 @@ static void moe_vk_cpu(Model *m, LCache *cache, int layer, int topk, const float
             vkt_note(layer, uniq[u0 + u], &src);
         }
     }
-    free(down); free(gathered);
+    free(down); free(gathered); free(uniq);
 }
 
 static void moe_vk_block(Model *m, Layer *l, LCache *cache, int layer, int topk, const float *xc,
                          int rows, float *outc, const int *chosen, const float *weights, int with_shared) {
     int dim = m->c.dim, draws = rows * topk;
-    uint8_t taken[MOE_ROW_CHUNK * MOE_TOPK_MAX], want[MOE_ROW_CHUNK * MOE_TOPK_MAX];
-    const float *dev[MOE_ROW_CHUNK * MOE_TOPK_MAX];
+    uint8_t *taken = xmalloc((size_t)draws * 2, "device draws"), *want = taken + draws;
+    const float **dev = xmalloc((size_t)draws * sizeof(*dev), "device rows");
     for (int r = 0; r < rows; r++) rt_count(layer, chosen + r * topk, topk);
     int ndev = vkt_issue(layer, xc, rows, topk, chosen, taken);
     for (int d = 0; d < draws; d++) { want[d] = !taken[d]; if (taken[d]) ehit_mark(m, layer, chosen[d]); }
@@ -2478,8 +2703,26 @@ static void moe_vk_block(Model *m, Layer *l, LCache *cache, int layer, int topk,
         const float *sh = shared + (size_t)r * dim;
         if (with_shared) for (int i = 0; i < dim; i++) o[i] += sh[i];
     }
-    free(shared); free(contrib);
+    free(shared); free(contrib); free(taken); free(dev);
 }
+/* The tier's streaming (a big prompt chunk's cold experts on the device): a group of a
+ * backbone layer's experts through its cache as moe_vk_cpu reads them (expert_slots_at:
+ * the misses fetched together), up to the cache's capacity, valid until the next read. */
+static int vk_load_batch(void *ctx, int layer, const int *e, int n, VktExpertSrc *srcs, void **h) {
+    Model *m = ctx;
+    LCache *cache = &m->cache[layer];
+    if (n > cache->cap) n = cache->cap;
+    if (n > 64) n = 64;
+    if (n < 1) return 0;
+    Slot *slot[64];
+    expert_slots_at(m, cache, "layers", layer, e, n, slot);
+    for (int u = 0; u < n; u++) { srcs[u] = vk_slot_src(slot[u]); h[u] = slot[u]; }
+    return n;
+}
+static int vk_load(void *ctx, int layer, int e, VktExpertSrc *src, void **h) {
+    return vk_load_batch(ctx, layer, &e, 1, src, h) == 1;
+}
+static void vk_unhold(void *ctx, void *h) { (void)ctx; (void)h; }
 #endif
 
 /* The MoE for a block of positions, expert-major.
@@ -2507,6 +2750,22 @@ static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int 
     int dim = c->dim;
     if (topk > MOE_TOPK_MAX) {
         fprintf(stderr, "[moe] n_activated %d exceeds the scratch\n", topk); exit(1); }
+#ifdef COLI_VULKAN
+    /* the tier streams a prompt chunk's cold experts: the whole step in one block, so
+     * each expert's rows meet in one GEMM (moe_vk_block's arrays follow its size) */
+    if (vkt_ready() && !strcmp(kind, "layers") && vkt_step_rows(n, MOE_ROW_CHUNK) > MOE_ROW_CHUNK) {
+        int *chosen = xmalloc((size_t)n * topk * sizeof(int), "routing");
+        float *weights = xmalloc((size_t)n * topk * sizeof(float), "routing weights");
+        float *scores = xmalloc((size_t)n * E * sizeof(float), "gate scores");
+        mvb_rows(scores, E, &l->gate_w, x, dim, n);
+        for (int r = 0; r < n; r++)
+            moe_gate(m, l, E, topk, scores + (size_t)r * E, chosen + r * topk, weights + r * topk);
+        free(scores);
+        moe_vk_block(m, l, cache, layer, topk, x, n, out, chosen, weights, with_shared);
+        free(chosen); free(weights);
+        return;
+    }
+#endif
 
     for (int r0 = 0; r0 < n; r0 += MOE_ROW_CHUNK) {
         int rows = n - r0 < MOE_ROW_CHUNK ? n - r0 : MOE_ROW_CHUNK;
@@ -4225,10 +4484,16 @@ static void vk_report(void) {
  * device); the activation is the clamped SwiGLU. The history (.coli_usage, beside
  * the container or COLI_USAGE) is kept only while the tier is on; it gives the warm
  * start, read straight from the container in parallel. */
+static int vk_placed(const void *data) {   /* on the device already (the dense weights on the device only) */
+    if (!g_v41_dho) return 0;
+    V41Home *h = v41_home_of(data);
+    return h && h->gone;
+}
 static size_t vk_w8_bytes(const W8 *w) {   /* as the device holds it: fmt 12, an f32 per 32 inputs */
+    if (vk_placed(w->q)) return 0;
     return w->q ? (size_t)w->O * w->I + (size_t)w->O * ((w->I + FP8_TILE - 1) / FP8_TILE) * 4 : 0;
 }
-static size_t vk_wb_bytes(const WB *w) { return w->w ? (size_t)w->O * w->I * 2 : 0; }
+static size_t vk_wb_bytes(const WB *w) { return w->w && !vk_placed(w->w) ? (size_t)w->O * w->I * 2 : 0; }
 /* The trunk the dense hook would put on the device, for the tier's budget. */
 static size_t vk_dense_bytes(Model *m) {
     if (!coli_vk_dense()) return 0;
@@ -4262,7 +4527,8 @@ static void vk_tier_start(Model *m, const char *snap, int cap) {
                     .gate_up = f, .down = f, .act = VKT_ACT_SWIGLU, .act_limit = c->swiglu_limit,
                     .max_rows = MOE_ROW_CHUNK * c->n_activated,
                     .ram_reserve = expert * (size_t)cap * (size_t)c->n_layers,
-                    .dense_bytes = vk_dense_bytes(m), .in_ram = vk_in_ram, .ram_ctx = m};
+                    .dense_bytes = vk_dense_bytes(m), .in_ram = vk_in_ram, .ram_ctx = m,
+                    .load = vk_load, .release = vk_unhold, .load_ctx = m, .load_batch = vk_load_batch};
     rt_init("deepseek_v41", c->n_layers, c->n_routed);
     rt_drop_row(c->n_layers);   /* no MTP row: the DSpark stages stay on the CPU */
     const char *up = getenv("COLI_USAGE");
@@ -4337,8 +4603,17 @@ int main(int argc, char **argv) {
 #ifdef COLI_VULKAN
     /* After the weights, as in glm53: the device is an option, never a requirement.
      * The matrices go up on their first multiply (see vk_mul), from this thread. */
-    g_vk_thread = pthread_self();
-    g_vk_ready = coli_vk_init_env_tier("deepseek_v41", vkt_wanted() && c->n_routed > 0);
+    if (!g_vk_opened) {          /* opened while the weights loaded when they may live on the device only */
+        g_vk_thread = pthread_self();
+        g_vk_ready = coli_vk_init_env_tier("deepseek_v41", vkt_wanted() && c->n_routed > 0);
+        const char *keep = getenv("COLI_VK_DENSE_HOST");
+        if (g_vk_ready && keep && *keep && atoi(keep) != 0)
+            coli_vk_dense_host_decide("deepseek_v41", v41c_decide(&m) != 0 || coli_vk_dense(), v41_dho_bytes(&m));
+    }
+    if (g_v41_dho)
+        coli_vk_dense_host_placed("deepseek_v41", g_v41_dho_kept
+            ? "the embedding, the head, the router, norms and mixers, DSpark's stages, the vision tower; and matrices the device refused"
+            : "the embedding, the head, the router, norms and mixers, DSpark's stages, the vision tower");
     v41c_start(&m);              /* COLI_VK_CHAIN: the trunk on the device, before the tier sizes itself */
     vk_tier_start(&m, snap, cap);
     v41c_atexit();               /* after the tier's: the chain goes before the device */

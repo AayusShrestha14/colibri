@@ -971,34 +971,94 @@ static void q38_validate_ids(const Cfg *c, const int *ids, int count,
     }
 }
 
-/* A decode run's speculation: drafting when the MTP head is attached, in the
- * mode Q38_MTP_FORCE names (tests: reject, accept, mixed; qwen38_core.h). */
-static Q38Spec q38_spec_begin(const Model *m) {
+/* A decode run's speculation (qwen38_core.h, "speculative decoding"): the MTP
+ * head's drafts when it is attached, Q38_MTP_DRAFTS of them per verify (1..3,
+ * default 2, the depth measured fastest on a Ryzen 8700GE, CPU and Vulkan chain
+ * alike, docs/speculative.md; 1 is the verify before it; 0 or auto lets the gate
+ * pick); prompt-lookup drafts under
+ * COLI_LOOKUP=1, up to COLI_LOOKUP_DRAFTS (1..5, default 5); the forced modes
+ * the tests use (Q38_MTP_FORCE, COLI_LOOKUP_FORCE), and COLI_SPEC_GATE=0,
+ * which drafts every proposal in full. */
+static int q38_spec_force_mode(const char *name, const char *value, int max_row, int lookup, int *row) {
+    *row = 0;
+    if (!value || !*value) return 0;
+    if (!lookup && !strcmp(value, "reject")) return 'r';
+    if (!strcmp(value, "accept")) return 'a';
+    if (!strcmp(value, "mixed")) return 'm';
+    if (!strcmp(value, "cycle")) return 'c';
+    if (!strncmp(value, "row", 3) && value[3] >= '1' && value[3] <= '0' + max_row && !value[4]) {
+        *row = value[3] - '0'; return 'w';
+    }
+    fprintf(stderr, "%s must be %saccept, mixed, cycle or row1..row%d\n", name, lookup ? "" : "reject, ", max_row);
+    exit(1);
+}
+static Q38Spec q38_spec_begin(Model *m, const int *prompt, int np) {
     Q38Spec sp; memset(&sp, 0, sizeof sp);
     sp.on = m->mtp;
-    const char *force = getenv("Q38_MTP_FORCE");
-    if (force && *force) {
-        if (!strcmp(force, "reject")) sp.force = 'r';
-        else if (!strcmp(force, "accept")) sp.force = 'a';
-        else if (!strcmp(force, "mixed")) sp.force = 'm';
-        else { fprintf(stderr, "Q38_MTP_FORCE must be reject, accept or mixed\n"); exit(1); }
+    sp.force = q38_spec_force_mode("Q38_MTP_FORCE", getenv("Q38_MTP_FORCE"), 3, 0, &sp.force_row);
+    const char *depth = getenv("Q38_MTP_DRAFTS");
+    sp.depth = 2;
+    if (depth && *depth) {
+        if (!strcmp(depth, "auto") || !strcmp(depth, "0")) sp.depth = 0;
+        else if (depth[0] >= '1' && depth[0] <= '3' && !depth[1]) sp.depth = depth[0] - '0';
+        else { fprintf(stderr, "Q38_MTP_DRAFTS must be 1, 2, 3, or 0 (auto: the gate picks)\n"); exit(1); }
+    }
+    sp.lookup = q38_env_bool("COLI_LOOKUP", 0);
+    sp.lookup_max = q38_env_positive_int("COLI_LOOKUP_DRAFTS", Q38_SPEC_ROWS - 1, Q38_SPEC_ROWS - 1);
+    sp.lk_force = q38_spec_force_mode("COLI_LOOKUP_FORCE", getenv("COLI_LOOKUP_FORCE"), Q38_SPEC_ROWS - 1, 1,
+                                      &sp.lk_force_row);
+    spec_gate_init(&sp.gate, !q38_env_bool("COLI_SPEC_GATE", 1));
+    if (sp.lookup && prompt && np > 0) {
+        sp.hist_cap = np + 256;
+        sp.hist = (int *)malloc((size_t)sp.hist_cap * sizeof(int));
+        if (sp.hist) { memcpy(sp.hist, prompt, (size_t)np * sizeof(int)); sp.hist_n = np; }
+        else { sp.lookup = 0; sp.hist_cap = 0; }
     }
     return sp;
 }
 
 /* Acceptance and tokens per forward, colibri.c's speculation line: a run's
  * at the end, a serve turn's after its DONE (stderr, never the wire). Tokens
- * are the decode tokens fed after the prompt, forwards the ones that fed them. */
+ * are the decode tokens fed after the prompt, forwards the ones that fed them;
+ * the MTP head's acceptance follows by draft position when it drafts deeper
+ * than one, and prompt lookup has a line of its own. */
 static void q38_spec_report(const Model *m, const Q38Spec *sp, const char *scope) {
-    if (!m->mtp) return;
-    fprintf(stderr, "[qwen38 MTP] %s: %.2f tokens/forward (%llu forwards per %llu tokens) | "
-                    "acceptance %.1f%% (%llu/%llu drafts) | wiring %c%s%s\n", scope,
-            sp->forwards ? (double)sp->tokens / sp->forwards : 0.0,
-            (unsigned long long)sp->forwards, (unsigned long long)sp->tokens,
-            sp->drafts ? 100.0 * sp->accepted / sp->drafts : 0.0,
-            (unsigned long long)sp->accepted, (unsigned long long)sp->drafts, m->mtp_wiring,
-            sp->force ? ", Q38_MTP_FORCE=" : "",
-            sp->force == 'r' ? "reject" : sp->force == 'a' ? "accept" : sp->force == 'm' ? "mixed" : "");
+    if (m->mtp) {
+        char depth[160] = "";
+        if (sp->depth != 1) {
+            int at = snprintf(depth, sizeof depth, " | %s, by position:", sp->depth ? "fixed depth" : "depth by the gate");
+            for (int j = 0; j < 3 && at < (int)sizeof depth; j++)
+                at += snprintf(depth + at, sizeof depth - (size_t)at, " %d %.1f%% (%llu/%llu)", j + 1,
+                               sp->depth_prop[j] ? 100.0 * sp->depth_hit[j] / sp->depth_prop[j] : 0.0,
+                               (unsigned long long)sp->depth_hit[j], (unsigned long long)sp->depth_prop[j]);
+        }
+        fprintf(stderr, "[qwen38 MTP] %s: %.2f tokens/forward (%llu forwards per %llu tokens) | "
+                        "acceptance %.1f%% (%llu/%llu drafts) | wiring %c%s%s%s%s\n", scope,
+                sp->forwards ? (double)sp->tokens / sp->forwards : 0.0,
+                (unsigned long long)sp->forwards, (unsigned long long)sp->tokens,
+                sp->drafts ? 100.0 * sp->accepted / sp->drafts : 0.0,
+                (unsigned long long)sp->accepted, (unsigned long long)sp->drafts, m->mtp_wiring,
+                sp->force ? ", Q38_MTP_FORCE=" : "",
+                sp->force == 'r' ? "reject" : sp->force == 'a' ? "accept" : sp->force == 'm' ? "mixed" :
+                sp->force == 'c' ? "cycle" : sp->force == 'w' ? "row" : "", depth,
+                sp->ended_ahead ? " | ended mid-verify" : "");
+    }
+    if (!sp->gate.off && ((m->mtp && sp->depth == 0) || sp->lookup)) {
+        char g[384];
+        spec_gate_describe(&sp->gate, m->mtp && sp->depth == 0 ? SPEC_SRC_MTP : SPEC_SRC_LOOKUP, g, sizeof g);
+        fprintf(stderr, "[qwen38 spec gate] %s: %s\n", scope, g);
+    }
+    if (sp->lookup || sp->lk_verifies)
+        fprintf(stderr, "[qwen38 lookup] %s: %.2f tokens/forward (%llu forwards per %llu tokens) | "
+                        "acceptance %.1f%% (%llu/%llu drafts in %llu verifies) | gate %s, %llu declined, %llu probes%s\n",
+                scope, sp->forwards ? (double)sp->tokens / sp->forwards : 0.0,
+                (unsigned long long)sp->forwards, (unsigned long long)sp->tokens,
+                sp->lk_drafts ? 100.0 * sp->lk_accepted / sp->lk_drafts : 0.0,
+                (unsigned long long)sp->lk_accepted, (unsigned long long)sp->lk_drafts,
+                (unsigned long long)sp->lk_verifies, sp->gate.off ? "off" : "on",
+                (unsigned long long)sp->gate.declined[SPEC_SRC_LOOKUP],
+                (unsigned long long)sp->gate.probes[SPEC_SRC_LOOKUP],
+                sp->ended_ahead && !m->mtp ? " | ended mid-verify" : "");
 }
 
 static Q38Spec g_q38_run_spec;   /* generate()'s, reported by main() */
@@ -1017,7 +1077,7 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     float *logit = step(m, prompt, np, 0);
     q38_tm_snapshot_prefill(m);        /* COLI_TIMERS: decode bank starts here */
     Q38Spec *sp = &g_q38_run_spec;
-    *sp = q38_spec_begin(m);           /* Q38_MTP=1: the head drafts, every token still the argmax below */
+    *sp = q38_spec_begin(m, prompt, np);   /* Q38_MTP=1, COLI_LOOKUP=1: drafts, every token still the argmax below */
     int len = np;
     for (int s = 0; s < n_new; s++) {
         int best = 0; float bv = logit[0];
@@ -1344,7 +1404,7 @@ typedef struct {
     /* the MTP head where the prompt left it: its settled rows and the
      * streams still waiting for their next token (Model.mtp_*) */
     float *mtp_pend;
-    int mtp_len, mtp_pend_n, mtp_pend_tok;
+    int mtp_len, mtp_pend_n, mtp_pend_tok[Q38_SPEC_ROWS];
 } Q38PrefixCache;
 
 static Q38PrefixCache g_q38_prefix;
@@ -1360,7 +1420,7 @@ static int q38_prefix_geometry(const Model *m,size_t *rec_cells,
                                size_t *conv_cells,size_t *ple_cells);
 static ColiPinPool g_q38_pins;
 typedef struct { float **rec, **conv, *ple; int64_t ple_hist[2]; int ple_len; int n_layers;
-                 float *mtp_pend; int mtp_len, mtp_pend_n, mtp_pend_tok; } Q38PinState;
+                 float *mtp_pend; int mtp_len, mtp_pend_n, mtp_pend_tok[Q38_SPEC_ROWS]; } Q38PinState;
 
 /* The MTP head's place in the sequence travels with every snapshot of the
  * recurrent state: its KV rows below mtp_len stay valid wherever the
@@ -1370,13 +1430,14 @@ typedef struct { float **rec, **conv, *ple; int64_t ple_hist[2]; int ple_len; in
 static void q38_mtp_state_copy(Model *m, float *pend, int *len, int *pend_n,
                                int *pend_tok, int to_state){
     if(!m->mtp||!pend) return;
-    size_t bytes=(size_t)2*m->c.hc_width*sizeof(float);
+    size_t bytes=(size_t)Q38_SPEC_ROWS*m->c.hc_width*sizeof(float);
+    size_t toks=(size_t)Q38_SPEC_ROWS*sizeof(int);
     if(to_state){
         memcpy(pend,m->mtp_pend,bytes);
-        *len=m->mtp_len; *pend_n=m->mtp_pend_n; *pend_tok=m->mtp_pend_tok;
+        *len=m->mtp_len; *pend_n=m->mtp_pend_n; memcpy(pend_tok,m->mtp_pend_tok,toks);
     } else {
         memcpy(m->mtp_pend,pend,bytes);
-        m->mtp_len=*len; m->mtp_pend_n=*pend_n; m->mtp_pend_tok=*pend_tok;
+        m->mtp_len=*len; m->mtp_pend_n=*pend_n; memcpy(m->mtp_pend_tok,pend_tok,toks);
     }
 }
 
@@ -1419,7 +1480,7 @@ static int q38_pin_state_copy(Model *m, Q38PinState **slot, int to_state){
             if (!st->ple){ q38_pin_state_free(st); return 0; }
         }
         if (m->mtp){
-            st->mtp_pend = (float*)malloc((size_t)2 * c->hc_width * sizeof(float));
+            st->mtp_pend = (float*)malloc((size_t)Q38_SPEC_ROWS * c->hc_width * sizeof(float));
             if (!st->mtp_pend){ q38_pin_state_free(st); return 0; }
         }
         *slot = st;
@@ -1445,7 +1506,7 @@ static int q38_pin_state_copy(Model *m, Q38PinState **slot, int to_state){
             memcpy(m->ple_history, st->ple_hist, sizeof(st->ple_hist));
         }
     }
-    q38_mtp_state_copy(m, st->mtp_pend, &st->mtp_len, &st->mtp_pend_n, &st->mtp_pend_tok, to_state);
+    q38_mtp_state_copy(m, st->mtp_pend, &st->mtp_len, &st->mtp_pend_n, st->mtp_pend_tok, to_state);
 #ifdef COLI_VULKAN
     if (!to_state) q38c_host_wrote(m, 0);   /* up to the device before the next chain step */
 #endif
@@ -1503,7 +1564,7 @@ static int q38_prefix_cache_layout(Model *m){
         g_q38_prefix.ple_cells=ple;
     }
     if(m->mtp&&!g_q38_prefix.mtp_pend){
-        g_q38_prefix.mtp_pend=(float*)malloc((size_t)2*m->c.hc_width*sizeof(float));
+        g_q38_prefix.mtp_pend=(float*)malloc((size_t)Q38_SPEC_ROWS*m->c.hc_width*sizeof(float));
         if(!g_q38_prefix.mtp_pend){q38_prefix_cache_dispose(&g_q38_prefix);return 0;}
     }
     if(g_q38_prefix.dn_rec&&g_q38_prefix.dn_conv&&g_q38_prefix.logits&&
@@ -1574,7 +1635,7 @@ static void q38_prefix_copy_state(Model *m,int to_cache){
         }
     }
     q38_mtp_state_copy(m,g_q38_prefix.mtp_pend,&g_q38_prefix.mtp_len,&g_q38_prefix.mtp_pend_n,
-                       &g_q38_prefix.mtp_pend_tok,to_cache);
+                       g_q38_prefix.mtp_pend_tok,to_cache);
 }
 
 static int q38_prefix_cache_save(Model *m,const int *ids,int len,const float *logits,
@@ -1806,7 +1867,7 @@ static int serve_one(Model *m, ServeReq *q){
     int eos_ids[4];int n_eos=serve_eos_ids(eos_ids,4,m->c.eos_id,m->c.vocab);
     /* Q38_MTP=1: the head drafts and a verify forward checks it; every token
      * is still sampled from the exact logits below, greedy or not. */
-    Q38Spec spec=q38_spec_begin(m);
+    Q38Spec spec=q38_spec_begin(m,ids,np);
     double first_token_at=0.0,last_token_at=0.0;
     unsigned char sbuf[16]; int sbn=0;
     for(int s=0;s<q->max_tok;s++){
@@ -1883,6 +1944,7 @@ static int serve_one(Model *m, ServeReq *q){
     serve_hits(m);
     q38_tm_report_bank(&timers,"request");
     {char scope[96];snprintf(scope,sizeof scope,"turn %s",q->id);q38_spec_report(m,&spec,scope);}
+    q38_spec_free(&spec);
     return input_eof?-1:0;
 }
 
@@ -1928,6 +1990,22 @@ static int q38_reference_mode(const char *path,int serve_mode){
 static void q38_expert_report(Model *m, int cap);   /* below, beside the expert layout accounting */
 #ifdef COLI_VULKAN
 static void q38_vk_tier_start(Model *m, int cap);   /* below: the Vulkan routed-expert tier */
+#endif
+
+#ifdef COLI_VULKAN
+/* After the device and the chain are decided, before the expert tier sizes its budget:
+ * the trunk goes up now, so the tier sees it placed. */
+static void q38_dho_start(Model *m) {
+    if(!g_vk_ready)return;
+    size_t bytes=0; int n=0;
+    q38_dho_each(m,q38_dho_count,&bytes,&n);
+    if(!coli_vk_dense_host_decide("qwen38",(g_vk_chain||g_vk_dense)&&!qt_ready(),bytes))return;
+    g_q38_dho_model=m;
+    g_vk_dense=1;   /* the steps the chain declines run their matrices on the device too: the CPU has none */
+    bytes=0; n=0;
+    q38_dho_each(m,q38_dho_drop,&bytes,&n);
+    coli_vk_dense_host_placed("qwen38","the embedding (its rows are gathered on the CPU), the vision tower, norms");
+}
 #endif
 
 #ifndef QWEN38_TEST_SERVE
@@ -2062,6 +2140,7 @@ int main(int argc, char **argv) {
     if(g_vk_ready&&!qt_ready())
         g_vk_chain=coli_vk_chain_decide("qwen38",vkt_wanted()&&m.c.experts>0,COLI_VK_CHAIN_OFF);
     if(g_vk_chain&&!vkc_init())g_vk_chain=0;
+    q38_dho_start(&m);   /* COLI_VK_DENSE_HOST: the trunk on the device only, before the tier sizes its budget */
 #endif
     if(is_ref)ref_logits=read_reference_logits(ref_root,m.c.vocab);
     g_capture_last_logit=ref_logits!=NULL||getenv("DUMP")!=NULL;
@@ -2178,6 +2257,7 @@ int main(int argc, char **argv) {
     double tot = m.hits + m.miss;
     if (g_ttft >= 0) fprintf(stderr, "TTFT: %.2f s (time to first token)\n", g_ttft);
     q38_spec_report(&m, &g_q38_run_spec, "run");
+    q38_spec_free(&g_q38_run_spec);
     if (g_q38_mtp_dump) { fclose(g_q38_mtp_dump); g_q38_mtp_dump = NULL; }
     tm_report(&m);
     fprintf(stderr, "\nPEAK RSS: %.2f GB\n", rss_gb());
@@ -2427,6 +2507,7 @@ static void q38_vk_dense_add(const Q38Weight *w,size_t *bytes){
 static size_t q38_vk_dense_bytes(Model *m){
     size_t b=0;
     if(!g_vk_dense&&!g_vk_chain)return 0;
+    if(coli_vk_dense_device_only())return 0;   /* placed already (q38_dho_start): the free memory the tier reads counts them */
     q38_vk_dense_add(&m->lm_head,&b);
     const GatedResidual *f=&m->final_gr;
     q38_vk_dense_add(&f->down,&b);q38_vk_dense_add(&f->up,&b);q38_vk_dense_add(&f->inject,&b);
@@ -2476,6 +2557,22 @@ static int q38_vk_in_ram(void *ctx,int layer,int e){
     int si=lc->by_expert?lc->by_expert[e]:-1;
     return si>=0&&si<lc->n&&lc->slots[si].eid==e;
 }
+/* The tier's streaming (a big prompt chunk's cold experts on the device): an expert's
+ * bytes as the CPU path has them, through the layer's RAM cache (a slot stays valid
+ * until the next load); several at once through the parallel reads. */
+static int q38_vk_load(void *ctx,int layer,int e,VktExpertSrc *src,void **h){
+    Model *m=(Model*)ctx;Slot *s=q38_expert_get(m,layer,e);
+    if(!s)return 0;
+    *src=q38_vk_src(s);*h=s;return 1;
+}
+static void q38_vk_release(void *ctx,void *h){(void)ctx;(void)h;}
+static int q38_vk_load_batch(void *ctx,int layer,const int *e,int n,VktExpertSrc *srcs,void **h){
+    Model *m=(Model*)ctx;Slot *sl[64];
+    if(n>m->cache[layer].cap)n=m->cache[layer].cap;
+    if(n<2||n>64||!q38_expert_get_batch(m,layer,e,n,sl))return 0;
+    for(int i=0;i<n;i++){srcs[i]=q38_vk_src(sl[i]);h[i]=sl[i];}
+    return n;
+}
 static void q38_vk_tier_start(Model *m,int cap){
     if(!g_vk_ready||qt_ready()){
         if(g_vk_ready&&qt_ready())
@@ -2505,7 +2602,8 @@ static void q38_vk_tier_start(Model *m,int cap){
                   .max_rows=q38_moe_prefill_rows(c,q38_prefill_batch_rows())*c->topk,
                   .ram_reserve=ram_expert*(size_t)cap*(size_t)c->layers,
                   .dense_bytes=q38_vk_dense_bytes(m),
-                  .in_ram=q38_vk_in_ram,.ram_ctx=m};
+                  .in_ram=q38_vk_in_ram,.ram_ctx=m,
+                  .load=q38_vk_load,.release=q38_vk_release,.load_ctx=m,.load_batch=q38_vk_load_batch};
     if(vc.max_rows<64)vc.max_rows=64;
     uint32_t **heat=rt_counts_all();
     atexit(coli_vk_shutdown);   /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */

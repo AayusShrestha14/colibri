@@ -39,10 +39,12 @@ HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE / "tools"))
 
 FAILS = []
+# Q38_MTP_DRAFTS=1: this harness gates the one-draft verify (S=2) and counts its loop;
+# deeper verifies and prompt lookup are tests/spec_drafts_harness.py's
 BASE_ENV = {"OMP_NUM_THREADS": "2", "COLI_NO_OMP_TUNE": "1", "COLI_CUDA": "0",
-            "Q38_TRUNK_GPU": "0", "NOSTREAM": "1", "USAGE_SAVE": "0"}
+            "Q38_TRUNK_GPU": "0", "NOSTREAM": "1", "USAGE_SAVE": "0", "Q38_MTP_DRAFTS": "1"}
 MTP_KEYS = ("Q38_MTP", "Q38_MTP_WIRING", "Q38_MTP_FORCE", "Q38_MTP_DUMP", "DUMP",
-            "Q38_PREFILL_BATCH", "Q38_TRUNK_MIN_KB", "Q38_EXPERT_INT4")
+            "Q38_PREFILL_BATCH", "Q38_TRUNK_MIN_KB", "Q38_EXPERT_INT4", "Q38_MTP_DRAFTS", "COLI_LOOKUP")
 
 
 def check(ok, what):

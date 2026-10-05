@@ -29,9 +29,12 @@ layout(constant_id = 3) const int WN = 32;    // rows per subgroup, a multiple o
 layout(constant_id = 4) const int BK = 32;    // inputs per staged step, a multiple of 32
 layout(constant_id = 5) const int SG = 64;    // subgroup size the pipeline requires
 layout(local_size_x_id = 6) in;               // (BM/WM) * (BN/WN) * SG threads
+// Expert intermediates stay on the device. Compute their row scales here instead
+// of downloading them for the host to append scales to the activation buffer.
+layout(constant_id = 7) const int DEVICE_SCALE = 0;
 
 layout(std430, binding = 0) readonly buffer X  { float x[]; };   // x[S*I], then rs[S]
-layout(std430, binding = 0) readonly buffer X4 { vec4  x4[]; };
+// One view of the dynamic input binding, including under MoltenVK.
 layout(std430, binding = 1) readonly buffer W  { uint  w[]; };
 layout(std430, binding = 1) readonly buffer W2 { uvec2 w2[]; };
 layout(std430, binding = 2) readonly buffer Sc { float scale[]; };
@@ -54,6 +57,33 @@ shared float16_t xhs[BN * WST];        // [s][i]: its B, column-major; hi part
 shared float16_t xls[BN * WST];        //                              lo part
 shared float ssh[BM];                  // the current group's scales
 shared float esh[NW * 16 * EST];       // per subgroup: one accumulator on its way to y
+shared uint xmag[DEVICE_SCALE != 0 ? NT : 1];
+shared float xscale[DEVICE_SCALE != 0 ? BN : 1];
+
+float row_scale(int s) {
+    return DEVICE_SCALE != 0 ? xscale[s % BN] : x[uint(p.S) * uint(p.I) + uint(s)];
+}
+
+void prepare_scales(int tid, int s0) {
+    const int lanes = max(1, NT / BN), rows = NT / lanes;
+    for (int first = 0; first < BN; first += rows) {
+        int r = first + tid / lanes, lane = tid % lanes, s = s0 + r;
+        uint m = 0u;
+        if (r < BN && s < p.S)
+            for (int i = lane; i < p.I; i += lanes)
+                m = max(m, floatBitsToUint(x[uint(s) * uint(p.I) + uint(i)]) & 0x7fffffffu);
+        xmag[tid] = m;
+        barrier();
+        if (lane == 0 && r < BN) {
+            for (int j = 1; j < lanes; j++) m = max(m, xmag[tid + j]);
+            int e = int(m >> 23) - 126;
+            if (m >= 0x7f800000u) e = 15;
+            e = max(e, -100);
+            xscale[r] = uintBitsToFloat(uint(15 - e + 127) << 23);
+        }
+        barrier();
+    }
+}
 
 #define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
 #define MATA coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
@@ -134,14 +164,14 @@ void fetch_step(int tid, int o0, int s0, int k0) {
         vec4 v = vec4(0.0);
         if (u < BN * (BK / 4) && s < p.S && k < p.I) {
             uint b = uint(s) * uint(p.I) + uint(k);
-            if ((p.I & 3) == 0) v = x4[b >> 2];
+            if ((p.I & 3) == 0) v = vec4(x[b], x[b + 1u], x[b + 2u], x[b + 3u]);
             else {
                 v.x = x[b];
                 if (k + 1 < p.I) v.y = x[b + 1u];
                 if (k + 2 < p.I) v.z = x[b + 2u];
                 if (k + 3 < p.I) v.w = x[b + 3u];
             }
-            v *= x[uint(p.S) * uint(p.I) + uint(s)];   // the row's power of two
+            v *= row_scale(s);
         }
         rx[r] = v;
     }
@@ -152,6 +182,7 @@ void main() {
     int sg = int(gl_SubgroupID), lane = int(gl_SubgroupInvocationID);
     int wm = sg % (BM / WM), wn = sg / (BM / WM);    // this subgroup's WM x WN
     int o0 = int(gl_WorkGroupID.x) * BM, s0 = int(gl_WorkGroupID.y) * BN;
+    if (DEVICE_SCALE != 0) prepare_scales(tid, s0);
     bool grouped = p.fmt != 1 && p.fmt != 2;
     int gsz = p.fmt == 5 ? 64 : p.gs;                // a multiple of BK
     int ng = grouped ? (p.I + gsz - 1) / gsz : 1;
@@ -239,7 +270,7 @@ void main() {
             [[unroll]] for (int t = 0; t < 256 / SG; t++) {
                 int n = lane / 16 + t * (SG / 16), s = s0 + wn * WN + j * 16 + n;
                 if (o < p.O && s < p.S)
-                    y[uint(s) * uint(p.O) + uint(o)] = esh[eb + m * EST + n] * sc / x[uint(p.S) * uint(p.I) + uint(s)];
+                    y[uint(s) * uint(p.O) + uint(o)] = esh[eb + m * EST + n] * sc / row_scale(s);
             }
             subgroupBarrier();
         }

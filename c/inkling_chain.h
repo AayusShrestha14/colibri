@@ -50,8 +50,17 @@
  * on the CPU from the prefix record (the ids the state was built from), a prefill's
  * worth of CPU work, and runs on the CPU from there. Only a state the ids do not
  * describe (audio) cannot be rebuilt: that stops the engine with a message.
- * COLI_VK_CHAIN_FAULT=n (vk_chain.c) fakes the loss at the n-th frame, for tests. */
+ * COLI_VK_CHAIN_FAULT=n (vk_chain.c) fakes the loss at the n-th frame, for tests.
+ *
+ * Past the device's budget (vk_kvsplit.h) each global layer keeps only a window of
+ * blocks of its K/V on the device (the sliding layers' rings are small and stay whole):
+ * the step's new rows go into their slots before the attention, which runs over the
+ * device's rows (chain_kvs.comp's form of chain_relattn) and on the CPU over the older
+ * positions from the host's canonical cache at once, the two merged through their
+ * softmax statistics. A split layer's mirror follows a watermark (vkc_kv_lower on a CPU
+ * step) instead of the [dlo, dhi) ranges. Below the budget the mirrors are whole. */
 #include "vk_chain.h"
+#include "vk_kvsplit.h"
 
 /* COLI_VK_CHAIN unset on an integrated GPU with the expert tier (coli_vk_chain_decide):
  * no Inkling checkpoint has been timed on one */
@@ -70,6 +79,9 @@ typedef struct {
     ColiVkTensor *t_lm, **t_q, **t_k, **t_v, **t_r, **t_o, **t_router, **t_dg, **t_du, **t_dd, **t_sg, **t_su, **t_sd;
     VkcBuf **kc, **vc, **ring[4];
     int *cap, *dlo, *dhi;                      /* per layer: ring rows; positions the host wrote alone */
+    VkcKvSplit ks;                             /* the global layers' split past the device's budget (ks.on) */
+    int *kli, nglob;                           /* per layer: its split table (-1: a sliding layer); global layers */
+    int *drows;                                /* per layer: the device mirror's rows (cap, or ks.rows when split) */
     int *slot, nslot;                          /* per layer: its K/V region in kvd, within its frame */
     int kvo_max, qo_max, ro_max, mi_max;
     size_t vs_off;                             /* the V rows' offset in kvs */
@@ -82,11 +94,6 @@ typedef struct {
     double host_ms;
 } InkChain;
 
-static int inkc_chunk_rows(void) {
-    const char *e = getenv("COLI_VK_CHAIN_ROWS");
-    int v = e && *e ? atoi(e) : 512;
-    return v < 1 ? 1 : v > 65535 ? 65535 : v;
-}
 static void inkc_fatal(const char *what) {
     fprintf(stderr, "[VK] inkling chain: %s -- stopping (COLI_VK_CHAIN=0 keeps the state on the CPU)\n", what);
     exit(1);
@@ -97,23 +104,15 @@ static int64_t inkc_cs_cells(const Cfg *c, int bank, int i) {
 
 /* The device copy of a resident matrix or of a view of one (wt_off_i: a shared expert
  * of the fused [ns][R][I] tensors): the per-matrix path's copy when it keeps a table
- * for the tensor (ink_vk_matmul, keyed by the view's first weight), else the chain's
- * own. NULL: not a form the shaders read as this CPU does (ink_vk_fmt). */
+ * for the tensor (ink_vk_view_tensor, keyed by the view's first element in the tensor),
+ * else the chain's own. NULL: not a form the shaders read as this CPU does (ink_vk_fmt). */
 static ColiVkTensor *inkc_tensor(Wt view, int I, int O) {
+    if (view.vk) return ink_vk_view_tensor(&view, I, O);   /* the per-matrix path's table, keyed by the view */
     int fmt = ink_vk_fmt(&view);
     const void *data = view.q4 ? (const void *)view.q4 : view.f ? (const void *)view.f : (const void *)view.h;
     const float *sc = view.q4 ? view.qs : NULL;
     int gs = view.q4 ? view.gs : 0;
     if (!fmt || !data) return NULL;
-    InkVk *v = view.vk;
-    if (v) for (int k = 0; k < v->n; k++) {
-        InkVkView *e = &v->e[k];
-        if (e->q && e->q != data) continue;
-        if (e->dead) return NULL;
-        e->q = data;
-        if (!e->t && !coli_vk_tensor_ensure(&e->t, data, sc, fmt, I, O, gs)) { e->dead = 1; return NULL; }
-        return e->t;
-    }
     ColiVkTensor *t = NULL;
     return coli_vk_tensor_ensure(&t, data, sc, fmt, I, O, gs) ? t : NULL;
 }
@@ -146,7 +145,8 @@ static InkChain *inkc_setup(Model *m) {
         !INKC_ARR(t_r, void *) || !INKC_ARR(t_o, void *) || !INKC_ARR(t_router, void *) || !INKC_ARR(t_dg, void *) ||
         !INKC_ARR(t_du, void *) || !INKC_ARR(t_dd, void *) || !INKC_ARR(kc, void *) || !INKC_ARR(vc, void *) ||
         !INKC_ARR(ring[0], void *) || !INKC_ARR(ring[1], void *) || !INKC_ARR(ring[2], void *) || !INKC_ARR(ring[3], void *) ||
-        !INKC_ARR(cap, int) || !INKC_ARR(dlo, int) || !INKC_ARR(dhi, int) || !INKC_ARR(slot, int)) return NULL;
+        !INKC_ARR(cap, int) || !INKC_ARR(dlo, int) || !INKC_ARR(dhi, int) || !INKC_ARR(slot, int) ||
+        !INKC_ARR(kli, int) || !INKC_ARR(drows, int)) return NULL;
 #undef INKC_ARR
     int nsl = ns > 0 ? ns : 1;
     ch->t_sg = calloc((size_t)L * nsl, sizeof(void *)); ch->t_su = calloc((size_t)L * nsl, sizeof(void *));
@@ -228,6 +228,7 @@ static InkChain *inkc_setup(Model *m) {
                 return NULL;
         }
     }
+    for (int i = 0; i < L; i++) ch->kli[i] = c->local[i] ? -1 : ch->nglob++;
     ch->cs_where = INKC_HOST; ch->host_zero = 0;
     ch->ok = 1;
     int nsp = 0; for (int i = 0; i < L; i++) nsp += c->sparse[i];
@@ -236,14 +237,38 @@ static InkChain *inkc_setup(Model *m) {
     return ch;
 }
 
-static int inkc_res(VkcBuf **b, size_t floats, int kind) { return vkc_reserve(b, (floats ? floats : 1) * sizeof(float), kind); }
-
-/* scratch for `rows` rows, and the K/V mirrors at the host's layout */
-static int inkc_scratch(InkChain *ch, Model *m, int rows) {
+/* inkc_res counts instead of reserving while g_inkc_count >= 0 (the chunk's sizing) */
+static long long g_inkc_count = -1;
+static int inkc_res(VkcBuf **b, size_t floats, int kind) {
+    if (g_inkc_count >= 0) { g_inkc_count += (long long)(floats ? floats : 1) * (long long)sizeof(float); return 1; }
+    return vkc_reserve(b, (floats ? floats : 1) * sizeof(float), kind);
+}
+static int inkc_bufs(InkChain *ch, Model *m, int rows);
+/* Prompt rows per chunk (vkc_chunk_rows): the chain's scratch a row, counted from the
+ * reservations, and the routed experts' outputs (the tier's rows, the CPU's
+ * contributions, and the host's sum). */
+static int inkc_chunk_rows(InkChain *ch, Model *m) {
+    size_t vs = ch->vs_off;
+    g_inkc_count = 0; inkc_bufs(ch, m, 1); long long b1 = g_inkc_count;
+    g_inkc_count = 0; inkc_bufs(ch, m, 2); long long b2 = g_inkc_count;
+    g_inkc_count = -1; ch->vs_off = vs;
+    size_t row = (size_t)(b2 - b1) + (size_t)(2 * m->c.topk + 2) * m->c.hidden * sizeof(float);
+    if (ch->ks.on) {
+        int heads = 1, dim = 1;
+        for (int i = 0; i < m->c.n_layers; i++) if (ch->kli[i] >= 0) {
+            if (L_HEADS(&m->c, i) > heads) heads = L_HEADS(&m->c, i);
+            if (L_HD(&m->c, i) > dim) dim = L_HD(&m->c, i);
+        }
+        row += (3 * (size_t)heads * (dim + 2) + ch->qo_max + ch->ro_max) * sizeof(float);
+    }
+    return vkc_chunk_rows("inkling", row);
+}
+/* the scratch buffers for `rows` rows */
+static int inkc_bufs(InkChain *ch, Model *m, int rows) {
     Cfg *c = &m->c; int D = c->hidden, ET = c->n_experts + c->n_shared, ns = c->n_shared > 0 ? c->n_shared : 1;
     size_t r = (size_t)rows;
     ch->vs_off = (r * ch->kvo_max + 63) & ~(size_t)63;
-    int ok = inkc_res(&ch->x, r * D, VKC_DEV) && inkc_res(&ch->nrm, r * D, VKC_DEV) && inkc_res(&ch->tmp, r * D, VKC_DEV) &&
+    return inkc_res(&ch->x, r * D, VKC_DEV) && inkc_res(&ch->nrm, r * D, VKC_DEV) && inkc_res(&ch->tmp, r * D, VKC_DEV) &&
              inkc_res(&ch->q, r * ch->qo_max, VKC_DEV) && inkc_res(&ch->kvs, ch->vs_off + r * ch->kvo_max, VKC_DEV) &&
              inkc_res(&ch->r, r * ch->ro_max, VKC_DEV) && inkc_res(&ch->ctx, r * ch->qo_max, VKC_DEV) &&
              inkc_res(&ch->h2, r * D, VKC_DEV) && inkc_res(&ch->lg, r * ET, VKC_DEV) &&
@@ -253,25 +278,57 @@ static int inkc_scratch(InkChain *ch, Model *m, int rows) {
              inkc_res(&ch->kvd, (size_t)ch->nslot * 2 * r * ch->kvo_max, VKC_DOWN) && inkc_res(&ch->csd, ch->csd_n, VKC_DOWN) &&
              inkc_res(&ch->outd, c->unpad_vocab, VKC_DOWN) && inkc_res(&ch->routed, r * D, VKC_UP) &&
              inkc_res(&ch->shw, (size_t)ns * r, VKC_UP) && inkc_res(&ch->tau, 2 * r, VKC_UP);
-    if (!ok) return 0;
+}
+/* Plan and allocate the KV mirror before sizing a prompt chunk. */
+static int inkc_mirror(InkChain *ch, Model *m) {
+    Cfg *c = &m->c;
+    if (ch->max_t != m->max_t || ch->hostK != m->K) {   /* a cache allocated anew: mirror it again */
+        /* the global layers' mirrors: whole, or split past the device's budget */
+        size_t row = 0, held = 0;
+        for (int i = 0; i < c->n_layers; i++) {
+            if (ch->kli[i] < 0) continue;
+            size_t b = (size_t)2 * L_KV(c, i) * L_HD(c, i) * sizeof(float);
+            if (b > row) row = b;
+            held += b * (size_t)ch->drows[i];
+        }
+        int plan = ch->nglob ? vkc_kv_plan(&ch->ks, "inkling", ch->nglob, row, m->max_t, 1, 0, held) : 1;
+        if (!plan) { ch->max_t = 0; ch->hostK = NULL; return 0; }
+        for (int i = 0; i < c->n_layers; i++) {
+            vkc_free(ch->kc[i]); vkc_free(ch->vc[i]); ch->kc[i] = ch->vc[i] = NULL;
+            int cap = kv_ring_rows(c, i, m->max_t), hd = L_HD(c, i), KV = L_KV(c, i);
+            int split = ch->ks.on && ch->kli[i] >= 0;
+            ch->cap[i] = cap;
+            ch->drows[i] = split ? ch->ks.rows : cap;
+            /* a ring: every row, whatever positions it holds; a whole cache: the positions held;
+             * a split layer: its watermark (vkc_kv_plan reset it) */
+            ch->dlo[i] = 0; ch->dhi[i] = split ? 0 : cap < m->max_t ? m->max_t : m->kv_len;
+            ch->kc[i] = vkc_buf((size_t)KV * ch->drows[i] * hd * sizeof(float), VKC_DEV);
+            ch->vc[i] = vkc_buf((size_t)KV * ch->drows[i] * hd * sizeof(float), VKC_DEV);
+            if (!ch->kc[i] || !ch->vc[i]) { ch->max_t = 0; ch->hostK = NULL; return 0; }
+        }
+        ch->max_t = m->max_t; ch->hostK = m->K;
+    }
+    return 1;
+}
+
+/* scratch for `rows` rows, and the K/V mirrors at the host's layout */
+static int inkc_scratch(InkChain *ch, Model *m, int rows) {
+    Cfg *c = &m->c; int D = c->hidden, ns = c->n_shared > 0 ? c->n_shared : 1;
+    size_t r = (size_t)rows;
+    if (!inkc_bufs(ch, m, rows)) return 0;
     if (ch->rows < rows) {
         float *hr = realloc(ch->host_routed, r * D * sizeof(float)), *hw = hr ? realloc(ch->host_w, (size_t)ns * r * sizeof(float)) : NULL;
         if (hr) ch->host_routed = hr;
         if (!hr || !hw) return 0;
         ch->host_w = hw; ch->rows = rows;
     }
-    if (ch->max_t != m->max_t || ch->hostK != m->K) {   /* a cache allocated anew: mirror it again */
-        for (int i = 0; i < c->n_layers; i++) {
-            vkc_free(ch->kc[i]); vkc_free(ch->vc[i]); ch->kc[i] = ch->vc[i] = NULL;
-            int cap = kv_ring_rows(c, i, m->max_t), hd = L_HD(c, i), KV = L_KV(c, i);
-            ch->cap[i] = cap;
-            /* a ring: every row, whatever positions it holds; a whole cache: the positions held */
-            ch->dlo[i] = 0; ch->dhi[i] = cap < m->max_t ? m->max_t : m->kv_len;
-            ch->kc[i] = vkc_buf((size_t)KV * cap * hd * sizeof(float), VKC_DEV);
-            ch->vc[i] = vkc_buf((size_t)KV * cap * hd * sizeof(float), VKC_DEV);
-            if (!ch->kc[i] || !ch->vc[i]) { ch->max_t = 0; ch->hostK = NULL; return 0; }
+    if (ch->ks.on) {
+        int hmax = 1, hdm = 1;
+        for (int i = 0; i < c->n_layers; i++) if (ch->kli[i] >= 0) {
+            if (L_HEADS(c, i) > hmax) hmax = L_HEADS(c, i);
+            if (L_HD(c, i) > hdm) hdm = L_HD(c, i);
         }
-        ch->max_t = m->max_t; ch->hostK = m->K;
+        if (!vkc_kv_parts(&ch->ks, r * hmax * (hdm + 2))) return 0;
     }
     return 1;
 }
@@ -289,14 +346,17 @@ static void inkc_cpu_step(Model *m, int pos_base, int S) {
     if (!ch || !ch->ok) return;
     ch->cs_where = INKC_HOST; ch->host_zero = 0;
     for (int i = 0; i < m->c.n_layers; i++) {
+        if (ch->ks.on && ch->kli[i] >= 0) { vkc_kv_lower(&ch->ks, ch->kli[i], pos_base); continue; }
         if (ch->dlo[i] >= ch->dhi[i]) { ch->dlo[i] = pos_base; ch->dhi[i] = pos_base + S; continue; }
         if (pos_base < ch->dlo[i]) ch->dlo[i] = pos_base;
         if (pos_base + S > ch->dhi[i]) ch->dhi[i] = pos_base + S;
     }
 }
 /* Record the uploads that make the device state the host's: the convolution states if
- * the host's are newer, and the rows of the last `cap` positions the host wrote alone. */
-static int inkc_push_state(InkChain *ch, Model *m) {
+ * the host's are newer, and the rows of the last `cap` positions the host wrote alone;
+ * a split layer: its window placed for the n rows from pos_base, its resident rows below
+ * pos_base uploaded. */
+static int inkc_push_state(InkChain *ch, Model *m, int pos_base, int n) {
     Cfg *c = &m->c; int ok = 1;
     if (ch->cs_where == INKC_HOST) {
         for (int i = 0; i < c->n_layers && ok; i++) for (int b = 0; b < 4 && ok; b++) {
@@ -306,6 +366,14 @@ static int inkc_push_state(InkChain *ch, Model *m) {
         ch->cs_where = INKC_BOTH;
     }
     for (int i = 0; i < c->n_layers && ok; i++) {
+        if (ch->ks.on && ch->kli[i] >= 0) {
+            int KV = L_KV(c, i), hd = L_HD(c, i);
+            VkcKvPart pt[2] = {{KV, hd, m->K[i], (size_t)ch->cap[i] * hd, ch->kc[i], 0},
+                               {KV, hd, m->V[i], (size_t)ch->cap[i] * hd, ch->vc[i], 0}};
+            vkc_kv_place(&ch->ks, ch->kli[i], pos_base, n);
+            ok = vkc_kv_push(&ch->ks, ch->kli[i], pt, 2, pos_base);
+            continue;
+        }
         if (ch->dlo[i] >= ch->dhi[i]) continue;
         int cap = ch->cap[i], hd = L_HD(c, i), KV = L_KV(c, i);
         int t0 = ch->dhi[i] - cap > ch->dlo[i] ? ch->dhi[i] - cap : ch->dlo[i];
@@ -373,6 +441,22 @@ static int inkc_attention(InkChain *ch, Model *m, int i, int n, int pb) {
     VkcNorm qn = {n * H, hd, H, 0, H * hd, hd, 0, H * hd, hd, (int)ch->o_qn[i], 0, 0, c->eps, 1.f};
     VkcNorm kn = {n * KV, hd, KV, 0, kvo, hd, 0, kvo, hd, (int)ch->o_kn[i], 0, 0, c->eps, 1.f};
     ok = ok && vkc_norm(ch->q, ch->prm, ch->q, &qn) && vkc_norm(ch->kvs, ch->prm, ch->kvs, &kn);
+    if (ok && ch->ks.on && ch->kli[i] >= 0) {
+        /* the split: the step's rows into their window slots first (the window holds every
+         * row of a step), then the attention over the device's rows and the host's */
+        int li = ch->kli[i];
+        VkcKvPart pk = {KV, hd, m->K[i], (size_t)cap * hd, ch->kc[i], 0}, pv = {KV, hd, m->V[i], (size_t)cap * hd, ch->vc[i], 0};
+        size_t ko = (size_t)ch->slot[i] * 2 * ch->rows * ch->kvo_max;
+        VkcKvRel a = {&ch->ks, li, ch->q, ch->kc[i], ch->vc[i], ch->r, ch->tau, ch->prm, ch->ctx, n, H, KV, hd, pb,
+                      L_EXT(c, i), dr, H * hd, H * dr, (int)ch->o_relp[i], 0, H * hd, 1.f / (float)hd,
+                      m->K[i], m->V[i], (size_t)cap * hd, (size_t)hd, (size_t)cap * hd, (size_t)hd,
+                      (const float *)vkc_ptr(ch->tau), m->L[i].relp, 0};
+        return vkc_kv_store(&ch->ks, li, &pk, ch->kvs, 0, (size_t)kvo, (size_t)hd, pb, n) &&
+               vkc_kv_store(&ch->ks, li, &pv, ch->kvs, vs, (size_t)kvo, (size_t)hd, pb, n) &&
+               vkc_copy(ch->kvd, ko, ch->kvs, 0, (size_t)n * kvo) &&
+               vkc_copy(ch->kvd, ko + (size_t)ch->rows * ch->kvo_max, ch->kvs, vs, (size_t)n * kvo) &&
+               vkc_kv_rel(&a) && vkc_matmul(ch->t_o[i], ch->ctx, 0, ch->tmp, 0, n);
+    }
     VkcRelAttn a = {n, H, KV, hd, pb, cap, local ? c->window : 0, L_EXT(c, i), dr,
                     0, H * hd, 0, H * hd, 0, 0, 0, (int)vs, kvo, 0, H * dr, (int)ch->o_relp[i], local ? ch->rows : 0,
                     1.f / (float)hd};
@@ -453,8 +537,10 @@ static int inkc_forward(Model *m, float *xh, int S, int pos_base, int want_x, fl
     InkChain *ch = inkc_setup(m);
     if (!ch || ch->failed) return 0;
     Cfg *c = &m->c; int D = c->hidden, L = c->n_layers, ET = c->n_experts + c->n_shared, ns = c->n_shared;
-    int CH = inkc_chunk_rows(), rows = S < CH ? S : CH;
-    if (pos_base + S > m->max_t || !inkc_scratch(ch, m, rows) || (want_x && !inkc_res(&ch->xd, (size_t)rows * D, VKC_DOWN))) {
+    int mirror_ok = inkc_mirror(ch, m);
+    int CH = mirror_ok ? inkc_chunk_rows(ch, m) : 1, rows = S < CH ? S : CH;
+    if (ch->ks.on && rows > ch->ks.chunk) rows = ch->ks.chunk;   /* a step's rows fit the split's window */
+    if (!mirror_ok || pos_base + S > m->max_t || !inkc_scratch(ch, m, rows) || (want_x && !inkc_res(&ch->xd, (size_t)rows * D, VKC_DOWN))) {
         fprintf(stderr, "[VK] inkling chain: device memory for %d rows refused; per-matrix path\n", rows);
         ch->failed = 1;
         return 0;
@@ -465,7 +551,7 @@ static int inkc_forward(Model *m, float *xh, int S, int pos_base, int want_x, fl
     for (int c0 = 0; c0 < S; c0 += rows) {
         int n = S - c0 < rows ? S - c0 : rows, pb = pos_base + c0;
         if (!vkc_begin() || !vkc_write(ch->x, 0, xh + (size_t)c0 * D, (size_t)n * D * sizeof(float)) ||
-            !inkc_push_state(ch, m)) goto lost;
+            !inkc_push_state(ch, m, pb, n)) goto lost;
         float *tau = (float *)vkc_ptr(ch->tau);   /* attention()'s tau: global rows, then 1 for sliding ones */
         for (int s = 0; s < n; s++) {
             float t = 1.f;
@@ -486,7 +572,11 @@ static int inkc_forward(Model *m, float *xh, int S, int pos_base, int want_x, fl
             ok = ok && vkc_matmul(ch->t_router[i], ch->h2, 0, ch->lg, 0, n) &&
                  vkc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * ET) && vkc_copy(ch->h2d, 0, ch->h2, 0, (size_t)n * D);
             double t0 = now_s();
-            ok = ok && vkc_submit(1);                      /* A1 */
+            /* A1; while it runs, the tier loads the experts this layer will likely
+             * stream (a big prompt chunk only) */
+            ok = ok && vkc_submit(0);
+            if (ok) vkt_stream_prefetch(i, n);
+            ok = ok && vkc_finish();
             m->t_attn += now_s() - t0;
             if (!ok) break;
             inkc_kv_down(ch, m, f0, i, n, pb);
@@ -521,6 +611,7 @@ static int inkc_forward(Model *m, float *xh, int S, int pos_base, int want_x, fl
         for (int i = 0; i < L; i++) for (int b = 0; b < 4; b++)
             memcpy(m->cs[b][i], csd + ch->o_csd[(size_t)b * L + i], (size_t)inkc_cs_cells(c, b, i) * sizeof(float));
         ch->cs_where = INKC_BOTH; ch->host_zero = 0;
+        for (int i = 0; i < L; i++) if (ch->kli[i] >= 0) vkc_kv_done(&ch->ks, ch->kli[i], pb + n);
         if (want_x) memcpy(xfin + (size_t)c0 * D, vkc_ptr(ch->xd), (size_t)n * D * sizeof(float));
         if (last) memcpy(logit, vkc_ptr(ch->outd), (size_t)c->unpad_vocab * sizeof(float));
     }
@@ -541,6 +632,7 @@ static void inkc_report(Model *m) {
     fprintf(stderr, "[VK] inkling chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
                     "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %.1f MiB on the device\n",
             ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms, st.dev_bytes / 1048576.0);
+    vkc_kv_report(&ch->ks);
     vkc_prof_print();
 }
 

@@ -74,7 +74,11 @@
  * matrix whose upload fails, stays on the CPU path below. The backend's dense
  * matmuls share one command buffer: main thread only. */
 #include "backend_vulkan.h"
+#include <pthread.h>
 static int g_vk_ready;
+/* COLI_VK_DENSE_HOST: the dense matrices on the device only (mimo_dho_start); the
+ * per-matrix path then runs on the device whatever coli_vk_dense() says */
+static int g_mimo_dho;
 #endif
 
 #define MIMO_MAX_LAYERS 128
@@ -263,6 +267,10 @@ typedef struct {
     float *s;          /* FP8: [O][nblk]; I8: [O] */
     void *vk;          /* COLI_VULKAN: the device copy, uploaded at start-up */
     int vk_off;        /* its upload failed: this matrix stays on the CPU */
+    /* COLI_VULKAN: how to read it back from disk (dw_reload), and 1 while the device
+     * holds it alone (COLI_VK_DENSE_HOST, the host copy dropped) */
+    char *vk_name;
+    int vk_kind, vk_bits, vk_li, vk_gone;
 } DW;
 
 /* 0 (default): the checkpoint's own FP8 and BF16 bytes, exact.
@@ -355,18 +363,20 @@ static int dw_upload(DW *d) {
 }
 
 static int dw_matmul_vk(float *y, const float *x, int S, const DW *d) {
-    if (!g_vk_ready || !coli_vk_dense() || d->vk_off || !vk_main_thread()) return 0;
+    if (!g_vk_ready || !(coli_vk_dense() || g_mimo_dho) || d->vk_off || !vk_main_thread()) return 0;
     DW *dev = (DW *)d;     /* the device copy is a cache inside a read-only matrix */
     if (!dw_upload(dev)) return 0;
     int gs; const float *sc;
     int fmt = dw_vk_fmt(d, &gs, &sc);
     return coli_vk_matmul((ColiVkTensor **)&dev->vk, y, x, d->w, sc, fmt, S, d->I, d->O, gs);
 }
+static void dw_reload(DW *d);   /* below, beside the loaders it re-runs */
 #endif
 
 static void dw_matmul(float *y, const float *x, int S, const DW *d) {
 #ifdef COLI_VULKAN
     if (dw_matmul_vk(y, x, S, d)) return;
+    if (d->vk_gone) dw_reload((DW *)d);   /* the CPU needs a matrix the device held alone (a lost device) */
 #endif
     switch (d->fmt) {
     case DW_F32:  matmul(y, x, (const float *)d->w, S, d->I, d->O); break;
@@ -417,8 +427,24 @@ static void dw_from_f32(DW *d, float *w, int O, int I) {
     }
 }
 
+#ifdef COLI_VULKAN
+enum { DWK_NONE = 0, DWK_BF16, DWK_FP8, DWK_QKV };
+/* What dw_reload needs to read the matrix back exactly as it was loaded: its name,
+ * its loader, the MIMO_DENSE_BITS it was loaded under (the tower forces its own). */
+static void dw_note(DW *d, const char *name, int kind) {
+    free(d->vk_name);
+    d->vk_name = strdup(name);
+    if (!d->vk_name) { fprintf(stderr, "OOM weight name\n"); exit(1); }
+    d->vk_kind = kind; d->vk_bits = g_dense_bits; d->vk_li = -1;
+}
+#define DW_NOTE(d, name, kind) dw_note(d, name, kind)
+#else
+#define DW_NOTE(d, name, kind) ((void)0)
+#endif
+
 static void dw_load_bf16(DW *d, shards *S, const char *name, int O, int I) {
     st_tensor *t = need(S, name, 0, O, I);
+    DW_NOTE(d, name, DWK_BF16);
     if (g_dense_bits == 0) {
         d->fmt = DW_BF16; d->O = O; d->I = I; d->s = NULL;
         d->w = xmalloc((size_t)t->nbytes, name);
@@ -441,6 +467,7 @@ static void dw_load_fp8(DW *d, shards *S, const char *name, int O, int I,
     if (scale_rows <= 0) scale_rows = (O + 127) / 128;
     st_tensor *t = need(S, name, 4, O, I);
     need(S, sname, 2, scale_rows, nblk);
+    DW_NOTE(d, name, DWK_FP8);
     uint8_t *raw = xmalloc((size_t)t->nbytes, name);
     st_read_raw_cap(S, name, raw, t->nbytes, 1);
     float *grid = xmalloc((size_t)scale_rows * nblk * sizeof(float), sname);
@@ -509,7 +536,42 @@ static void load_qkv(DW *d, shards *S, const Cfg *c, int li) {
     for (int ch = 0; ch < T; ch++) for (int r = 0; r < v_rows; r++) order[w++] = ch * rpc + q_rows + k_rows + r;
     dw_load_fp8(d, S, name, O, c->hidden, row_block, scale_rows, order);
     free(row_block); free(order);
+#ifdef COLI_VULKAN
+    d->vk_kind = DWK_QKV; d->vk_li = li;   /* read back through this function: the de-interleave */
+#endif
 }
+
+#ifdef COLI_VULKAN
+/* A matrix whose host copy was dropped (COLI_VK_DENSE_HOST) and that the CPU needs
+ * after all: read it back from the checkpoint with the loader and the MIMO_DENSE_BITS
+ * it was first read with, the same bytes, and keep it from there on. */
+static size_t dw_bytes(const DW *d);
+static pthread_mutex_t g_dw_dho_mx = PTHREAD_MUTEX_INITIALIZER;
+static shards *g_dw_dho_S;
+static const Cfg *g_dw_dho_c;
+static void dw_reload(DW *d) {
+    pthread_mutex_lock(&g_dw_dho_mx);
+    if (d->vk_gone) {
+        DW t = {0};
+        int saved = g_dense_bits;
+        g_dense_bits = d->vk_bits;
+        if (!g_dw_dho_S || !d->vk_name) { fprintf(stderr, "[VK] mimo: a dense matrix the device held alone cannot be read back\n"); exit(1); }
+        switch (d->vk_kind) {
+        case DWK_BF16: dw_load_bf16(&t, g_dw_dho_S, d->vk_name, d->O, d->I); break;
+        case DWK_FP8:  dw_load_fp8(&t, g_dw_dho_S, d->vk_name, d->O, d->I, NULL, 0, NULL); break;
+        case DWK_QKV:  load_qkv(&t, g_dw_dho_S, g_dw_dho_c, d->vk_li); break;
+        default: fprintf(stderr, "[VK] mimo: %s has no loader to read it back\n", d->vk_name); exit(1);
+        }
+        g_dense_bits = saved;
+        if (t.fmt != d->fmt || t.O != d->O || t.I != d->I) { fprintf(stderr, "[VK] mimo: %s came back in another form\n", d->vk_name); exit(1); }
+        d->w = t.w; d->s = t.s; d->nblk = t.nblk;
+        free(t.vk_name);
+        d->vk_gone = 0;
+        coli_vk_dense_host_reloaded(dw_bytes(d));
+    }
+    pthread_mutex_unlock(&g_dw_dho_mx);
+}
+#endif
 
 /* ------------------------------------------------------------------ model ---- */
 
@@ -902,6 +964,23 @@ static VktExpertSrc mimo_vk_src(const Model *m, const uint8_t *buf) {
                   *uq = gs + m->part[3], *us = uq + m->part[4];
     return (VktExpertSrc){gq, uq, dq, gs, us, ds};
 }
+/* The tier's streaming (a big prompt chunk's cold experts on the device): the experts'
+ * bytes through the layer cache as moe_cpu gets them (experts_ensure: a group at once,
+ * read in parallel, up to the cache's capacity), valid until the next ensure. */
+static int mimo_vk_load_batch(void *ctx, int li, const int *e, int n, VktExpertSrc *srcs, void **h) {
+    Model *m = ctx;
+    int cap = m->cache[li].cap;
+    if (n > cap) n = cap;
+    if (n < 1 || n > 64) return 0;
+    Slot *sl[64];
+    experts_ensure(m, li, e, n, sl);
+    for (int i = 0; i < n; i++) { srcs[i] = mimo_vk_src(m, sl[i]->buf); h[i] = sl[i]; }
+    return n;
+}
+static int mimo_vk_load(void *ctx, int li, int e, VktExpertSrc *src, void **h) {
+    return mimo_vk_load_batch(ctx, li, &e, 1, src, h) == 1;
+}
+static void mimo_vk_release(void *ctx, void *h) { (void)ctx; (void)h; }
 
 /* The CPU's experts of one MoE step: every (row, choice) pair i of sel -- or,
  * with a mask, those whose mask[i] is mval -- runs its expert, and its output
@@ -1217,6 +1296,15 @@ static void echo_frame(const Echo *e, int pos, int token, const float *lo, int v
 static void prefill(Model *m, const int *ids, int n, float *logits, float *all_logits,
                     const ImageRows *img, const Echo *echo) {
     int chunk = env_int("MIMO_CHUNK", 64);
+#ifdef COLI_VULKAN
+    /* the dense chain with a chunk from the budget (vkc_chunk_auto): blocks of its chunk,
+     * so a long prompt's MoE steps are big ones the tier can stream (not with a read-out,
+     * which holds a block's logits) */
+    if (!getenv("MIMO_CHUNK") && g_vk_chain && vkc_chunk_auto() && !echo) {
+        MimoChain *ch = mc_setup(m);
+        if (ch && !ch->failed) chunk = mc_chunk_rows(ch, m);
+    }
+#endif
     if (chunk < 1) chunk = 1;
     int used = 0, V = m->c.vocab;
     float *rows = NULL;
@@ -1301,6 +1389,50 @@ static size_t vk_dense_bytes(const Model *m, int vision) {
     return b;
 }
 
+/* ---- the dense matrices on the device only (COLI_VK_DENSE_HOST) ----------------
+ * With the trunk on the device (the chain, or COLI_VK_DENSE), every trunk matrix goes
+ * up now, before the expert tier sizes its budget, and its host copy is dropped; the
+ * tower too when the per-matrix path is on (COLI_VK_DENSE), else it stays on the CPU
+ * with its copy. The per-matrix path then answers on the device whatever
+ * coli_vk_dense() says (the CPU holds no copy), and the CPU reads a matrix back from
+ * disk only when it needs it after all (dw_reload: a lost device). Kept on the host:
+ * the embedding (its rows are gathered on the CPU), the routers (the host computes
+ * them), norms and vectors, the patch embedding. */
+static void dw_drop(DW *d, int *n) {
+    if (!d->w || d->vk_off || d->vk_gone || !d->vk_name || !dw_upload(d)) return;
+    size_t b = dw_bytes(d);
+    free(d->w); free(d->s);
+    d->w = NULL; d->s = NULL; d->vk_gone = 1;
+    coli_vk_dense_host_dropped(b);
+    (*n)++;
+}
+static void mimo_dho_start(Model *m) {
+    if (!g_vk_ready) return;
+    int vision = coli_vk_dense();
+    if (!coli_vk_dense_host_decide("mimo", coli_vk_dense() || g_vk_chain, vk_dense_bytes(m, vision))) return;
+    g_mimo_dho = 1;
+    g_dw_dho_S = &m->S; g_dw_dho_c = &m->c;
+    int n = 0;
+    for (int li = 0; li < m->c.n_layers; li++) {
+        Layer *l = &m->L[li];
+        dw_drop(&l->qkv, &n); dw_drop(&l->o, &n);
+        if (!m->c.moe[li]) { dw_drop(&l->gate, &n); dw_drop(&l->up, &n); dw_drop(&l->down, &n); }
+    }
+    dw_drop(&m->head, &n);
+    if (g_vision) {
+        Vision *v = g_vision;
+        DW *t[3] = {&v->embed, &v->fc1, &v->fc2};
+        for (int k = 0; k < 3; k++) { if (vision) dw_drop(t[k], &n); else t[k]->vk_off = 1; }
+        for (int i = 0; i < v->depth; i++) {
+            DW *b[5] = {&v->b[i].qkv, &v->b[i].proj, &v->b[i].gate, &v->b[i].up, &v->b[i].down};
+            for (int k = 0; k < 5; k++) { if (vision) dw_drop(b[k], &n); else b[k]->vk_off = 1; }
+        }
+    }
+    coli_vk_dense_host_placed("mimo", vision || !g_vision
+        ? "the embedding (its rows are gathered on the CPU), the routers, norms, the patch embedding"
+        : "the embedding (its rows are gathered on the CPU), the routers, norms, the vision tower (on the CPU: COLI_VK_DENSE=1 puts it on the device)");
+}
+
 /* Is the expert in this layer's RAM cache now (the tier's balance asks)? */
 static int vk_in_ram(void *ctx, int li, int e) {
     const Model *m = ctx;
@@ -1333,9 +1465,11 @@ static void vk_tier_start(Model *m) {
                     .gate_up = f, .down = f, .act = VKT_ACT_SWIGLU,
                     .max_rows = MIMO_VK_ROWS * c->topk,
                     .ram_reserve = (size_t)(m->e_bytes + 8192) * (size_t)cap * (size_t)nmoe,
-                    .dense_bytes = (coli_vk_dense() ? vk_dense_bytes(m, 1) : g_vk_chain ? vk_dense_bytes(m, 0) : 0) +
+                    .dense_bytes = (coli_vk_dense_device_only() ? 0 :   /* placed already (mimo_dho_start) */
+                                    coli_vk_dense() ? vk_dense_bytes(m, 1) : g_vk_chain ? vk_dense_bytes(m, 0) : 0) +
                                    (g_vk_chain ? mc_kv_bytes(m) : 0),   /* the chain's KV caches */
-                    .in_ram = vk_in_ram, .ram_ctx = m};
+                    .in_ram = vk_in_ram, .ram_ctx = m,
+                    .load = mimo_vk_load, .release = mimo_vk_release, .load_ctx = m, .load_batch = mimo_vk_load_batch};
     atexit(coli_vk_shutdown);   /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
     if (vkt_init(&vc, NULL)) atexit(vkt_shutdown);
 }
@@ -1852,6 +1986,7 @@ int main(int argc, char **argv) {
             g_vk_chain = coli_vk_chain_decide("mimo", tier, COLI_VK_CHAIN_UNMEASURED);
             if (g_vk_chain && !vkc_init()) g_vk_chain = 0;
         }
+        mimo_dho_start(m);   /* COLI_VK_DENSE_HOST: the dense matrices on the device only, before the tier sizes its budget */
         if (g_vk_ready && tier) vk_tier_start(m);
         if (g_vk_ready && !vkt_ready() && !coli_vk_dense()) coli_vk_dense_decide("mimo", 0, 1);   /* no tier after all */
         if (g_vk_chain) {   /* the chain's teardown before the device's (the tier registered the device's) */

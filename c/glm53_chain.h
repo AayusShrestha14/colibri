@@ -32,6 +32,12 @@
  *     is brought back before anything reads it there (a pin, a state capture, a CPU
  *     forward of the session, another session taking the device) and pushed up after
  *     anything writes it there (a restored pin or state).
+ * Past the device's budget (vk_kvsplit.h) each MLA layer keeps only some blocks of its
+ * latent rows on the device: the window of the newest, and the blocks the k-pooled
+ * selection reads most. The attention core runs over those on the device and over the
+ * rest on the CPU (from the host's canonical cache) at once, merged through the softmax
+ * statistics; the index keys, pool gates and pooled keys, which every row scores, stay
+ * whole.
  * A device lost while the device holds the newest KDA state: the state is rebuilt on the
  * CPU from the input rows of the positions since the host's copy was last current (the
  * chain keeps them: the embedding rows, or the vision tower's), the forward runs again on
@@ -44,6 +50,7 @@
  * a KDA head above 256 key or 128 value floats, an indexer above 64 heads, 4096 query
  * floats or k-pooling below 2). */
 #include "vk_chain.h"
+#include "vk_kvsplit.h"
 
 #define G53C_HOST 0
 #define G53C_DEV  1
@@ -59,6 +66,9 @@ typedef struct {
     VkcMla *mla;
     VkcMlaCache *kv; VkcBuf **ik, **ig, **pk, **win, **st;
     int *kv_valid, *pool_valid;
+    int *mla_ord, n_mla, dev_rows;            /* the MLA layers' order; device latent rows a layer */
+    VkcKvSplit ks;                            /* the split past the device's budget (ks.on) */
+    VkcMlaCache kvtmp;                        /* the split: a step's new rows before their slots */
     VkcMlaScratch sc;
     VkcBuf *xs, *xn, *col, *nrm, *br, *mix, *hp, *gs, *us, *hs, *ds, *qkv3, *cm, *kf, *kb, *kg, *klow, *ky;
     VkcBuf *ikd, *iq, *ihw, *igd, *isc, *sel;
@@ -75,11 +85,6 @@ static G53Chain *g_g53c;
 static int g_vk_chain = 0;
 static int g_g53c_inited = 0;
 
-static int g53c_rows(void) {
-    const char *e = getenv("COLI_VK_CHAIN_ROWS");
-    int v = e && *e ? atoi(e) : 512;
-    return v < 1 ? 1 : v > 65535 ? 65535 : v;
-}
 
 /* A Mat's device copy (the per-matrix path's own, where it made one); f32 as fmt 10. */
 static ColiVkTensor *g53c_tensor(const Mat *wc) {
@@ -136,6 +141,7 @@ static void g53c_cpu_step(const GModel *m, const GSession *s, int start) {
     for (int i = 0; i < m->c.n_layers; i++) {
         if (ch->kv_valid[i] > start) ch->kv_valid[i] = start;
         if (ch->pool_valid[i] > start / m->c.index_kpool) ch->pool_valid[i] = start / m->c.index_kpool;
+        if (m->c.is_full[i]) vkc_kv_lower(&ch->ks, ch->mla_ord[i], start);
     }
 }
 
@@ -160,9 +166,10 @@ static int g53c_setup(GModel *m) {
     ch->mla = calloc(L, sizeof(VkcMla)); ch->kv = calloc(L, sizeof(VkcMlaCache));
     ch->ik = calloc(L, sizeof(void *)); ch->ig = calloc(L, sizeof(void *)); ch->pk = calloc(L, sizeof(void *));
     ch->win = calloc(L, sizeof(void *)); ch->st = calloc(L, sizeof(void *));
-    ch->kv_valid = calloc(L, sizeof(int)); ch->pool_valid = calloc(L, sizeof(int));
+    ch->kv_valid = calloc(L, sizeof(int)); ch->pool_valid = calloc(L, sizeof(int)); ch->mla_ord = calloc(L, sizeof(int));
     if (!ch->fna || !ch->fnf || !ch->mla || !ch->kv || !ch->ik || !ch->ig || !ch->pk || !ch->win || !ch->st ||
-        !ch->kv_valid || !ch->pool_valid) return 0;
+        !ch->kv_valid || !ch->pool_valid || !ch->mla_ord) return 0;
+    for (int i = 0; i < L; i++) if (c->is_full[i]) ch->mla_ord[i] = ch->n_mla++;
     g_g53c = ch;
     /* the parameter arena */
     size_t n = 0;
@@ -235,7 +242,38 @@ static int g53c_setup(GModel *m) {
     return 1;
 }
 
-static int g53c_res(VkcBuf **b, size_t floats, int kind) { return vkc_reserve(b, (floats ? floats : 1) * sizeof(float), kind); }
+/* g53c_res counts instead of reserving while g_g53c_count >= 0 (the chunk's sizing) */
+static long long g_g53c_count = -1;
+static int g53c_res(VkcBuf **b, size_t floats, int kind) {
+    if (g_g53c_count >= 0) { g_g53c_count += (long long)(floats ? floats : 1) * (long long)sizeof(float); return 1; }
+    return vkc_reserve(b, (floats ? floats : 1) * sizeof(float), kind);
+}
+static int g53c_scratch(G53Chain *ch, const GModel *m, int rows, int ctx);
+/* Prompt rows per chunk (vkc_chunk_rows): the chain's scratch a row, counted from the
+ * reservations (the MLA scratch as vkc_mla_scratch sizes it, the indexer's scores at
+ * the session's capacity), and the routed experts' outputs (the tier's rows, the
+ * host's sum) for it. */
+static int g53c_rows(G53Chain *ch, const GModel *m, int ctx) {
+    if (!vkc_chunk_auto()) return vkc_chunk_rows("glm53", 0);
+    const Cfg *c = &m->c;
+    size_t mla = 0;
+    for (int i = 0; i < c->n_layers; i++) if (c->is_full[i]) {
+        const VkcMla *a = &ch->mla[i];
+        mla = (size_t)(a->q_lora > 0 ? a->q_lora : 1) + (size_t)a->H * (a->Q + a->R) + (size_t)(a->K + a->R) +
+              2 * (size_t)a->H * a->K + (size_t)a->H * a->V;
+        break;
+    }
+    size_t ksz = ch->kvd_layer;
+    g_g53c_count = 0; g53c_scratch(ch, m, 1, ctx); long long b1 = g_g53c_count;
+    g_g53c_count = 0; g53c_scratch(ch, m, 2, ctx); long long b2 = g_g53c_count;
+    g_g53c_count = -1; ch->kvd_layer = ksz;
+    size_t row = (size_t)(b2 - b1) + mla * sizeof(float) + (size_t)(2 * c->topk + 2) * c->hidden * sizeof(float);
+    /* ffn_layer_ex allocates both activation matrices and its gather/output
+     * buffers even when the tier takes every routed assignment. */
+    size_t wide = c->dense_inter > c->moe_inter ? c->dense_inter : c->moe_inter;
+    row += 2 * (wide + c->hidden) * sizeof(float);
+    return vkc_chunk_rows("glm53", row);
+}
 
 static int g53c_scratch(G53Chain *ch, const GModel *m, int rows, int ctx) {
     const Cfg *c = &m->c;
@@ -245,7 +283,7 @@ static int g53c_scratch(G53Chain *ch, const GModel *m, int rows, int ctx) {
     int mfull = -1; for (int i = 0; i < L; i++) if (c->is_full[i]) { mfull = i; break; }
     size_t r = (size_t)rows;
     ch->kvd_layer = r * (c->kv_lora + 2 * ID);
-    int ok = (mfull < 0 || vkc_mla_scratch(&ch->sc, &ch->mla[mfull], rows)) &&
+    int ok = (mfull < 0 || g_g53c_count >= 0 || vkc_mla_scratch(&ch->sc, &ch->mla[mfull], rows)) &&
              g53c_res(&ch->xs, r * HD, VKC_DEV) && g53c_res(&ch->xn, r * HD, VKC_DEV) && g53c_res(&ch->col, r * D, VKC_DEV) &&
              g53c_res(&ch->nrm, r * D, VKC_DEV) && g53c_res(&ch->br, r * D, VKC_DEV) && g53c_res(&ch->mix, r * nm, VKC_DEV) &&
              g53c_res(&ch->hp, r * (2 * H + H * H), VKC_DEV) && g53c_res(&ch->gs, r * MI, VKC_DEV) &&
@@ -260,6 +298,16 @@ static int g53c_scratch(G53Chain *ch, const GModel *m, int rows, int ctx) {
         ok = g53c_res(&ch->ikd, r * ID, VKC_DEV) && g53c_res(&ch->iq, r * IH * ID, VKC_DEV) && g53c_res(&ch->ihw, r * IH, VKC_DEV) &&
              g53c_res(&ch->igd, r * ID, VKC_DEV) && g53c_res(&ch->isc, r * (size_t)(ctx / c->index_kpool + 1), VKC_DEV) &&
              g53c_res(&ch->sel, r * (size_t)(1 + width), VKC_DEV);
+    if (g_g53c_count >= 0) {   /* count the split scratch without allocating or changing capacities */
+        if (ch->ks.on && mfull >= 0)
+            g_g53c_count += (long long)r * (3LL * c->n_heads * (c->kv_lora + 2) +
+                                  (long long)c->n_heads * c->kv_lora + c->kv_lora + 1 +
+                                  coli_sparse_index_width(c->index_topk, c->index_kpool, c->index_kpool_tail)) * sizeof(float);
+        return ok;
+    }
+    if (ok && ch->ks.on && mfull >= 0)   /* the split: the partial results, a step's new rows before their slots */
+        ok = vkc_kv_parts(&ch->ks, r * c->n_heads * (c->kv_lora + 2)) &&
+             (ch->kvtmp.cap >= rows || (g53c_res(&ch->kvtmp.lat, r * c->kv_lora, VKC_DEV) && (ch->kvtmp.cap = rows)));
     if (!ok) return 0;
     if (ch->rows < rows) {
         float *hr = realloc(ch->host_routed, r * D * sizeof(float));
@@ -269,34 +317,41 @@ static int g53c_scratch(G53Chain *ch, const GModel *m, int rows, int ctx) {
     return 1;
 }
 
-/* The MLA mirror: room for `need` positions (the owner's), filled again when it grows. */
-static int g53c_mirror(G53Chain *ch, const GModel *m, int need, int limit) {
+/* The MLA mirror: room for `need` positions (the owner's), filled again when it grows,
+ * and planned again then (vkc_kv_plan): whole when it fits the device's budget, else the
+ * split (the latent rows; the index keys, pool gates and pooled keys stay whole), for
+ * steps of `rows` rows. */
+static int g53c_mirror(G53Chain *ch, const GModel *m, int need, int limit, int rows) {
     const Cfg *c = &m->c; int L = c->n_layers, ID = c->index_hd, pool = c->index_kpool;
     if (ch->cap >= need) return 1;
     int cap = 256; while (cap < need) cap *= 2;
     if (cap > limit) cap = limit;
     if (cap < need) return 0;
+    size_t row = (size_t)c->kv_lora * sizeof(float);
+    if (ch->n_mla && !vkc_kv_plan(&ch->ks, "glm53", ch->n_mla, row, cap, rows, 1, (size_t)ch->n_mla * ch->dev_rows * row)) return 0;
+    int dr = ch->ks.on ? ch->ks.rows : cap;
     for (int i = 0; i < L; i++) {
         if (!c->is_full[i]) continue;
         vkc_free(ch->kv[i].lat); vkc_free(ch->ik[i]); vkc_free(ch->ig[i]); vkc_free(ch->pk[i]);
         ch->kv[i] = (VkcMlaCache){NULL, NULL, 0}; ch->ik[i] = ch->ig[i] = ch->pk[i] = NULL;
         ch->kv_valid[i] = ch->pool_valid[i] = 0;
     }
-    ch->cap = 0;
+    ch->cap = 0; ch->dev_rows = 0;
     for (int i = 0; i < L; i++) {
         if (!c->is_full[i]) continue;
-        ch->kv[i].lat = vkc_buf((size_t)cap * c->kv_lora * sizeof(float), VKC_DEV); ch->kv[i].cap = cap;
+        ch->kv[i].lat = vkc_buf((size_t)dr * c->kv_lora * sizeof(float), VKC_DEV); ch->kv[i].cap = dr;
         ch->ik[i] = vkc_buf((size_t)cap * ID * sizeof(float), VKC_DEV);
         ch->ig[i] = vkc_buf((size_t)cap * ID * sizeof(float), VKC_DEV);
         ch->pk[i] = vkc_buf((size_t)(cap / pool + 1) * ID * sizeof(float), VKC_DEV);
         if (!ch->kv[i].lat || !ch->ik[i] || !ch->ig[i] || !ch->pk[i]) return 0;
     }
-    ch->cap = cap;
+    ch->cap = cap; ch->dev_rows = dr;
     return 1;
 }
 
-/* Record the uploads that make the device the owner's below `start`. */
-static int g53c_push(G53Chain *ch, const GModel *m, const GSession *s, int start) {
+/* Record the uploads that make the device the owner's below `start`, for a step of
+ * n_rows rows (the split: its window placed first). */
+static int g53c_push(G53Chain *ch, const GModel *m, const GSession *s, int start, int n_rows) {
     const Cfg *c = &m->c; int ok = 1, K = c->kv_lora, ID = c->index_hd;
     if (ch->where == G53C_HOST) {
         size_t ns = (size_t)c->kda_heads * c->kda_hd * c->kda_hd, nw = (size_t)3 * c->kda_proj * c->conv_k;
@@ -311,8 +366,13 @@ static int g53c_push(G53Chain *ch, const GModel *m, const GSession *s, int start
         const GLayerState *ls = &s->layer[i];
         int t0 = ch->kv_valid[i], n = start - t0;
         if (ch->pool_valid[i] > start / c->index_kpool) ch->pool_valid[i] = start / c->index_kpool;   /* rows from start change */
-        if (n <= 0) continue;
-        ok = vkc_write(ch->kv[i].lat, (size_t)t0 * K, ls->latent + (size_t)t0 * K, (size_t)n * K * sizeof(float)) &&
+        if (ch->ks.on) {      /* the split: the window placed, its latent rows below start uploaded */
+            VkcKvPart pl = {1, K, ls->latent, 0, ch->kv[i].lat, 0};
+            vkc_kv_place(&ch->ks, ch->mla_ord[i], start, n_rows);
+            ok = vkc_kv_push(&ch->ks, ch->mla_ord[i], &pl, 1, start);
+        }
+        if (n <= 0 || !ok) continue;
+        ok = (ch->ks.on || vkc_write(ch->kv[i].lat, (size_t)t0 * K, ls->latent + (size_t)t0 * K, (size_t)n * K * sizeof(float))) &&
              vkc_write(ch->ik[i], (size_t)t0 * ID, ls->ikeys + (size_t)t0 * ID, (size_t)n * ID * sizeof(float)) &&
              vkc_write(ch->ig[i], (size_t)t0 * ID, ls->igates + (size_t)t0 * ID, (size_t)n * ID * sizeof(float));
         ch->kv_valid[i] = start;
@@ -370,7 +430,7 @@ static int g53c_kda(G53Chain *ch, const GModel *m, const GLayer *l, int i, int n
            vkc_kda_rec(KD, ch->cm, ch->kf, ch->kb, ch->kg, ch->prm, ch->st[i], ch->ky, &rp) &&
            vkc_matmul(g53c_tensor(&l->ko), ch->ky, 0, ch->br, 0, n);
 }
-static int g53c_mla(G53Chain *ch, const GModel *m, const GLayer *l, int i, int n, int pb) {
+static int g53c_mla(G53Chain *ch, const GModel *m, const GSession *s, const GLayer *l, int i, int n, int pb) {
     const Cfg *c = &m->c; int IH = c->index_nh, ID = c->index_hd, pool = c->index_kpool, K = c->kv_lora;
     int width = coli_sparse_index_width(c->index_topk, pool, c->index_kpool_tail);
     size_t ko = (size_t)i * ch->kvd_layer;
@@ -379,7 +439,9 @@ static int g53c_mla(G53Chain *ch, const GModel *m, const GLayer *l, int i, int n
     VkcDsaPool kp = {done > p0 ? done - p0 : 0, pool, p0, ID, 0, ID, (int)ch->o_ape[i], 0, 0, ID};
     VkcDsaPick sp = {n, pb, IH, ID, c->index_topk, pool, 0, IH * ID, 0, IH, 0, c->index_kpool_tail, (pb + n) / pool + 1,
                      1 + width, sqrtf((float)IH), 1.f / sqrtf((float)ID)};
-    int ok = vkc_mla_qkv(&ch->mla[i], &ch->sc, ch->nrm, 0, n, pb, NULL, &ch->kv[i], ch->kvd, ko) &&
+    int ok = (ch->ks.on ? vkc_kv_mla_qkv(&ch->ks, ch->mla_ord[i], &ch->mla[i], &ch->sc, ch->nrm, 0, n, pb, NULL, &ch->kv[i],
+                                         &ch->kvtmp, ch->kvd, ko)
+                        : vkc_mla_qkv(&ch->mla[i], &ch->sc, ch->nrm, 0, n, pb, NULL, &ch->kv[i], ch->kvd, ko)) &&
              vkc_matmul(g53c_tensor(&l->iwq), ch->sc.qa, 0, ch->iq, 0, n) &&
              vkc_matmul(g53c_tensor(&l->iwk), ch->nrm, 0, ch->ikd, 0, n) &&
              vkc_mla_lnorm(ch->ikd, ch->prm, ch->ik[i], &ln) &&
@@ -390,7 +452,9 @@ static int g53c_mla(G53Chain *ch, const GModel *m, const GLayer *l, int i, int n
              vkc_copy(ch->kvd, ko + (size_t)n * (K + ID), ch->igd, 0, (size_t)n * ID) &&
              vkc_dsa_pool_keys(ch->ik[i], ch->ig[i], ch->prm, ch->pk[i], &kp) &&
              vkc_dsa_pool_select(ch->iq, ch->ihw, ch->pk[i], ch->isc, ch->sel, &sp) &&
-             vkc_mla_attn(&ch->mla[i], &ch->sc, n, pb, 0, &ch->kv[i], ch->sel, 0, 1 + width, NULL, 0, ch->br, 0);
+             (ch->ks.on ? vkc_kv_mla_attn(&ch->ks, ch->mla_ord[i], &ch->mla[i], &ch->sc, n, pb, 0, &ch->kv[i], ch->sel, 0, 1 + width,
+                                          NULL, 0, ch->br, 0, s->layer[i].latent, NULL)
+                        : vkc_mla_attn(&ch->mla[i], &ch->sc, n, pb, 0, &ch->kv[i], ch->sel, 0, 1 + width, NULL, 0, ch->br, 0));
     if (ok && done > ch->pool_valid[i]) ch->pool_valid[i] = done;
     return ok;
 }
@@ -427,6 +491,15 @@ static void g53c_recover(GModel *m, GSession *s, int start, int dev) {
     free(xs); free(xn);
 }
 
+/* The prompt block forward_prefill hands the chain: its chunk, when the chain runs with
+ * a chunk from the budget (vkc_chunk_auto); 0 = forward_prefill's own (GLM53_PREFILL_CHUNK). */
+static int g53c_prefill_rows(GModel *m, GSession *s, int n) {
+    G53Chain *ch = g_g53c;
+    if (!g_vk_chain || !ch || !ch->ok || ch->failed || !vkc_chunk_auto()) return 0;
+    if (!g53c_mirror(ch, m, s->filled + n, s->cap, 1)) return 0;
+    int rows = g53c_rows(ch, m, s->cap);
+    return ch->ks.on && rows > ch->ks.chunk ? ch->ks.chunk : rows;
+}
 /* Every layer for n rows of `streams` (the session's positions start..), the final
  * streams back into it. 0 = not taken: the CPU runs the layers (streams untouched). */
 static int g53c_forward(GModel *m, GSession *s, float *streams, int n, int start) {
@@ -438,10 +511,14 @@ static int g53c_forward(GModel *m, GSession *s, float *streams, int n, int start
         if (ch->owner) g53c_sync_host(m, ch->owner);
         ch->owner = s; ch->where = G53C_HOST;
         for (int i = 0; i < L; i++) ch->kv_valid[i] = ch->pool_valid[i] = 0;
+        vkc_kv_reset(&ch->ks);
     }
-    int CH = g53c_rows(), rows = n < CH ? n : CH, dev0 = ch->where == G53C_DEV;
+    int dev0 = ch->where == G53C_DEV;
     if (vkc_lost()) { g53c_recover(m, s, start, dev0); return 0; }
-    if (!g53c_mirror(ch, m, start + n, s->cap) || !g53c_scratch(ch, m, rows, start + n)) {
+    int mirror_ok = g53c_mirror(ch, m, start + n, s->cap, 1);
+    int CH = mirror_ok ? g53c_rows(ch, m, s->cap) : 1, rows = n < CH ? n : CH;
+    if (ch->ks.on && rows > ch->ks.chunk) rows = ch->ks.chunk;   /* a step's rows fit the split's window */
+    if (!mirror_ok || !g53c_scratch(ch, m, rows, start + n)) {
         fprintf(stderr, "[VK] glm53 chain: device memory for %d rows at %d positions refused; per-matrix path\n", rows, start + n);
         g53c_cpu_step(m, s, start);
         ch->failed = 1; g_vk_chain = 0;
@@ -472,7 +549,7 @@ static int g53c_forward(GModel *m, GSession *s, float *streams, int n, int start
     if (!outs) return 0;
     for (int c0 = 0; c0 < n; c0 += rows) {
         int nr = n - c0 < rows ? n - c0 : rows, pb = start + c0;
-        if (!vkc_begin() || !g53c_push(ch, m, s, pb) || !vkc_write(ch->xs, 0, streams + (size_t)c0 * HD, (size_t)nr * HD * sizeof(float)))
+        if (!vkc_begin() || !g53c_push(ch, m, s, pb, nr) || !vkc_write(ch->xs, 0, streams + (size_t)c0 * HD, (size_t)nr * HD * sizeof(float)))
             goto lost;
         int ok = 1, pending = 0, pulled = 0;
         for (int i = 0; i < L && ok; i++) {
@@ -484,7 +561,7 @@ static int g53c_forward(GModel *m, GSession *s, float *streams, int n, int start
             }
             double ta = now_s();
             ok = ok && g53c_pre(ch, m, ch->fna[i], ch->o_hca[i], ch->o_in[i], nr) &&
-                 (c->is_full[i] ? g53c_mla(ch, m, l, i, nr, pb) : g53c_kda(ch, m, l, i, nr)) &&
+                 (c->is_full[i] ? g53c_mla(ch, m, s, l, i, nr, pb) : g53c_kda(ch, m, l, i, nr)) &&
                  g53c_post(ch, m, nr) &&
                  g53c_pre(ch, m, ch->fnf[i], ch->o_hcf[i], ch->o_post[i], nr);
             if (!ok) break;
@@ -493,7 +570,11 @@ static int g53c_forward(GModel *m, GSession *s, float *streams, int n, int start
                 m->t_attn += now_s() - ta;
                 continue;
             }
-            ok = vkc_copy(ch->h2d, 0, ch->nrm, 0, (size_t)nr * D) && vkc_submit(1);   /* A1 */
+            /* A1; while it runs, the tier loads the experts this layer will likely
+             * stream (a big prompt chunk only) */
+            ok = vkc_copy(ch->h2d, 0, ch->nrm, 0, (size_t)nr * D) && vkc_submit(0);
+            if (ok) vkt_stream_prefetch(i, nr);
+            ok = ok && vkc_finish();
             m->t_attn += now_s() - ta;
             if (!ok) break;
             g53c_pull(ch, m, s, pulled, i + 1, pb, nr); pulled = i + 1;
@@ -514,7 +595,7 @@ static int g53c_forward(GModel *m, GSession *s, float *streams, int n, int start
         if (!ok) goto lost;
         g53c_pull(ch, m, s, pulled, L, pb, nr);
         memcpy(outs + (size_t)c0 * HD, vkc_ptr(ch->xd), (size_t)nr * HD * sizeof(float));
-        for (int i = 0; i < L; i++) if (c->is_full[i]) ch->kv_valid[i] = pb + nr;
+        for (int i = 0; i < L; i++) if (c->is_full[i]) { ch->kv_valid[i] = pb + nr; vkc_kv_done(&ch->ks, ch->mla_ord[i], pb + nr); }
         ch->where = G53C_DEV;
     }
     memcpy(streams, outs, (size_t)n * HD * sizeof(float));
@@ -535,6 +616,7 @@ static void g53c_report(void) {
     fprintf(stderr, "[VK] glm53 chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
                     "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %.1f MiB on the device\n",
             ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms, st.dev_bytes / 1048576.0);
+    vkc_kv_report(&ch->ks);
     vkc_prof_print();
 }
 
