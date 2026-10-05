@@ -1001,6 +1001,7 @@ f32 throughout, as the CPU's f32 path.
 | `COLI_VK_KV_DEVICE_ROWS` | from the budget | The positions a split layer keeps on the device; set, the cache splits whenever it is longer. |
 | `COLI_VK_KV_BLOCK` | `64` | Positions per block of the split's block table. |
 | `COLI_VK_KV_PIN` | off | `1`: enable read-based block pins; QSA/DSA/pooled MLA rounding can then depend on read history. DeepSeek preserves its sparse arithmetic in either mode. |
+| `COLI_VK_KV_COLD` | unset | `device`: a split layer's host part attended on the device too, from a shadow of the host's rows ([below](#a-kv-cache-past-the-devices-budget)); off by default, because on the measured integrated GPU it slowed decode. |
 
 Each run and serve turn prints `[VK] <engine> chain: N forwards, F frames (ops,
 matmuls, tiled GEMM), the time spent waiting for the device, the routed experts' host
@@ -2063,6 +2064,38 @@ round trip is paid only on layers with a host part.
 | `vkc_kvs_ds` | `chain_kvs` (mode 4) | DeepSeek's sparse attention with its sink over the window rows and the resident compressed rows; with every listed row resident, `vkc_dsv4_attn`'s bits |
 | `vkc_kvs_merge` | `chain_kvs` (mode 2) | the two parts joined, a gate or V4's bf16 rounding after |
 
+**The host's part on the device (`COLI_VK_KV_COLD=device`, off by default).** The
+host's rows can also be attended on the device, so a step with a host part runs in one
+frame with no round trip:
+- **The copy.** Each split layer keeps a shadow of the host's rows in page-aligned memory
+  the device reads in place (an imported host allocation, `VK_EXT_external_memory_host`).
+  The shadow follows the host's cache row by row and is lowered with it on a rewind or a
+  rollback.
+- **The ops.** `chain_kvs` reads the shadow with its COLD flag (the GQA, MLA and Inkling
+  forms; position t is row t). The prompt's rows take the blocked attention
+  (`chain_attnb`'s part mode) in chunks of 512 positions, one workgroup each, and mode 5
+  of `chain_kvs` joins them in order.
+- **The bits.** The chunks are fixed by position, so a row's bits do not depend on how a
+  forward is cut into steps, as on the CPU path.
+- **Where it applies.** It needs a device that imports host memory, no read-based pins
+  and no staged uploads. DeepSeek's sparse forms keep the host's part on the CPU. Where
+  it cannot run, the line says so and the CPU computes the host's part.
+
+The run's report adds `| the host's part on the device: N layer steps, R rows copied
+to the shadow in T ms (M MiB held)`.
+
+| Qwen3.6-35B-A3B, 7579-token prompt, Radeon 780M, the chain | first token after | 31 decode tokens |
+|---|---|---|
+| 1024 positions a layer on the device, the host's part on the CPU | 121 s | 3.5 s |
+| the same, the host's part on the device | 114 s | 20 s |
+| 4096 positions a layer, on the CPU | 143 s | |
+| the same, on the device | 137 s | |
+
+The prompt gains 4 to 6%. Decode is 5.7 times slower: with the default, the CPU
+computes the host's part while the device runs its own, and on this integrated GPU the
+decode attention is slower than the CPU's. Hence the default. A dedicated GPU, whose
+attention outruns the CPU's by more, has not been measured.
+
 `vk_kvsplit.h` carries the rest: the plan, the tables, the uploads and the stores of a
 step's rows, the host's part (`vkc_kv_host_attn`, with the same bias, tau and V4
 rounding), and one call per form for an engine (`vkc_kv_gqa`, `vkc_kv_mla`,
@@ -2132,7 +2165,9 @@ part): the CPU's tokens, logits within each family's tolerance, chunks of 3, pro
 only, the split off, a lost device, pins, MTP and n-gram drafts, serve sessions with
 pins, prompt-cache extensions and divergent prompts, and the prefix-reuse tests;
 `kv-split-deepseek` the same for deepseek_v41 and deepseek_v4; `kv-split-sanitize` and
-`kv-split-deepseek-sanitize` a set of each under ASan and UBSan.
+`kv-split-deepseek-sanitize` a set of each under ASan and UBSan. `kv-split-cold` and
+`kv-split-cold-sanitize` run `kv-split` and `kv-split-sanitize` again with
+`COLI_VK_KV_COLD=device`, and every gate must have run the host's part on the device.
 
 Validation on the local Lavapipe device covers numerical correctness, not hardware
 throughput. A discrete GPU has not been measured for this change.

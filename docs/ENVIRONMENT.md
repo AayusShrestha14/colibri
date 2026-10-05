@@ -272,6 +272,7 @@ With `COLI_VULKAN=1` every MoE engine (qwen36, qwen38, inkling, olmoe, kimi_k3, 
 | `COLI_VK_KV_DEVICE_ROWS` | from the device's budget | The positions a split layer keeps on the device; set, the cache splits whenever it is longer (the tests' small device, a measurement's split). |
 | `COLI_VK_KV_BLOCK` | `64` | Positions per block of the split cache's block table. |
 | `COLI_VK_KV_PIN` | off | `1`: pin blocks by sparse-selection reads. For QSA/DSA/pooled MLA this can change rounding with read history; the default keeps the partition independent of chunking and prefix reuse. DeepSeek stages missing selected rows and preserves its arithmetic in either mode. |
+| `COLI_VK_KV_COLD` | unset | `device`: the host's part of a split KV cache attended on the device too, from a shadow of the host's rows (GQA, MLA and Inkling forms; DeepSeek keeps it on the CPU). Off by default: on the measured integrated GPU it made the prompt 4-6% faster and decode 5.7x slower (see [vulkan.md](vulkan.md#a-kv-cache-past-the-devices-budget)). |
 | `COLI_VK_CHAIN_FAULT` | off | Tests: the n-th chain frame fails as a lost device would; the engine rebuilds the state on the CPU and runs there (colibri, mimo and the DeepSeek engines have none to rebuild: the CPU continues from its host caches). |
 | `DUMP` | unset | colibri, glm53, deepseek_v41 and deepseek_v4 in a `VK=1` build: every logits row the forward computes, appended to this file as raw f32 (the Vulkan gates compare the device's with the CPU's). |
 

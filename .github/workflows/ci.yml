@@ -362,6 +362,13 @@ jobs:
           - family: kv-split-sanitize
             req: c/tools/requirements-qwen38-tiny.txt
             extra: numpy pillow
+          # the same with the host's part on the device too (COLI_VK_KV_COLD=device)
+          - family: kv-split-cold
+            req: c/tools/requirements-qwen38-tiny.txt
+            extra: numpy pillow
+          - family: kv-split-cold-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
+            extra: numpy pillow
           - family: kv-split-deepseek
             req: c/tools/requirements-deepseek-v4-tiny.txt
             extra: sympy pillow

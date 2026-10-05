@@ -1569,6 +1569,53 @@ size_t coli_vk_import_alignment(void) {
 #endif
 }
 size_t coli_vk_imported_bytes(void) { return __atomic_load_n(&g_import_bytes, __ATOMIC_RELAXED); }
+/* A host range read in place by a shader (the chain's VKC_HOST): the pages around it,
+ * so the caller's allocation need not be aligned; the pages past its ends are the
+ * process's own and are never written. */
+int coli_vk_host_buffer(const void *ptr, size_t bytes, void **buf_out, void **mem_out, size_t *off) {
+#ifdef VK_EXT_external_memory_host
+    size_t al = coli_vk_import_alignment();
+    if (!al || !ptr || !bytes) return 0;
+    uintptr_t p = (uintptr_t)ptr, base = p / al * al, end = (p + bytes + al - 1) / al * al;
+    size_t sz = end - base;
+    if (sz > G.ssbo_range) return 0;
+    static PFN_vkGetMemoryHostPointerPropertiesEXT gp;
+    if (!gp) gp = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(G.dev, "vkGetMemoryHostPointerPropertiesEXT");
+    VkMemoryHostPointerPropertiesEXT mp = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+    if (!gp || gp(G.dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, (void *)base, &mp) != VK_SUCCESS ||
+        !mp.memoryTypeBits) return 0;
+    VkExternalMemoryBufferCreateInfo eb = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &eb, .size = sz,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    VkBuffer b;
+    if (vkCreateBuffer(G.dev, &bi, NULL, &b) != VK_SUCCESS) return 0;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(G.dev, b, &req);
+    uint32_t bits = mp.memoryTypeBits & req.memoryTypeBits, mt = 0;
+    if (!bits || req.size > sz) { vkDestroyBuffer(G.dev, b, NULL); return 0; }
+    while (!(bits & (1u << mt))) mt++;
+    VkImportMemoryHostPointerInfoEXT imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, .pHostPointer = (void *)base};
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &imp, .allocationSize = sz,
+        .memoryTypeIndex = mt};
+    VkDeviceMemory m;
+    if (vkAllocateMemory(G.dev, &ai, NULL, &m) != VK_SUCCESS) { vkDestroyBuffer(G.dev, b, NULL); return 0; }
+    if (vkBindBufferMemory(G.dev, b, m, 0) != VK_SUCCESS) { vkDestroyBuffer(G.dev, b, NULL); vkFreeMemory(G.dev, m, NULL); return 0; }
+    *buf_out = (void *)b; *mem_out = (void *)m; *off = (size_t)(p - base);
+    __atomic_add_fetch(&g_import_bytes, sz, __ATOMIC_RELAXED);
+    return 1;
+#else
+    (void)ptr; (void)bytes; (void)buf_out; (void)mem_out; (void)off;
+    return 0;
+#endif
+}
+void coli_vk_host_buffer_free(void *buf, void *mem, size_t bytes) {
+    if (!G.dev) return;
+    if (buf) vkDestroyBuffer(G.dev, (VkBuffer)buf, NULL);
+    if (mem) vkFreeMemory(G.dev, (VkDeviceMemory)mem, NULL);
+    if (bytes) __atomic_sub_fetch(&g_import_bytes, bytes, __ATOMIC_RELAXED);
+}
 int coli_vk_tensor_import(ColiVkTensor **tensor, const void *weights, size_t alloc_bytes, const float *scales,
                           int fmt, int I, int O, int gs) {
     if (*tensor) return (*tensor)->fmt == fmt && (*tensor)->I == I && (*tensor)->O == O;
