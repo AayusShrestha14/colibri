@@ -387,9 +387,94 @@ ld2_kimi_k3() {
   unset CHAIN_SERVE_TOL CHAIN_SERVE_EXPECT
 }
 
+# deepseek_v41: v41_gate (the CPU's tokens and exit, every forward's logits within 1e-4 of
+# the largest) with the split forced at a layer the second device may start at (the
+# fixture's 1, 3 and 5: its first compressed layer owns its caches and runs its indexer);
+# the second device's chain ran
+ld2_v41_gate() {   # <tag> <n0> <n1> <env...> -- <argv...>
+  local tag=$1 n0=$2 n1=$3; shift 3
+  v41_gate "$tag" COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=$n0 COLI_VK_CHAIN_LAYERS2=$n1 COLI_VK_TIER_BALANCE=0 "$@"
+  ld2_ran deepseek_v41 "$tag" vk.log
+}
+# ld2_v41_lost <tag> <n0> <n1> <back> <env...> -- <argv...>: the second device lost <back>
+# of its frames before the end of the same run without a fault (0: at its first frame,
+# its setup); the CPU's tokens, and its layers on the CPU from the start (back 0) or from
+# the forward it was lost in
+ld2_v41_lost() {
+  local tag=$1 n0=$2 n1=$3 back=$4 frames k=1; shift 4
+  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  local D2=(COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=$n0 COLI_VK_CHAIN_LAYERS2=$n1 COLI_VK_TIER_BALANCE=0 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1)
+  rm -f chain.usage
+  env "${envs[@]}" ./deepseek_v41 "$@" > cpu.txt 2> cpu.log || true
+  if [ "$back" -gt 0 ]; then
+    env "${envs[@]}" "${D2[@]}" ./deepseek_v41 "$@" > /dev/null 2> vk.log || true
+    frames=$(sed -n 's/^\[VK\] deepseek_v41 dev2 chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p' vk.log | tail -1)
+    [ -n "$frames" ] && [ "$frames" -gt "$back" ] || { cat vk.log; fail "$tag: no fault-free run to count frames from"; }
+    k=$((frames - back + 1))
+  fi
+  rm -f chain.usage
+  env "${envs[@]}" "${D2[@]}" COLI_VK_CHAIN_FAULT2=$k ./deepseek_v41 "$@" > vk.txt 2> vk.log || true
+  { [ -s cpu.txt ] && cmp -s cpu.txt vk.txt; } || { cat cpu.txt vk.txt; tail -20 vk.log; fail "$tag: the tokens differ from the CPU"; }
+  grep -q "COLI_VK_CHAIN_FAULT2" vk.log || { cat vk.log; fail "$tag: the second device's fault never fired"; }
+  if [ "$back" = 0 ]; then
+    grep -q "^\[VK\] deepseek_v41 dev2 chain: 0 of [0-9]* layers on the device: the chain stays off (layer 0 did not reach the device: the device was lost" vk.log ||
+      { cat vk.log; fail "$tag: the second device's layers did not go to the CPU"; }
+  else
+    grep -q "deepseek_v41 dev2 chain: the device was lost; the CPU runs its layers" vk.log || { cat vk.log; fail "$tag: the loss was not taken over"; }
+  fi
+  rm -f chain.usage
+  echo "OK $tag: tokens = CPU (fault at the second device's frame $k)"
+}
+ld2_deepseek_v41() {
+  v41_chain_fixtures
+  local s f cap T=(SNAP=dsv41_long) A=(-- 8 dsv41_long/ref.json)
+  for s in "1 2" "1 5" "3 3" "5 1"; do ld2_v41_gate "ld2 deepseek_v41 ${s/ / + }" ${s% *} ${s#* } "${T[@]}" "${A[@]}"; done
+  for cap in 1 2; do ld2_v41_gate "ld2 deepseek_v41 cap=$cap" 1 4 SNAP=dsv41_tiny -- $cap dsv41_tiny/ref.json; done
+  # a layer the second device may not start at: forced there, it stays off; the fit's
+  # choice comes down to the last layer it may start at (a device for 2 layers: 1)
+  v41_gate "ld2 deepseek_v41 forced at layer 2" COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=2 COLI_VK_CHAIN_LAYERS2=2 "${T[@]}" "${A[@]}"
+  grep -q "layer 2 reads what the layers before it make in a forward" vk.log && [ "$(ld2_forwards deepseek_v41 vk.log)" = 0 ] ||
+    { cat vk.log; fail "ld2 deepseek_v41 forced at layer 2: the second device did not stay off"; }
+  ptl_v41_probe ptl-probe.log COLI_VK_DEVICE_CAP_MB=256 COLI_VK_TIER_RESERVE_GB=0.04 "${T[@]}" "${A[@]}"
+  cap=$(PTL_PROBE_CAP_MB=256 ptl_calc cap deepseek_v41 ptl-probe.log 2) || fail "ld2 deepseek_v41 the fit: no cap from the probe"
+  v41_gate "ld2 deepseek_v41 the fit at layer 2 (cap $cap MiB)" COLI_VK_DEV2=0 COLI_VK_DEVICE_CAP_MB=$cap COLI_VK_TIER_RESERVE_GB=0.04 \
+    COLI_VK_TIER_BALANCE=0 "${T[@]}" "${A[@]}"
+  grep -q "deepseek_v41 chain: 1 of 6 layers on the device: the second device's layers start at layer 1" vk.log ||
+    { grep -a '^\[VK\]' vk.log; fail "ld2 deepseek_v41 the fit at layer 2: it did not come down to layer 1"; }
+  ld2_ran deepseek_v41 "ld2 deepseek_v41 the fit at layer 2" vk.log
+  # DSpark drafts accepted (1, 3) and rejected (2, 4, 5), the targets on the second device
+  for f in 1 2 3 4 5; do ld2_v41_gate "ld2 deepseek_v41 DSpark spec=$f" 1 5 SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=$f -- 8 dsv41_tiny/ref.json; done
+  ld2_v41_gate "ld2 deepseek_v41 DSpark spec=5, one cache slot" 3 3 SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=5 -- 1 dsv41_tiny/ref.json
+  ld2_v41_gate "ld2 deepseek_v41 prompt in chunks of 3" 1 5 "${T[@]}" COLI_VK_CHAIN_ROWS=3 "${A[@]}"
+  ld2_v41_gate "ld2 deepseek_v41 prompt in chunks of 7" 3 3 "${T[@]}" COLI_VK_CHAIN_ROWS=7 -- 2 dsv41_long/ref.json
+  CHAINMODE=2 ld2_v41_gate "ld2 deepseek_v41 prompts only" 1 5 "${T[@]}" "${A[@]}"
+  ld2_v41_gate "ld2 deepseek_v41 tier off" 3 3 "${T[@]}" COLI_VK_TIER=0 "${A[@]}"
+  ld2_v41_gate "ld2 deepseek_v41 beside the per-matrix trunk" 3 3 "${T[@]}" COLI_VK_DENSE=1 "${A[@]}"
+  ld2_v41_gate "ld2 deepseek_v41 V41_INDEX_OWNER=1" 1 5 "${T[@]}" V41_INDEX_OWNER=1 "${A[@]}"
+  ld2_v41_gate "ld2 deepseek_v41 experts on both devices too" 3 3 "${T[@]}" COLI_VK_TIER_GB=0.00002 "${A[@]}"
+  # the compressed rows split on both devices' kv_source layers (1 on the first, 3 on the second)
+  ld2_v41_gate "ld2 deepseek_v41 KV split on both" 3 3 COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=2 "${T[@]}" "${A[@]}"
+  [ "$(kv_hostparts deepseek_v41 vk.log)" -gt 0 ] && [ "$(kv_hostparts "deepseek_v41 dev2" vk.log)" -gt 0 ] ||
+    { cat vk.log; fail "ld2 deepseek_v41 KV split on both: a device's split ran no host part"; }
+  # the second device lost: at its setup, mid-decode, in the prompt, between drafts
+  ld2_v41_lost "ld2 deepseek_v41 second device lost at its setup" 1 5 0 "${T[@]}" "${A[@]}"
+  ld2_v41_lost "ld2 deepseek_v41 second device lost mid-decode" 1 5 5 "${T[@]}" "${A[@]}"
+  ld2_v41_lost "ld2 deepseek_v41 second device lost in the prompt" 3 3 60 "${T[@]}" COLI_VK_CHAIN_ROWS=7 "${A[@]}"
+  ld2_v41_lost "ld2 deepseek_v41 second device lost between drafts" 1 5 8 SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=5 -- 8 dsv41_tiny/ref.json
+  # serve sessions frame for frame, DSpark, prompts only; images on the wire
+  export CHAIN_SERVE_EXPECT='deepseek_v41 dev2 chain: [1-9][0-9]* forwards'
+  $PY tests/vulkan_chain_serve.py ./deepseek_v41 dsv41_tiny V41_DSPARK=0 COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=1 COLI_VK_CHAIN_LAYERS2=5
+  $PY tests/vulkan_chain_serve.py ./deepseek_v41 dsv41_tiny V41_DSPARK=1 COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=3 COLI_VK_CHAIN_LAYERS2=3
+  COLI_VK_CHAIN=2 $PY tests/vulkan_chain_serve.py ./deepseek_v41 dsv41_tiny V41_DSPARK=1 COLI_VK_CHAIN_ROWS=3 COLI_VK_DEV2=0 \
+    COLI_VK_CHAIN_LAYERS=1 COLI_VK_CHAIN_LAYERS2=5
+  unset CHAIN_SERVE_EXPECT
+  $PY tests/vulkan_chain_v41_image.py ./deepseek_v41 dsv41_tiny V41_DSPARK=0 COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=1 COLI_VK_CHAIN_LAYERS2=5
+  rm -f chain.usage chain-serve.usage chain-image.usage ptl-probe.log
+}
+
 family_layers_dev2() {
   export OMP_NUM_THREADS=2
-  make qwen36 qwen38 olmoe mimo inkling colibri glm53 kimi_k3 tests/test_vk_chain VK=1
+  make qwen36 qwen38 olmoe mimo inkling colibri glm53 kimi_k3 deepseek_v41 tests/test_vk_chain VK=1
   COLI_VK_DEV2=0 ./tests/test_vk_chain shaders/qmatmul.spv | tee vk_chain.log
   tail -1 vk_chain.log | grep -qx PASS || fail "the chain's ops on two devices"
   ld2_qwen36
@@ -400,6 +485,7 @@ family_layers_dev2() {
   ld2_colibri
   ld2_glm53
   ld2_kimi_k3
+  ld2_deepseek_v41
   unset OMP_NUM_THREADS
 }
 family_layers_dev2_sanitize() {
