@@ -1750,6 +1750,9 @@ static void attn_project_check(const Cfg *c);
 static int v41c_decide(Model *m);   /* deepseek_v41_chain.h: COLI_VK_CHAIN, decided once */
 static int v41c_fit_now(Model *m);  /* deepseek_v41_chain.h: how many layers the chain places, once */
 static void v41c_fit_recount(Model *m);
+static int v41c_prepare(Model *m);
+static int v41c_build_layer(Model *m, int i, const char **why);
+static void v41c_cut_layer(Model *m, int i, const char *why);
 /* What the device would hold alone: the trunk matrices model_load reads into mappings,
  * of the first `layers` layers (a partial chain's; every layer otherwise). */
 static size_t v41_dho_bytes(Model *m, int layers) {
@@ -1802,6 +1805,7 @@ static void v41_dho_open(Model *m) {
     if (!g_v41_dho) v41c_fit_recount(m);   /* the chain's own set goes up after all */
     g_v41_dho_layers = layers;
     g_v41_shards = &m->S;
+    v41c_prepare(m);   /* the chain's layers built whole as they are read */
 }
 /* One matrix up as a lookup will ask for it, marked as held by the device alone. */
 static int v41_dho_up(const void *q, const uint8_t *tiles, int fmt, int O, int I) {
@@ -1851,12 +1855,14 @@ static void v41_dho_unplace(Model *m, int k) {
 /* The matrices read since the last call: up, then their pages back. wo_a goes up whole
  * for the chain and per output group for the per-matrix path (attention_project's
  * block views), each only where that path runs. With a partial chain (the fit) a layer
- * goes up whole or not at all: its pages go back only once all of it is on the device,
- * and a matrix the device refuses ends the chain before its layer (vkc_fit_shrink). */
+ * goes up whole or not at all, its chain state with it (v41c_build_layer): its pages go
+ * back only once all of it is on the device, so a layer that does not get there reads
+ * nothing back; it ends the chain before it (vkc_fit_shrink). */
 static unsigned g_v41_dho_kept;
 static void v41_dho_place(Model *m, int mark) {   /* mark: the layer just read (its fault count noted), -1 none */
     const Cfg *c = &m->c;
     int chain = v41c_decide(m), fit = g_v41_fit.L > 0, failed = -1;
+    const char *why = "a matrix the device refused";
     size_t from = g_v41_home_n;
     for (size_t k = 0; k < g_v41_home_n; k++) if (!g_v41_home[k].placed) { from = k; break; }
     for (size_t k = from; k < g_v41_home_n; k++) {
@@ -1879,9 +1885,9 @@ static void v41_dho_place(Model *m, int mark) {   /* mark: the layer just read (
         else g_v41_dho_kept++;
     }
     if (!fit) return;
+    if (failed < 0 && mark >= 0 && mark < g_v41_fit.n && !v41c_build_layer(m, mark, &why)) failed = mark;
     if (failed >= 0) {   /* everything of that layer and after off the device, the chain cut before it */
-        v41_dho_unplace(m, failed);
-        vkc_fit_shrink("deepseek_v41", &g_v41_fit, failed, "a matrix the device refused");
+        v41c_cut_layer(m, failed, why);
         return;
     }
     for (size_t k = from; k < g_v41_home_n; k++) {   /* the whole batch is there: its pages back */
@@ -2006,6 +2012,12 @@ static void model_load(Model *m, const char *snap, int ecap, int engram_cache_ro
             V41_DHO(wb_load(&m->S, &l->idx_wproj, NAME("layers.%d.attn.indexer.weights_proj.weight", i),
                     c->index_n_heads, dim));
         }
+        /* an engram table's projection, read with its layer (the device-only placement puts
+         * a layer up whole); the tables themselves open below */
+        for (int t = 0; m->engram.active && t < m->engram.n_layers; t++)
+            if (m->engram.layer_of[t] == i)
+                V41_DHO(w8_load(&m->S, &l->eng_wkv, NAME("layers.%d.engram.wkv.weight", i),
+                        dim * (hc + 1), m->engram.cols * m->engram.head_dim));
 #ifdef COLI_VULKAN
         if (g_v41_dho) v41_dho_place(m, i);   /* one layer in RAM at a time */
 #endif
@@ -2018,14 +2030,6 @@ static void model_load(Model *m, const char *snap, int ecap, int engram_cache_ro
                 fprintf(stderr, "[engram] table %d names layer %d\n", t, layer); exit(1); }
             m->L[layer].engram_index = t;
             engram_table_open(&e->table[t], &m->S, layer, e->head_dim, engram_cache_rows);
-#ifdef COLI_VULKAN
-            g_v41_load_layer = layer;
-#endif
-            V41_DHO(w8_load(&m->S, &m->L[layer].eng_wkv, NAME("layers.%d.engram.wkv.weight", layer),
-                    dim * (hc + 1), e->cols * e->head_dim));
-#ifdef COLI_VULKAN
-            if (g_v41_dho) v41_dho_place(m, -1);
-#endif
             wf_load(&m->S, &m->L[layer].eng_q, NAME("layers.%d.engram.q_weight", layer),
                     (int64_t)hc * dim);
             wf_load(&m->S, &m->L[layer].eng_k, NAME("layers.%d.engram.k_weight", layer),

@@ -282,24 +282,32 @@ static void v41c_fit_recount(Model *m) {
     for (int i = 0; i < g_v41_fit.L; i++) g_v41_fit.per[i] = v41c_layer_bytes(m, i, rows, 0, 0, &g_v41_fit.mat[i]);
 }
 
+/* Layer i's state on the device, nothing of it read from disk: its mHC mix matrices (f32,
+ * the host keeps them), its window ring and its compressor's group. Kept when there. */
+static int v41c_layer_state(V41Chain *ch, Model *m, int i, const char **why) {
+    Cfg *c = &m->c; Layer *l = &m->L[i];
+    int H = c->hc_mult, D = c->dim, nm = (2 + H) * H, r = c->compress_ratio[i];
+    *why = "a matrix the device refused";
+    if (!coli_vk_tensor_ensure(&ch->fna[i], l->hc_attn_fn.w, NULL, 10, H * D, nm, 0) ||
+        !coli_vk_tensor_ensure(&ch->fnf[i], l->hc_ffn_fn.w, NULL, 10, H * D, nm, 0)) return 0;
+    *why = "device memory for its state refused";
+    if (!ch->win[i] && !(ch->win[i] = vkc_buf((size_t)ch->Wd * c->head_dim * sizeof(float), VKC_DEV))) return 0;
+    if (c->kv_source[i] && r > 1 && !ch->ring[i] && !(ch->ring[i] = vkc_buf((size_t)2 * r * c->head_dim * sizeof(float), VKC_DEV)))
+        return 0;
+    return 1;
+}
 /* Layer i's tensors and state on the device (its matrices through the per-matrix path's
  * map: already there when the trunk lives on the device only). 0 with *why set. */
 static int v41c_layer_up(V41Chain *ch, Model *m, int i, const char **why) {
     Cfg *c = &m->c; Layer *l = &m->L[i];
-    int H = c->hc_mult, D = c->dim, nm = (2 + H) * H, r = c->compress_ratio[i];
+    int r = c->compress_ratio[i];
     *why = "a matrix the device refused";
-    int ok = coli_vk_tensor_ensure(&ch->fna[i], l->hc_attn_fn.w, NULL, 10, H * D, nm, 0) &&
-             coli_vk_tensor_ensure(&ch->fnf[i], l->hc_ffn_fn.w, NULL, 10, H * D, nm, 0) &&
-             v41c_w8(&l->wq_a) && v41c_w8(&l->wq_b) && v41c_w8(&l->wkv) && v41c_w8(&l->wo_a) && v41c_w8(&l->wo_b) &&
+    int ok = v41c_w8(&l->wq_a) && v41c_w8(&l->wq_b) && v41c_w8(&l->wkv) && v41c_w8(&l->wo_a) && v41c_w8(&l->wo_b) &&
              v41c_w8(&l->sh_w1) && v41c_w8(&l->sh_w3) && v41c_w8(&l->sh_w2);
     if (ok && c->kv_source[i]) ok = v41c_wb(&l->comp_wkv) && (r <= 1 || v41c_wb(&l->comp_wgate)) && v41c_wb(&l->idx_wk);
     if (ok && c->index_source[i] && r > 0) ok = v41c_w8(&l->idx_wq_b) && v41c_wb(&l->idx_wproj);
-    if (ok && l->engram_index >= 0) ok = v41c_w8(&l->eng_wkv) != NULL;
-    if (!ok) return 0;
-    *why = "device memory for its state refused";
-    if (!(ch->win[i] = vkc_buf((size_t)ch->Wd * c->head_dim * sizeof(float), VKC_DEV))) return 0;
-    if (c->kv_source[i] && r > 1 && !(ch->ring[i] = vkc_buf((size_t)2 * r * c->head_dim * sizeof(float), VKC_DEV))) return 0;
-    return 1;
+    if (ok && l->eng_wkv.q) ok = v41c_w8(&l->eng_wkv) != NULL;
+    return ok && v41c_layer_state(ch, m, i, why);
 }
 /* Everything of layer i off the device: the chain's tensors and buffers, and the device
  * copies of its matrices (their entries refused: the CPU multiplies them from now on). */
@@ -325,28 +333,64 @@ static void v41c_cut(V41Chain *ch, Model *m, int i, const char *why) {
     vkc_fit_shrink("deepseek_v41", &g_v41_fit, i, why);
 }
 
+/* The chain's struct, made once: by the device-only placement, which builds each of the
+ * chain's layers whole as model_load reads it (v41c_build_layer), else by the setup. */
+static V41Chain *v41c_alloc(Model *m) {
+    if (g_v41c) return g_v41c;
+    Cfg *c = &m->c;
+    int L = c->n_layers;
+    V41Chain *ch = calloc(1, sizeof *ch);
+    if (!ch) return NULL;
+    size_t **offs[] = {&ch->o_an, &ch->o_fn, &ch->o_qn, &ch->o_kn, &ch->o_sink, &ch->o_hca, &ch->o_hcf, &ch->o_cn, &ch->o_ikn,
+                       &ch->o_eq, &ch->o_ek};
+    for (size_t k = 0; k < sizeof offs / sizeof *offs; k++) if (!(*offs[k] = calloc(L, sizeof(size_t)))) return NULL;
+    ch->fna = calloc(L, sizeof(void *)); ch->fnf = calloc(L, sizeof(void *));
+    ch->win = calloc(L, sizeof(void *)); ch->ckv = calloc(L, sizeof(void *));
+    ch->ikey = calloc(L, sizeof(void *)); ch->ring = calloc(L, sizeof(void *));
+    ch->kv_valid = calloc(L, sizeof(int)); ch->ccap = calloc(L, sizeof(int)); ch->sli = malloc(L * sizeof(int));
+    if (!ch->fna || !ch->fnf || !ch->win || !ch->ckv || !ch->ikey || !ch->ring || !ch->kv_valid || !ch->ccap || !ch->sli) return NULL;
+    ch->n = g_v41_fit.L > 0 ? g_v41_fit.n : L;
+    ch->W = c->window; ch->K = c->index_topk > 0 ? c->index_topk : 0; ch->rmax = 1;
+    for (int i = 0; i < L; i++) if (c->kv_source[i] && c->compress_ratio[i] > ch->rmax) ch->rmax = c->compress_ratio[i];
+    ch->Wd = ch->W + v41c_rows();
+    return g_v41c = ch;
+}
+/* The device-only placement of layer i put its matrices up (model_load, v41_dho_place):
+ * its state goes up too before its host pages are given back, so the layer reaches the
+ * device whole or not at all and a failure reads nothing back. 0 with *why set. */
+static int g_v41c_build;   /* the chain's layers are built in the placement (v41_dho_open) */
+static int v41c_build_layer(Model *m, int i, const char **why) {
+    V41Chain *ch = g_v41c;
+    if (!g_v41c_build || !ch || i >= ch->n) return 1;
+    return v41c_layer_state(ch, m, i, why);
+}
+
+/* Layer i did not reach the device (v41_dho_place, as model_load reads it): the chain cut
+ * before it, whatever of it and of the layers after it is up freed. */
+static void v41c_cut_layer(Model *m, int i, const char *why) {
+    if (g_v41c) { v41c_cut(g_v41c, m, i, why); return; }
+    if (g_v41_dho) v41_dho_unplace(m, i);
+    vkc_fit_shrink("deepseek_v41", &g_v41_fit, i, why);
+}
+/* Before the layers are read, when the trunk lives on the device only: the chain's
+ * pipelines and its struct, so the placement builds each of its layers whole. 0: it will
+ * not (the setup says why later). */
+static int v41c_prepare(Model *m) {
+    if (!g_v41_dho || g_v41_fit.L < 1 || g_v41_fit.n < 1 || !v41c_decide(m) || v41c_unsupported(m)) return 0;
+    if (!(g_v41c_inited = vkc_init()) || !(vkc_mla_ready() && vkc_mhc_ready() && vkc_dsv4_ready())) return 0;
+    return g_v41c_build = v41c_alloc(m) != NULL;
+}
+
 static int v41c_setup(Model *m) {
     Cfg *c = &m->c;
     int L = c->n_layers, D = c->dim, H = c->hc_mult, nm = (2 + H) * H;
     const char *why = v41c_unsupported(m);
     if (why) { fprintf(stderr, "[VK] deepseek_v41 chain: %s; the CPU runs the layers\n", why); return 0; }
-    int N = g_v41_fit.L > 0 ? g_v41_fit.n : L;
-    if (N < 1) return 0;
-    V41Chain *ch = calloc(1, sizeof *ch);
+    if ((g_v41_fit.L > 0 ? g_v41_fit.n : L) < 1) return 0;
+    V41Chain *ch = v41c_alloc(m);
     if (!ch) return 0;
-    size_t **offs[] = {&ch->o_an, &ch->o_fn, &ch->o_qn, &ch->o_kn, &ch->o_sink, &ch->o_hca, &ch->o_hcf, &ch->o_cn, &ch->o_ikn,
-                       &ch->o_eq, &ch->o_ek};
-    for (size_t k = 0; k < sizeof offs / sizeof *offs; k++) if (!(*offs[k] = calloc(L, sizeof(size_t)))) return 0;
-    ch->fna = calloc(L, sizeof(void *)); ch->fnf = calloc(L, sizeof(void *));
-    ch->win = calloc(L, sizeof(void *)); ch->ckv = calloc(L, sizeof(void *));
-    ch->ikey = calloc(L, sizeof(void *)); ch->ring = calloc(L, sizeof(void *));
-    ch->kv_valid = calloc(L, sizeof(int)); ch->ccap = calloc(L, sizeof(int)); ch->sli = malloc(L * sizeof(int));
-    if (!ch->fna || !ch->fnf || !ch->win || !ch->ckv || !ch->ikey || !ch->ring || !ch->kv_valid || !ch->ccap || !ch->sli) return 0;
-    ch->n = N;
-    g_v41c = ch;
-    ch->W = c->window; ch->K = c->index_topk > 0 ? c->index_topk : 0; ch->rmax = 1;
-    for (int i = 0; i < L; i++) if (c->kv_source[i] && c->compress_ratio[i] > ch->rmax) ch->rmax = c->compress_ratio[i];
-    ch->Wd = ch->W + v41c_rows();
+    int N = ch->n;
+    if (N < 1) return 0;
     /* the parameter arena, the chain's layers' */
     size_t n = 0;
     for (int i = 0; i < N; i++) {
