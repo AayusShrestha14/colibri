@@ -111,6 +111,14 @@ int  coli_vk_tensor_ensure(ColiVkTensor **tensor, const void *weights, const flo
 int    coli_vk_tensor_import(ColiVkTensor **tensor, const void *weights, size_t alloc_bytes, const float *scales,
                              int fmt, int I, int O, int gs);
 size_t coli_vk_import_alignment(void);
+/* Host memory a shader reads in place (VK_EXT_external_memory_host, where
+ * coli_vk_import_alignment() is not 0): the pages around [ptr, ptr + bytes) as a storage
+ * buffer of the primary device (VkBuffer, VkDeviceMemory as void *), *off the byte
+ * offset of ptr in it. 0 when the device refuses. The pages must stay mapped until
+ * coli_vk_host_buffer_free (bytes: the buffer's, ptr's page-rounded range), after the
+ * last submission that read them. */
+int    coli_vk_host_buffer(const void *ptr, size_t bytes, void **buf, void **mem, size_t *off);
+void   coli_vk_host_buffer_free(void *buf, void *mem, size_t bytes);
 size_t coli_vk_imported_bytes(void);
 
 /* SECOND DEVICE (COLI_VK_DEV2): a self-contained context on another Vulkan GPU that

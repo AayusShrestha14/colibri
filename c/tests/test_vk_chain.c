@@ -1874,6 +1874,9 @@ static void kvs_arrive(float *dst, const float *src, int nseg, size_t seg, int l
 static void kvs_keep_rows(const float *o, int pb, int S) { if (kvs_keep) memcpy(kvs_keep + (size_t)pb * kvs_keep_row, o, (size_t)S * kvs_keep_row * 4); }
 
 /* GQA: steps of `step` rows from position 0 to T, the device holding `rows` positions. */
+/* COLI_VK_KV_COLD=device (test_kvs_cold, or a family run with it): every split step's host part must run on
+ * the device, but where pins are on (they need the CPU's lists) */
+static int kvs_cold_wanted(void) { const char *c = getenv("COLI_VK_KV_COLD"); return c && !strcmp(c, "device"); }
 static void test_kvs_gqa(int T, int step, int H, int KVH, int hd, int vd, int B, int rows, int win, int sink, int kv_pm,
                          int gated, int lists, int selects) {
     char rv[32]; snprintf(rv, sizeof rv, "%d", rows); setenv("COLI_VK_KV_DEVICE_ROWS", rv, 1);
@@ -1969,8 +1972,9 @@ static void test_kvs_gqa(int T, int step, int H, int KVH, int hd, int vd, int B,
     }
     CHECK(ok && worst < 2e-5 && splits > 0, "kvs gqa T %d step %d H %d/%d hd %d vd %d B %d rows %d win %d sink %d pm %d gate %d lists %d: "
           "err %.2e (%d split steps, %d whole)", T, step, H, KVH, hd, vd, B, rows, win, sink, kv_pm, gated, lists, worst, splits, fins);
-    printf("  kvs gqa T %d step %d rows %d lists %d: rel err %.2e, %d split steps, %d whole, %llu host positions, %llu pinned\n",
-           T, step, rows, lists, worst, splits, fins, ks.host_pos, ks.pins);
+    printf("  kvs gqa T %d step %d rows %d lists %d: rel err %.2e, %d split steps, %d whole, %llu host positions, %llu pinned%s\n",
+           T, step, rows, lists, worst, splits, fins, ks.host_pos, ks.pins, ks.cold_dev ? ", the host's part on the device" : "");
+    CHECK(!kvs_cold_wanted() || ks.np || (ks.cold_dev && ks.dev_cold > 0 && ks.host_pos == 0), "kvs gqa: the host's part did not run on the device");
     CHECK(!ks.np || !selects || ks.pins > 0, "kvs gqa lists: no block was pinned");
     vkc_free(kc); vkc_free(vc); vkc_free(qb); vkc_free(nk); vkc_free(nv); vkc_free(ob); vkc_free(sb); vkc_free(lb);
     vkc_kv_free(&ks);
@@ -2058,9 +2062,10 @@ static void test_kvs_mla(int T, int step, int H, int K, int R, int B, int rows, 
     }
     CHECK(ok && worst < 2e-5 && splits > 0, "kvs mla T %d step %d H %d K %d R %d B %d rows %d start %d lists %d: err %.2e (%d split steps)",
           T, step, H, K, R, B, rows, kv_start, lists, worst, splits);
-    printf("  kvs mla T %d step %d K %d rows %d lists %d: rel err %.2e, %d split steps, %llu host positions, %llu pinned\n",
-           T, step, K, rows, lists, worst, splits, ks.host_pos, ks.pins);
-    CHECK(!lists || ks.pins > 0, "kvs mla lists: no block was pinned");
+    printf("  kvs mla T %d step %d K %d rows %d lists %d: rel err %.2e, %d split steps, %llu host positions, %llu pinned%s\n",
+           T, step, K, rows, lists, worst, splits, ks.host_pos, ks.pins, ks.cold_dev ? ", the host's part on the device" : "");
+    CHECK(!lists || !ks.np || ks.pins > 0, "kvs mla lists: no block was pinned");
+    CHECK(!kvs_cold_wanted() || ks.np || (ks.cold_dev && ks.dev_cold > 0 && ks.host_pos == 0), "kvs mla: the host's part did not run on the device");
     vkc_free(lat); vkc_free(rope); vkc_free(qab); vkc_free(nl); vkc_free(ob); vkc_free(lb);
     vkc_kv_free(&ks);
     free(Lh); free(Rh); free(Lx); free(Rx); free(posl); free(sel); free(ref); free(nh);
@@ -2141,7 +2146,9 @@ static void test_kvs_rel(int T, int step, int H, int KVH, int hd, int ext, int d
     }
     CHECK(ok && worst < 2e-5 && splits > 0, "kvs rel T %d step %d H %d/%d hd %d ext %d d_rel %d B %d rows %d: err %.2e (%d split steps)",
           T, step, H, KVH, hd, ext, d_rel, B, rows, worst, splits);
-    printf("  kvs rel T %d step %d rows %d ext %d: rel err %.2e, %d split steps, %llu host positions\n", T, step, rows, ext, worst, splits, ks.host_pos);
+    printf("  kvs rel T %d step %d rows %d ext %d: rel err %.2e, %d split steps, %llu host positions%s\n", T, step, rows, ext, worst,
+           splits, ks.host_pos, ks.cold_dev ? ", the host's part on the device" : "");
+    CHECK(!kvs_cold_wanted() || ks.np || (ks.cold_dev && ks.dev_cold > 0 && ks.host_pos == 0), "kvs rel: the host's part did not run on the device");
     vkc_free(kc); vkc_free(vc); vkc_free(qb); vkc_free(rb); vkc_free(nk); vkc_free(nv); vkc_free(ob); vkc_free(tb); vkc_free(pb_);
     vkc_kv_free(&ks);
     free(Kh); free(Vh); free(Kx); free(Vx); free(relp); free(ref); free(nkh); free(nvh); free(tau);
@@ -2307,6 +2314,49 @@ static void test_kvs(void) {
                   (size_t)(T - first) * H * hd * sizeof(float)), "kvs: rows crossing 64K differ with chunk size");
     printf("  kvs: compared all %d rows crossing 64K bit for bit across chunk sizes\n", T - first);
     kvs_start = 0; kvs_keep = NULL; free(a); free(b);
+}
+
+/* COLI_VK_KV_COLD=device: the host's part on the device, from the shadow of the host's
+ * rows. Every case without pins against the same double-precision reference (sinks,
+ * gates, MiMo's position-major rows, windows, lists, MLA with and without a rope key and
+ * a nonzero start, Inkling's bias reaching into the host's rows), each split step's host
+ * part on the device and none on the CPU, and the same bits for every position however
+ * the forward is cut (steps of 1 to 4, slices of rows, crossing 64K). */
+static void test_kvs_cold(void) {
+    if (!coli_vk_import_alignment()) { printf("  kvs cold: no host memory the device reads in place here, skipped\n"); return; }
+    setenv("COLI_VK_KV_COLD", "device", 1);
+    /* T step H KVH hd vd B rows win sink pm gate lists selects */
+    test_kvs_gqa(40, 1, 4, 2, 32, 32, 4, 12, 0, 0, 0, 1, 0, 0);
+    test_kvs_gqa(41, 3, 4, 2, 32, 32, 4, 8, 0, 0, 0, 1, 0, 0);
+    test_kvs_gqa(70, 7, 4, 2, 48, 32, 8, 32, 0, 1, 1, 0, 0, 0);
+    test_kvs_gqa(300, 1, 8, 2, 64, 64, 16, 64, 0, 0, 0, 1, 0, 0);
+    test_kvs_gqa(600, 50, 4, 4, 16, 16, 16, 128, 0, 0, 0, 0, 0, 0);
+    test_kvs_gqa(60, 3, 4, 2, 32, 32, 4, 24, 0, 0, 0, 1, 1, 1);       /* lists, no pins */
+    test_kvs_gqa(50, 2, 4, 2, 256, 256, 4, 16, 0, 0, 0, 1, 1, 1);
+    test_kvs_gqa(60, 2, 4, 2, 32, 24, 4, 16, 20, 1, 1, 0, 0, 0);
+    test_kvs_gqa(48, 12, 4, 2, 32, 32, 4, 40, 0, 0, 0, 1, 0, 0);
+    /* T step H K R B rows kv_start lists */
+    test_kvs_mla(40, 1, 4, 32, 8, 4, 12, 0, 0);
+    test_kvs_mla(90, 5, 2, 64, 16, 8, 40, 0, 1);
+    test_kvs_mla(60, 4, 3, 48, 0, 4, 16, 0, 0);
+    test_kvs_mla(70, 2, 2, 512, 64, 8, 32, 5, 0);
+    test_kvs_mla(40, 3, 1, 1024, 8, 4, 16, 0, 1);
+    /* T step H KVH hd ext d_rel B rows */
+    test_kvs_rel(60, 1, 4, 2, 32, 8, 4, 4, 16);
+    test_kvs_rel(80, 5, 4, 2, 16, 40, 16, 8, 32);
+    test_kvs_rel(50, 3, 2, 1, 128, 16, 64, 4, 24);
+    test_kvs_steps();
+    int T = 65543, first = 65531, H = 2, hd = 16;
+    float *a = calloc((size_t)T * H * hd, sizeof(float));
+    float *b = calloc((size_t)T * H * hd, sizeof(float));
+    kvs_start = first; kvs_keep_row = (size_t)H * hd;
+    kvs_keep = a; test_kvs_gqa(T, 1, H, 1, hd, hd, 64, 512, 0, 0, 0, 0, 0, 0);
+    kvs_keep = b; test_kvs_gqa(T, 7, H, 1, hd, hd, 64, 512, 0, 0, 0, 0, 0, 0);
+    CHECK(!memcmp(a + (size_t)first * H * hd, b + (size_t)first * H * hd,
+                  (size_t)(T - first) * H * hd * sizeof(float)), "kvs cold: rows crossing 64K differ with chunk size");
+    kvs_start = 0; kvs_keep = NULL; free(a); free(b);
+    unsetenv("COLI_VK_KV_COLD");
+    printf("  kvs cold: every case with the host's part on the device, the same bits however the forward is cut\n");
 }
 
 /* COLI_VK_CHAIN_BENCH=1: decode-shaped GEMVs back to back in one frame (the chain's
@@ -2559,7 +2609,7 @@ int main(int argc, char **argv) {
         printf("dsv4 rounding done\n");
     }
     if (!vkc_kvs_ready()) { fails++; printf("FAIL: the split KV shader did not load\n"); }
-    else { test_kvs(); printf("kvs done\n"); }
+    else { test_kvs(); test_kvs_cold(); printf("kvs done\n"); }
     if (getenv("COLI_VK_DEV2")) { test_dev2(spv); printf("dev2 done\n"); }
     VkcStats st; vkc_stats(&st);
     printf("chain: %llu frames, %llu ops, %llu matmuls (%llu GEMM), %llu barriers\n", st.frames, st.ops, st.matmuls, st.gemms, st.barriers);

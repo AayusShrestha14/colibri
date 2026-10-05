@@ -67,6 +67,7 @@ typedef struct { VkDeviceMemory mem; uint8_t *map; } VkcBlock;
 typedef struct { VkaPool p; uint32_t memtype; int mapped; } VkcPool;
 struct VkcBuf {
     VkBuffer buf;
+    VkDeviceMemory mem;               /* VKC_HOST: the imported pages */
     int kind;
     size_t bytes;
     VkaRange r;
@@ -218,6 +219,7 @@ VkcBuf *vkc_buf(size_t bytes, int kind) {
 }
 
 static void buf_release(VkcBuf *b) {
+    if (b->kind == VKC_HOST) { coli_vk_host_buffer_free((void *)b->buf, (void *)b->mem, b->bytes); free(b); return; }
     VkcPool *P = &KC.pool[b->kind];
     vkDestroyBuffer(KC.dev, b->buf, NULL);
     if (vka_free(&P->p, b->r)) {
@@ -260,6 +262,21 @@ int vkc_reserve(VkcBuf **b, size_t bytes, int kind) {
 }
 void *vkc_ptr(const VkcBuf *b) { return b ? b->ptr : NULL; }
 size_t vkc_bytes(const VkcBuf *b) { return b ? b->bytes : 0; }
+VkcBuf *vkc_host(const void *ptr, size_t bytes, size_t *off) {
+    /* the primary device's import: on the second device's chain the host's part of a
+     * split stays on the CPU (vkc_kv_shadow says so) */
+    if (!vkc_ready() || !ptr || !bytes || g_kd) return NULL;
+    void *buf = NULL, *mem = NULL;
+    size_t o = 0;
+    if (!coli_vk_host_buffer(ptr, bytes, &buf, &mem, &o)) return NULL;
+    size_t al = coli_vk_import_alignment(), sz = (o + bytes + al - 1) / al * al;   /* the pages, as imported */
+    VkcBuf *b = calloc(1, sizeof *b);
+    if (!b) { coli_vk_host_buffer_free(buf, mem, sz); return NULL; }
+    b->kind = VKC_HOST; b->buf = (VkBuffer)buf; b->mem = (VkDeviceMemory)mem;
+    b->bytes = sz;
+    *off = o;
+    return b;
+}
 
 /* ---- init ------------------------------------------------------------------------ */
 static VkShaderModule load_module(const char *dir_spv, const char *file) {
@@ -862,12 +879,43 @@ int vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBu
         if (w.a.sel_row > 0) x.a.sel_off += r0 * w.a.sel_row;
         if (r0 && !attn_slice_next()) return 0;
         if (blocked) {
-            struct { VkcAttnW w; int br; } pc = {x, br};
+            struct { VkcAttnW w; int br, B, anchor, part, st_off; } pc = {x, br, 0, 0, 0, 0};
             ok = record(KAB.pipe, bd, 7, &pc, sizeof pc, (uint32_t)x.a.KVH, (uint32_t)((x.a.S + br - 1) / br), 1);
             KC.st.attn_blocked += ok;
         } else ok = record(KC.pipe[P_ATTN], bd, 7, &x, sizeof x, (uint32_t)x.a.H, (uint32_t)x.a.S, 1);
     }
     return ok;
+}
+static int attn_part_rec(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, const VkcAttnW *p, int blk, int anchor, int st_off,
+                         int ch, int nz, int o_z, int st_z) {
+    KC.kind = PK_ATTN;
+    VkcAttnW w = *p;
+    if (w.vd <= 0) w.vd = w.a.hd;
+    int G = w.a.KVH > 0 ? w.a.H / w.a.KVH : 0;
+    if (w.a.hd > 256 || w.vd > 256 || G < 1 || G > 32 || w.a.H % w.a.KVH || w.a.sel_row > 0 || w.sink || w.ring || blk < 1 ||
+        anchor < 0 || ch < 0 || (ch > 0 && (ch % 16 || nz < 1 || nz > 65535)) || !kab_pipe()) return 0;
+    w.a.has_gate = 0; w.a.g_off = ch; w.a.g_row = o_z; w.a.g_seg = st_z;   /* the chunks (unused by part otherwise) */
+    VkcBind bd[7] = {B(q, 0), B(kc, 0), B(vc, 0), B(o, 1), B(NULL, 0), B(NULL, 0), B(NULL, 0)};
+    int br = 32 / G, S = w.a.S, rr = attn_slice_rows(S, w.a.pos_base, (double)w.a.H * (w.a.hd > w.vd ? w.a.hd : w.vd), br);
+    int ok = 1;
+    for (int r0 = 0; ok && r0 < S; r0 += rr) {
+        VkcAttnW x = w;
+        int n = S - r0 < rr ? S - r0 : rr;
+        x.a.S = n; x.a.pos_base = w.a.pos_base + r0;
+        x.a.q_off += r0 * w.a.q_row; x.a.o_off += r0 * w.a.o_row;
+        if (r0 && !attn_slice_next()) return 0;
+        struct { VkcAttnW w; int br, B, anchor, part, st_off; } pc = {x, br, blk, anchor, 1, st_off + r0 * w.a.H * 2};
+        ok = record(KAB.pipe, bd, 7, &pc, sizeof pc, (uint32_t)x.a.KVH, (uint32_t)((x.a.S + br - 1) / br), (uint32_t)(ch > 0 ? nz : 1));
+        KC.st.attn_blocked += ok;
+    }
+    return ok;
+}
+int vkc_attn_part(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, const VkcAttnW *p, int blk, int anchor, int st_off) {
+    return attn_part_rec(q, kc, vc, o, p, blk, anchor, st_off, 0, 1, 0, 0);
+}
+int vkc_attn_part_chunks(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, const VkcAttnW *p, int blk, int anchor, int st_off,
+                         int ch, int nz, int o_z, int st_z) {
+    return ch > 0 && attn_part_rec(q, kc, vc, o, p, blk, anchor, st_off, ch, nz, o_z, st_z);
 }
 int vkc_dnconv(VkcBuf *in, VkcBuf *w, VkcBuf *ring, VkcBuf *out, VkcBuf *snap, const VkcDnConv *p) {
     KC.kind = PK_DNCONV;
@@ -1701,6 +1749,16 @@ int vkc_kvs_merge(VkcBuf *dev, VkcBuf *cpu, VkcBuf *gate, VkcBuf *out, const Vkc
     struct { int mode; VkcKvsMerge b; } pc = {2, *p};
     KC.kind = PK_ATTN;
     VkcBind bd[4] = {B(dev, 0), B(cpu, 0), B(p->flags & VKC_KVS_GATE ? gate : NULL, 0), B(out, 1)};
+    uint32_t gx, gy; grid((uint64_t)p->n, &gx, &gy);
+    return record(pipe, bd, 4, &pc, sizeof pc, gx, gy, 1);
+}
+int vkc_kvs_join(VkcBuf *parts, VkcBuf *out, const VkcKvsJoin *p) {
+    VkPipeline pipe = kvs_pipe();
+    if (!pipe || !parts || !out || p->n < 0 || p->d < 1 || p->nz < 0) return 0;
+    if (p->n == 0) return open_frame() && !KC.lost;
+    struct { int mode; VkcKvsJoin b; } pc = {5, *p};
+    KC.kind = PK_ATTN;
+    VkcBind bd[4] = {B(parts, 0), B(NULL, 0), B(NULL, 0), B(out, 1)};
     uint32_t gx, gy; grid((uint64_t)p->n, &gx, &gy);
     return record(pipe, bd, 4, &pc, sizeof pc, gx, gy, 1);
 }
