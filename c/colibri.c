@@ -666,7 +666,8 @@ static inline int vk_reg_served(int layer,int eid){
 /* The shared tier's view of this model's experts (vk_tier_start). */
 static struct {
     int on;                       /* vkt_init accepted the experts */
-    int gu_fmt, gu_gs, dn_fmt, dn_gs;   /* the QT formats it was given (gate = up) */
+    int nl;                       /* the model's layers; the MTP head's (index nl) is [1] below */
+    int gu_fmt[2], gu_gs[2], dn_fmt[2], dn_gs[2];   /* the QT formats it was given (gate = up) */
     size_t exp_bytes;             /* one expert on the device */
 } g_vkt;
 static int vk_tier_resident_count(Model *m);
@@ -5572,20 +5573,23 @@ static int mb_gs_compat(int est_fmt, int est_gs, int fmt, int gs){
 static const void *vk_qt_codes(const QT *t){
     return t->fmt==0 ? (const void*)t->qf : (t->fmt==1||t->fmt==8) ? (const void*)t->q8 : (const void*)t->q4;
 }
-/* An expert slot as the tier reads it, or 0 when its tensors are not in the format the
- * tier was configured with (a mixed container): such an expert stays on the CPU. */
-static int vk_slot_src(const ESlot *e, VktExpertSrc *src){
-    if(!g_vkt.on || e->g.fmt!=g_vkt.gu_fmt || e->u.fmt!=g_vkt.gu_fmt || e->g.gs!=g_vkt.gu_gs ||
-       e->u.gs!=g_vkt.gu_gs || e->d.fmt!=g_vkt.dn_fmt || e->d.gs!=g_vkt.dn_gs ||
+/* An expert slot of `layer` as the tier reads it, or 0 when its tensors are not in the
+ * format the tier was configured with for that layer (the model's, or the MTP head's:
+ * int8 beside int4; a mixed container): such an expert stays on the CPU. */
+static int vk_slot_src(const ESlot *e, int layer, VktExpertSrc *src){
+    int k = layer>=g_vkt.nl;
+    if(!g_vkt.on || e->g.fmt!=g_vkt.gu_fmt[k] || e->u.fmt!=g_vkt.gu_fmt[k] || e->g.gs!=g_vkt.gu_gs[k] ||
+       e->u.gs!=g_vkt.gu_gs[k] || e->d.fmt!=g_vkt.dn_fmt[k] || e->d.gs!=g_vkt.dn_gs[k] ||
        e->g.planar || e->u.planar || e->d.planar) return 0;
     *src=(VktExpertSrc){vk_qt_codes(&e->g),vk_qt_codes(&e->u),vk_qt_codes(&e->d),e->g.s,e->u.s,e->d.s};
     return src->g && src->u && src->d;
 }
-/* Does this MoE call go through moe_vk? Layers 0..n_layers-1 only: the MTP head's
- * experts are int8 and stay on the CPU. CUDA, Metal, the cluster workers and the
+/* Does this MoE call go through moe_vk? The layers the tier serves: the model's, and
+ * the MTP head's (index n_layers) when the tier took it as an extra layer (its experts
+ * int8 beside int4, COLI_VK_TIER_MTP). CUDA, Metal, the cluster workers and the
  * ablation harness keep moe()'s own loop. */
 static int moe_vk_on(Model *m,int layer){
-    if(!g_vulkan || layer<0 || layer>=m->c.n_layers || omp_in_parallel()) return 0;
+    if(!g_vulkan || layer<0 || layer>=(vkt_ready() ? vkt_layers() : m->c.n_layers) || omp_in_parallel()) return 0;
     if(!vkt_ready() && g_vk_reg_n2<=0) return 0;
     if(g_abl.mode || g_metal_enabled || g_pre_idx) return 0;
 #if !defined(_WIN32)
@@ -5649,7 +5653,7 @@ static void vk_cpu_pairs(Model *m,int layer,const float *x,int rows,int K,const 
             if(g_prof){ m->t_ecpu+=dt; m->cpu_expert_rows+=(uint64_t)nr;
                 m->cpu_expert_bytes+=qt_bytes(&e->g)+qt_bytes(&e->u)+qt_bytes(&e->d); }
             VktExpertSrc vs;
-            if(note && vk_slot_src(e,&vs)) vkt_note(layer,eid,&vs);   /* may promote it to the device */
+            if(note && vk_slot_src(e,layer,&vs)) vkt_note(layer,eid,&vs);   /* may promote it to the device */
         }
         ecache_promote_ws(m,layer,nmiss);
     }
@@ -10851,7 +10855,7 @@ static int vk_load_batch(void *ctx,int layer,const int *e,int n,VktExpertSrc *sr
         for(int q=0;q<nmiss;q++) expert_load(m,layer,e[miss[q]],&m->ws[q],1,1);
         m->t_ewait += now_s()-t0; }
     int k=0;
-    for(;k<n;k++){ if(!vk_slot_src(use[k],&srcs[k])) break; h[k]=m; }
+    for(;k<n;k++){ if(!vk_slot_src(use[k],layer,&srcs[k])) break; h[k]=m; }
     g_vks_layer=layer; g_vks_nmiss=nmiss; g_vks_held=k;
     if(!k) vk_stream_promote(m);
     return k;
@@ -10911,8 +10915,24 @@ static void vk_tier_start(Model *m){
     if(g_glmc_partial) dense+=(double)g_glmc_lazy;
     { const char *r=getenv("COLI_VK_RESERVE_GB"), *tr=getenv("COLI_VK_TIER_RESERVE_GB");
       if(r && *r){ double extra=atof(r)-(tr&&*tr?atof(tr):1.0); if(extra>0) dense+=extra*1073741824.0; } }
+    /* The MTP head's layer (index NL): its experts as the container keeps them (int8
+     * beside int4), the tier's extra layer. By default on a discrete GPU only: on a GPU
+     * that shares the RAM, qwen38's head measured no faster there (docs/vulkan.md, "The
+     * MTP head's layer on the tier"); COLI_VK_TIER_MTP=1 or 0 decides. */
+    VktFmt xgu={VKT_SRC_NONE,0}, xdn={VKT_SRC_NONE,0}; int xf[3]={0,0,0}, xgs[3]={0,0,0};
+    { const char *tm=getenv("COLI_VK_TIER_MTP");
+      int want = tm&&*tm ? *tm!='0' : !coli_vk_device_shares_ram();
+      if(m->has_mtp && want){
+          for(int k=0;k<3;k++) xf[k]=vk_expert_fmt(m,NL,0,k,&xgs[k]);
+          if(xf[0]!=xf[1] || xgs[0]!=xgs[1] || !vk_src_kind(xf[0],xgs[0],&xgu) || !vk_src_kind(xf[2],xgs[2],&xdn)){
+              fprintf(stderr,"[VK] tier colibri: the MTP head's experts in fmt %d/%d/%d have no device form, they stay on the CPU\n",
+                      xf[0],xf[1],xf[2]);
+              xgu.kind=VKT_SRC_NONE;
+          }
+      } }
     VktConfig vc={.engine="colibri", .layers=NL, .experts=E, .hidden=c->hidden, .inter=c->moe_inter, .topk=c->topk,
                   .gate_up=gu, .down=dn, .act=VKT_ACT_SWIGLU, .act_limit=0.f,
+                  .extra_layers=xgu.kind!=VKT_SRC_NONE, .extra_gate_up=xgu, .extra_down=xdn,
                   .max_rows=GLM_VK_ROWS*c->topk,
                   .ram_reserve=(size_t)((double)m->ecap*expert_cache_row_bytes(m,m->ebits)),
                   .dense_bytes=(size_t)dense,
@@ -10921,7 +10941,8 @@ static void vk_tier_start(Model *m){
                   .load=vk_load, .release=vk_unhold, .load_ctx=m, .load_batch=vk_load_batch};
     atexit(coli_vk_shutdown);   /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
     if(!vkt_init(&vc,m->eusage)) return;
-    g_vkt.on=1; g_vkt.gu_fmt=f[0]; g_vkt.gu_gs=gs[0]; g_vkt.dn_fmt=f[2]; g_vkt.dn_gs=gs[2];
+    g_vkt.on=1; g_vkt.nl=NL; g_vkt.gu_fmt[0]=f[0]; g_vkt.gu_gs[0]=gs[0]; g_vkt.dn_fmt[0]=f[2]; g_vkt.dn_gs[0]=gs[2];
+    g_vkt.gu_fmt[1]=xf[0]; g_vkt.gu_gs[1]=xgs[0]; g_vkt.dn_fmt[1]=xf[2]; g_vkt.dn_gs[1]=xgs[2];
     g_vkt.exp_bytes=vkt_expert_bytes(c->hidden,c->moe_inter,gu,dn);
     atexit(vkt_shutdown);
     g_vk_model=m; atexit(vk_tier_report_run);   /* runs first: the tier is still up */
@@ -10937,9 +10958,9 @@ static void vk_tier_start(Model *m){
         #pragma omp parallel for schedule(dynamic,4)
         for(int i=0;i<n;i++){
             VktExpertSrc vs; ESlot *p=pin_indexed(m,ql[i],qe[i]);
-            if(p && vk_slot_src(p,&vs)){ vkt_put(ql[i],qe[i],&vs); continue; }
+            if(p && vk_slot_src(p,ql[i],&vs)){ vkt_put(ql[i],qe[i],&vs); continue; }
             ESlot *t=&tmp[omp_get_thread_num()];
-            int ok = expert_load(m,ql[i],qe[i],t,0,0)==0 && vk_slot_src(t,&vs);   /* demand=0: startup */
+            int ok = expert_load(m,ql[i],qe[i],t,0,0)==0 && vk_slot_src(t,ql[i],&vs);   /* demand=0: startup */
             vkt_put(ql[i],qe[i],ok?&vs:NULL);   /* NULL: planned but not placed (a mixed container) */
         }
         vkt_put_done();

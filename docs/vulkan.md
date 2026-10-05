@@ -119,7 +119,7 @@ the shared expert tier ([below](#the-routed-expert-tier-vk_tierc)).
 | olmoe | attention q/k/v/o, router, lm_head; routed experts on the expert tier | f32; experts int8 per row | embedding, the experts the tier does not hold |
 | kimi_k3 (Kimi K3) | the shared experts' matrices (one row at a time: decode); routed experts on the expert tier | shared experts int8 rows, int4-g64, f32 (`K3_BITS`); experts MXFP4 with ue8m0 scales (fmt 7), SiTU-GLU in the latent space | KDA, MLA, the latent projections, router, head, prefill's shared experts, the experts the tier does not hold |
 | mimo | trunk and vision tower; routed experts on the expert tier | native fp8/bf16, int8, f32 (`MIMO_DENSE_BITS`); experts MXFP4 with e8m0 scales (fmt 7) | router, the experts the tier does not hold |
-| deepseek_v41 | the trunk, vision included; routed experts on the expert tier | fp8 in 32x32 ue8m0 tiles, bf16; experts MXFP4 (fp4, a ue8m0 scale per 32) | the DSpark stages and their experts, the experts the tier does not hold |
+| deepseek_v41 | the trunk, vision included; routed experts on the expert tier | fp8 in 32x32 ue8m0 tiles, bf16; experts MXFP4 (fp4, a ue8m0 scale per 32) | the DSpark stages (their experts on the tier on a discrete GPU), the experts the tier does not hold |
 | deepseek_v4 | resident dense layers, head, router, compressors; routed experts on the expert tier | fp8 in 128x128 blocks, bf16; experts MXFP4 (fp4, a ue8m0 scale per 32) with [an activation of its own](#deepseek-v4s-activation) | the indexer's `weights_proj`, DSpark stages, the `--oracle` path's dense layers, the experts the tier does not hold |
 | glm53 (GLM-5.3 Flash) | the resident matrices (an f32 checkpoint's experts among them); the streaming container's routed experts on the expert tier | int8 and int4-g64 (`GLM53_BITS`); experts int4-gs64 | f32 matrices (`GLM53_BITS=32`), the streamed experts the tier does not hold, all of them when `swiglu_limit` is 0 |
 | qwenimage | the DiT's matrices | int8, bf16, f32 (`COLI_IMG_BITS`) | text encoder, VAE, attention |
@@ -456,7 +456,7 @@ order its CPU-only run does, and keeps a history for the warm start where it has
 | olmoe | int8 rows `I8_ROW` (fmt 1), gate, up and down as the merged container holds them | SwiGLU | `COLI_USAGE` only | [Inkling and OLMoE](#inkling-and-olmoe) |
 | kimi_k3 (Kimi K3) | the checkpoint's MXFP4 with ue8m0 scales `MXFP4_E8M0` 32 (fmt 7): gate `w1`, up `w3`, down `w2`, in the latent space | SiTU-GLU (`VKT_ACT_SITU`) | `COLI_USAGE` (default `<snap>/.coli_usage`) | [Kimi K3 and MiMo](#kimi-k3-and-mimo) |
 | mimo (MiMo-V2.6 Flash and Pro) | the release's MXFP4 `MXFP4_E8M0` 32 (fmt 7) | SwiGLU | none: the tier fills as experts pass by | [Kimi K3 and MiMo](#kimi-k3-and-mimo) |
-| deepseek_v41 (DeepSeek V4.1 Flash) | MXFP4 `MXFP4_E8M0` 32 (fmt 7), as the checkpoint stores it | SwiGLU with `swiglu_limit` | `COLI_USAGE` (default `<snap>/.coli_usage`), kept only while the tier is on | the backbone's layers; the DSpark stages keep their own experts on the CPU |
+| deepseek_v41 (DeepSeek V4.1 Flash) | MXFP4 `MXFP4_E8M0` 32 (fmt 7), as the checkpoint stores it | SwiGLU with `swiglu_limit` | `COLI_USAGE` (default `<snap>/.coli_usage`), kept only while the tier is on | the backbone's layers; the DSpark stages, with caches of their own, are extra layers ([below](#the-mtp-heads-layer-on-the-tier-coli_vk_tier_mtp)) |
 | deepseek_v4 (DeepSeek V4 Flash) | MXFP4 `MXFP4_E8M0` 32 (fmt 7); pinned experts unpacked from rows16 | `VKT_ACT_SWIGLU_V4` | the store's own `<model>/.coli_usage` | [DeepSeek V4's activation](#deepseek-v4s-activation) |
 | colibri (GLM-5.2) | `F32` (fmt 10), int8 `I8_ROW` (fmt 1), int4 per row `I4U_PAIRS_ROW` (fmt 2), int4-gs `I4U_PAIRS_GS` (fmt 4), int3-g64 `I3_G64` (fmt 5); down may have its own | SwiGLU | `<snap>/.coli_usage` | [GLM-5.2 and GLM-5.3 Flash](#glm-52-and-glm-53-flash-on-the-tier) |
 | glm53 (GLM-5.3 Flash) | the streaming container's int4-gs64 `I4U_PAIRS_GS` 64 (fmt 4) | SwiGLU with `swiglu_limit`, run only above 0 | `COLI_USAGE` (default `<snap>/.coli_usage`) | [GLM-5.2 and GLM-5.3 Flash](#glm-52-and-glm-53-flash-on-the-tier) |
@@ -608,12 +608,29 @@ the default puts them on the tier on a discrete GPU only;
 `COLI_VK_TIER_MTP=1` or `0` decides either way. A discrete GPU was not measured here.
 
 When the head's experts have no device form (`[VK] tier qwen38: the extra layers' expert
-format ... has no device form`), mix formats or find no room, they stay on the CPU. The tokens are the CPU run's either way:
-the MTP layer's experts join the row in rank order like the others'.
-`tests/test_vk_tier`'s `extra` case gates the pools (an f32 extra layer, eight times an
-int4 expert: each pool evicts its own kind, no upload refused, an extra expert gets in
-beside a full main pool on its own promotions), and the `qwen` family runs the head's
-layer on the device on both MTP fixtures.
+format ... has no device form`), mix formats or find no room, they stay on the CPU. The
+tokens are the CPU run's either way: the MTP layer's experts join the row in rank order
+like the others'.
+
+**The other engines with a drafting head.**
+
+| Engine | Extra layers | Their experts |
+|---|---|---|
+| colibri (GLM-5.2) | the MTP head's layer, index `n_layers` | as the container keeps them (int8 beside int4 in a converted GLM-5.2), checked like the model's |
+| deepseek_v41 | the DSpark stages, `n_layers + stage` | the backbone's MXFP4; each stage's cache is the RAM side the balance and the exclusive RAM cache read |
+| deepseek_v4 | none | its full DSpark drafter (three stages, the DSpark supplement) keeps its experts on the CPU: the tiny fixture has one MTP layer, so no test reaches that path |
+| glm53 | none | its MTP layer has no routed experts |
+
+The same `COLI_VK_TIER_MTP` decides, with the same default.
+
+**Tests.** `tests/test_vk_tier`'s `extra` case gates the pools (an f32 extra layer, eight
+times an int4 expert: each pool evicts its own kind, no upload refused, an extra expert
+gets in beside a full main pool on its own promotions). The `qwen` family runs the head's
+layer on the device on both MTP fixtures and its default on Lavapipe; `glm` colibri's
+head with f32 and 4-bit experts at two drafts, and its default; `deepseek` V4.1's two
+DSpark stages at three forced acceptances, the default at five. Each must give the CPU's
+tokens and serve experts of the extra layers from the device; the sanitizer families run
+one of each.
 
 ### A second device (`COLI_VK_DEV2`)
 
@@ -750,7 +767,8 @@ int3-g64 when a bf16 or FP8 checkpoint is quantized at load, the int4-gs contain
 down may have its own (`--down-bits 3`; an int4-g64 container's rows narrower than the
 group stay per row). E8/IQ3 experts (fmt 6, whose input is rotated), int2 and fp8 have
 no device form and stay on the CPU (`[VK] tier colibri: experts in fmt 6/6/6 ... stay
-on the CPU`), and so does the MTP head's layer (int8). The tier serves every row count:
+on the CPU`). The MTP head's layer (its experts int8 in a converted container) is an extra
+layer ([above](#the-mtp-heads-layer-on-the-tier-coli_vk_tier_mtp)). The tier serves every row count:
 decode, the MTP and n-gram verify rows and the batched prefill, by blocks of 64 rows; the
 fixed set it replaces served S <= 4 only.
 
@@ -1409,8 +1427,9 @@ forward of the session and when another session takes the device, and goes up af
 pin or a state is restored.
 
 **Drafts and the MTP head.** colibri's speculative decode runs as before: the verify
-rows go through the chain, the MTP head stays on the CPU and reads the chain's final
-rows, and n-gram drafts work the same way. glm53 has no draft path.
+rows go through the chain, the MTP head runs on the CPU (its routed experts on the
+expert tier on a discrete GPU) and reads the chain's final rows, and n-gram drafts work
+the same way. glm53 has no draft path.
 
 **A lost device.** The forward that failed runs again on the CPU from its input (the
 chain keeps the caller's rows untouched until its last chunk is through), and the CPU

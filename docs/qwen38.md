@@ -375,7 +375,8 @@ step. It takes every expert form this engine reads: the int4-g64 sidecar's plana
 records (as int4 groups of 64 on the device), the release's FP8 with the 128x128
 block-scale bank (fmt 12, the block scale repeated over its rows), BF16. Decode and
 prefill both use it; an MTP verify's two rows take the device's per-row route, so
-they get a decode step's bits; the MTP head's own layer stays on the CPU. Every
+they get a decode step's bits; the MTP head's own layer goes on the tier as an extra
+layer on a discrete GPU (`COLI_VK_TIER_MTP`, [vulkan.md](vulkan.md#the-mtp-heads-layer-on-the-tier-coli_vk_tier_mtp)). Every
 expert's output joins its row in rank order, device or not.
 
 ```bash
