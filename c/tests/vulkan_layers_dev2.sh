@@ -472,9 +472,58 @@ ld2_deepseek_v41() {
   rm -f chain.usage chain-serve.usage chain-image.usage ptl-probe.log
 }
 
+# deepseek_v4: v4_chain_gate (the CPU's and the reference's ids, the teacher-forced rows,
+# the drafts, every logits row within V4_CHAIN_TOL) with the split forced; the second
+# device's chain ran (FAULT2_BACK=k: lost k of its frames before the end of a fault-free
+# run, 0 at its setup: the CPU runs its layers)
+ld2_v4_gate() {   # <tag> <n0> <n1> <fixture> <case> <env...>
+  local tag=$1 n0=$2 n1=$3 fx=$4 c=$5; shift 5
+  v4_chain_gate "$tag" "$fx" "$c" COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=$n0 COLI_VK_CHAIN_LAYERS2=$n1 COLI_VK_TIER_BALANCE=0 "$@"
+  [ -n "${FAULT2_BACK:-}" ] || ld2_ran deepseek_v4 "$tag" v4-vk.err
+}
+ld2_deepseek_v4() {
+  v4_chain_fixtures
+  local c fx A=ids:20,21,22,23,24,25,26,27,28,29,20,21,22:12 R=ids:20,21,22,23,50,51,52,20,21,22:12
+  local M=ids:30,31,32,33,34,35,60,61,30,31,32,33,34,35,36,37,38,39,40,41,30,31,32:12
+  for c in short compressed long; do
+    ld2_v4_gate "ld2 deepseek_v4 1 + 2" 1 2 deepseek_v4_tiny_t $c
+    ld2_v4_gate "ld2 deepseek_v4 2 + 1" 2 1 deepseek_v4_tiny_t $c
+  done
+  ld2_v4_gate "ld2 deepseek_v4 8 experts" 1 2 deepseek_v4_tiny_e8 long
+  ld2_v4_gate "ld2 deepseek_v4 2 output groups" 1 2 deepseek_v4_tiny_g2 long
+  ld2_v4_gate "ld2 deepseek_v4 a window of 4, ratios 4 and 2" 1 2 deepseek_v4_tiny_w4 long
+  ld2_v4_gate "ld2 deepseek_v4 an indexer of 64 heads of 128" 1 2 deepseek_v4_tiny_ix long
+  ld2_v4_gate "ld2 deepseek_v4 experts on both devices too" 1 2 deepseek_v4_tiny_e8 long COLI_VK_TIER_GB=0.00009
+  ld2_v4_gate "ld2 deepseek_v4 tier off" 1 2 deepseek_v4_tiny_t long COLI_VK_TIER=0 COLI_VK_DENSE=0
+  ld2_v4_gate "ld2 deepseek_v4 beside the per-matrix trunk" 1 2 deepseek_v4_tiny_t long COLI_VK_DENSE=1
+  ld2_v4_gate "ld2 deepseek_v4 prefill chunks of 7" 2 1 deepseek_v4_tiny_t long V4_PREFILL_CHUNK=7
+  ld2_v4_gate "ld2 deepseek_v4 chain chunks of 3" 1 2 deepseek_v4_tiny_e8 long COLI_VK_CHAIN_ROWS=3
+  ld2_v4_gate "ld2 deepseek_v4 V4_IDX_IDENTITY=1" 1 2 deepseek_v4_tiny_t long V4_IDX_IDENTITY=1
+  CHAINMODE=2 ld2_v4_gate "ld2 deepseek_v4 prompts only" 1 2 deepseek_v4_tiny_t long
+  ld2_v4_gate "ld2 deepseek_v4 n-gram drafts accepted and rejected" 1 2 deepseek_v4_tiny_t $A V4_DRAFT=4 V4_NGRAM_PARTIAL_KEEP=1
+  ld2_v4_gate "ld2 deepseek_v4 an n-gram draft rejected" 2 1 deepseek_v4_tiny_t $R V4_DRAFT=4 V4_NGRAM_PARTIAL_KEEP=1
+  ld2_v4_gate "ld2 deepseek_v4 n-gram drafts, a window of 4" 1 2 deepseek_v4_tiny_w4 $M V4_DRAFT=4 V4_NGRAM_PARTIAL_KEEP=1
+  ld2_v4_gate "ld2 deepseek_v4 V4_MTP=1" 1 2 deepseek_v4_tiny_t long V4_MTP=1 V4_DRAFT=3
+  # the compressed rows split on both devices (layer 1 ratio 4 on the first, layer 2 ratio 8 on the second)
+  ld2_v4_gate "ld2 deepseek_v4 KV split on both" 2 1 deepseek_v4_tiny_t long COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=2
+  [ "$(kv_hostparts deepseek_v4 v4-vk.err)" -gt 0 ] && [ "$(kv_hostparts "deepseek_v4 dev2" v4-vk.err)" -gt 0 ] ||
+    { cat v4-vk.err; fail "ld2 deepseek_v4 KV split on both: a device's split ran no host part"; }
+  # the second device lost: at its setup, mid-decode, in the prompt, between drafts
+  FAULT2_BACK=0 ld2_v4_gate "ld2 deepseek_v4 second device lost at its setup" 1 2 deepseek_v4_tiny_t long
+  FAULT2_BACK=3 ld2_v4_gate "ld2 deepseek_v4 second device lost mid-decode" 1 2 deepseek_v4_tiny_t long
+  FAULT2_BACK=30 ld2_v4_gate "ld2 deepseek_v4 second device lost in the prompt" 1 2 deepseek_v4_tiny_t long COLI_VK_CHAIN_ROWS=7
+  FAULT2_BACK=10 ld2_v4_gate "ld2 deepseek_v4 second device lost between drafts" 1 2 deepseek_v4_tiny_w4 $M V4_DRAFT=4 V4_NGRAM_PARTIAL_KEEP=1
+  # served: the pin, its extension, a read-only prompt and a shorter one
+  COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=1 COLI_VK_CHAIN_LAYERS2=2 V4_SERVE_EXPECT='deepseek_v4 dev2 chain: [1-9][0-9]* forwards' \
+    v4_chain_serve deepseek_v4_tiny_t
+  rm -rf deepseek_v4_tiny_t deepseek_v4_tiny_e8 deepseek_v4_tiny_g2 deepseek_v4_tiny_w4 deepseek_v4_tiny_ix chain.usage
+  rm -f cpu.f32 vk.f32 v4-*.f32 v4-*.json v4-*.err v4-tf.txt
+}
+
 family_layers_dev2() {
   export OMP_NUM_THREADS=2
   make qwen36 qwen38 olmoe mimo inkling colibri glm53 kimi_k3 deepseek_v41 tests/test_vk_chain VK=1
+  make deepseek-v4 VK=1
   COLI_VK_DEV2=0 ./tests/test_vk_chain shaders/qmatmul.spv | tee vk_chain.log
   tail -1 vk_chain.log | grep -qx PASS || fail "the chain's ops on two devices"
   ld2_qwen36
@@ -486,6 +535,7 @@ family_layers_dev2() {
   ld2_glm53
   ld2_kimi_k3
   ld2_deepseek_v41
+  ld2_deepseek_v4
   unset OMP_NUM_THREADS
 }
 family_layers_dev2_sanitize() {
