@@ -396,6 +396,17 @@ of them on the device the way a GPU-equipped PC should use its card:
   than 1.25 x their heat + 4). A promotion copies the expert's bytes once on the engine thread
   (at most `COLI_VK_TIER_RATE` per token, 16) and an uploader thread writes it to
   the device; it serves from the next layer step on.
+- **A fresh install starts warm.** A model downloaded a minute ago has no history,
+  so its first runs would fill the tier one routing at a time. `coli setup` copies a
+  starting history into the model folder when it has none, for the catalog models
+  that ship one (`c/profiles/<catalog id>.coli_usage`: Qwen3.6-35B-A3B and Qwen3.8
+  Flash Next). It comes from a calibration session (16 prompts: chat in five
+  languages, code, reasoning, JSON), and the engine adds every run's routing to it,
+  so your own use takes over; an existing history is never replaced. Measured on a
+  Radeon 780M with Qwen3.6-35B-A3B, two prompts outside the calibration set, 128
+  tokens, two rounds each: the first run went from 5.9-6.2 tok/s without it to
+  10.9-11.1 with it, the device serving 92-94% of the routed experts instead of
+  15-16%, for a warm start of about 3 s.
 - **The device and the CPU compute at the same time.** For each MoE layer step the
   routed (row, expert) pairs whose expert is resident go to the device as ONE
   submit that nobody waits for: per expert, its rows run gate+up and the activation
@@ -959,6 +970,44 @@ a prefill's worth of CPU work, and runs on the CPU from there. Only a state the 
 not describe (a turn with an image) cannot be rebuilt: that stops the engine with a
 message. `COLI_VK_CHAIN_FAULT=n` fakes the loss at the n-th frame (the tests use it).
 
+**Qwen3.8 on a partial chain** ([A partial chain](#a-partial-chain); `vkc_fit`,
+`COLI_VK_CHAIN_LAYERS`). When its layers do not all fit the device,
+qwen38's chain takes the first N. At startup, before any upload, the dense-host pass and the
+expert tier, the fit counts each layer's matrices in the format they go up in (the trunk's
+int8 rows, bf16 or f32) with its shared expert's gate; its state at its starting size (a
+DeltaNet layer's recurrent state and conv ring with a verify's first copy of each, an
+attention layer's K/V and index-key mirrors at the KV split's floor of three blocks and its
+rows of the chunk's K/V read-back, the PLE ring with the PLE layer); and its parameters. The
+fixed part is the scratch of one 256-row chunk. The tail is the final mixer, lm_head and the
+MTP head's matrices. A partial chain is placed then and there, layer by layer, so the tier
+sizes itself after it. The full chain keeps its setup at the first forward, so with every
+layer fitting the uploads and the tier's budget are the ones before. A forward runs the N
+layers chunk by chunk on the device. After layer N-1 every row's four hyper-connection
+streams come back to the host once per chunk, and the CPU runs layers N.. over all the
+rows, the final mixer and lm_head. The device's layers keep their DeltaNet, conv, K/V,
+index-key and pooled-key state on the device. A verify copies their state into the chain's
+slots. The CPU's layers keep theirs on the host, and the CPU's copies roll them back. The PLE
+ring and its n-gram history go with whichever side holds the PLE layer. The MTP head runs
+outside the chain and reads the final streams from whichever side ran the last layer: with a
+partial chain its matrices stay on the CPU, with the full chain and the per-matrix path on
+they answer from the device one at a time, as before. A lost
+device rebuilds only the device's layers from the prefix record. The vision tower's rows and
+the n-gram table stay on the host as before. With `COLI_VK_DENSE_HOST=0` only the N layers'
+host copies go (with the full chain fitted, each layer once all of it is on the device). The
+tiny fixture on Lavapipe under `COLI_VK_DEVICE_CAP_MB=58.758690` with
+`COLI_VK_TIER_RESERVE_GB=0.04`:
+
+```
+[VK] qwen38 chain fit: free 61612952 B, reserve 42949672 B, fixed 18569232 B (the engine's 1529872 B, the pools' 17039360 B), tail 8960 B, layers 47664 92768 24112 92768 B, matrices 27080 21184 16832 21184 B
+[VK] qwen38 chain: 1 of 4 layers on the device (0.0 MiB), 3 on the CPU, the head and what goes with it (0.0 MiB) on the CPU (free 58.8 MiB, reserve 41.0 MiB)
+[VK] qwen38 chain: 1 of 4 layers placed: 27080 B of matrices on the device (the fit counted 27080 B for these layers), chain buffers 4210736 B, device memory held 4329472 B
+[VK] qwen38 chain: 1 layers on the device (0 QSA), 18 matrices resident, 0.0 MiB of parameters; the CPU runs the other layers, the final mixer and lm_head
+```
+
+`tests/vulkan_engines.sh partial-qwen38` (and `-sanitize`) covers it on Lavapipe. No
+Qwen3.8 checkpoint ran on a partial chain and no discrete GPU was available, so what N a
+real card takes for the 4.1 GiB trunk is not measured.
+
 **The shaders** (`shaders/chain_*.comp`, each documented at its top): RMSNorm over
 segments (rows, heads with a gate between them, streams with a weight slice each,
 zero-centred or not, L2); RoPE from a host table (the CPU's own cosf/sinf at the CPU's
@@ -1324,6 +1373,41 @@ a quantized KV cache (KV8, KV_TQ), PILOT, LOOKA, the exact verify of
 dense matrices), and geometries past the ops' limits. With the chain on, the per-matrix
 switches (`COLI_VK_DENSE`, `COLI_VK_ATTN`, `COLI_VK_DEV2`) keep working beside it: the
 chain's tensors are their device copies where they made one.
+
+**A partial chain** ([the fit](#a-partial-chain)). GLM-5.2's dense part is 9.9 GB, more
+than an 8 or 12 GB card holds. Both engines decide N right after the load, before the
+chain's pipelines take their first blocks and before colibri's pins and `cap_for_ram`,
+glm53's expert cache and the tier size themselves, and place layers 0..N-1 one at a time
+(`COLI_VK_CHAIN_LAYERS=n` forces N). A forward runs all
+its chunks through the N device layers; then the residual rows (colibri) or the hc_mult
+streams (glm53) come back to the host once per chunk, and the CPU's own layer loop runs
+layers N..L-1, the final norm and the head on them. When colibri's layer N is a shared
+DSA indexer layer, the selection made by the device's last full layer comes back with
+the rows (1 + `index_topk` ints a row) into the CPU's, so layer N reads the same positions
+it would on the device. The KV mirror, its watermarks, the KV split and glm53's KDA state
+on the device cover the N layers; the CPU layers' KV rows and KDA state are the host's
+alone. After a lost device colibri runs the forward again on the CPU, and glm53 rebuilds
+the KDA state of the device's layers only (the CPU layers ran every position already).
+With `COLI_VK_DENSE_HOST=0` only the N layers drop their host copies, each once all of it
+reached the device; colibri's `resident dense`, and with it the pins and `cap_for_ram`,
+counts only what was dropped, and glm53's expert cache sizes itself after them. `coli
+plan` predicts glm53's N from the same numbers (`_glm53_chain_layout` in
+`resource_plan.py`, checked against the engine's fit line); colibri's dense formats come
+from its command line, which the plan does not see, so it gives colibri no device-only
+credit and no N. lm_head,
+and colibri's MTP layer and eh_proj, go to the device only with every layer there and
+room for them. Until then the per-matrix path (`COLI_VK_DENSE`, `COLI_VK_ATTN`) multiplies
+on the device only what the chain placed, and the line
+`[VK] <engine> chain: N of L layers held at exit: M B of matrices on the device` says so at
+exit. The `partial-glm` and `partial-glm-sanitize` families
+(`tests/vulkan_partial_glm.sh`) check it on the tiny fixtures, with glm_tiny's shared
+indexer layers and a six-layer GLM-5.3 whose KDA and MLA layers alternate, so MLA layers
+run on both sides of the handoff. On Lavapipe every configuration gives the CPU's tokens,
+every logits row within 6.7e-7 (colibri, 43 configurations) and 7.8e-7 (glm53, 38) of the
+largest logit, and `coli plan` predicts glm53's N, free, per-layer and fixed bytes as the
+engine prints them under the four caps it is aimed with; the sanitized runs report no
+diagnostic. No discrete GPU was available, and the 780M box was busy with other work: the
+fit on a real card's budget is not measured.
 
 **Arithmetic.** f32 activations throughout, as the CPU's f32 paths: colibri's CPU int8
 dot (`IDOT`, on by default for int8 and, from two rows, int4 rows) rounds activations,
@@ -2414,6 +2498,9 @@ predict a layer more than the engine places.
 | deepseek_v4 | the hc_mult streams; DSpark's taps of the last three layers come from whichever side ran them | yes |
 | qwen36 (Qwen3.6, Qwen3-Coder, Qwen3.8-27B, Clef) | the residual rows alone; a prompt-lookup verify rolls each side back with its own copies (the device's DeltaNet slots, the CPU's snapshots) ([qwen36](#the-dense-chain-vk_chainc)) | yes |
 | olmoe | the residual rows alone; `PILOT` keeps prefetching the next layers from the chain's rows ([olmoe](#olmoe-and-inkling)) | yes |
+| qwen38 | the four hyper-connection streams of every row; the MTP head reads the final streams from whichever side ran the last layer, and the PLE ring and n-gram history stay with the PLE layer's side | yes |
+| colibri (GLM-5.2) | the residual rows; when layer N is a shared DSA indexer layer, the selection the device's last full layer made (1 + `index_topk` ints a row) | yes ([GLM](#glm-52-and-glm-53-flash-on-the-chain)) |
+| glm53 (GLM-5.3 Flash) | the hc_mult streams | yes ([GLM](#glm-52-and-glm-53-flash-on-the-chain)) |
 
 **`COLI_VK_DEVICE_CAP_MB=n`** (tests) makes the device hold at most n MiB of device-local
 memory (a fraction is taken): every allocation of the backend and the chain (tensors, the
