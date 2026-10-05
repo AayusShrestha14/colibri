@@ -976,6 +976,203 @@ def _glm53_chain_layout(info, env, vulkan):
 _VK_CHAIN_LAYOUT["glm53"] = _glm53_chain_layout
 
 
+def _vk_rows(env, default):
+    """vkc_fit_rows(default): COLI_VK_CHAIN_ROWS when a number, else the engine's block."""
+    value = (env.get("COLI_VK_CHAIN_ROWS") or "").strip()
+    if not value or value == "auto":
+        return default
+    match = re.match(r"\s*([+-]?\d+)", value)
+    rows = int(match[1]) if match else 0
+    return min(max(rows, 1), 65535)
+
+
+def _v41_chain_layout(info, env, vulkan):
+    """deepseek_v41_chain.h: v41c_layer_bytes, v41c_fixed_bytes, v41c_tail_bytes, with the
+    device-only placement's extra matrices when COLI_VK_DENSE_HOST may drop the host copies
+    (v41c_fit_now runs at v41_dho_open then)."""
+    root = info.get("config") or {}
+    c = root.get("text_config") or root
+    try:
+        L = int(c.get("n_layers") or c["num_hidden_layers"])
+        D = int(c.get("dim") or c["hidden_size"])
+        nh = int(c.get("n_heads") or c["num_attention_heads"])
+        hd, QL, ol = int(c["head_dim"]), int(c["q_lora_rank"]), int(c["o_lora_rank"])
+        og = int(c.get("o_groups") or 1)
+        inter = int(c.get("moe_inter_dim") or c["moe_intermediate_size"])
+        rd = int(c.get("rope_head_dim") or c["qk_rope_head_dim"])
+        W = int(c.get("window_size") or c.get("sliding_window") or 128)
+        ratios = [int(r) for r in c["compress_ratios"][:L]]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if L < 1 or len(ratios) < L or og < 1:
+        return None
+    H = int(c.get("hc_mult") or 1)
+    IH0, ID0 = int(c.get("index_n_heads") or 0), int(c.get("index_head_dim") or 0)
+    K = max(int(c.get("index_topk") or 0), 0)
+    kv_source = set(c.get("kv_source_layers") or c.get("kv_source_layer_ids") or [])
+    index_source = set(c.get("index_source_layers") or c.get("index_source_layer_ids") or [])
+    targets = len(c.get("dspark_target_layer_ids") or [])
+    maxpos = int(c.get("max_seq_len") or c.get("max_position_embeddings") or 4096)
+    match = re.match(r"\s*([+-]?\d+)", env.get("CTX") or "")
+    if match and 2 <= int(match[1]) < maxpos:
+        maxpos = int(match[1])
+    nm, hr, HD = (2 + H) * H, 2 * H + H * H, H * D
+    # the engram tables (a sidecar the scan does not read): the layers whose wkv is there
+    engram = {}
+    for tensor in info.get("dense_tensors", []):
+        name = _text_weight_name(tensor["name"])
+        found = re.fullmatch(r"layers\.(\d+)\.engram\.wkv\.weight", name)
+        if found and isinstance(tensor.get("shape"), list) and len(tensor["shape"]) == 2:
+            engram[int(found[1])] = tensor["shape"]
+    host = _vk_flag(env, "COLI_VK_DENSE_HOST")
+    dho = host is None or host == 0
+    prefill = _vk_flag(env, "COLI_VK_CHAIN") == 2
+    views = prefill and dho
+    rows = _vk_rows(env, 512)
+    ring = _vk_rows(env, 512)
+
+    def t(fmt, columns, out):
+        return vk_tensor_bytes(fmt, columns, out, 32 if fmt == 12 else 0)
+    layers = []
+    for i in range(L):
+        r = ratios[i]
+        b = 2 * t(10, HD, nm) + t(12, D, QL) + t(12, QL, nh * hd) + t(12, D, hd)
+        b += t(12, nh * hd // og, og * ol) + (og * t(12, nh * hd // og, ol) if views else 0)
+        b += t(12, og * ol, D) + 2 * t(12, D, inter) + t(12, inter, D)
+        if i in kv_source:
+            b += t(11, D, hd) + (t(11, D, hd) if r > 1 else 0) + t(11, hd, ID0)
+        if i in index_source and (r > 0 or dho):
+            b += t(12, QL, IH0 * ID0) + t(11, D, IH0)
+        if i in engram:
+            b += t(12, engram[i][1], engram[i][0])
+        b += vk_buf_bytes((W + ring) * hd * 4)
+        floats = 2 * D + QL + hd + nh + 2 * (3 + nm)
+        if i in kv_source and r > 0:
+            first = min(64, max(maxpos // r, 1))
+            if r > 1:
+                b += vk_buf_bytes(2 * r * hd * 4)
+            b += vk_buf_bytes(first * hd * 4) + vk_buf_bytes(first * ID0 * 4)
+            floats += hd + ID0 + (rows // r) * (hd + ID0) + (2 * r * hd if r > 1 else 0)
+        if i in engram:
+            floats += 2 * H * D
+        floats += min(rows, W) * hd
+        layers.append(b + 4 * floats)
+    # v41c_scratch's counting pass at `rows` rows, the context of the window and them
+    IH, ID = IH0 if IH0 > 0 else 1, ID0 if ID0 > 0 else 1
+    rmax = max([1] + [ratios[i] for i in kv_source if i < L])
+    ew = next(iter(engram.values()))[1] if engram else 1
+    T = targets if targets > 0 else 1
+    wcap, n = W + rows, rows
+    counts = [n * HD, n * HD, n * nm, n * hr, n * hr, n * D, n * D, n * QL, n * QL, n * nh * hd, n * hd,
+              n * nh * hd, n * og * ol, n * D, n * hd, n * hd, n * IH * ID, n * IH, n * wcap, n * wcap,
+              n * (W + K), (n + rmax) * 2 * rd, n * ew, n * D * (H + 1), n * inter, n * inter, n * inter,
+              n * D, n * D, n * T * D, n * HD, n * hr, n * D]
+    fixed = sum(4 * (x if x else 1) for x in counts)
+    _, dense = _vk_chain_dense("deepseek_v41", env, vulkan)
+    tail = 0
+    if dense:
+        tail = t(11, D, int(c.get("vocab_size") or 0)) + L * t(11, D, int(c.get("n_routed_experts") or 0))
+        if prefill and not dho:
+            tail += L * og * t(12, nh * hd // og, ol)
+    return VkChainLayout(layers, fixed, tail)
+
+
+def _k3_vk_fmt(tensors, name, out, columns, bits, explicit):
+    """kimi_k3.c w_load as the device takes the result (k3_vk_fmt): (fmt, group)."""
+    tensor = tensors.get(name)
+    if tensor is not None and tensor["dtype"] == "U8":   # a repacked container: its own bits
+        if tensor["size"] == out * columns:
+            return (4, 64) if explicit and bits == 4 and columns % 64 == 0 else (1, 0)
+        return (4, 64)
+    if bits >= 32:
+        return (10, 0)
+    if bits <= 4 and columns % 64 == 0:
+        return (4, 64)
+    return (1, 0)
+
+
+def _k3_chain_layout(info, env, vulkan):
+    """kimi_k3_chain.h: k3c_layer_bytes, k3c_fixed_bytes, the head as the tail."""
+    root = info.get("config") or {}
+    c = root.get("text_config") or root
+    la = c.get("linear_attn_config") or {}
+    try:
+        L, D, vocab = int(c["num_hidden_layers"]), int(c["hidden_size"]), int(c["vocab_size"])
+        first_dense, dense_inter = int(c["first_k_dense_replace"]), int(c["intermediate_size"])
+        nh, QL, KL = int(c["num_attention_heads"]), int(c["q_lora_rank"]), int(c["kv_lora_rank"])
+        nope, R, V = int(c["qk_nope_head_dim"]), int(c["qk_rope_head_dim"]), int(c["v_head_dim"])
+        E, inter, LT = int(c["num_experts"]), int(c["moe_intermediate_size"]), int(c["routed_expert_hidden_size"])
+        shared, res_bs = int(c["num_shared_experts"]), int(c["attn_res_block_size"])
+        heads, hd, conv = int(la["num_heads"]), int(la["head_dim"]), int(la["short_conv_kernel_size"])
+        kda = {int(v) - 1 for v in la["kda_layers"]}
+    except (KeyError, TypeError, ValueError):
+        return None
+    if L < 1 or res_bs < 1:
+        return None
+    P = heads * hd
+
+    def number(name, default):
+        match = re.match(r"\s*([+-]?\d+)", env.get(name) or "")
+        return int(match[1]) if match else default
+    explicit = (env.get("K3_BITS") is not None)
+    bits, mbits, hbits = number("K3_BITS", 4), number("K3_MLA_BITS", 8), number("K3_HEAD_BITS", 8)
+    tensors = {_text_weight_name(tensor["name"]): tensor for tensor in info.get("dense_tensors", [])}
+
+    def w(name, out, columns, b):
+        fmt, group = _k3_vk_fmt(tensors, name, out, columns, b, explicit)
+        return vk_tensor_bytes(fmt, columns, out, group)
+    rows = _vk_rows(env, 256)
+    layers = []
+    for i in range(L):
+        p = f"model.layers.{i}."
+        b, floats = 0, 4 * D
+        if i in kda:
+            for part in ("q", "k", "v", "g"):
+                b += w(p + f"self_attn.{part}_proj.weight", P, D, bits)
+            b += w(p + "self_attn.o_proj.weight", D, P, bits)
+            b += vk_tensor_bytes(10, D, hd) + vk_tensor_bytes(10, hd, P) + vk_tensor_bytes(10, D, heads)
+            b += vk_buf_bytes(3 * P * conv * 4) + vk_buf_bytes(heads * hd * hd * 4)
+            floats += 3 * P * conv + heads + P + hd
+        else:
+            b += (w(p + "self_attn.q_a_proj.weight", QL, D, mbits) +
+                  w(p + "self_attn.q_b_proj.weight", nh * (nope + R), QL, mbits) +
+                  w(p + "self_attn.kv_a_proj_with_mqa.weight", KL + R, D, mbits) +
+                  w(p + "self_attn.kv_b_proj.weight", nh * (nope + V), KL, mbits) +
+                  w(p + "self_attn.o_proj.weight", D, nh * V, mbits) +
+                  w(p + "self_attn.g_proj.weight", nh * V, D, mbits))
+            b += vk_buf_bytes(rows * KL * 4) + (vk_buf_bytes(rows * R * 4) if R > 0 else 0)
+            floats += QL + KL + rows * (KL + R)
+        if i >= first_dense:
+            moe, si = p + "block_sparse_moe.", inter * shared
+            b += vk_tensor_bytes(10, D, E)
+            b += (w(moe + "routed_expert_down_proj.weight", LT, D, bits) + w(moe + "routed_expert_up_proj.weight", D, LT, bits) +
+                  w(moe + "shared_experts.gate_proj.weight", si, D, bits) + w(moe + "shared_experts.up_proj.weight", si, D, bits) +
+                  w(moe + "shared_experts.down_proj.weight", D, si, bits))
+            floats += LT
+        else:
+            b += (w(p + "mlp.gate_proj.weight", dense_inter, D, bits) + w(p + "mlp.up_proj.weight", dense_inter, D, bits) +
+                  w(p + "mlp.down_proj.weight", D, dense_inter, bits))
+        layers.append(b + 4 * floats)
+    # k3c_scratch's counting pass at `rows` rows, the MLA scratch as k3c_chunk_rows counts
+    # it, and the output mix's parameters
+    nbmax = (L + res_bs - 1) // res_bs
+    MI = max(inter * shared, dense_inter)
+    n = rows
+    counts = [n * D, n * nbmax * D, n * D, n * D, n * D, 3 * n * P, n * 3 * P, n * hd, n * P, n * heads, n * P, n * P,
+              n * nh * V, n * E, n * LT, n * MI, n * MI, n * MI, n * D, n * LT, n * D, n * D, n * E, n * LT,
+              n * (KL + R), n * D, vocab, n * LT]
+    fixed = sum(4 * (x if x else 1) for x in counts) + (4 * n * R if R > 0 else 0)
+    if any(i not in kda for i in range(L)):
+        fixed += 4 * n * (QL + nh * (nope + R) + (KL + R) + 2 * nh * KL + nh * V)
+    fixed += 8 * D
+    tail = w("lm_head.weight", vocab, D, hbits)
+    return VkChainLayout(layers, fixed, tail)
+
+
+_VK_CHAIN_LAYOUT["deepseek_v41"] = _v41_chain_layout
+_VK_CHAIN_LAYOUT["kimi"] = _k3_chain_layout
+
+
 def _analysis_signature(shards, config_path):
     parts = [f"v{_ANALYSIS_CACHE_VERSION}"]
     st = config_path.stat()
