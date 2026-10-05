@@ -1159,13 +1159,16 @@ and the CPU runs on from where the host's caches end. The device's layers keep t
 mirrors behind the watermarks above; the CPU's layers keep their caches on the host
 only, and nothing of them, of the head or of the tower goes up through the per-matrix
 path. A layer that does not fully reach the device is freed and the chain keeps the
-layers before it. With `COLI_VK_DENSE_HOST=0` only the N layers drop their host copies.
+layers before it. With `COLI_VK_DENSE_HOST=0` only the N layers drop their host copies,
+and `coli plan` (`resource_plan.py`, MiMo's layout) predicts the same N from the
+checkpoint's header and config and credits those layers alone.
 `tests/vulkan_engines.sh partial-inkling-mimo` gates it on the fixture (every N from 0
 to 6, text and picture, the three dense forms, N from a device cap and from an upload
 failing inside a layer, chunks of 3 rows, one token at a time, prompts only, the KV
 split, a lost device, device-only weights, serve sessions and the prefix-reuse tests)
-on the CPU's tokens and logits within 1e-4 of the largest. Lavapipe only: no discrete
-GPU was available, so the fit's choice on a real card is not measured.
+on the CPU's tokens and logits within 1e-4 of the largest, and `coli plan`'s numbers on
+the engine's (free, per-layer and fixed bytes, N) under each cap. Lavapipe only: no
+discrete GPU was available, so the fit's choice on a real card is not measured.
 
 **The default.** The chain's speed on a real MiMo model is not measured: no MiMo
 checkpoint is on the test box (the smallest, Flash, has 309B parameters). The chain is
@@ -1322,12 +1325,15 @@ layer by layer, as its own forward does, then the head and the per-position head
 device's layers keep their mirrors, rings and convolution states as above; the CPU's
 layers keep theirs on the host, so a CPU step lowers and a lost device rebuilds the
 device's layers alone (`rebuilding the state of P positions ... (the device's layers;
-the CPU's have theirs)`). `tests/vulkan_engines.sh partial-inkling-mimo` gates it on the
-tiny fixtures (every N from 0 to 8, the dense-int4g64 container, the expert containers,
-bf16, D = 6144 with N from 0 to 2, N from a device cap and from an upload failing inside
-a layer, chunks of 3, prompts only, the KV split, a lost device, device-only weights,
-serve sessions and the prefix-reuse and dashboard tests) on the CPU's tokens and every
-forward's logits within 1e-4 of the largest, on Lavapipe; no discrete GPU was available.
+the CPU's have theirs)`). `coli plan` (`resource_plan.py`, inkling's layout, which reads
+the dense-int4g64 container's forms when it is there) predicts the same N.
+`tests/vulkan_engines.sh partial-inkling-mimo` gates it on the tiny fixtures (every N
+from 0 to 8, the dense-int4g64 container, the expert containers, bf16, D = 6144 with N
+from 0 to 2, N from a device cap and from an upload failing inside a layer, chunks of 3,
+prompts only, the KV split, a lost device, device-only weights, serve sessions and the
+prefix-reuse and dashboard tests) on the CPU's tokens and every forward's logits within
+1e-4 of the largest, and `coli plan`'s numbers on the engine's under each cap, on
+Lavapipe; no discrete GPU was available.
 
 **Inkling: not measured.** No Inkling checkpoint runs on the box (the model is 975B),
 so its integrated-GPU default is off (`COLI_VK_CHAIN_UNMEASURED`: the `[VK]` line says
