@@ -20,8 +20,8 @@
 #            primary device's sub-batches (MiMo keeps no history: its prompt goes in
 #            blocks of four rows instead, MIMO_CHUNK=4, and what the first blocks
 #            promoted to the second device meets the next ones there);
-#   evict    the second device full too (COLI_VK_EXPERTS2=2): evictions, no failed
-#            upload;
+#   evict    the second device full too (COLI_VK_EXPERTS2=2, or D2_E2): evictions, no
+#            failed upload;
 #   fault    the second device's second batch fails (COLI_VK_DEV2_FAULT=2): the CPU's
 #            tokens, the second device stopped and its experts went back to the CPU,
 #            the primary device still served.
@@ -52,7 +52,7 @@ d2_case() {
   local D2_X=1
   case $kind in
     big)   x=(COLI_VK_TIER_GEMM_ROWS=2); D2_X=4 ;;
-    evict) x=(COLI_VK_EXPERTS2=2) ;;
+    evict) x=(COLI_VK_EXPERTS2=${D2_E2:-2}) ;;
     fault) x=(COLI_VK_DEV2_FAULT=2) ;;
   esac
   $run cpu.tok cpu.log "$@"
@@ -74,8 +74,8 @@ d2_case() {
         { grep -a '\[VK\] tier' vk.log; fail "$tag big: no batch of the second device beside a prompt step"; } ;;
     evict)
       d2_check "$eng" vk.log "$tag $kind"
-      echo "$l" | grep -qE ': resident [0-2] \(budget 2,' || { grep -a '\[VK\] tier' vk.log; fail "$tag evict: the second device is not held to two experts"; }
-      [ "$(tier_evictions "$eng" vk.log)" -gt 0 ] || { grep -a '\[VK\] tier' vk.log; fail "$tag evict: no eviction"; }
+      echo "$l" | grep -qE ": resident [0-${D2_E2:-2}] \\(budget ${D2_E2:-2}," || { grep -a '\[VK\] tier' vk.log; fail "$tag evict: the second device is not held to ${D2_E2:-2} experts"; }
+      [ "${D2_NOEVICT:-0}" = 1 ] || [ "$(tier_evictions "$eng" vk.log)" -gt 0 ] || { grep -a '\[VK\] tier' vk.log; fail "$tag evict: no eviction"; }
       [ "$(tier_failed "$eng" vk.log)" = 0 ] || { grep -a '\[VK\] tier' vk.log; fail "$tag evict: an upload failed"; } ;;
     fault)
       grep -qa "^\[VK\] tier $eng: a batch on the second device failed, its experts go back to the CPU" vk.log &&
@@ -217,7 +217,9 @@ family_dev2() {
     d2_case olmoe d2_olmoe "dev2 olmoe" $k
     d2_case inkling d2_inkling "dev2 inkling" $k
     d2_case colibri d2_colibri "dev2 colibri" $k
-    d2_case glm53 d2_glm53 "dev2 glm53" $k
+    # glm53's fixture routes four experts in all, and in six tokens none gets the heat to
+    # displace another (LFRU's margin): its evict case checks the bound and the uploads
+    D2_E2=1 D2_NOEVICT=1 d2_case glm53 d2_glm53 "dev2 glm53" $k
   done
   # (colibri's own registry on the second device, with the tier off, is the glm family's)
   # without COLI_VK_DEV2 nothing of the second device appears
