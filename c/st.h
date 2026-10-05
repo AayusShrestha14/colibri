@@ -454,7 +454,7 @@ static void st_fmt_stamp_ingest(shards *S, jval *root, const char *shard_path) {
         fprintf(stderr, "%s: __metadata__[\"colibri.fmt\"] is not a JSON string -- malformed stamp, refusing (untrusted container)\n",
                 shard_path); exit(1); }
     char *arena2 = NULL;
-    jval *inner = json_parse(stamp->str, &arena2);
+    jval *inner = json_parse_checked(stamp->str);
     if (!inner || inner->t != J_OBJ) {
         fprintf(stderr, "%s: __metadata__[\"colibri.fmt\"] does not parse as a JSON object -- malformed stamp, refusing (untrusted container)\n",
                 shard_path); exit(1); }
@@ -581,7 +581,7 @@ static void st_index_load(st_index *ix, const char *dir) {
     char *text = malloc((size_t)size + 1);
     if (!text || fread(text, 1, (size_t)size, f) != (size_t)size) { free(text); fclose(f); return; }
     text[size] = 0; fclose(f);
-    ix->root = json_parse(text, &ix->arena);
+    ix->root = memchr(text, 0, (size_t)size) ? NULL : json_parse_checked(text);
     free(text);
     jval *map = ix->root ? json_get(ix->root, "weight_map") : NULL;
     if (!map || map->t != J_OBJ) { json_free(ix->root); ix->root = NULL; free(ix->arena); ix->arena = NULL; return; }
@@ -721,7 +721,9 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
         hdr[hlen] = 0;
         int64_t data_start = 8 + (int64_t)hlen;
         char *arena = NULL;
-        jval *root = json_parse(hdr, &arena);
+        /* A partial object must not index weights or authorize an overlay.
+         * Header padding is JSON whitespace; embedded NUL is not padding. */
+        jval *root = memchr(hdr, 0, (size_t)hlen) ? NULL : json_parse_checked(hdr);
         if (!root || root->t != J_OBJ) {
             fprintf(stderr, "%s: safetensors header is not a JSON object\n", files[fi]); exit(1); }
         st_fmt_stamp_ingest(S, root, files[fi]);
