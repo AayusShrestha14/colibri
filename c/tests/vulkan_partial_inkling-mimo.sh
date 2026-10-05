@@ -87,6 +87,7 @@ ptl_cap() {
   local eng=$1 tag=$2 probe=$3 k=$4; shift 4
   local cap; cap=$(PTL_PROBE_CAP_MB=256 ptl_calc cap "$eng" "$probe" "$k") || { cat "$probe"; fail "$tag: no cap from the probe"; }
   PTL_CAP=$cap "$@"
+  PTL_CAP_LAST=$cap
   local p; p=$(ptl_calc predict "$eng" vk.log) || { cat vk.log; fail "$tag: no fit line"; }
   [ "$p" = "$k" ] || { grep -a "^\[VK\] $eng chain" vk.log; fail "$tag: under COLI_VK_DEVICE_CAP_MB=$cap the rule says $p layers, not $k"; }
   ptl_check_n "$eng" vk.log "$k" "$tag"
@@ -96,6 +97,44 @@ ptl_cap() {
 # The reserve the capped runs keep for a chunk's scratch and the frames' staging (the tier
 # takes the rest of the device): 0.04 GiB.
 PTL_RESERVE=0.04
+# ptl_plan <engine> <tag> <fixture> <log> <env...>: coli plan's prediction (resource_plan.py,
+# vk_chain_fit) for the same device and settings, from the checkpoint's header and config
+# alone: the engine's free bytes, per-layer bytes, fixed bytes, tail and N. The tiny
+# inkling's config says model_type inkling_text, which the family registry does not
+# take: the plan reads a copy that says inkling (the real checkpoint's), the tensors linked.
+ptl_plan() {
+  local eng=$1 tag=$2 fx=$3 log=$4; shift 4
+  $PY - "$eng" "$fx" "$log" "$@" <<'PY' || fail "$tag: coli plan predicts otherwise"
+import json, os, re, shutil, sys, tempfile
+sys.path.insert(0, ".")
+import resource_plan as rp
+eng, fx, log = sys.argv[1], sys.argv[2], sys.argv[3]
+env = dict(a.split("=", 1) for a in sys.argv[4:] if "=" in a)
+env.update(COLI_VULKAN="1", COLI_VK_CHAIN="1")
+lines = open(log, errors="replace").read().splitlines()
+f = [l for l in lines if l.startswith(f"[VK] {eng} chain fit: ")][-1]
+num = lambda key: int(re.search(key + r" (\d+) B", f)[1])
+layers = [int(x) for x in re.search(r"layers((?: \d+)*) B", f)[1].split()]
+n = int(re.findall(rf"\[VK\] {eng} chain: (\d+) of \d+ layers on the device", "\n".join(lines))[0])
+with tempfile.TemporaryDirectory() as tmp:
+    model = fx
+    config = json.load(open(os.path.join(fx, "config.json")))
+    if config.get("model_type") == "inkling_text":
+        model = os.path.join(tmp, "model")
+        os.mkdir(model)
+        json.dump(dict(config, model_type="inkling"), open(os.path.join(model, "config.json"), "w"))
+        for name in os.listdir(fx):
+            if name != "config.json":
+                os.symlink(os.path.abspath(os.path.join(fx, name)), os.path.join(model, name))
+    fit = rp.vk_chain_fit(rp.analyze_model(model), eng, env, {"type": "cpu"})
+ok = fit is not None and (fit["layers"], fit["fixed"], fit["free"], fit["n"]) == (layers, num("fixed"), num("free"), n)
+if fit is None:
+    sys.exit(f"   coli plan: no fit for {eng}")
+print(f"   coli plan: N = {fit['n']} of {fit['L']} ({'as the engine' if ok else 'the engine: %d' % n}), "
+      f"layers {'= the engine' if fit['layers'] == layers else fit['layers']}, fixed {fit['fixed']} B, free {fit['free']} B")
+sys.exit(0 if ok else 1)
+PY
+}
 
 ptl_inkling() {
   ptl_ink_fixtures
@@ -123,7 +162,22 @@ ptl_inkling() {
   SNAP=tiny_inkling ./inkling 8 0 $R > cpu.log 2>&1 || true
   PTL_CAP=256 ink_cap_run; cp vk.log ptl-probe.log
   ptl_check_n inkling ptl-probe.log 8 "partial inkling cap probe"
-  for k in 1 4 7; do ptl_cap inkling "partial inkling cap for N=$k" ptl-probe.log $k ink_cap_run; echo "OK partial inkling cap for N=$k: tokens = CPU"; done
+  for k in 1 4 7; do
+    ptl_cap inkling "partial inkling cap for N=$k" ptl-probe.log $k ink_cap_run
+    ptl_plan inkling "partial inkling cap for N=$k" tiny_inkling vk.log COLI_VK_DEVICE_CAP_MB=$PTL_CAP_LAST COLI_VK_TIER_RESERVE_GB=$PTL_RESERVE
+    echo "OK partial inkling cap for N=$k: tokens = CPU, coli plan's N the engine's"
+  done
+  # the dense-int4g64 container's forms, and D = 6144, in the plan
+  rm -f chain.usage
+  env COLI_VK_DEVICE_CAP_MB=256 COLI_VK_TIER_RESERVE_GB=$PTL_RESERVE COLI_VK_CHAIN_LAYERS=0 COLI_USAGE=chain.usage COLI_VULKAN=1 \
+    COLI_VK_CHAIN=1 SNAP=tiny_inkling_q ./inkling 8 0 $R > vk.log 2>&1 || true
+  ptl_plan inkling "partial inkling plan, the dense-int4g64 container" tiny_inkling_q vk.log COLI_VK_DEVICE_CAP_MB=256 \
+    COLI_VK_TIER_RESERVE_GB=$PTL_RESERVE COLI_VK_CHAIN_LAYERS=0
+  rm -f chain.usage
+  env COLI_VK_DEVICE_CAP_MB=256 COLI_VK_TIER_RESERVE_GB=$PTL_RESERVE COLI_USAGE=chain.usage COLI_VULKAN=1 COLI_VK_CHAIN=1 \
+    SNAP=tiny_inkling_wide ./inkling 8 0 $W > vk.log 2>&1 || true
+  ptl_plan inkling "partial inkling plan, D=6144" tiny_inkling_wide vk.log COLI_VK_DEVICE_CAP_MB=256 COLI_VK_TIER_RESERVE_GB=$PTL_RESERVE
+  echo "OK partial inkling plan: coli plan's numbers the engine's (the container, D = 6144)"
 
   # ---- an upload failing inside layer k's setup (COLI_VK_STAGED_FAULT, aimed from a probe's
   # counts): the layers before it on the device, nothing of layer k; the full chain's setup
@@ -255,7 +309,18 @@ ptl_mimo_all() {
   }
   PTL_CAP=256 mimo_cap_run; cp vk.log ptl-probe.log
   ptl_check_n mimo ptl-probe.log 6 "partial mimo cap probe"
-  for k in 1 3 5; do ptl_cap mimo "partial mimo cap for N=$k" ptl-probe.log $k mimo_cap_run; echo "OK partial mimo cap for N=$k: tokens = CPU"; done
+  for k in 1 3 5; do
+    ptl_cap mimo "partial mimo cap for N=$k" ptl-probe.log $k mimo_cap_run
+    ptl_plan mimo "partial mimo cap for N=$k" mimo_tiny vk.log COLI_VK_DEVICE_CAP_MB=$PTL_CAP_LAST COLI_VK_TIER_RESERVE_GB=$PTL_RESERVE MIMO_DENSE_BITS=32
+    echo "OK partial mimo cap for N=$k: tokens = CPU, coli plan's N the engine's"
+  done
+  for bits in 0 8; do   # the release's FP8/BF16 and int8 rows, a block of 3, in the plan
+    env COLI_VK_DEVICE_CAP_MB=256 COLI_VK_TIER_RESERVE_GB=$PTL_RESERVE COLI_VK_CHAIN_LAYERS=0 MIMO_CHUNK=3 COLI_TEMP=0 COLI_VULKAN=1 \
+      COLI_VK_CHAIN=1 MIMO_DENSE_BITS=$bits ./mimo mimo_tiny --ids "$P" --ngen 1 > /dev/null 2> vk.log
+    ptl_plan mimo "partial mimo plan bits=$bits" mimo_tiny vk.log COLI_VK_DEVICE_CAP_MB=256 COLI_VK_TIER_RESERVE_GB=$PTL_RESERVE \
+      COLI_VK_CHAIN_LAYERS=0 MIMO_CHUNK=3 MIMO_DENSE_BITS=$bits
+  done
+  echo "OK partial mimo plan: coli plan's numbers the engine's (MIMO_DENSE_BITS 0 and 8, blocks of 3)"
 
   # ---- an upload failing inside layer k (the full chain's setup, after the tier; the
   # device-only one, before it)
