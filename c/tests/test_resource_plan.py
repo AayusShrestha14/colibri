@@ -1225,10 +1225,13 @@ memInfo.free:                     23.50 GB (97%)
         MiB = 1 << 20
         kwargs = dict(context=64, ram_gb=4, available_memory=16 * GB,
                       available_disk=16 * GB, gpus=[])
+        # Model the device explicitly: a CPU-only runner must exercise the same
+        # placement policy without relying on an installed Vulkan driver.
+        dgpu = {"type": "discrete", "budget_bytes": 16 * GB}
         host = build_plan(self.model, env={"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1",
-                                           "COLI_VK_DENSE_HOST": "1"}, **kwargs)
+                                           "COLI_VK_DENSE_HOST": "1"}, vulkan=dgpu, **kwargs)
         only = build_plan(self.model, env={"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1",
-                                           "COLI_VK_DENSE_HOST": "0"}, **kwargs)
+                                           "COLI_VK_DENSE_HOST": "0"}, vulkan=dgpu, **kwargs)
         self.assertEqual(only["tiers"]["ram"]["dense_bytes"], 256)
         self.assertEqual(only["tiers"]["ram"]["dense_on_device_bytes"],
                          host["tiers"]["ram"]["dense_bytes"] - 256)
@@ -1248,6 +1251,22 @@ memInfo.free:                     23.50 GB (97%)
         # without COLI_VULKAN nothing changes
         cpu = build_plan(self.model, env={"COLI_VK_DENSE_HOST": "0"}, **kwargs)
         self.assertEqual(cpu["tiers"]["ram"]["dense_bytes"], host["tiers"]["ram"]["dense_bytes"])
+
+    def test_vulkan_without_a_device_keeps_dense_weights_in_ram(self):
+        self.write_qwen38()
+        kwargs = dict(context=64, ram_gb=4, available_memory=16 * GB,
+                      available_disk=16 * GB, gpus=[])
+        cpu = build_plan(self.model, env={}, **kwargs)["tiers"]["ram"]
+        with mock.patch("setup_hw.detect_vulkan", return_value={"devices": []}):
+            for host in (None, "0", "1"):
+                with self.subTest(dense_host=host):
+                    env = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1"}
+                    if host is not None:
+                        env["COLI_VK_DENSE_HOST"] = host
+                    ram = build_plan(self.model, env=env, **kwargs)["tiers"]["ram"]
+                    self.assertEqual(ram["dense_on_device_bytes"], 0)
+                    self.assertEqual(ram["dense_bytes"], cpu["dense_bytes"])
+                    self.assertEqual(ram["expert_cache_bytes"], cpu["expert_cache_bytes"])
 
     def test_vulkan_device_only_decision_follows_the_engine_rule(self):
         from resource_plan import vk_dense_device_only
