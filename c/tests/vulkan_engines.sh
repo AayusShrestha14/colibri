@@ -49,6 +49,11 @@ cd "$(dirname "$0")/.."
 export VK_ICD_FILENAMES=${VK_ICD_FILENAMES:-/usr/share/vulkan/icd.d/lvp_icd.json}
 export COLI_NO_OMP_TUNE=1
 PY=${PY:-python3}
+# Speculative decoding is on by default (MTP and prompt lookup, docs/speculative.md): its
+# verifies change how many rows a forward dumps and when (the gate decides from measured
+# times), which the families' row-by-row logits comparisons do not expect. They run with it
+# off; the cases that test it turn it on themselves (Q38_MTP=1, COLI_LOOKUP=1, DRAFT=n).
+export COLI_LOOKUP=${COLI_LOOKUP:-0} Q38_MTP=${Q38_MTP:-0}
 
 fail() { echo "FAIL: $*"; exit 1; }
 
@@ -2165,7 +2170,7 @@ family_glm_chain() {
   COLI_VK_CHAIN=2 CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=32
   # a pin restored over rows another branch rewrote: the KDA state goes up from the pin,
   # the MLA rows' watermark comes down
-  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_USAGE=$PWD/chain.usage $PY tests/glm53_pin_branch_harness.py --binary ./glm53 --fixture glm53_mm_tiny
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_USAGE=$PWD/chain.usage COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 $PY tests/glm53_pin_branch_harness.py --binary ./glm53 --fixture glm53_mm_tiny
   unset OMP_NUM_THREADS CAP_RAISE
 }
 
@@ -3756,7 +3761,7 @@ kv_split_glm53() {
     CHAIN_SERVE_EXPECT="$E" CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=32 $K
     CHAIN_SERVE_EXPECT="$E" CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=4 COLI_VK_CHAIN_ROWS=3 $K
     CHAIN_SERVE_EXPECT="$E" CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=32 KV_SLOTS=2 $K
-    env $K COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_USAGE=$PWD/chain.usage $PY tests/glm53_pin_branch_harness.py --binary ./glm53 --fixture glm53_mm_tiny
+    env $K COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_USAGE=$PWD/chain.usage COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 $PY tests/glm53_pin_branch_harness.py --binary ./glm53 --fixture glm53_mm_tiny
   }
 }
 kv_split_glm53_sanitize() {

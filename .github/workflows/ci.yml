@@ -269,6 +269,12 @@ jobs:
             req: c/tools/requirements-qwen38-tiny.txt
           - family: dense-only-qwen38-sanitize
             req: c/tools/requirements-qwen38-tiny.txt
+          # qwen38's partial dense chain (the first N layers on the device, the rest and
+          # the head on the CPU), and the same under ASan and UBSan
+          - family: partial-qwen38
+            req: c/tools/requirements-qwen38-tiny.txt
+          - family: partial-qwen38-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
           - family: dense-only-qwen36-olmoe
             req: c/tools/requirements-qwen38-tiny.txt
           - family: dense-only-qwen36-olmoe-sanitize
@@ -290,6 +296,15 @@ jobs:
             extra: pillow
           - family: dense-only-glm-sanitize
             req: c/tools/requirements-qwen38-tiny.txt
+            extra: pillow
+          # the partial chain of colibri and glm53 (the first N layers on the device):
+          # COLI_VK_CHAIN_LAYERS, COLI_VK_DEVICE_CAP_MB, an upload failing mid-setup, the
+          # forward paths with N < L, and the same under ASan and UBSan
+          - family: partial-glm
+            req: c/tools/requirements-glm53-tiny.txt
+            extra: pillow
+          - family: partial-glm-sanitize
+            req: c/tools/requirements-glm53-tiny.txt
             extra: pillow
           - family: dense-only-deepseek
             req: c/tools/requirements-deepseek-v4-tiny.txt

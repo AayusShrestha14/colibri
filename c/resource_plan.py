@@ -750,6 +750,232 @@ def _olmoe_chain_layout(info, env, vulkan):
 _VK_CHAIN_LAYOUT["olmoe"] = _olmoe_chain_layout
 
 
+_Q38_CHAIN_MATRICES = frozenset(_Q38_TRUNK_COMPONENTS) | {
+    "linear_attn.in_proj_a", "linear_attn.in_proj_b", "ple.key_proj", "ple.value_proj"}
+
+
+def _q38_env_int(env, name, default):
+    """C's atol/atoi: the leading integer, 0 when there is none."""
+    value = env.get(name)
+    if value is None or not value.strip():
+        return default
+    match = re.match(r"\s*([+-]?\d+)", value)
+    return int(match[1]) if match else 0
+
+
+def _q38_vk_fmt(tensor, tag, env):
+    """q38_vk_fmt: the format a resident matrix goes up in. The trunk's int8 rows (fmt 1)
+    when q38_trunk_cpu_int8 quantized it (a trunk component of at least Q38_TRUNK_MIN_KB
+    with its float scales, not in Q38_TRUNK_SKIP); else the rows as loaded: bf16 (fmt 11)
+    from a BF16 tensor with Q38_NATIVE_BF16, f32 (fmt 10) otherwise."""
+    rows, columns = tensor["shape"]
+    if tag and env.get("Q38_TRUNK_CPU_INT8") != "0":
+        min_kb = _q38_env_int(env, "Q38_TRUNK_MIN_KB", 1024)
+        skipped = set((env.get("Q38_TRUNK_SKIP") or "").split(","))
+        if min_kb >= 0 and rows * columns + 4 * rows >= min_kb * 1024 and tag not in skipped:
+            return 1
+    return 11 if tensor["dtype"] == "BF16" and env.get("Q38_NATIVE_BF16") != "0" else 10
+
+
+def _q38_chain_layout(info, env, vulkan):
+    """qwen38_chain.h: q38c_fit_layer, q38c_fit_fixed, q38c_fit_tail. None for a device
+    whose memory the plan does not know (no budget, no heap size, no cap) unless N is
+    forced: no prediction, the plan as before (every layer and every host copy)."""
+    device = vulkan or {}
+    known = _vk_cap_bytes(env) or device.get("budget_bytes") or device.get("device_local_bytes")
+    if not known and (env.get("COLI_VK_CHAIN_LAYERS") or "").strip() in ("", "auto"):
+        return None
+    c = info.get("config") or {}
+    c = c.get("text_config") or c
+    try:
+        L, H, vocab = int(c["num_hidden_layers"]), int(c["hidden_size"]), int(c["vocab_size"])
+        kinds = [0 if t == "linear_attention" else 1 for t in c["layer_types"]][:L]
+        QH, KVH, D = int(c["num_attention_heads"]), int(c["num_key_value_heads"]), int(c["head_dim"])
+        IQ, ID = int(c["indexer_n_heads"]), int(c["indexer_head_dim"])
+        budget, ratio = int(c["indexer_budget"]), int(c["indexer_compress_ratio"])
+        VH, VD = int(c["linear_num_value_heads"]), int(c["linear_value_head_dim"])
+        KH, KD, CK = int(c["linear_num_key_heads"]), int(c["linear_key_head_dim"]), int(c["linear_conv_kernel_dim"])
+        E, SI = int(c["num_experts"]), int(c["shared_expert_intermediate_size"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if L < 1 or len(kinds) != L:
+        return None
+    C, R = int(c.get("hc_count") or 4), int(c.get("hc_lowrank") or 320)
+    W = C * H
+    rope = c.get("rope_parameters") or {}
+    partial = rope.get("partial_rotary_factor", c.get("partial_rotary_factor", 1.0))
+    rotary = int(D * float(partial if partial is not None else 1.0))
+    ngram, per_ngram = int(c.get("ngram_size") or 3), int(c.get("heads_per_ngram") or 8)
+    ple_dim, ple_k = int(c.get("ple_embed_dim") or H), int(c.get("ple_conv_kernel_size") or 4)
+    heads = (ngram - 1) * per_ngram
+    Ep = max(heads * (ple_dim // heads if heads > 0 else 0), 1)
+    ids = c.get("ple_layer_ids") or []
+    ple = int(ids[0]) - 1 if ids else -1
+    CD = 2 * KH * KD + VH * VD
+    rows = _q38_chain_rows(env)
+    rows0 = 3 * max(_q38_env_int(env, "COLI_VK_KV_BLOCK", 64), 1)
+    kvo = KVH * D
+    # each layer's matrices as they go up, and the shared expert's gate (fmt 10, H x 1)
+    layers = [vk_tensor_bytes(10, H, 1) for _ in range(L)]
+    for tensor in info.get("dense_tensors", []):
+        layer, part, shape = _vk_layer_index(tensor["name"]), _layer_component(tensor["name"]), tensor.get("shape")
+        if layer is None or layer >= L or part not in _Q38_CHAIN_MATRICES or not isinstance(shape, list) or len(shape) != 2:
+            continue
+        if part.startswith("ple.") and layer != ple:
+            continue
+        fmt = _q38_vk_fmt(tensor, _Q38_TRUNK_COMPONENTS.get(part), env)
+        layers[layer] += vk_tensor_bytes(fmt, shape[1], shape[0])
+    for i in range(L):
+        floats = 2 * W
+        if kinds[i]:
+            floats += 2 * D + 2 * ID
+            layers[i] += (2 * vk_buf_bytes(kvo * rows0 * 4) + vk_buf_bytes(ID * rows0 * 4) +
+                          vk_buf_bytes(ID * (rows0 // max(ratio, 1) + 1) * 4) + rows * (2 * kvo + ID) * 4)
+        else:
+            floats += CD * CK + 2 * VH + VD
+            layers[i] += 2 * vk_buf_bytes(VH * KD * VD * 4) + 2 * vk_buf_bytes(CD * (CK - 1) * 4)
+        if i == ple:
+            floats += 3 * W + W * ple_k
+            layers[i] += vk_buf_bytes(2 * W * (ple_k - 1) * ngram * 4)
+        layers[i] += 4 * floats
+    # q38c_bufs' counting pass at `rows` rows, no context yet and no attention layer, the
+    # streams' read-back and the final norm
+    r, nb, rot = rows, 1, rotary if rotary > 0 else 2
+    counts = [r * W, r * W, r * R, r * W, r * H, r * C, r * C, r * H, r * QH * 2 * D, r * kvo, r * kvo,
+              r * (IQ + 1) * ID, r * QH * D, r * 2 * nb, r * (budget + ratio), r * CD, r * VH * VD, r * 2 * VH,
+              r * CD, r * VH * VD, r * E, r * SI, r * SI, r * SI, r * H, r, r * H, r * W, r * H, r * W, r * W,
+              r * H, r * E, r * (2 * kvo + ID), 2 * vocab, r * H, r * Ep, r * rot, nb * rot]
+    fixed = sum(4 * (n if n else 1) for n in counts) + (rows + 1) * W * 4
+    # the tail: the final mixer and lm_head; under Q38_MTP=1 the MTP head's matrices too
+    # (the scan leaves its tensors out: its decoder layer has an attention layer's shapes,
+    # its two projections are H x H and its mixer the final mixer's)
+    tail, head_dtype = 0, "BF16"
+    attn_parts = {}
+    last_attn = max([i for i in range(L) if kinds[i]] + [-1])
+    for tensor in info.get("dense_tensors", []):
+        name, shape = _text_weight_name(tensor["name"]), tensor.get("shape")
+        if not isinstance(shape, list) or len(shape) != 2:
+            continue
+        if name == "lm_head.weight":
+            head_dtype = tensor["dtype"]
+            tail += vk_tensor_bytes(_q38_vk_fmt(tensor, "lmhead", env), shape[1], shape[0])
+        elif name in ("model.hyper_connection_mixer.input_mix_weight_down.weight",
+                      "model.hyper_connection_mixer.input_mix_weight_up.weight"):
+            tail += vk_tensor_bytes(_q38_vk_fmt(tensor, None, env), shape[1], shape[0])
+        elif _vk_layer_index(tensor["name"]) == last_attn and _layer_component(tensor["name"]) in _Q38_CHAIN_MATRICES:
+            attn_parts[_layer_component(tensor["name"])] = tensor
+    if env.get("Q38_MTP") == "1" and int(c.get("mtp_num_hidden_layers") or 0) == 1:
+        for part, tensor in attn_parts.items():
+            tail += vk_tensor_bytes(_q38_vk_fmt(tensor, _Q38_TRUNK_COMPONENTS.get(part), env),
+                                    tensor["shape"][1], tensor["shape"][0])
+        for tag, out, cols in (("mtpfce", H, H), ("mtpfch", H, H), ("mtpmixd", R, W), ("mtpmixu", W, R)):
+            tensor = {"shape": [out, cols], "dtype": head_dtype}
+            tail += vk_tensor_bytes(_q38_vk_fmt(tensor, tag, env), cols, out)
+    return VkChainLayout(layers, fixed, tail)
+
+
+def _q38_chain_rows(env):
+    """vkc_fit_rows(256): COLI_VK_CHAIN_ROWS when it is a number, else 256."""
+    value = (env.get("COLI_VK_CHAIN_ROWS") or "").strip()
+    if not value or value == "auto":
+        return 256
+    return min(max(_q38_env_int(env, "COLI_VK_CHAIN_ROWS", 256), 1), 65535)
+
+
+_VK_CHAIN_LAYOUT["qwen38"] = _q38_chain_layout
+
+
+def _glm53_chain_layout(info, env, vulkan):
+    """glm53_chain.h g53c_fit_plan: each layer's device bytes (the mHC mixes in f32, its
+    matrices at GLM53_BITS as quantize_loaded leaves them, an int4 container's as it is,
+    the absorbed kv_b halves, its share of the parameter arena, a KDA layer's state and
+    window, an MLA layer's caches at their first 256 positions), the scratch of one prompt
+    chunk at GLM53_MAXT and the head."""
+    config = info.get("config") or {}
+    c = config.get("text_config") if isinstance(config.get("text_config"), dict) else config
+    try:
+        L, D, V = int(c["num_hidden_layers"]), int(c["hidden_size"]), int(c["vocab_size"])
+        H = int(c.get("hc_mult") or 1)
+        linear = c["linear_attn_config"]
+        kh, kd, ck = int(linear["num_heads"]), int(linear["head_dim"]), int(linear["short_conv_kernel_size"])
+        nh, ql, kvl = int(c["num_attention_heads"]), int(c["q_lora_rank"]), int(c["kv_lora_rank"])
+        qn, qr, vh = int(c["qk_nope_head_dim"]), int(c.get("qk_rope_head_dim") or 0), int(c["v_head_dim"])
+        di, mi, ns = int(c["intermediate_size"]), int(c["moe_intermediate_size"]), int(c.get("n_shared_experts") or 1)
+        kinds = list(c["layer_types"])[:L]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if len(kinds) < L or L < 1:
+        return None
+    IH, ID = int(c.get("index_n_heads") or 0), int(c.get("index_head_dim") or 0)
+    pool, topk = int(c.get("index_kpool") or 1), int(c.get("index_topk") or 0)
+    full = ["linear" not in str(k) for k in kinds]
+    if c.get("first_k_dense_replace") is not None:
+        first_dense = int(c["first_k_dense_replace"])
+    else:
+        mlp = c.get("mlp_layer_types") or []
+        first_dense = next((i for i, k in enumerate(mlp) if "sparse" in str(k)), len(mlp))
+    setting = re.match(r"\s*([+-]?\d+)", env.get("GLM53_BITS", "4"))
+    bits = int(setting[1]) if setting else 4
+    packed = {_text_weight_name(t["name"]) for t in info.get("dense_tensors", []) if t.get("dtype") in ("U8", "I8")}
+    P, nm, HD = kh * kd, (2 + H) * H, H * D
+
+    def mat(rows, columns, name=None):
+        if name is not None and name in packed:
+            return vk_tensor_bytes(4, columns, rows, 64)
+        if bits == 32:
+            return vk_tensor_bytes(10, columns, rows)
+        if bits == 4 and columns % 64 == 0:
+            return vk_tensor_bytes(4, columns, rows, 64)
+        return vk_tensor_bytes(1, columns, rows)
+    layers = []
+    for i in range(L):
+        p = f"model.layers.{i}."
+        size = 2 * vk_tensor_bytes(10, HD, nm)
+        if full[i]:
+            a = p + "self_attn."
+            size += (mat(ql, D, a + "q_a_proj.weight") + mat(nh * (qn + qr), ql, a + "q_b_proj.weight") +
+                     mat(kvl + qr, D, a + "kv_a_proj_with_mqa.weight") + mat(nh * kvl, qn) + mat(nh * vh, kvl) +
+                     mat(D, nh * vh, a + "o_proj.weight") + mat(IH * ID, ql, a + "indexer.wq_b.weight") +
+                     mat(ID, D, a + "indexer.wk.weight") + mat(IH, D, a + "indexer.weights_proj.weight") +
+                     mat(ID, D, a + "indexer.index_kpool_compress_gate"))
+            floats = 2 * D + 2 * (3 + nm) + ql + kvl + 2 * ID + pool * ID
+            size += (vk_buf_bytes(256 * kvl * 4) + 2 * vk_buf_bytes(256 * ID * 4) +
+                     vk_buf_bytes((256 // pool + 1) * ID * 4))
+        else:
+            a = p + "self_attn."
+            size += (mat(P, D, a + "q_proj.weight") + mat(P, D, a + "k_proj.weight") + mat(P, D, a + "v_proj.weight") +
+                     mat(D, P, a + "o_proj.weight") + mat(kd, D, a + "g_a_proj.weight") + mat(P, kd, a + "g_b_proj.weight") +
+                     mat(kd, D, a + "f_a_proj.weight") + mat(P, kd, a + "f_b_proj.weight") + mat(kh, D, a + "b_proj.weight"))
+            floats = 2 * D + 2 * (3 + nm) + 3 * P * ck + kh + P + kd
+            size += vk_buf_bytes(3 * P * ck * 4) + vk_buf_bytes(kh * kd * kd * 4)
+        m = p + ("mlp." if i < first_dense else "mlp.shared_experts.")
+        inner = di if i < first_dense else mi * ns
+        size += mat(inner, D, m + "gate_proj.weight") + mat(inner, D, m + "up_proj.weight") + mat(D, inner, m + "down_proj.weight")
+        layers.append(size + 4 * floats)
+    # g53c_scratch's counting pass for one chunk (every layer's new rows down) and the MLA
+    # scratch, at vkc_fit_rows(128) rows and a serve slot's context
+    value = (env.get("COLI_VK_CHAIN_ROWS") or "").strip()
+    match = re.match(r"([+-]?\d+)", value) if value and value != "auto" else None
+    r = min(max(int(match[1]), 1), 65535) if match else 128
+    match = re.match(r"\s*([+-]?\d+)", env.get("GLM53_MAXT") or "")
+    ctx = max(int(match[1]) if match else 8192, 64)
+    wide = max(di, mi)
+    width = topk + pool - 1 if c.get("index_kpool_always_select_tail") else topk
+    counts = [r * HD, r * HD, r * D, r * D, r * D, r * nm, r * (2 * H + H * H), r * wide, r * wide, r * wide, r * D,
+              r * D, L * r * (kvl + 2 * ID), r * HD, r * D]
+    if P > 0:
+        counts += [3 * r * P, 3 * r * P, r * P, r * kh, r * P, r * kd, r * P]
+    if any(full):
+        counts += [r * ID, r * IH * ID, r * IH, r * ID, r * (ctx // pool + 1), r * (1 + width)]
+        counts += [r * ql, r * nh * qn, r * kvl, r * nh * kvl, r * nh * kvl, r * nh * vh]
+    fixed = sum(vk_buf_bytes(4 * (n if n else 1)) for n in counts) + vk_buf_bytes(4)
+    tail = 0 if c.get("tie_word_embeddings") else mat(V, D, "lm_head.weight")
+    return VkChainLayout(layers, fixed, tail)
+
+
+_VK_CHAIN_LAYOUT["glm53"] = _glm53_chain_layout
+
+
 def _analysis_signature(shards, config_path):
     parts = [f"v{_ANALYSIS_CACHE_VERSION}"]
     st = config_path.stat()
@@ -1011,6 +1237,54 @@ def qwen38_int4_sidecar(info):
                 typical_expert_bytes=record, max_expert_bytes=record,
                 expert_bytes_by_layer=per_layer, per_cap_bytes=record * len(per_layer),
                 expert_fixed_bytes=0, qwen38_int4_experts=True)
+
+
+def _q38_mtp_head(info, env):
+    """Price Qwen3.8's MTP head when the engine attaches it (qwen38_core.h,
+    q38_mtp_attach): on by default when the config names one head and the
+    checkpoint carries its weights, off with Q38_MTP=0. The head is one more
+    layer over the model's, which analyze_model does not count: its dense
+    tensors (attention with the indexer, the shared expert, the mixers, the two
+    fc projections) stay resident, priced here at their size on disk, and its
+    routed experts get their own cache of Q38_MTP_CAP slots, the layers' cap by
+    default, at the head's own record (the snapshot's FP8: the int4-g64 sidecar
+    holds the model's layers only). With the default that is one more expert per
+    cache slot; a fixed Q38_MTP_CAP is a fixed cost instead. Without this the
+    plan handed the cache about 0.9 GB the head then took (cap 161 on Qwen3.8
+    Flash Next: 161 FP8 experts of 4.69 MiB, and 173 MiB of head)."""
+    resolved = info["resolved_family"]
+    if resolved.descriptor.id != "qwen38" or (env.get("Q38_MTP") or "").strip() == "0":
+        return info
+    config = info.get("config") or {}
+    text = config.get("text_config", config) if isinstance(config, dict) else {}
+    if text.get("mtp_num_hidden_layers") != 1:
+        return info
+    dense, experts = 0, {}
+    try:
+        for shard in sorted(Path(info["path"]).glob("*.safetensors")):
+            for name, size, _dtype, _shape in _tensor_sizes(shard, with_shape=True):
+                if not (name.startswith("mtp.") or ".mtp." in name):
+                    continue
+                expert = re.search(r"\.experts\.(\d+)\.", name)
+                if expert:
+                    experts[int(expert[1])] = experts.get(int(expert[1]), 0) + size
+                else:
+                    dense += size
+    except OSError:
+        return info
+    if not dense or not experts:
+        return info      # a container without the head's weights: the engine decodes without it
+    record = max(experts.values())
+    fixed = info["expert_fixed_bytes"]
+    per_cap = info["per_cap_bytes"]
+    cap = (env.get("Q38_MTP_CAP") or "").strip()
+    if cap.isdigit() and int(cap) > 0:
+        fixed += min(int(cap), len(experts)) * record
+    else:
+        per_cap += record
+    return dict(info, dense_bytes=info["dense_bytes"] + dense, per_cap_bytes=per_cap,
+                expert_fixed_bytes=fixed, qwen38_mtp_head_bytes=dense,
+                qwen38_mtp_expert_bytes=record)
 
 
 #: MEMORYSTATUSEX as Windows defines it, in order. Kept as data so a test can
@@ -2210,6 +2484,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     info = qwen38_int4_sidecar(analyze_model(model))
     env_now = os.environ if env is None else env
     info = _q38_cpu_dense_tensors(info, env_now)
+    info = _q38_mtp_head(info, env_now)
     info = _glm53_dense_tensors(info, env_now)
     # Only the matrices a family's dho pass can release earn RAM credit. The
     # embedding, norms, CPU-only components and unrecognized formats stay reserved.

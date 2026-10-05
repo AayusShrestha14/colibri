@@ -95,7 +95,8 @@ trunk on the CPU anywhere and `COLI_VK_DENSE=1` puts it on the device anywhere;
 
 This engine kept no expert history before; with the tier on it keeps route_trace.h's
 `.coli_usage` beside the container (`COLI_USAGE` moves it), saved at the end of
-every run and serve turn, and fills the tier from it at the next start. With
+every run and serve turn, and fills the tier from it at the next start. `coli
+setup` gives Qwen3.6-35B-A3B a starting one ([vulkan.md](vulkan.md#the-routed-expert-tier-vk_tierc)). With
 `COLI_CUDA=1` as well, the CUDA tier wins.
 
 On an integrated Radeon 780M, with the int4 gs64 container at cap 64 and the trunk
@@ -107,10 +108,10 @@ measurements and what they leave out are in
 9.94 tok/s against the CPU's 6.01 and the 512-token prompt 9.5 s
 ([vulkan.md](vulkan.md#the-chain-on-a-radeon-780m)).
 
-## Prompt-lookup drafts (`COLI_LOOKUP=1`, off by default)
+## Prompt-lookup drafts (on by default, `COLI_LOOKUP=0` turns them off)
 
 When the recent tokens repeat an n-gram of the prompt or the output (a code edit, a
-quote, repeated structure), `COLI_LOOKUP=1` drafts the up to 5 tokens that followed it
+quote, repeated structure), the engine drafts the up to 5 tokens that followed it
 and checks them in one verify forward. The DeltaNet state is copied after each verify
 row, so a rejected draft rolls back by swapping a copy in. A gate drafts only where the
 measured acceptance and verify cost say it pays. The output is that of plain decoding,
