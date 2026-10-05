@@ -169,13 +169,15 @@ static int vkc_kv_plan_need(VkcKvSplit *ks, const char *engine, int nl, size_t r
     if (selects && vkc_kv_env("COLI_VK_KV_PIN", 0) != 0) { nw = ns / 2 > 3 ? ns / 2 : 3; np = ns - nw; }
     if ((long)ns * B >= cap) return 1;
     ks->B = B; ks->ns = ns; ks->nw = nw; ks->np = np; ks->rows = ns * B; ks->nl = nl; ks->cap = cap;
-    /* A step writes at most cb blocks' worth of rows (an eighth of the window, a block at
-     * least), so its rows span at most cb blocks past its first. A row's share reaches
-     * back `anchor` blocks: every block of it stays in the window while a step holds the
-     * row (anchor <= nw - 1 - cb), and it covers the step's earlier rows (anchor >= cb),
-     * which reach the host's cache only after the step. */
-    int cb = nw / 8 > 1 ? nw / 8 : 1;
-    if (nw - 1 - cb < cb) cb = (nw - 1) / 2;
+    /* A step writes at most cb blocks' worth of rows, so its rows span at most cb blocks
+     * past its first. A row's share reaches back `anchor` blocks: every block of it stays
+     * in the window while a step holds the row (anchor <= nw - 1 - cb), and it covers the
+     * step's earlier rows (anchor >= cb), which reach the host's cache only after the
+     * step. cb is the largest both allow: a prompt's chunk is a step, and every chunk
+     * carries its own frames and expert loads (with an eighth of the window, Qwen3.6's
+     * 7.6K-token prompt on a Radeon 780M took 170 s to its first token at 1024 rows on the
+     * device and 183 s at 4096; with this, 122 s and 142 s; docs/vulkan.md). */
+    int cb = (nw - 1) / 2 > 1 ? (nw - 1) / 2 : 1;
     ks->chunk = cb * B;
     ks->anchor = nw - 1 - cb;
     int nblk = (cap + B - 1) / B + 1;
