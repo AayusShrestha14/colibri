@@ -3941,14 +3941,20 @@ static int xb_issue(XbCtx *X, ColiVkExpert *const *ex, const int *rows, int coun
         if (!n) { free(off); return 0; }
         X->yoff = n; X->cyoff = total;
     }
-    /* the activation rows, packed per expert; where each output row will be */
-    int j = 0;
+    /* the activation rows, packed per expert; where each output row will be (the copies
+     * in parallel for a prompt step, as coli_vk_xb_sub_issue's) */
+    int *first = malloc((size_t)count * sizeof(int));
+    if (!first) { free(off); return 0; }
+    for (int c = 0, j = 0; c < count; j += rows[c], c++) first[c] = j;
+    #pragma omp parallel for schedule(dynamic, 4) if (total >= 256)
     for (int c = 0; c < count; c++)
-        for (int r = 0; r < rows[c]; r++, j++) {
+        for (int r = 0; r < rows[c]; r++) {
+            int j = first[c] + r;
             memcpy((uint8_t *)X->x.ptr + off[3 * c] + (size_t)r * dr, xrows[j], dr);
             X->yoff[j] = off[3 * c + 2] + (size_t)r * dr;
             if (v4) ((float *)((uint8_t *)X->x.ptr + off[3 * c] + xb_up((size_t)rows[c] * dr, a)))[r] = wrows ? wrows[j] : 1.0f;
         }
+    free(first);
     X->nrows = total;
     int ngemm = 0;
     int ok = xb_record_submit(X, X->cmd, X->fence, X->qpool, ex, rows, count, off, v4, &ngemm);

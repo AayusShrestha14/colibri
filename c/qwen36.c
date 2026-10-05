@@ -3312,7 +3312,84 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
     int use_xf = !use_qq && !use_qt && !use_vk && xf_mode(m);
     int *xidx = use_xf || use_vk ? malloc(sizeof(int) * (size_t)S * K) : NULL;
     float *xval = use_xf || use_vk ? falloc((int64_t)S * K) : NULL;
-    for (int s = 0; s < S; s++) {
+    /* A prompt's routing in parallel (the shared kernel's and the Vulkan tier's, which
+     * collect the routing first): softmax, group-limited top-k and renormalisation per
+     * token are independent, each exactly as the loop below; the momentum logits cross
+     * tokens but never feed the routing, so they go first in token order, and the
+     * bookkeeping (collected experts, frequencies, the tier's history) after, in token
+     * order. Not with cache routing or the agreement meter, whose state crosses tokens.
+     * 1011 tokens of Qwen3.6: about 4 ms a layer on one core. */
+    int par_route = (use_xf || use_vk) && S >= 64 && !g_cache_route && !g_route_agree && E <= 1024 && K <= 256 &&
+                    !(c->n_group > 1 && c->n_group > E);
+    if (par_route) {
+        if (m->momentum_logits && m->pilot_smooth > 0.f) {
+            float *ema = m->momentum_logits + (int64_t)layer * E;
+            for (int s = 0; s < S; s++) {
+                const float *pr = logits + (int64_t)s*E;
+                int is_zero = 1; for (int e = 0; e < E; e++) if (ema[e] != 0.f) { is_zero = 0; break; }
+                if (is_zero) { for (int e = 0; e < E; e++) ema[e] = pr[e]; }
+                else { for (int e = 0; e < E; e++) ema[e] = (1.f - m->pilot_smooth)*pr[e] + m->pilot_smooth*ema[e]; }
+            }
+        }
+        #pragma omp parallel for schedule(static)
+        for (int s = 0; s < S; s++) {
+            float *pr = logits + (int64_t)s*E;
+            softmax_row(pr, E);
+            uint8_t keep[1024]; int Ec = E;
+            if (c->n_group > 1 && c->n_group <= Ec) {
+                int per = E / c->n_group;
+                float gs[1024];
+                for (int gi = 0; gi < c->n_group; gi++) {
+                    float b1 = -1e30f, b2 = -1e30f;
+                    for (int e = gi*per; e < gi*per+per; e++) { float v = pr[e]; if (v > b1) { b2=b1; b1=v; } else if (v > b2) b2=v; }
+                    gs[gi] = b1 + b2;
+                }
+                uint8_t gkeep[1024] = {0};
+                for (int kk = 0; kk < c->topk_group; kk++) {
+                    int bg = -1; float bv = -1e30f;
+                    for (int gi = 0; gi < c->n_group; gi++) { if (!gkeep[gi] && gs[gi] > bv) { bv = gs[gi]; bg = gi; } }
+                    if (bg < 0) break; gkeep[bg] = 1;
+                }
+                for (int e = 0; e < Ec; e++) keep[e] = 0;
+                for (int gi = 0; gi < c->n_group; gi++) if (gkeep[gi]) for (int e = gi*per; e < gi*per+per; e++) keep[e] = 1;
+            } else {
+                for (int e = 0; e < Ec; e++) keep[e] = 1;
+            }
+            int *idx = xidx + (int64_t)s*K; float *val = xval + (int64_t)s*K;
+            for (int kk = 0; kk < K; kk++) {
+                int best = -1; float bv = -1e30f;
+                for (int e = 0; e < E; e++) {
+                    if (!keep[e]) continue;
+                    int taken = 0; for (int j = 0; j < kk; j++) if (idx[j]==e){taken=1;break;}
+                    if (!taken && pr[e] > bv) { bv = pr[e]; best = e; }
+                }
+                idx[kk] = best; val[kk] = bv;
+            }
+            for (int kk = 0; kk < K; kk++) if (idx[kk] < 0) { idx[kk] = -1 - kk; val[kk] = 0.f; }   /* degraded: below */
+            float sm=0; for (int kk=0;kk<K;kk++) sm+=val[kk]; if (sm>0) for (int kk=0;kk<K;kk++) val[kk]/=sm;
+        }
+        for (int s = 0; s < S; s++) {
+            int *idx = xidx + (int64_t)s*K;
+            for (int kk = 0; kk < K; kk++) {   /* the serial loop's degradation, its warning once */
+                if (idx[kk] >= 0) continue;
+                static int warned_par;
+                if (!warned_par) {
+                    warned_par = 1;
+                    fprintf(stderr, "[router] non-finite logits at layer %d, or fewer than top-k "
+                                    "experts eligible: selection degraded\n", layer);
+                }
+                idx[kk] = kk;
+            }
+            if (m->resident_collecting)
+                for (int kk = 0; kk < K; kk++) m->seen[(int64_t)layer * E + idx[kk]] = 1;
+            if (!m->hot_pinned && m->freq) {
+                uint32_t *freq_l = m->freq + (int64_t)layer * E;
+                for (int kk = 0; kk < K; kk++) freq_l[idx[kk]]++;
+            }
+            if (use_vk && m->vk_hist) rt_count(layer, idx, K);
+        }
+    }
+    for (int s = par_route ? S : 0; s < S; s++) {
         float *pr = logits + (int64_t)s*E;
         if (m->momentum_logits && m->pilot_smooth > 0.f) {
             float *ema = m->momentum_logits + (int64_t)layer * E;
