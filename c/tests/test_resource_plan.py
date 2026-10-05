@@ -2058,9 +2058,12 @@ class Qwen38PartialChainTest(unittest.TestCase):
         c = dict(self.CONFIG, mtp_num_hidden_layers=1)
         (self.model / "config.json").write_text(json.dumps(c))
         info = dict(info, config=c)
-        self.assertEqual(_q38_chain_layout(info, {"Q38_MTP": "1"}, None).tail, 43008)
-        self.assertEqual(_q38_chain_layout(info, {"Q38_MTP": "1", "Q38_TRUNK_MIN_KB": "0"}, None).tail, 27392)
-        self.assertEqual(_q38_chain_layout(info, {}, None).tail, 8960)
+        self.assertEqual(_q38_chain_layout(info, {"Q38_MTP": "1"}, device).tail, 43008)
+        self.assertEqual(_q38_chain_layout(info, {"Q38_MTP": "1", "Q38_TRUNK_MIN_KB": "0"}, device).tail, 27392)
+        self.assertEqual(_q38_chain_layout(info, {}, device).tail, 8960)
+        # a device whose memory the plan does not know: no prediction unless N is forced
+        self.assertIsNone(_q38_chain_layout(info, {}, {"type": "integrated"}))
+        self.assertIsNotNone(_q38_chain_layout(info, {"COLI_VK_CHAIN_LAYERS": "2"}, {"type": "integrated"}))
         # COLI_VK_CHAIN_ROWS lowers the chunk the fit counts: the scratch and the attention
         # layers' read-back rows
         small = vk_chain_fit(info, "qwen38", dict(on, COLI_VK_CHAIN_ROWS="3"), device)

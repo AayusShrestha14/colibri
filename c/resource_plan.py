@@ -778,7 +778,13 @@ def _q38_vk_fmt(tensor, tag, env):
 
 
 def _q38_chain_layout(info, env, vulkan):
-    """qwen38_chain.h: q38c_fit_layer, q38c_fit_fixed, q38c_fit_tail."""
+    """qwen38_chain.h: q38c_fit_layer, q38c_fit_fixed, q38c_fit_tail. None for a device
+    whose memory the plan does not know (no budget, no heap size, no cap) unless N is
+    forced: no prediction, the plan as before (every layer and every host copy)."""
+    device = vulkan or {}
+    known = _vk_cap_bytes(env) or device.get("budget_bytes") or device.get("device_local_bytes")
+    if not known and (env.get("COLI_VK_CHAIN_LAYERS") or "").strip() in ("", "auto"):
+        return None
     c = info.get("config") or {}
     c = c.get("text_config") or c
     try:
