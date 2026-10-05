@@ -91,9 +91,10 @@ static int g_vk_ready = 0;  /* COLI_VULKAN=1 and the device opened */
 static int g_vk_dense = 0;  /* the resident matrices run there (coli_vk_dense_decide) */
 /* A partial chain (glm53_chain.h, vkc_fit): the device holds the first N layers only, or
  * not the head. mv and mm then multiply on the device only what is there already: a
- * matrix without a device copy stays on the CPU (G53_VK_MAY). */
+ * matrix without a device copy stays on the CPU (G53_VK_MAY). A matrix of the second
+ * device's layers (COLI_VK_CHAIN_LAYERS2) is only its chain's to read. */
 static int g_g53_partial = 0;
-#define G53_VK_MAY(w) (!g_g53_partial || (w)->vk != NULL)
+#define G53_VK_MAY(w) ((!g_g53_partial || (w)->vk != NULL) && !((w)->vk && coli_vk_tensor_dev((const ColiVkTensor *)(w)->vk)))
 #endif
 #ifndef COLI_VULKAN   /* exclusive RAM/VRAM (vk_tier.h) is the Vulkan build's: no device holds an expert */
 static inline int  vkt_ram_first(int layer, int eid) { (void)layer; (void)eid; return 0; }
@@ -1048,7 +1049,7 @@ static void g53_dho_reload(Mat *w) {
 static int g53_dho_gone(const Mat *w) { return __atomic_load_n(&w->vk_gone, __ATOMIC_ACQUIRE); }
 /* The device's copy of a matrix it holds alone: 0 = the CPU computes (after a read-back). */
 static int g53_dho_matmul(const Mat *w, float *out, const float *x, int S) {
-    if (omp_in_parallel() || !w->vk) return 0;
+    if (omp_in_parallel() || !w->vk || coli_vk_tensor_dev((const ColiVkTensor *)w->vk)) return 0;
     return coli_vk_matmul((ColiVkTensor **)&((Mat *)w)->vk, out, x, NULL, NULL, g53_vk_fmt(w), S, w->columns,
                           w->rows, w->fmt == 4 ? w->gs : 0);
 }

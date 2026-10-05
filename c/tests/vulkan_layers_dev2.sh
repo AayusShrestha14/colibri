@@ -47,7 +47,7 @@ ld2_lost() {
   env "${envs[@]}" COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=$n0 COLI_VK_CHAIN_LAYERS2=$n1 COLI_VK_CHAIN_FAULT2=$k \
     COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 COLI_VULKAN=1 COLI_VK_CHAIN=1 ./"$eng" "$@" > vk.log 2>&1 || true
   case $eng in
-    colibri) mla_toks "$eng" cpu.log > cpu.tok; mla_toks "$eng" vk.log > vk.tok
+    colibri|glm53) mla_toks "$eng" cpu.log > cpu.tok; mla_toks "$eng" vk.log > vk.tok
              { [ -s cpu.tok ] && cmp -s cpu.tok vk.tok; } || { cat cpu.tok vk.tok; tail -20 vk.log; fail "$tag: the tokens differ from the CPU"; } ;;
     *) same_tokens cpu.log vk.log "$tag" ;;
   esac
@@ -264,9 +264,53 @@ ld2_colibri() {
     $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 KV_SLOTS=2 COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=2 COLI_VK_CHAIN_LAYERS2=2
 }
 
+# glm53 (GLM-5.3 Flash): the six-layer fixture, KDA and MLA alternating (the KDA state on
+# both devices); the head stays on the host
+ld2_glm53() {
+  [ -d glm53_mm_tiny ] || glm_chain_fixtures
+  [ -d glm53_l6s-i4 ] || { ptl_g53_l6 glm53_l6; $PY tools/make_glm53_streaming_pair.py --fixture glm53_l6 --output glm53_l6s > /dev/null; }
+  [ -f glm53_l6_serve/tokenizer.json ] || { rm -rf glm53_l6_serve && cp -r glm53_l6s-i4 glm53_l6_serve
+                                            $PY tools/make_edge_tiny_tokenizer.py --vocab-size 128 ./glm53_l6_serve > /dev/null; }
+  local ids F="--model glm53_l6s-i4" G="GLM53_BITS=32 USAGE_SAVE=0" s
+  local M="--model glm53_mm_tiny --ids 103,117,268,268,268,268,120,121 --patches glm53_mm_tiny/patches.f32 --grid 4x4"
+  ids=$($PY -c "print(','.join(str((i*37+5)%120+2) for i in range(100)))")
+  for s in "2 2" "3 3" "1 5" "4 1"; do
+    ld2_mla glm53 "ld2 glm53 ${s/ / + }" ${s% *} ${s#* } $G -- $F --ids $ids --greedy 6
+  done
+  ld2_mla glm53 "ld2 glm53 decode" 3 3 $G -- $F --ids 5,7,9,11,13,17,19,23 --greedy 8
+  ld2_mla glm53 "ld2 glm53 4-bit trunk" 2 3 GLM53_BITS=4 USAGE_SAVE=0 -- $F --ids $ids --greedy 4
+  ld2_mla glm53 "ld2 glm53 chain chunks of 3" 2 2 $G COLI_VK_CHAIN_ROWS=3 -- $F --ids $ids --greedy 4
+  ld2_mla glm53 "ld2 glm53 prefill chunks of 7, one cache slot" 3 2 GLM53_BITS=4 USAGE_SAVE=0 GLM53_PREFILL_CHUNK=7 \
+    GLM53_EXPERT_GB=0.000001 -- $F --ids $ids --greedy 4
+  ld2_mla glm53 "ld2 glm53 experts on both devices too" 3 3 $G COLI_VK_TIER_GB=0.0002 -- $F --ids $ids --greedy 6
+  ld2_mla glm53 "ld2 glm53 an image" 2 1 $G -- $M --greedy 4
+  CHAINMODE=2 ld2_mla glm53 "ld2 glm53 prompts only" 3 3 $G GLM53_PREFILL_CHUNK=16 -- $F --ids $ids --greedy 6
+  ld2_mla glm53 "ld2 glm53 KV split on both" 2 2 COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 $G -- $F --ids $ids --greedy 8
+  [ "$(kv_hostparts glm53 vk.log)" -gt 0 ] && [ "$(kv_hostparts "glm53 dev2" vk.log)" -gt 0 ] ||
+    { cat vk.log; fail "ld2 glm53 KV split on both: a device's split ran no host part"; }
+  # the second device lost: at its setup, mid-prompt and mid-decode (both devices' KDA
+  # state rebuilt from the primary's record), after an image
+  LD2_EXPECT=setup ld2_lost glm53 "ld2 glm53 second device lost at its setup" 3 3 1 $G -- $F --ids $ids --greedy 6
+  ld2_lost glm53 "ld2 glm53 second device lost in a prompt chunk" 3 3 12 $G GLM53_PREFILL_CHUNK=16 -- $F --ids $ids --greedy 6
+  ld2_lost glm53 "ld2 glm53 second device lost mid-decode" 3 3 40 $G -- $F --ids $ids --greedy 6
+  ld2_lost glm53 "ld2 glm53 second device lost after an image" 2 1 6 $G -- $M --greedy 4
+  # a pin's branch over the image fixture, its KDA state on both devices (layer 2 on the second)
+  rm -f chain.usage
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=2 COLI_VK_CHAIN_LAYERS2=1 COLI_USAGE=$PWD/chain.usage COLI_VK_TIER=0 \
+    $PY tests/glm53_pin_branch_harness.py --binary ./glm53 --fixture glm53_mm_tiny --tol 1e-5
+  rm -f chain.usage
+  # serve sessions: pins, the prompt cache, two KV slots
+  CHAIN_SERVE_EXPECT='glm53 dev2 chain: [1-9][0-9]* forwards' CHAIN_SERVE_DIALECT=numeric \
+    $PY tests/vulkan_chain_serve.py ./glm53 glm53_l6_serve GLM53_BITS=32 COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=3 COLI_VK_CHAIN_LAYERS2=3
+  CHAIN_SERVE_EXPECT='glm53 dev2 chain: [1-9][0-9]* forwards' CHAIN_SERVE_DIALECT=numeric \
+    $PY tests/vulkan_chain_serve.py ./glm53 glm53_l6_serve GLM53_BITS=4 COLI_VK_CHAIN_ROWS=3 COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=2 COLI_VK_CHAIN_LAYERS2=2
+  CHAIN_SERVE_EXPECT='glm53 dev2 chain: [1-9][0-9]* forwards' CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=numeric \
+    $PY tests/vulkan_chain_serve.py ./glm53 glm53_l6_serve GLM53_BITS=32 KV_SLOTS=2 COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=3 COLI_VK_CHAIN_LAYERS2=3
+}
+
 family_layers_dev2() {
   export OMP_NUM_THREADS=2
-  make qwen36 qwen38 olmoe mimo inkling colibri tests/test_vk_chain VK=1
+  make qwen36 qwen38 olmoe mimo inkling colibri glm53 tests/test_vk_chain VK=1
   COLI_VK_DEV2=0 ./tests/test_vk_chain shaders/qmatmul.spv | tee vk_chain.log
   tail -1 vk_chain.log | grep -qx PASS || fail "the chain's ops on two devices"
   ld2_qwen36
@@ -275,6 +319,7 @@ family_layers_dev2() {
   ld2_mimo
   ld2_inkling
   ld2_colibri
+  ld2_glm53
   unset OMP_NUM_THREADS
 }
 family_layers_dev2_sanitize() {
