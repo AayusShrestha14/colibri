@@ -36,12 +36,14 @@ static const char *at(const char *name){
     return path[k];
 }
 
+#ifndef _WIN32
 static int put(const char *path, const char *text){
     FILE *f = fopen(path, "wb");
     if(!f) return -1;
     fputs(text, f);
     return fclose(f);
 }
+#endif
 
 /* the file's bytes, or "" when it cannot be read */
 static const char *get(const char *path){
