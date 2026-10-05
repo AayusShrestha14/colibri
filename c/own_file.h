@@ -39,6 +39,7 @@ static inline int coli_own_is_link(const char *path){
 }
 
 static inline FILE *coli_own_fopen(const char *path, const char *mode){
+    if(mode[0] != 'r' && mode[0] != 'w'){ errno = EINVAL; return NULL; }   /* the modes the POSIX side takes */
     DWORD a = GetFileAttributesA(path);
     if(a != INVALID_FILE_ATTRIBUTES){
         if(a & FILE_ATTRIBUTE_REPARSE_POINT){ errno = ELOOP; return NULL; }
