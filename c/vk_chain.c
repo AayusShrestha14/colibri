@@ -132,6 +132,13 @@ static int vkc_tensor_info(const ColiVkTensor *t, ColiVkTensorInfo *ti) {
 int vkc_ready(void) { return KC.ready && !KC.lost; }
 int vkc_device(int d) { int was = g_kd; g_kd = d == 1 ? 1 : 0; return was; }
 int vkc_device_now(void) { return g_kd; }
+void vkc_shutdown(void);
+void vkc_shutdown_all(void) {   /* both devices' contexts, the second first (at exit) */
+    int was = g_kd;
+    g_kd = 1; vkc_shutdown();
+    g_kd = 0; vkc_shutdown();
+    g_kd = was;
+}
 int vkc_lost(void) { return KC.lost; }
 
 static void lose(const char *what, VkResult r) {
@@ -488,10 +495,12 @@ int vkc_submit(int wait) {
     vkEndCommandBuffer(f->cmd);
     f->open = 0; KC.cur = -1;
     if (KC.lost) return 0;
-    {   /* COLI_VK_CHAIN_FAULT=n (tests): the n-th submission fails as a lost device would */
-        static long fault = -2;
-        if (fault == -2) { const char *e = getenv("COLI_VK_CHAIN_FAULT"); fault = e && *e ? atol(e) : -1; }
-        if (fault > 0 && (long)KC.st.frames + 1 >= fault) { lose("queue submit (COLI_VK_CHAIN_FAULT)", VK_ERROR_DEVICE_LOST); return 0; }
+    {   /* COLI_VK_CHAIN_FAULT=n (tests): the primary device's n-th submission fails as a lost
+         * device would; COLI_VK_CHAIN_FAULT2 the second device's */
+        static long fault[2] = {-2, -2};
+        if (fault[g_kd] == -2) { const char *e = getenv(g_kd ? "COLI_VK_CHAIN_FAULT2" : "COLI_VK_CHAIN_FAULT"); fault[g_kd] = e && *e ? atol(e) : -1; }
+        if (fault[g_kd] > 0 && (long)KC.st.frames + 1 >= fault[g_kd])
+            { lose(g_kd ? "queue submit (COLI_VK_CHAIN_FAULT2)" : "queue submit (COLI_VK_CHAIN_FAULT)", VK_ERROR_DEVICE_LOST); return 0; }
     }
     vkResetFences(KC.dev, 1, &f->fence);
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &f->cmd};
@@ -1387,14 +1396,15 @@ int vkc_fit(const char *engine, int L, const size_t *layer_bytes, const size_t *
     fit->fixed = fixed_bytes + fit->pools;
     fit->tail_b = tail_bytes;
     size_t room = fit->free_b > fit->reserve ? fit->free_b - fit->reserve : 0;
-    const char *e = getenv("COLI_VK_CHAIN_LAYERS");
+    /* forced: COLI_VK_CHAIN_LAYERS on the primary, COLI_VK_CHAIN_LAYERS2 on the second device */
+    const char *fvar = g_kd ? "COLI_VK_CHAIN_LAYERS2" : "COLI_VK_CHAIN_LAYERS", *e = getenv(fvar);
     char forced[48] = "";
     if (e && *e && strcmp(e, "auto") != 0) {
         int v = atoi(e);
         fit->n = v < 0 ? 0 : v > fit->L ? fit->L : v;
         fit->forced = 1;
         fit->tail = fit->n == fit->L && fit->L > 0;
-        snprintf(forced, sizeof forced, "COLI_VK_CHAIN_LAYERS=%s", e);
+        snprintf(forced, sizeof forced, "%s=%s", fvar, e);
     } else if (fit->fixed + all <= room) {
         fit->n = fit->L;
         fit->tail = fit->fixed + all + tail_bytes <= room;

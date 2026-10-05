@@ -64,6 +64,7 @@ void vkc_shutdown(void);      /* before coli_vk_shutdown (register it with atexi
  * the op fails; vkc_free takes it back on its own device. Returns the previous device. */
 int  vkc_device(int d);
 int  vkc_device_now(void);
+void vkc_shutdown_all(void);   /* both devices' contexts: what an engine registers with atexit */
 
 VkcBuf *vkc_buf(size_t bytes, int kind);                 /* zero-filled; NULL when out of memory */
 void    vkc_free(VkcBuf *b);                             /* waits for the frames that may read it */
