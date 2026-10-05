@@ -2466,7 +2466,7 @@ int main(int argc, char **argv) {
         snprintf(pinpath, sizeof(pinpath), "%s/hot_pinned.bin", snap);
         FILE *pinf_chk = fopen(pinpath, "rb");
         if (!pinf_chk) {
-            FILE *pinf_save = fopen(pinpath, "wb");
+            FILE *pinf_save = coli_own_fopen(pinpath, "wb");   /* never through a planted link */
             if (pinf_save) {
                 size_t expected_size = (size_t)m.c.n_layers * m.c.n_experts;
                 fwrite(m.is_pinned, 1, expected_size, pinf_save);

@@ -1912,6 +1912,9 @@ tests/test_tier$(EXE): tests/test_tier.c
 tests/test_grammar$(EXE): tests/test_grammar.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_own_file$(EXE): tests/test_own_file.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 # RoPE inv_freq precompute must stay byte-identical to the old powf-per-position
 # path; drives the real rope_interleave (includes colibri.c) vs a reference.
 # -ffp-contract=off: the in-test reference is a DIFFERENT loop body than the
