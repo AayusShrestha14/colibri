@@ -179,20 +179,40 @@ ld2_mimo() {
   echo "OK ld2 mimo second device lost: tokens = CPU, $(grep -o 'the device was lost at position [0-9]*' mimo-vk.err)"
 }
 
+ld2_inkling() {
+  [ -f tiny_inkling/ref_long.json ] || kv_inkling_fixtures
+  local R=tiny_inkling/ref_inkling.json T=SNAP=tiny_inkling b
+  ld2_gate inkling "ld2 inkling 3 + 5, lm_head on the second device" 3 5 $T -- 8 0 $R
+  ld2_gate inkling "ld2 inkling 2 + 2, the CPU the rest and lm_head" 2 2 $T -- 8 0 $R
+  ld2_gate inkling "ld2 inkling 1 + 7, prompt in chunks of 3" 1 7 $T COLI_VK_CHAIN_ROWS=3 -- 8 0 $R
+  for b in 4 8; do ld2_gate inkling "ld2 inkling runtime int$b" 3 5 $T -- 2 $b $R; done
+  ld2_gate inkling "ld2 inkling experts on both devices too" 3 5 $T COLI_VK_TIER_GB=0.00002 -- 8 0 $R
+  CHAINMODE=2 ld2_gate inkling "ld2 inkling prompts only" 3 5 $T -- 8 0 $R
+  # the global layers' KV split on both devices
+  ld2_gate inkling "ld2 inkling KV split on both" 4 4 COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 $T -- 8 0 tiny_inkling/ref_long.json
+  [ "$(kv_hostparts inkling vk.log)" -gt 0 ] && [ "$(kv_hostparts "inkling dev2" vk.log)" -gt 0 ] ||
+    { cat vk.log; fail "ld2 inkling KV split on both: a device's split ran no host part"; }
+  LD2_EXPECT=setup ld2_lost inkling "ld2 inkling second device lost at its setup" 3 5 1 $T -- 8 0 $R
+  ld2_lost inkling "ld2 inkling second device lost mid-decode" 3 5 30 $T -- 8 0 $R
+  CHAIN_SERVE_EXPECT='inkling dev2 chain: [1-9][0-9]* forwards' \
+    $PY tests/vulkan_chain_serve.py ./inkling tiny_inkling INK_PREFIX_LOG=1 COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=3 COLI_VK_CHAIN_LAYERS2=5
+}
+
 family_layers_dev2() {
   export OMP_NUM_THREADS=2
-  make qwen36 qwen38 olmoe mimo tests/test_vk_chain VK=1
+  make qwen36 qwen38 olmoe mimo inkling tests/test_vk_chain VK=1
   COLI_VK_DEV2=0 ./tests/test_vk_chain shaders/qmatmul.spv | tee vk_chain.log
   tail -1 vk_chain.log | grep -qx PASS || fail "the chain's ops on two devices"
   ld2_qwen36
   ld2_qwen38
   ld2_olmoe
   ld2_mimo
+  ld2_inkling
   unset OMP_NUM_THREADS
 }
 family_layers_dev2_sanitize() {
   make clean >/dev/null 2>&1 || true
-  make qwen36 qwen38 olmoe VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  make qwen36 qwen38 olmoe mimo inkling VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
   export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
   [ -d qwen36_kv_c ] || kv_qwen36_fixtures
   kv_san qwen36 "asan ld2 qwen36 KV split on both" COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=4 COLI_VK_CHAIN_LAYERS2=4 \
@@ -206,5 +226,9 @@ family_layers_dev2_sanitize() {
   kv_san olmoe "asan ld2 olmoe KV split on both, PILOT" COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=2 COLI_VK_CHAIN_LAYERS2=2 \
     COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 PILOT=1 WIDE=2 SNAP=olmoe_tiny_c ./olmoe 2 8 olmoe_tiny/ref_olmoe_long.json
   [ "$(ld2_forwards olmoe san.log)" -gt 0 ] || { cat san.log; fail "asan ld2 olmoe: the second device's chain never ran"; }
+  [ -f tiny_inkling/ref_long.json ] || kv_inkling_fixtures
+  kv_san inkling "asan ld2 inkling KV split on both" COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=4 COLI_VK_CHAIN_LAYERS2=4 \
+    COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 SNAP=tiny_inkling ./inkling 8 0 tiny_inkling/ref_long.json
+  [ "$(ld2_forwards inkling san.log)" -gt 0 ] || { cat san.log; fail "asan ld2 inkling: the second device's chain never ran"; }
   make clean >/dev/null 2>&1 || true
 }
