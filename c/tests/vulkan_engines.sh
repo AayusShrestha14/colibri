@@ -2910,8 +2910,10 @@ ptl_L() {
 #   predict  N as vkc_fit's rule gives it from the line's numbers
 #   cap      the COLI_VK_DEVICE_CAP_MB (MiB, a fraction) under which exactly k layers fit:
 #            the bytes the probe held at the fit (its cap PTL_PROBE_CAP_MB less its free),
-#            the reserve, fixed and k layers, and half of layer k (k < L) or the tail too
-#            (k = L)
+#            the reserve, the engine's fixed bytes, the pools' granularity at the new cap,
+#            k layers, and half of layer k (k < L) or the tail too (k = L). Probe with the
+#            same settings and a cap of 256 or less: up to 256 MiB the pools' blocks (and so
+#            what is held at the fit) do not depend on the cap
 #   fault    the COLI_VK_STAGED_FAULT count to aim inside layer k's setup: the second time
 #            the point is reached within it (the placed line's marks; a first one there may
 #            be a fresh block's zero fill, which only skips the fill)
@@ -2935,9 +2937,18 @@ if what in ("predict", "cap"):
         n, acc = 0, fixed
         while n < L and acc + layers[n] <= room: acc += layers[n]; n += 1
         print(n); sys.exit(0)
+    # the pools' part of fixed depends on the cap (coli_vk_block_bytes): recompute it
+    def blk(cap, d):
+        b = 64 << 10
+        while b < cap // 4096: b <<= 1
+        return min(b, d)
+    pools = lambda cap: blk(cap, 256 << 20) + 3 * blk(cap, 64 << 20) + 4 * (4 << 20)
+    engine = int(re.search(r"the engine's (\d+) B", f)[1])
     held = int(float(os.environ["PTL_PROBE_CAP_MB"]) * 1048576) - free
-    need = res + fixed + sum(layers[:k]) + (layers[k] // 2 if k < L else tail + 4096)
-    print(f"{(held + need) / 1048576:.6f}")
+    cap = held + free
+    for _ in range(4):
+        cap = held + res + engine + pools(cap) + sum(layers[:k]) + (layers[k] // 2 if k < L else tail + 4096)
+    print(f"{cap / 1048576:.6f}")
 elif what == "fault":
     p = [l for l in lines if re.match(rf"\[VK\] {eng} chain: \d+ of \d+ layers placed", l)]
     m = re.search(r"reached ([\d,]+) times", p[-1] if p else "")
