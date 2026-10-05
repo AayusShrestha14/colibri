@@ -332,6 +332,12 @@ jobs:
             req: c/tools/requirements-deepseek-v4-tiny.txt
             extra: sympy pillow
           - family: dev2-sanitize
+          # DeepSeek V4.1 Flash and Kimi K3 (the V4.1 fixture's requirements; Kimi K3's
+          # fixture needs numpy alone)
+          - family: partial-dsk
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          - family: partial-dsk-sanitize
             req: c/tools/requirements-deepseek-v4-tiny.txt
             extra: sympy pillow
           # big prompt chunks and expert streaming (docs/vulkan.md): every chain engine on a

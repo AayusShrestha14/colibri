@@ -1441,6 +1441,30 @@ tokens, and every logits row is within 1e-6 of the largest logit: 9.3e-7 at wors
 Lavapipe, 1.1e-6 on a Radeon 780M (RADV) and 1.0e-6 on an Intel Iris Xe (Mesa's Dozen,
 four configurations).
 
+**A partial chain** ([below](#a-partial-chain)): when the dense layers do not all fit the
+device, deepseek_v41 chains the first N and `forward_full`'s CPU loop runs the rest from
+layer N (`v41c_forward` returns the layers it ran). The handoff gives back every row's
+`hc_mult` streams and the last FFN site's mix, and the host state the CPU's layers read
+from a chain layer within the same forward: the candidate mask (`m->candidates`, when the
+candidate source is a chain layer and an index source after N reads it) and the index
+list the last chain index source published (`m->shared_topk`, which a compressed layer
+after N reads before the next index source runs). A chain layer that reads a CPU layer's
+index keys (the published-key rule: the layer that published last, or an earlier row's
+layer in a verify) reads the host's rows as the CPU's layer order has them at that point,
+from a mirror of those keys lowered after every forward. The chain's layers write their
+rings, compressed rows, keys and groups back at the end of the forward as before; the
+CPU's layers keep theirs on the host. The fit counts each layer's matrices (fp8 as fmt 12
+with a scale per 32 inputs, the compressor's and the indexer's bf16, the mHC mixes in
+f32, an engram layer's `eng_wkv`; for prompts only with the dense weights on the device
+only, wo_a per output group too), its window ring, its compressor's group and 64
+compressed rows and keys, its share of the parameters and of a forward's pull buffer; the
+fixed part is the scratch of one 512-row chunk, the tail (with `COLI_VK_DENSE`) the head
+and the routers. With the dense weights on the device only the fit runs before the
+layers are read and each chained layer goes up whole as it is read (its matrices, an
+engram layer's projection, its state) before its host pages are given back, so a layer
+that does not reach the device reads nothing back from disk. DSpark's stages take the
+means of their target layers from whichever side ran them.
+
 **The default**: `COLI_VK_CHAIN_UNMEASURED`, so the chain is off on an integrated GPU
 (`COLI_VK_CHAIN=1` turns it on, `2` for prompts only) and on a discrete GPU follows the
 rule above. No DeepSeek checkpoint was run on the chain: none is on the 780M box, and
@@ -1624,6 +1648,26 @@ and 6.1e-3; the 780M: 2.3e-4, 9.9e-4 and 3.3e-3). The tests hold every logits ro
 configuration. With the CPU's int8 expert activations (`K3_IDOT=1`, tier off) a flipped
 int8 step moved the logits by 8.3e-3 on Lavapipe (no step flipped on the 780M), the
 tokens unchanged; that configuration is gated on its tokens.
+
+**A partial chain** ([below](#a-partial-chain)): kimi_k3 chains the first N layers and
+`step_chunk_ex` runs the rest with `k3_layers_forward_range` from layer N. The handoff
+moves each row's AttnRes state after layer N-1: the prefix, the block snapshots so far
+and their count, written to the caller's buffers once every chunk is through (a lost
+device reruns the forward from its untouched input). The chain's layers keep their KDA
+state, convolution windows and MLA mirrors on the device as before (the "who holds the
+newest" flag, its syncs and pushes and the watermarks cover them alone); the CPU's layers
+keep theirs on the host, so after a lost device only the chain layers' KDA state is
+rebuilt from the prefix record (layers 0..N-1 replayed). The fit runs once the device is
+open and before the expert cache is sized: each layer's matrices in the form the loader
+made of them (int4-g64, int8 rows or f32; the router and the KDA decay and beta
+projections in f32), the KDA state and windows, an MLA layer's mirror and down rows at one
+256-row chunk's positions, its share of the parameters; the fixed part is the scratch of
+one chunk and the output mix, the tail the head. With every layer on the device and not
+the head, the chain hands the CPU its final normalized rows and the CPU multiplies the
+head. With the dense weights on the device only, only the chain's layers' matrices (and
+the head with the tail) give back their host copies, after the setup, so a layer that
+does not reach the device has nothing to read back; the expert cache's RAM plan counts
+only those.
 
 **The default**: kimi_k3 passes `COLI_VK_CHAIN_UNMEASURED`: off on an integrated GPU
 (`COLI_VK_CHAIN=1` turns it on, `2` for prompts only), on a discrete GPU the rule above.
@@ -2469,6 +2513,8 @@ predict a layer more than the engine places.
 | qwen38 | the four hyper-connection streams of every row; the MTP head reads the final streams from whichever side ran the last layer, and the PLE ring and n-gram history stay with the PLE layer's side | yes |
 | colibri (GLM-5.2) | the residual rows; when layer N is a shared DSA indexer layer, the selection the device's last full layer made (1 + `index_topk` ints a row) | yes ([GLM](#glm-52-and-glm-53-flash-on-the-chain)) |
 | glm53 (GLM-5.3 Flash) | the hc_mult streams | yes ([GLM](#glm-52-and-glm-53-flash-on-the-chain)) |
+| deepseek_v41 | the hc_mult streams and the last site's mix; the candidate mask and the published index list a chain layer made for the CPU's layers; DSpark's target means from whichever side ran them | yes |
+| kimi_k3 | the AttnRes prefix, the block snapshots and their count; with every layer but not the head, the final rows for the CPU's head | yes |
 
 **`COLI_VK_DEVICE_CAP_MB=n`** (tests) makes the device hold at most n MiB of device-local
 memory (a fraction is taken): every allocation of the backend and the chain (tensors, the
@@ -2491,6 +2537,19 @@ and the prefix-reuse tests, and the chain against itself (chunks, prefill blocks
 with N < L; the dense weights on the device only with N < L. A discrete GPU has not been
 measured: none is available here, so the fit's behaviour on one (the budget a real driver
 reports, its allocation granularity) is not verified.
+
+`partial-dsk` does the same for DeepSeek V4.1 Flash and Kimi K3 on Lavapipe:
+`COLI_VK_CHAIN_LAYERS` at every k of their six-layer fixtures (V4.1's cuts at 2 and 4 hand
+the CPU's layers the index list and the candidate mask; Kimi K3's at 1, 3 and 5 cut inside
+an AttnRes block of two layers); `COLI_VK_DEVICE_CAP_MB` aimed at 0, 1, 3 and 5 layers and
+at every layer but the head (the line's N and `coli plan`'s, with the same free, per-layer
+and fixed bytes); an upload failing inside layers 0, 2 and 4, and with the dense weights on
+the device only inside layer 3, where nothing is read back from disk; prompt chunks, expert
+streaming, DSpark drafts (V4.1), prompts only, the tier off, the per-matrix path beside,
+the KV split, a lost device (V4.1: the forward again on the CPU; Kimi K3: the chain layers'
+KDA state rebuilt from the prefix record), serve sessions with prefix reuse, Kimi K3's
+recurrent-state photos and V4.1's images with N < L; the dense weights on the device only
+with N < L.
 
 ## Correctness
 
