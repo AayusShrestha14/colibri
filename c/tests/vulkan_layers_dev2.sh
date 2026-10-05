@@ -568,7 +568,8 @@ family_layers_dev2_sanitize() {
     COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 PILOT=1 WIDE=2 SNAP=olmoe_tiny_c ./olmoe 2 8 olmoe_tiny/ref_olmoe_long.json
   [ "$(ld2_forwards olmoe san.log)" -gt 0 ] || { cat san.log; fail "asan ld2 olmoe: the second device's chain never ran"; }
   [ -f tiny_inkling/ref_long.json ] || kv_inkling_fixtures
-  kv_san inkling "asan ld2 inkling KV split on the second device" COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=4 COLI_VK_CHAIN_LAYERS2=4 \
+  # the fixture's one global layer (5) on the first device, where kv_san counts the host parts
+  kv_san inkling "asan ld2 inkling KV split on the first device, layers 6 and 7 on the second" COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=6 COLI_VK_CHAIN_LAYERS2=2 \
     COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 SNAP=tiny_inkling ./inkling 8 0 tiny_inkling/ref_long.json
   [ "$(ld2_forwards inkling san.log)" -gt 0 ] || { cat san.log; fail "asan ld2 inkling: the second device's chain never ran"; }
   make clean >/dev/null 2>&1 || true
