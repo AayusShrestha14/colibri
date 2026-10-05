@@ -106,10 +106,11 @@ family_staged() {
   make tests/test_vk_tier tests/test_vk_chain VK=1   # the shaders too
   cc -O2 -pthread -DVK_TEST backend_vulkan.c -o vk_test -lvulkan -lm
   local m e d d0=""
-  for m in mapped staged staged-again window; do
+  for m in mapped staged staged-again staged-noimport window; do
     case $m in
       mapped) e=COLI_VK_STAGED=0 ;;
       staged|staged-again) e=COLI_VK_STAGED=1 ;;
+      staged-noimport) e="COLI_VK_STAGED=1 COLI_VK_UP_IMPORT=0" ;;   # every copy through the staging buffer
       window) e=COLI_VK_HOST_VISIBLE_CAP_MB=246 ;;
     esac
     env -u COLI_VK_STAGED -u COLI_VK_HOST_VISIBLE_CAP_MB $e COLI_VK_TEST_MATMUL_ONLY=1 ./vk_test shaders/qmatmul.spv > vk_test.log 2> vk_test.err
@@ -126,10 +127,53 @@ family_staged() {
   tail -1 vk_tier.log | grep -qx PASS || { cat vk_tier.log vk_tier.err; fail "staged routed-expert tier"; }
   staged_check vk_tier.err "staged routed-expert tier"
   echo "OK staged routed-expert tier: $(grep -o 'resident data in host memory: .*' vk_tier.err)"
+  COLI_VK_STAGED=1 COLI_VK_UP_IMPORT=0 ./tests/test_vk_tier shaders/qmatmul.spv > vk_tier.log 2> vk_tier.err
+  tail -1 vk_tier.log | grep -qx PASS || { cat vk_tier.log vk_tier.err; fail "staged routed-expert tier, no imports"; }
+  echo "OK staged routed-expert tier, every copy staged (COLI_VK_UP_IMPORT=0)"
   COLI_VK_STAGED=1 ./tests/test_vk_chain shaders/qmatmul.spv > vk_chain.log 2> vk_chain.err
   tail -1 vk_chain.log | grep -qx PASS || { cat vk_chain.log vk_chain.err; fail "staged chain ops"; }
   staged_check vk_chain.err "staged chain ops"
   echo "OK staged chain ops: $(grep -o 'resident data in host memory: .*' vk_chain.err)"
+}
+# imported_copies <log>: the copies the exit report says came straight from host memory
+imported_copies() { sed -n 's/.* MiB of them straight from host memory in \([0-9]*\) copies.*/\1/p' "$1" | tail -1; }
+# Staged uploads straight from host memory (up_import, VK_EXT_external_memory_host): the
+# tier's experts from the host image they are converted in, the trunk's rows from the
+# weights. The same tokens and logits as every copy through the staging buffer
+# (COLI_VK_UP_IMPORT=0); the exit report counts the imported copies; an import the driver
+# refuses (COLI_VK_STAGED_FAULT=import) is staged instead.
+staged_import() {
+  make qwen36 VK=1
+  [ -f qwen36_tiny/ref_full.json ] && [ -d qwen36_tiny_c ] || {
+    $PY tools/make_qwen36_tiny.py --out qwen36_tiny --ref-mode full --emit-ref qwen36_tiny/ref_full.json
+    $PY tools/convert_qwen36.py --model qwen36_tiny --out qwen36_tiny_c --ebits 8; }
+  local i n f
+  SNAP=qwen36_tiny_c COLI_DENSE_I8=0 ./qwen36 8 8 qwen36_tiny/ref_full.json > cpu.log 2>&1 || true
+  COLI_VULKAN=1 COLI_VK_STAGED=1 SNAP=qwen36_tiny_c ./qwen36 1 8 qwen36_tiny/ref_full.json > imp.log 2>&1 || true
+  grep -q '^\[VK\] ready' imp.log || { cat imp.log; fail "staged imports: the probe did not open the device"; }
+  if ! grep -q '^\[VK\] staged uploads: copied straight from host memory' imp.log; then
+    echo "OK staged imports: this driver has no VK_EXT_external_memory_host, every copy is staged"; return 0
+  fi
+  for i in 1 0; do
+    rm -f imp.usage
+    env COLI_USAGE=imp.usage COLI_VULKAN=1 COLI_VK_STAGED=1 COLI_VK_UP_IMPORT=$i COLI_VK_DENSE=1 COLI_VK_TIER_SYNC=1 \
+      COLI_DENSE_I8=0 DUMP=imp$i.f32 SNAP=qwen36_tiny_c ./qwen36 8 8 qwen36_tiny/ref_full.json > imp$i.log 2>&1 || true
+    same_tokens cpu.log imp$i.log "staged imports COLI_VK_UP_IMPORT=$i"
+    staged_check imp$i.log "staged imports COLI_VK_UP_IMPORT=$i"
+  done
+  cmp -s imp1.f32 imp0.f32 || fail "staged imports: the logits differ from every copy staged"
+  n=$(imported_copies imp1.log); [ "${n:-0}" -gt 0 ] || { grep '\[VK\] memory' imp1.log; fail "staged imports: nothing imported"; }
+  [ "$(imported_copies imp0.log)" = 0 ] || { grep '\[VK\] memory' imp0.log; fail "staged imports: COLI_VK_UP_IMPORT=0 imported"; }
+  echo "OK staged imports: tokens = CPU, logits = every copy staged, $n copies straight from host memory"
+  rm -f imp.usage
+  env COLI_USAGE=imp.usage COLI_VULKAN=1 COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=import:1 COLI_VK_DENSE=1 COLI_VK_TIER_SYNC=1 \
+    COLI_DENSE_I8=0 SNAP=qwen36_tiny_c ./qwen36 8 8 qwen36_tiny/ref_full.json > impf.log 2>&1 || true
+  grep -q "COLI_VK_STAGED_FAULT: import #1 fails" impf.log || { cat impf.log; fail "staged imports: the import fault never fired"; }
+  same_tokens cpu.log impf.log "staged imports, a refused import"
+  f=$(sed -n 's/.* copies (\([0-9]*\) not imported).*/\1/p' impf.log | tail -1)
+  [ "${f:-0}" -ge 1 ] || { grep '\[VK\] memory' impf.log; fail "staged imports: the refused import is not counted"; }
+  echo "OK staged imports, a refused import: staged instead, tokens = CPU"
+  rm -f imp.usage imp0.f32 imp1.f32
 }
 # An engine under the emulated window, COLI_VK_STAGED unset: it stages on its own, the
 # tier with the trunk on the device and the chain give the CPU's tokens (and logits),
@@ -143,6 +187,7 @@ staged_window() {
   chain_gate qwen36 "window qwen36 chain" 1 COLI_VK_HOST_VISIBLE_CAP_MB=246 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
   staged_check vk.log "window qwen36 chain"
   echo "OK window qwen36: staged on its own, $(grep -o 'resident data in host memory: .*' vk.log)"
+  staged_import   # here: the engine's fixture needs the fixture dependencies, which staged's job has not
 }
 
 # Staged uploads failing (COLI_VK_STAGED_FAULT=<point>[:n], the n-th time) at every point
