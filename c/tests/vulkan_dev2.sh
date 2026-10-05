@@ -91,7 +91,7 @@ d2_case() {
     excl)
       d2_check "$eng" vk.log "$tag $kind"
       local g; g=$(sed -n "s/^\[VK\] tier $eng run: .* | exclusive: \([0-9]*\) RAM copies.*/\1/p" vk.log | tail -1)
-      [ "${g:-0}" -gt 0 ] || { grep -a '\[VK\] tier' vk.log; fail "$tag excl: the RAM cache gave up no copy of a device expert"; }
+      [ "${D2_NOEVICT:-0}" = 1 ] || [ "${g:-0}" -gt 0 ] || { grep -a '\[VK\] tier' vk.log; fail "$tag excl: the RAM cache gave up no copy of a device expert"; }
       l="$l; $g RAM copies of device experts given up first" ;;
     noexcl)
       ! grep -qa "^\[VK\] tier $eng run: .* | exclusive:" vk.log || { grep -a '\[VK\] tier' vk.log; fail "$tag noexcl: COLI_VK_TIER_EXCLUSIVE=0 gave copies up"; } ;;
@@ -151,6 +151,7 @@ PY
 d2_colibri() {   # the primary device held at two experts by the engine's own cap
   local tok=$1 log=$2 st=(); shift 2; d2_fresh glm_tiny_i4r/.coli_usage
   [ "${D2_KEEP:-0}" = 1 ] && st=(STATS=glm_tiny_i4r/.coli_usage)
+  [ "${D2_SMALL:-0}" = 1 ] && st+=(CAP_RAISE=0)   # the excl cases: the cache stays at the slots asked for
   env SNAP=glm_tiny_i4r REF=glm_tiny_i4r/ref_glm.json IDOT=0 COLI_VK_EXPERTS=2 "${st[@]}" "$@" ./colibri $(d2_cap 64 2) 4 4 > "$log" 2>&1 || true
   d2_done glm_tiny_i4r/.coli_usage
   grep -aE '^GLM C engine|^PREFILL|^\[ORACLE\] mismatch' "$log" | sed 's/ | [0-9.]* pos\/s//' > "$tok" || true
@@ -248,7 +249,9 @@ family_dev2() {
     d2_case inkling d2_inkling "dev2 inkling" $k
     d2_case colibri d2_colibri "dev2 colibri" $k
     # glm53's fixture routes four experts in all, and in six tokens none gets the heat to
-    # displace another (LFRU's margin): its evict case checks the bound and the uploads
+    # displace another (LFRU's margin): its evict case checks the bound and the uploads.
+    # Three on the devices leave one for the CPU, which its one RAM slot keeps: its excl
+    # case has nothing to give up and checks the tokens and the second device
     D2_E2=1 D2_NOEVICT=1 d2_case glm53 d2_glm53 "dev2 glm53" $k
   done
   # (colibri's own registry on the second device, with the tier off, is the glm family's)
