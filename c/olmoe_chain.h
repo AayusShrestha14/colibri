@@ -226,7 +226,7 @@ static int olc_bufs(OlmChain *ch, Model *m, int rows);
 static void olc_fit_start(Model *m) {
     Cfg *c = &m->c; int L = c->n_layers, D = c->hidden, E = c->n_experts, H = c->n_heads, hd = c->head_dim;
     if (!g_vk_ready || !olc_geometry_ok(c)) return;
-    if (!coli_vk_chain_decide(NULL, vkt_wanted() && E > 0, OLMOE_CHAIN_IGPU) || !vkc_init()) return;
+    if (!coli_vk_chain_decide(NULL, vkt_wanted() && E > 0, OLMOE_CHAIN_IGPU)) return;
     size_t *per = calloc((size_t)L, sizeof *per), *mat = calloc((size_t)L, sizeof *mat);
     if (!per || !mat) { free(per); free(mat); return; }
     const char *e = getenv("COLI_VK_KV_BLOCK");
@@ -248,13 +248,12 @@ static void olc_fit_start(Model *m) {
     size_t tail = m->lm_head ? vkc_fit_tensor(10, D, c->vocab, 0) : 0;
     int n = vkc_fit("olmoe", L, per, mat, fixed, tail, &g_olc_fit);
     free(per); free(mat);
+    /* the chain's pipelines now, after the fit read the free memory */
+    if (n > 0 && !vkc_init()) return;   /* no chain after all (olc_start finds it so too): no fit */
     g_olc_fit_on = 1;
     for (int i = n; i < L; i++) olc_layer_cpu(NULL, m, i);
     if (!g_olc_fit.tail && !m->vk_lm_head) m->vk_lm_head = &g_vk_refused;
-    if (n == 0) {   /* the chain off: its blocks and pipelines go, every byte is the tier's */
-        vkc_shutdown();
-        vkc_fit_placed("olmoe", &g_olc_fit);
-    }
+    if (n == 0) vkc_fit_placed("olmoe", &g_olc_fit);   /* the chain off: nothing of it on the device */
 }
 /* After the dense-host decision, before the tier: the chain's N layers (and the head) on
  * the device now, so the tier sizes its budget from what is left. */

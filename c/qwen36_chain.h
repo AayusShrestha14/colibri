@@ -426,12 +426,14 @@ static void q36c_start(Model *m) {
     q36c_fit_qw(&m->lm_head, &tail, &tail_m);
     int n = vkc_fit("qwen36", L, per, mat, fixed, tail, &g_q36c_fit);
     free(per); free(mat);
+    /* the chain's pipelines now, after the fit read the free memory: nothing of it was on
+     * the device before (vkc_init's own buffer counts in the pools' share) */
+    if (n > 0 && !vkc_init()) { g_vk_chain = 0; return; }   /* no chain after all: no fit, as before */
     g_q36c_fit_on = 1;
     for (int i = n; i < L; i++) q36c_layer_cpu(NULL, m, i);
     if (!g_q36c_fit.tail) m->lm_head.vk_off = 1;
-    if (n == 0) {   /* the chain off: its blocks and pipelines go, every byte is the tier's */
+    if (n == 0) {   /* the chain off: nothing of it on the device, every byte is the tier's */
         g_vk_chain = 0;
-        vkc_shutdown();
         vkc_fit_placed("qwen36", &g_q36c_fit);
     }
 }

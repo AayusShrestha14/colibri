@@ -5812,7 +5812,8 @@ int main(int argc, char **argv) {
                     "a dense model on a device sharing the CPU's RAM; COLI_VK_IMPORT=0 copies them")
                     : "this device cannot import host memory");
     }
-    if (g_vk_chain && !vkc_init()) g_vk_chain = 0;
+    /* the chain's pipelines come up with its fit (q36c_start, below): nothing of the
+     * chain is on the device before it has decided how many layers fit */
 #endif
     if (ref_image && ref_image->t == J_OBJ) {
         jval *gh = json_get(ref_image, "grid_h"), *gw = json_get(ref_image, "grid_w");
@@ -6017,6 +6018,7 @@ int main(int argc, char **argv) {
 
 #ifdef COLI_VULKAN
     q36c_start(&m);      /* COLI_VK_CHAIN: how many layers the chain places (vkc_fit), before any upload */
+    if (g_vk_chain && !g_q36c_fit_on && !vkc_init()) g_vk_chain = 0;   /* no fit (PILOT, a geometry, ...): as before */
     q36_dho_start(&m);   /* COLI_VK_DENSE_HOST: the dense matrices on the device only, before the tier sizes its budget */
     if (g_q36c_fit_on && g_vk_chain) {   /* the chain's layers on the device now, so the tier sizes after them */
         q36c_place(&m);
