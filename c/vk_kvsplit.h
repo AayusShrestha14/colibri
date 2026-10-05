@@ -149,11 +149,11 @@ static int vkc_kv_plan_need(VkcKvSplit *ks, const char *engine, int nl, size_t r
     } else {
         double used = 0, bud = 0;
         size_t avail;
-        if (coli_vk_mem_budget(&used, &bud)) avail = bud > used ? (size_t)((bud - used) * 1e9) : 0;
+        if (coli_vk_mem_budget_dev(vkc_device_now(), &used, &bud)) avail = bud > used ? (size_t)((bud - used) * 1e9) : 0;
         else {
-            size_t dev = coli_vk_device_local_bytes(), w = 0, n = 0;
+            size_t dev = coli_vk_device_local_bytes_dev(vkc_device_now()), w = 0, n = 0;
             VkcStats st; vkc_stats(&st);
-            coli_vk_mem_info(&w, &n);
+            coli_vk_mem_info_dev(vkc_device_now(), &w, &n);
             avail = dev > w + st.dev_bytes ? dev - w - st.dev_bytes : 0;
         }
         avail += held;
@@ -895,10 +895,10 @@ static int vkc_kv_sparse_reserve(VkcBuf **b, size_t bytes) {
     if (old >= bytes) return 1;
     double used = 0, budget = 0;
     size_t free_bytes;
-    if (coli_vk_mem_budget(&used, &budget)) free_bytes = budget > used ? (size_t)((budget - used) * 1e9) : 0;
+    if (coli_vk_mem_budget_dev(vkc_device_now(), &used, &budget)) free_bytes = budget > used ? (size_t)((budget - used) * 1e9) : 0;
     else {
-        size_t total = coli_vk_device_local_bytes(), weights = 0, count = 0;
-        VkcStats st; vkc_stats(&st); coli_vk_mem_info(&weights, &count);
+        size_t total = coli_vk_device_local_bytes_dev(vkc_device_now()), weights = 0, count = 0;
+        VkcStats st; vkc_stats(&st); coli_vk_mem_info_dev(vkc_device_now(), &weights, &count);
         free_bytes = total > weights + st.dev_bytes ? total - weights - st.dev_bytes : 0;
     }
     if (bytes - old > free_bytes) return 0;

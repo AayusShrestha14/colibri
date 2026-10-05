@@ -102,6 +102,8 @@ static float *down(VkcBuf *b, size_t off, size_t n) {
 /* ---- matmul ----------------------------------------------------------------------- */
 static uint16_t f2bf(float f) { uint32_t u; memcpy(&u, &f, 4); return (uint16_t)((u + 0x7fff + ((u >> 16) & 1)) >> 16); }
 static float bf2f(uint16_t h) { uint32_t u = (uint32_t)h << 16; float f; memcpy(&f, &u, 4); return f; }
+static int g_test_dev;   /* the device test_matmul uploads to (the chain's current one) */
+static float *g_mm_out;  /* test_matmul's output, kept when set to non-NULL (the two devices' bits) */
 static void test_matmul(int fmt, int S, int I, int O, size_t xo, size_t yo) {
     float *x = fvec((size_t)S * I, 1.f), *W = malloc((size_t)O * I * sizeof(float));
     void *codes = NULL; float *sc = NULL; int gs = 0;
@@ -127,7 +129,8 @@ static void test_matmul(int fmt, int S, int I, int O, size_t xo, size_t yo) {
         codes = w;
     }
     ColiVkTensor *t = NULL;
-    if (!coli_vk_tensor_ensure(&t, codes, sc, fmt, I, O, gs)) { CHECK(0, "matmul fmt %d: upload", fmt); return; }
+    if (!(g_test_dev ? coli_vk_tensor_ensure2(&t, codes, sc, fmt, I, O, gs) : coli_vk_tensor_ensure(&t, codes, sc, fmt, I, O, gs))) {
+        CHECK(0, "matmul fmt %d: upload", fmt); return; }
     float *ref = malloc((size_t)S * O * sizeof *ref);
     for (int s = 0; s < S; s++) for (int o = 0; o < O; o++) {
         double a = 0; for (int i = 0; i < I; i++) a += (double)x[(size_t)s * I + i] * W[(size_t)o * I + i];
@@ -141,6 +144,7 @@ static void test_matmul(int fmt, int S, int I, int O, size_t xo, size_t yo) {
     float *y = (float *)vkc_ptr(yb) + yo;
     double e = relerr(y, ref, (size_t)S * O, 1e-3);
     CHECK(ok && e < 2e-4 && !bad(y, (size_t)S * O), "matmul fmt %d S %d I %d O %d xo %zu yo %zu: ok %d err %.2e", fmt, S, I, O, xo, yo, ok, e);
+    if (g_mm_out) memcpy(g_mm_out, y, (size_t)S * O * sizeof(float));
     vkc_free(xb); vkc_free(yb); coli_vk_tensor_free(t);
     free(x); free(W); free(codes); free(sc); free(ref);
 }
@@ -2336,6 +2340,67 @@ static void bench_gemv(void) {
     }
 }
 
+/* ---- a second device (vkc_device(1), COLI_VK_DEV2) -------------------------------------
+ * The chain's context on COLI_VK_DEV2's device: the ops against their references there,
+ * the matmul's bits equal to device 0's, and the boundary held (a buffer of one device
+ * bound or copied on the other fails; vkc_free takes it back on its own device). */
+static void test_dev2(const char *spv) {
+    const char *d2 = getenv("COLI_VK_DEV2");
+    if (!coli_vk_init_dev2(spv, strcmp(d2, "auto") ? atoi(d2) : -1)) { CHECK(0, "dev2: the second device did not open"); return; }
+    vkc_device(1);
+    if (!vkc_init()) { CHECK(0, "dev2: the chain's pipelines did not come up there"); vkc_device(0); return; }
+    vkc_device(0);
+    int fmts[4] = {1, 4, 10, 11};
+    for (int k = 0; k < 4; k++) {
+        int shapes[3][3] = {{1, 192, 70}, {40, 256, 160}, {2, 3072, 40}};
+        for (int j = 0; j < 3; j++) {
+            int S = shapes[j][0], I = shapes[j][1], O = shapes[j][2];
+            float *y0 = malloc((size_t)S * O * sizeof(float)), *y1 = malloc((size_t)S * O * sizeof(float));
+            unsigned seed = rng;
+            g_mm_out = y0; test_matmul(fmts[k], S, I, O, 0, 0);
+            rng = seed; vkc_device(1); g_test_dev = 1;
+            g_mm_out = y1; test_matmul(fmts[k], S, I, O, 0, 0);
+            g_test_dev = 0; vkc_device(0); g_mm_out = NULL;
+            CHECK(!memcmp(y0, y1, (size_t)S * O * sizeof(float)), "dev2: matmul fmt %d S %d: device 1's bits differ from device 0's", fmts[k], S);
+            free(y0); free(y1);
+        }
+    }
+    vkc_device(1);
+    test_norm(VKC_NORM_ADD1, 0); test_norm(0, 0);
+    test_rope();
+    test_attn(1, 140, 32, 0); test_attn(5, 200, 64, 0);
+    setenv("COLI_VK_ATTN_BLOCK", "16", 1); test_attn_hk(40, 7, 16, 2, 256, 0); unsetenv("COLI_VK_ATTN_BLOCK");
+    test_dnrec(8, 8, 8, 4, 0); test_dnrec(32, 100, 6, 3, 1);
+    if (vkc_kvs_ready()) test_kvs_steps();
+    /* the boundary: device 0's buffer on device 1 */
+    vkc_device(0);
+    float v[64]; for (int i = 0; i < 64; i++) v[i] = (float)i;
+    VkcBuf *a0 = up(v, 64);
+    vkc_device(1);
+    VkcBuf *a1 = up(v, 64), *b1 = vkc_buf(64 * 4, VKC_DEV);
+    vkc_begin();
+    int cross = vkc_copy(b1, 0, a0, 0, 64);
+    vkc_submit(1);
+    vkc_begin();
+    int same = vkc_copy(b1, 0, a1, 0, 64);
+    vkc_submit(1);
+    CHECK(!cross && same, "dev2: a copy across devices %s, one on device 1 %s", cross ? "ran" : "refused", same ? "ran" : "failed");
+    VkcNorm nm = {1, 64, 1, 0, 64, 64, 0, 64, 64, 0, 0, VKC_NORM_NOW, 1e-6f, 1.f};
+    vkc_begin();
+    int bound = vkc_norm(a0, a1, b1, &nm);
+    vkc_submit(1);
+    CHECK(!bound, "dev2: an op bound device 0's buffer on device 1");
+    vkc_free(a1); vkc_free(b1);
+    vkc_device(0);
+    vkc_free(a0);
+    vkc_device(1);
+    vkc_free(NULL);
+    VkcStats st; vkc_stats(&st);
+    printf("dev2: chain on the second device, %llu frames, %llu ops, %llu matmuls\n", st.frames, st.ops, st.matmuls);
+    vkc_shutdown();
+    vkc_device(0);
+}
+
 int main(int argc, char **argv) {
     const char *spv = argc > 1 ? argv[1] : "shaders/qmatmul.spv";
     if (!coli_vk_init(spv)) { printf("FAIL: no Vulkan device (shaders %s)\n", spv); return 1; }
@@ -2495,6 +2560,7 @@ int main(int argc, char **argv) {
     }
     if (!vkc_kvs_ready()) { fails++; printf("FAIL: the split KV shader did not load\n"); }
     else { test_kvs(); printf("kvs done\n"); }
+    if (getenv("COLI_VK_DEV2")) { test_dev2(spv); printf("dev2 done\n"); }
     VkcStats st; vkc_stats(&st);
     printf("chain: %llu frames, %llu ops, %llu matmuls (%llu GEMM), %llu barriers\n", st.frames, st.ops, st.matmuls, st.gemms, st.barriers);
     vkc_shutdown();
