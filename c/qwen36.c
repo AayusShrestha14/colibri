@@ -3252,13 +3252,22 @@ static void moe_vk_run(Model *m, Layer *l, int layer, const float *x, int S, flo
         if (xf) moe_vk_xf_cpu(m, layer, xb, rows, ib, want, ctb);
         else    moe_vk_i8_cpu(m, layer, xb, rows, ib, want, ctb, g, u);
         if (shb) { memset(shb, 0, (size_t)rows * D * sizeof(float)); qwen_shared_experts_cpu(m, l, xb, rows, shb, g, u, hh); }
-        if (ndev && !vkt_join(dev)) {   /* the batch failed (the tier stops): those pairs here */
+        const float *dsum = NULL;   /* a step wholly on the device: its routed rows summed there */
+        if (ndev && !vkt_join_sum(dev, vb, &dsum)) {   /* the batch failed (the tier stops): those pairs here */
             if (xf) moe_vk_xf_cpu(m, layer, xb, rows, ib, taken, ctb);
             else    moe_vk_i8_cpu(m, layer, xb, rows, ib, taken, ctb, g, u);
             memset(taken, 0, (size_t)n);
         }
+        /* rows apart (a prompt step reads tens of MB here); each row in rank order */
+        #pragma omp parallel for schedule(static) if (rows >= 64)
         for (int s = 0; s < rows; s++) {
             float *os = out + (int64_t)(s0 + s) * D;
+            if (dsum) {   /* the device's sum is this loop's for a zeroed row */
+                const float *ds = dsum + (int64_t)s * D;
+                for (int d = 0; d < D; d++) os[d] += ds[d];
+                if (shb) { const float *sp = shb + (int64_t)s * D; for (int d = 0; d < D; d++) os[d] += sp[d]; }
+                continue;
+            }
             for (int k = 0; k < K; k++) {
                 int i = s * K + k;
                 if (ib[i] < 0) continue;
