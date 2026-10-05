@@ -260,7 +260,7 @@ static size_t q38c_fit_w(const Q38Weight *w, int payload) {
     int fmt = q38_vk_fmt(w);
     return payload ? coli_vk_tensor_payload(fmt, w->cols, w->rows, 0) : vkc_fit_tensor(fmt, w->cols, w->rows, 0);
 }
-static int q38c_kv_rows0(void) { return 3 * (int)vkc_kv_env("COLI_VK_KV_BLOCK", 64); }
+static int q38c_kv_rows0(void) { long b = vkc_kv_env("COLI_VK_KV_BLOCK", 64); return 3 * (int)(b < 1 ? 1 : b); }
 /* layer i's device bytes (as q38c_setup places it, its state at its starting size) and its matrices' payload */
 static void q38c_fit_layer(Model *m, int i, int rows, size_t *bytes, size_t *payload) {
     Cfg *c = &m->c; int H = c->hidden, W = c->hc_width;
