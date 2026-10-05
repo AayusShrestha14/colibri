@@ -126,9 +126,35 @@ ptl_mla() {
   [ "$want" -ge "$L" ] || ptl_mla_held "$eng" vk.log "$tag"
   echo "   N = $want of $L, $(ptl_calc matrices "$eng" vk.log | cut -d' ' -f1) B of matrices on the device after setup"
 }
+# ptl_mla_plan <tag> <model dir> <log> <env...>: coli plan's prediction (resource_plan.py,
+# vk_chain_fit) for glm53 on the same device and settings: the engine's free bytes,
+# per-layer bytes, fixed bytes and N, from the checkpoint's header and config alone.
+# colibri has no layout (its dense formats are the command line's): nothing to compare.
+ptl_mla_plan() {
+  local tag=$1 fx=$2 log=$3; shift 3
+  $PY - "$fx" "$log" "$@" <<'PY' || fail "$tag: coli plan predicts otherwise"
+import re, sys
+sys.path.insert(0, ".")
+import resource_plan as rp
+fx, log = sys.argv[1], sys.argv[2]
+env = dict(a.split("=", 1) for a in sys.argv[3:] if "=" in a)
+env.update(COLI_VULKAN="1", COLI_VK_CHAIN="1")
+lines = open(log, errors="replace").read().splitlines()
+f = [l for l in lines if l.startswith("[VK] glm53 chain fit: ")][-1]
+num = lambda key: int(re.search(key + r" (\d+) B", f)[1])
+layers = [int(x) for x in re.search(r"layers((?: \d+)*) B", f)[1].split()]
+n = int(re.findall(r"\[VK\] glm53 chain: (\d+) of \d+ layers on the device", "\n".join(lines))[0])
+fit = rp.vk_chain_fit(rp.analyze_model(fx), "glm53", env, {"type": "cpu"})
+ok = (fit["layers"], fit["fixed"], fit["free"], fit["n"]) == (layers, num("fixed"), num("free"), n)
+print(f"   coli plan: N = {fit['n']} of {fit['L']} ({'as the engine' if ok else 'the engine: %d' % n}), "
+      f"layers {'= the engine' if fit['layers'] == layers else fit['layers']}, fixed {fit['fixed']} B, free {fit['free']} B")
+sys.exit(0 if ok else 1)
+PY
+}
 # ptl_mla_cap <engine> <tag> <k> <env...> -- <argv...>: COLI_VK_DEVICE_CAP_MB aimed at k
 # layers from a probe at 256 MiB with the same settings; the reserve holds the device's
-# own scratch beside what the tier takes
+# own scratch beside what the tier takes. glm53: coli plan predicts the same N (PTL_MODEL
+# names the checkpoint)
 ptl_mla_cap() {
   local eng=$1 tag=$2 k=$3; shift 3
   local R=COLI_VK_TIER_RESERVE_GB=0.04 cap pred
@@ -137,6 +163,8 @@ ptl_mla_cap() {
   PTL_WANT=$k ptl_mla "$eng" "$tag (cap $cap MiB)" - COLI_VK_DEVICE_CAP_MB="$cap" $R "$@"
   pred=$(ptl_calc predict "$eng" vk.log)
   [ "$pred" = "$k" ] || { grep -a "^\[VK\] $eng chain" vk.log; fail "$tag: the rule gives $pred from the run's own numbers"; }
+  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done
+  if [ -n "${PTL_MODEL:-}" ]; then ptl_mla_plan "$tag" "$PTL_MODEL" vk.log COLI_VK_DEVICE_CAP_MB="$cap" $R "${envs[@]}"; fi
 }
 # ptl_mla_fault <engine> <tag> <k> <env...> -- <argv...>: a staged upload fails inside
 # layer k's setup (every layer asked for): the chain keeps the layers before it
@@ -293,7 +321,8 @@ ptl_family_glm() {
   PTL_WANT=6 ptl_mla glm53 "partial glm53 the fit, everything fitting" - GLM53_BITS=32 -- $F --ids $ids --greedy 4
   ptl_mla_same glm53 "partial glm53 the fit = every layer asked for" "X=1" "COLI_VK_CHAIN_LAYERS=6" GLM53_BITS=32 -- $F --ids $ids --greedy 4
   # ---- a small device; an upload failing in the middle of the setup
-  for k in 1 4 0; do ptl_mla_cap glm53 "partial glm53 a device for $k layers" $k GLM53_BITS=32 -- $F --ids $ids --greedy 4; done
+  for k in 1 4 0; do PTL_MODEL=glm53_l6s-i4 ptl_mla_cap glm53 "partial glm53 a device for $k layers" $k GLM53_BITS=32 -- $F --ids $ids --greedy 4; done
+  PTL_MODEL=glm53_l6s-i4 ptl_mla_cap glm53 "partial glm53 a device for 3 layers, 4-bit trunk, chunks of 7" 3 GLM53_BITS=4 COLI_VK_CHAIN_ROWS=7 -- $F --ids $ids --greedy 4
   for k in 0 2 5; do ptl_mla_fault glm53 "partial glm53 an upload failing in layer $k" $k GLM53_BITS=4 -- $F --ids $ids --greedy 4; done
   # ---- the forward paths with N < L
   ptl_mla glm53 "partial glm53 prefill chunks of 7, one cache slot" 3 GLM53_BITS=4 GLM53_PREFILL_CHUNK=7 GLM53_EXPERT_GB=0.000001 -- $F --ids $ids --greedy 4
@@ -307,7 +336,7 @@ ptl_family_glm() {
   KV=16:4 ptl_mla glm53 "partial glm53 the KV split" 4 GLM53_BITS=32 -- $F --ids $ids --greedy 8
   KV=16:4 ptl_mla glm53 "partial glm53 the KV split, chain chunks of 3" 2 GLM53_BITS=32 COLI_VK_CHAIN_ROWS=3 -- $F --ids $ids --greedy 8
   FAULT_BACK=7 REBUILD=1 ptl_mla glm53 "partial glm53 device lost, the device layers' KDA state rebuilt" 3 GLM53_BITS=32 GLM53_PREFILL_CHUNK=16 -- $F --ids $ids --greedy 6
-  FAULT_BACK=5 REBUILD=1 ptl_mla glm53 "partial glm53 device lost after an image" 2 GLM53_BITS=32 -- $M --greedy 4
+  FAULT_BACK=2 REBUILD=1 ptl_mla glm53 "partial glm53 device lost after an image" 2 GLM53_BITS=32 -- $M --greedy 4
   ptl_mla_same glm53 "partial glm53 chunks of 1 = 7" "COLI_VK_CHAIN_ROWS=1" "COLI_VK_CHAIN_ROWS=7" COLI_VK_CHAIN_LAYERS=4 GLM53_BITS=32 -- $F --ids $ids --greedy 4
   # ---- the dense weights on the device only
   for k in 1 3; do ptl_mla_dho glm53 "partial glm53 device only, $k of 6 layers" $k glm53_l6s-i4 GLM53_BITS=32 -- $F --ids $ids --greedy 4; done

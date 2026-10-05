@@ -780,13 +780,16 @@ static void g53c_start(GModel *m) {
     if (!m->has_io || m->layer_begin != 0 || m->layer_end != c->n_layers) return;   /* a segment: no chain, no drop */
     int on = coli_vk_chain_decide("glm53", tier_on, COLI_VK_CHAIN_UNMEASURED);
     const char *no = NULL;
+    const char *why = on ? g53c_check(m) : NULL;
+    if (why) fprintf(stderr, "[VK] glm53 chain: %s; per-matrix path\n", why);
+    /* the fit before anything of the chain is on the device (its pools' first blocks are
+     * the fit's own granularity, as coli plan counts them) */
+    if (on && !why) g53c_fit_plan(m);
     if (on && !(g_g53c_inited = vkc_init())) no = "the chain's pipelines did not come up";
     if (on && !no && !(vkc_mla_ready() && vkc_kda_ready() && vkc_mhc_ready()))
         no = "the MLA, KDA or mHC shaders are missing";
     if (no) fprintf(stderr, "[VK] glm53: %s: the dense chain stays off\n", no);
-    const char *why = on && !no ? g53c_check(m) : NULL;
-    if (why) fprintf(stderr, "[VK] glm53 chain: %s; per-matrix path\n", why);
-    if (on && !no && !why) g53c_fit_plan(m);   /* before any upload */
+    if (no) g_g53c_fitted = 0;   /* no chain after all: everything as before */
     g53_dho_start(m, tier_on, g_g53c_fitted ? g_g53c_fit.n : -1, g_g53c_fitted ? g_g53c_fit.tail : 1);
     if (!g_g53c_fitted) return;
     if (g_g53c_fit.n > 0 && g53c_setup(m)) g_vk_chain = on;

@@ -660,12 +660,15 @@ static void glmc_start(Model *m) {
 #endif
     if (on && !no && (g_kv8 || g_tq)) no = "a quantized KV cache (KV8, KV_TQ) stays on the CPU";
     if (on && !no && g_pilot) no = "PILOT prefetch reads the residual on the host";
+    const char *why = on && !no ? glmc_check(m) : NULL;
+    if (why) fprintf(stderr, "[VK] colibri chain: %s; per-matrix path\n", why);
+    /* the fit before anything of the chain is on the device (its pools' first blocks are
+     * the fit's own granularity, as coli plan counts them) */
+    if (on && !no && !why) glmc_fit_plan(m);
     if (on && !no && !(g_glmc_inited = vkc_init())) no = "the chain's pipelines did not come up";
     if (on && !no && !vkc_mla_ready()) no = "the MLA shaders are missing (chain_mla, chain_hgemv, chain_dsa)";
     if (no) fprintf(stderr, "[VK] colibri: %s: the dense chain stays off\n", no);
-    const char *why = on && !no ? glmc_check(m) : NULL;
-    if (why) fprintf(stderr, "[VK] colibri chain: %s; per-matrix path\n", why);
-    if (on && !no && !why) glmc_fit_plan(m);   /* before any upload */
+    if (no) g_glmc_fitted = 0;   /* no chain after all: everything as before */
     glm_dho_start(m);
     if (!g_glmc_fitted) return;
     if (g_glmc_fit.n > 0 && glmc_setup(m)) g_vk_chain = on;
