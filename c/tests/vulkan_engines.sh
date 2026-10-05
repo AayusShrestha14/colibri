@@ -488,10 +488,10 @@ family_qwen() {
   ! grep -aq 'extra layers' vk.log || { grep -a '\[VK\] tier' vk.log; fail "shared RAM: the MTP head's layer went on the tier by default"; }
   echo "OK shared RAM: the MTP head's experts on the CPU by default"
 }
-mtp_on_device() {  # <tag>: vk.log's tier served experts of the MTP head's layer
-  local n; n=$(grep -a -o 'extra layers (1): [0-9]*' vk.log | tail -1 | grep -o '[0-9]*$')
-  [ "${n:-0}" -gt 0 ] || { grep -a '\[VK\] tier' vk.log; fail "$1: no expert of the MTP head's layer ran on the device"; }
-  echo "OK $1: $(grep -a -o 'extra layers (1): [0-9]* of [0-9]* routed experts on the device' vk.log | tail -1)"
+mtp_on_device() {  # <tag> [log, vk.log]: the tier served experts of the MTP head's layers (its extra layers)
+  local log=${2:-vk.log} n; n=$(grep -a -o 'extra layers ([0-9]*): [0-9]*' "$log" | tail -1 | grep -o '[0-9]*$')
+  [ "${n:-0}" -gt 0 ] || { grep -a '\[VK\] tier' "$log"; fail "$1: no expert of the MTP head's layers ran on the device"; }
+  echo "OK $1: $(grep -a -o 'extra layers ([0-9]*): [0-9]* of [0-9]* routed experts on the device' "$log" | tail -1)"
 }
 
 # The routed-expert tier under ASan and UBSan: a sanitized VK=1 build of both qwen
@@ -536,7 +536,7 @@ family_qwen_sanitize() {
   done
   san qwen38 "asan qwen38 eviction" Q38_PREFILL_BATCH=0 COLI_VK_TIER_GB=0.0000065 SNAP=qwen38_tiny_fp8 ./qwen38 1 8 qwen38_tiny_fp8/ref.json
   san qwen38 "asan qwen38 MTP" COLI_VK_DENSE=1 Q38_MTP=1 COLI_VK_TIER_MTP=1 Q38_PREFILL_BATCH=0 SNAP=qwen38_tiny_int4_mtp ./qwen38 2 8 qwen38_tiny_int4_mtp/ref.json
-  cp san.log vk.log; mtp_on_device "asan qwen38 MTP"
+  mtp_on_device "asan qwen38 MTP" san.log
   san qwen38 "asan qwen38 tier alone" COLI_VK_DENSE=0 SNAP=qwen38_tiny_int4 ./qwen38 4 8 qwen38_tiny_int4/ref_int4.json
   make clean >/dev/null 2>&1 || true
 }
@@ -929,9 +929,17 @@ family_deepseek() {
   }
   for cap in 1 2 8; do v41_tier "cap=$cap" SNAP=dsv41_tiny ./deepseek_v41 $cap dsv41_tiny/ref.json; done
   for cap in 2 8; do v41_tier "40-token prompt cap=$cap" SNAP=dsv41_long ./deepseek_v41 $cap dsv41_long/ref.json; done
-  # DSpark: the drafts stay on the CPU, the verify rows of the backbone take the device
+  # DSpark: the verify rows of the backbone take the device, and the drafts stay on the
+  # CPU (the default on Lavapipe, which shares the RAM); with COLI_VK_TIER_MTP=1 (the
+  # default on a discrete GPU) the stages are the tier's extra layers, their experts on
+  # the device too
   for force in 1 2 3 4 5; do
     v41_tier "DSpark spec=$force" SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=$force ./deepseek_v41 1 dsv41_tiny/ref.json
+    ! grep -aq 'extra layers' v41-vk.err || { grep -a '\[VK\] tier' v41-vk.err; fail "deepseek_v41 DSpark spec=$force: the stages went on the tier by default on shared RAM"; }
+  done
+  for force in 1 3 5; do
+    v41_tier "DSpark stages on the tier spec=$force" SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=$force COLI_VK_TIER_MTP=1 ./deepseek_v41 1 dsv41_tiny/ref.json
+    mtp_on_device "deepseek_v41 DSpark stages on the tier spec=$force" v41-vk.err
   done
   EVICT=1 v41_tier "a budget of three experts" COLI_VK_TIER_GB=0.00005 SNAP=dsv41_long ./deepseek_v41 8 dsv41_long/ref.json
   v41_tier "trunk on the device too" COLI_VK_DENSE=1 SNAP=dsv41_long ./deepseek_v41 2 dsv41_long/ref.json
@@ -1080,6 +1088,8 @@ PY
   local cap force p
   for cap in 1 8; do san deepseek_v41 "asan deepseek_v41 cap=$cap" SNAP=dsv41_long ./deepseek_v41 $cap dsv41_long/ref.json; done
   for force in 2 4; do san deepseek_v41 "asan deepseek_v41 DSpark spec=$force" SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=$force ./deepseek_v41 1 dsv41_tiny/ref.json; done
+  san deepseek_v41 "asan deepseek_v41 DSpark stages on the tier" SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=3 COLI_VK_TIER_MTP=1 ./deepseek_v41 1 dsv41_tiny/ref.json
+  mtp_on_device "asan deepseek_v41 DSpark stages on the tier" san.log
   san deepseek_v41 "asan deepseek_v41 eviction" COLI_VK_TIER_GB=0.00005 SNAP=dsv41_long ./deepseek_v41 8 dsv41_long/ref.json
   san deepseek_v41 "asan deepseek_v41 trunk on the device" COLI_VK_DENSE=1 SNAP=dsv41_tiny ./deepseek_v41 2 dsv41_tiny/ref.json
   p=$($PY -c 'import json; c=json.load(open("deepseek_v4_tiny_t/ref.json"))["cases"]["long"]; print("".join("<t%03d>" % t for t in c["prompt_ids"]))')
@@ -1494,6 +1504,17 @@ family_glm() {
   cmp -s <(grep -a '^GLM C engine' cpu.log) <(grep -a '^GLM C engine' vk.log) || { cat vk.log; fail "colibri COLI_VK_TIER=0: tokens differ"; }
   ! grep -qa '^\[VK\] tier colibri' vk.log || { cat vk.log; fail "colibri COLI_VK_TIER=0: the tier started"; }
   echo "OK colibri COLI_VK_TIER=0: tokens = CPU, no tier"
+  # the MTP head's layer as the tier's extra layer (COLI_VK_TIER_MTP=1, the default on a
+  # discrete GPU): its experts f32 and quantized at load, two drafts; Lavapipe shares the
+  # RAM, where the default keeps them on the CPU
+  $PY tools/make_glm_mtp_tiny.py --src glm_tiny --out glm_tiny_mtp > /dev/null && cp ref_glm.json glm_tiny_mtp/
+  glm_tier "colibri MTP head on the tier, f32" glm_tiny_mtp glm_tiny_mtp/ref_glm.json DRAFT=2 COLI_VK_TIER_MTP=1 -- 64 16 16
+  mtp_on_device "colibri MTP head on the tier, f32"
+  glm_tier "colibri MTP head on the tier, 4-bit" glm_tiny_mtp glm_tiny_mtp/ref_glm.json DRAFT=2 IDOT=0 COLI_VK_TIER_MTP=1 -- 2 4 4
+  mtp_on_device "colibri MTP head on the tier, 4-bit"
+  glm_tier "colibri MTP head, shared RAM default" glm_tiny_mtp glm_tiny_mtp/ref_glm.json DRAFT=2 -- 64 16 16
+  ! grep -aq 'extra layers' vk.log || { grep -a '\[VK\] tier' vk.log; fail "colibri: the MTP head's layer went on the tier by default on shared RAM"; }
+  echo "OK colibri shared RAM: the MTP head's experts on the CPU by default"
 
   # glm53: its int4-gs64 streaming container (swiglu_limit 10), dense matrices f32 and int4
   local ids
@@ -1544,6 +1565,9 @@ family_glm_sanitize() {
   HIST=1 gsan colibri "asan colibri tier + COLI_VK_DEV2" glm_tiny_i4r SNAP=glm_tiny_i4r REF=glm_tiny_i4r/ref_glm.json COLI_VK_EXPERTS=4 COLI_VK_DEV2=0 ./colibri 64 4 4
   gsan colibri "asan colibri int4 at load, PIPE=1" glm_tiny SNAP=glm_tiny REF=ref_glm.json PIPE=1 ./colibri 1 4 4
   gsan colibri "asan colibri int8 at load, PILOT=1" glm_tiny SNAP=glm_tiny REF=ref_glm.json PILOT=1 ./colibri 2 8 8
+  $PY tools/make_glm_mtp_tiny.py --src glm_tiny --out glm_tiny_mtp > /dev/null && cp ref_glm.json glm_tiny_mtp/
+  gsan colibri "asan colibri MTP head on the tier" glm_tiny_mtp SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 IDOT=0 COLI_VK_TIER_MTP=1 ./colibri 2 4 4
+  mtp_on_device "asan colibri MTP head on the tier" san.log
   local ids
   ids=$($PY -c "print(','.join(str((i*37+5)%120+2) for i in range(100)))")
   gsan glm53 "asan glm53 decode" - GLM53_BITS=32 ./glm53 --model glm53_stream-i4 --ids 5,7,9,11,13,17,19,23 --greedy 20
