@@ -895,7 +895,7 @@ they answer from the device one at a time, as before. A lost
 device rebuilds only the device's layers from the prefix record. The vision tower's rows and
 the n-gram table stay on the host as before. With `COLI_VK_DENSE_HOST=0` only the N layers'
 host copies go (with the full chain fitted, each layer once all of it is on the device). The
-tiny fixture on Lavapipe under `COLI_VK_DEVICE_CAP_MB=58.821190` with
+tiny fixture on Lavapipe under `COLI_VK_DEVICE_CAP_MB=58.758690` with
 `COLI_VK_TIER_RESERVE_GB=0.04`:
 
 ```
