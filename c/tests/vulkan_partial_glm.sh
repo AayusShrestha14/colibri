@@ -377,7 +377,7 @@ ptl_family_glm() {
     CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_l6_serve GLM53_BITS=32 COLI_VK_CHAIN_LAYERS=3
   unset CHAIN_SERVE_EXPECT
   # a pin restored over rows another branch rewrote, 2 of 4 layers on the device
-  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_CHAIN_LAYERS=2 COLI_USAGE=$PWD/chain.usage $PY tests/glm53_pin_branch_harness.py --binary ./glm53 --fixture glm53_mm_tiny
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_CHAIN_LAYERS=2 COLI_USAGE=$PWD/chain.usage COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 $PY tests/glm53_pin_branch_harness.py --binary ./glm53 --fixture glm53_mm_tiny
   rm -rf glm_tiny_shx glm53_l6 glm53_l6s-i4 glm53_l6_serve chain.usage
   rm -f ptl-probe.err ptl-ram*.log same-*.log same-*.tok same-*.f32
   unset OMP_NUM_THREADS CAP_RAISE
