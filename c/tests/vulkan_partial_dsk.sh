@@ -375,6 +375,10 @@ ptl_k3_dho() {
   ptl_k3 "$tag" "$c" "$k" COLI_VK_DENSE_HOST=0 "$@"
   local n want L r
   n=$(dho_dropped vk.log); want=$(ptl_k3_droppable "$k"); L=$(ptl_L kimi_k3 vk.log); r=$(dho_reloaded vk.log)
+  # RELOAD_MLA=1 (prompts only: decode runs on the CPU, whose MLA attention reads kv_b by
+  # row): each MLA layer on the device reads its kv_b back once, as in the dense-only family
+  local reloads=0
+  [ "${RELOAD_MLA:-0}" = 1 ] && reloads=$(sed -n 's/^\[VK\] kimi_k3 chain: [0-9]* layers on the device ([0-9]* KDA, \([0-9]*\) MLA.*/\1/p' vk.log | tail -1)
   [ "$k" = "$L" ] && want=$((want + 1))   # the head, with every layer
   [ "$n" = "$want" ] || { grep '^\[VK\]' vk.log; fail "$tag: $n host copies dropped, the $k layers have $want"; }
   if [ "$k" -lt "$L" ]; then
@@ -383,7 +387,7 @@ ptl_k3_dho() {
   fi
   if [ -n "${FAULT_BACK:-}" ]; then
     [ "$r" -gt 0 ] && [ "$r" -le "$n" ] || { grep '^\[VK\]' vk.log; fail "$tag: $r matrices read back after the loss ($n on the device only)"; }
-  else [ "$r" = 0 ] || { grep '^\[VK\]' vk.log; fail "$tag: $r matrices read back from disk on a healthy run"; }; fi
+  else [ "$r" = "${reloads:-0}" ] || { grep '^\[VK\]' vk.log; fail "$tag: $r matrices read back from disk on a healthy run, expected ${reloads:-0}"; }; fi
   echo "   $n host copies dropped (the $k layers' $want), $r read back"
 }
 # ptl_k3_same <tag> <case> <a> <b> <env...>: the chain's logits under settings a and b the
@@ -432,7 +436,7 @@ ptl_k3_cases() {
   # ---- the dense weights on the device only
   for k in 1 3 6; do ptl_k3_dho "partial kimi_k3 device only, $k of 6 layers" long $k $O; done
   ptl_k3_dho "partial kimi_k3 device only, staged" long 3 $O COLI_VK_STAGED=1
-  CHAINMODE=2 ptl_k3_dho "partial kimi_k3 device only, prompts only" long 3 $O
+  CHAINMODE=2 RELOAD_MLA=1 ptl_k3_dho "partial kimi_k3 device only, prompts only" long 3 $O
   FAULT_BACK=3 REBUILD=1 ptl_k3_dho "partial kimi_k3 device only, device lost mid-decode" long 3 $O
   ptl_k3_fault "partial kimi_k3 device only, an upload failing in layer 3" long 3 $O COLI_VK_DENSE_HOST=0
   [ "$(dho_reloaded vk.log)" = 0 ] || { grep '^\[VK\]' vk.log; fail "partial kimi_k3 device only, an upload failing: read back from disk"; }
