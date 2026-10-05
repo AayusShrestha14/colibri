@@ -1141,6 +1141,35 @@ the picture) are the previous build's; with `COLI_VULKAN=1` and `COLI_VK_CHAIN=0
 unset, those of 54 (the tier balanced deterministically, `COLI_VK_TIER_BALANCE=0`, since
 its balance moves bits from run to run on either build).
 
+**A partial chain.** MiMo-V2.6's dense part (about 24 GB on Flash, 32 GB on Pro in its
+native FP8/BF16 form) does not fit most cards, so the chain takes the first N layers
+that do (`vkc_fit`, decided at start-up before anything goes up; `COLI_VK_CHAIN_LAYERS`
+forces N) and the CPU runs the others and the head. A layer's bytes are its matrices in
+their `MIMO_DENSE_BITS` form (the fused qkv, o_proj, and the dense layer 0's MLP), its
+K/V mirror at the size the chain allocates (a sliding layer's ring; a full layer's
+context, or `COLI_VK_KV_DEVICE_ROWS` when that asks for fewer: the split covers the
+rest) and its norms and sink logits; the head is the tail, with the vision tower when
+the per-matrix path would take it (`COLI_VK_DENSE`). A partial chain places its layers
+before the tier sizes itself; with everything fitting, the layers go up after the tier
+as before. Each prompt chunk crosses the N device layers, its residual rows come down
+with the frame that ends it (the buffer the normed rows use), and the CPU runs layers
+N.. and the head on those rows before the next chunk; a chunk counts as computed once
+both sides ran it, so a device lost in a later chunk loses nothing either side holds,
+and the CPU runs on from where the host's caches end. The device's layers keep their
+mirrors behind the watermarks above; the CPU's layers keep their caches on the host
+only, and nothing of them, of the head or of the tower goes up through the per-matrix
+path. A layer that does not fully reach the device is freed and the chain keeps the
+layers before it. With `COLI_VK_DENSE_HOST=0` only the N layers drop their host copies,
+and `coli plan` (`resource_plan.py`, MiMo's layout) predicts the same N from the
+checkpoint's header and config and credits those layers alone.
+`tests/vulkan_engines.sh partial-inkling-mimo` gates it on the fixture (every N from 0
+to 6, text and picture, the three dense forms, N from a device cap and from an upload
+failing inside a layer, chunks of 3 rows, one token at a time, prompts only, the KV
+split, a lost device, device-only weights, serve sessions and the prefix-reuse tests)
+on the CPU's tokens and logits within 1e-4 of the largest, and `coli plan`'s numbers on
+the engine's (free, per-layer and fixed bytes, N) under each cap. Lavapipe only: no
+discrete GPU was available, so the fit's choice on a real card is not measured.
+
 **The default.** The chain's speed on a real MiMo model is not measured: no MiMo
 checkpoint is on the test box (the smallest, Flash, has 309B parameters). The chain is
 on for a discrete GPU (the common rule), off on an integrated GPU (`COLI_VK_CHAIN=1`
@@ -1275,6 +1304,36 @@ What the numbers say:
 **Not measured**: a discrete GPU; OLMoE in serve sessions, past a 537-token context, with
 `PILOT` (its experts fit in RAM here) or with the dense trunk on the device beside the
 chain (`COLI_VK_DENSE=1`).
+
+**Inkling's partial chain.** Inkling's dense part is 49 GB in bf16 (about 15 GB in the
+dense-int4g64 container), so on any consumer card its chain is partial: `vkc_fit` decides
+at start-up, before anything goes up and before the expert cache is sized, how many
+layers from the first fit (`COLI_VK_CHAIN_LAYERS` forces N), and the CPU runs the others
+and lm_head. A layer's bytes are its matrices in the form each goes up in (q, k, v, r,
+o_proj; the dense MLP's three, or the router's f32 copy and each shared expert's three),
+its share of the parameter arena, its four convolution rings and its K/V mirror at the
+window's rows (a global layer's grows with the context: the KV split covers that). No fit
+is made when the chain would decline anyway: bf16 matrices on a CPU whose bf16 dot
+rounds the activations go to the device in no form (the `[VK] inkling: 0 resident
+matrices go to the GPU` case), and the chain declines as before. A partial chain places
+its layers at start-up, before the tier sizes itself (so does every fit with
+`COLI_VK_DENSE_HOST` dropping the host copies, which drops each layer's only once all of
+it is on the device); with everything fitting and the host copies kept, the layers go up
+at the first forward as before. Every chunk of a forward crosses the N layers, the
+residual rows come down once a chunk, and the CPU runs layers N.. over all the rows
+layer by layer, as its own forward does, then the head and the per-position heads. The
+device's layers keep their mirrors, rings and convolution states as above; the CPU's
+layers keep theirs on the host, so a CPU step lowers and a lost device rebuilds the
+device's layers alone (`rebuilding the state of P positions ... (the device's layers;
+the CPU's have theirs)`). `coli plan` (`resource_plan.py`, inkling's layout, which reads
+the dense-int4g64 container's forms when it is there) predicts the same N.
+`tests/vulkan_engines.sh partial-inkling-mimo` gates it on the tiny fixtures (every N
+from 0 to 8, the dense-int4g64 container, the expert containers, bf16, D = 6144 with N
+from 0 to 2, N from a device cap and from an upload failing inside a layer, chunks of 3,
+prompts only, the KV split, a lost device, device-only weights, serve sessions and the
+prefix-reuse and dashboard tests) on the CPU's tokens and every forward's logits within
+1e-4 of the largest, and `coli plan`'s numbers on the engine's under each cap, on
+Lavapipe; no discrete GPU was available.
 
 **Inkling: not measured.** No Inkling checkpoint runs on the box (the model is 975B),
 so its integrated-GPU default is off (`COLI_VK_CHAIN_UNMEASURED`: the `[VK]` line says
