@@ -91,6 +91,20 @@
  * 4. Report: vkt_report("run" or "turn", ram_hits, disk_loads) where the engine
  *    prints its "[VK] <engine>" line; EMAP's tier bits: vkt_resident(l, e) -> 2.
  *
+ * 5. Streaming (optional, for prompts; vk_tier.c, "streaming"): give .load and .release
+ *    (and .load_batch when the engine reads several experts in parallel), which hand
+ *    the tier an expert's bytes as the CPU path would get them. Then
+ *      - block a prompt step with B = vkt_step_rows(S, block): the whole step when the
+ *        tier streams, so each expert's rows meet in one GEMM;
+ *      - vkt_issue takes, besides the resident experts, every cold expert the rule
+ *        streams (it loads them through .load, uploads them into its staging slots and
+ *        computes them as sub-batches); taken[] says which pairs, as before, and the
+ *        join hands back their rows;
+ *      - optionally, between submitting the frame that computes a layer's routing and
+ *        waiting for it: vkt_stream_prefetch(layer, S) loads the experts that layer will
+ *        likely stream while the device works.
+ *    COLI_VK_TIER_STREAM=0 turns it off: the tier behaves as without the hooks.
+ *
  * Source kinds (VktSrc) and what the device holds -- the conversion runs on the
  * uploader thread, nothing changes in the engine's RAM:
  *   VKT_SRC_I8_ROW        int8, f32 per row                      -> fmt 1
@@ -135,6 +149,14 @@ typedef struct { VktSrc kind; int gs; } VktFmt;     /* gs: group (block) size, 0
 #define VKT_ACT_SITU   1
 #define VKT_ACT_SWIGLU_V4 2
 
+/* One expert as it sits in RAM: codes and scales of gate, up, down (float scales,
+ * or ue8m0 bytes for VKT_SRC_MXFP4_E8M0; NULL for bf16/f32). Read during the call
+ * only: the tier copies what it keeps. */
+typedef struct {
+    const void *g, *u, *d;
+    const void *gs, *us, *ds;
+} VktExpertSrc;
+
 typedef struct {
     const char *engine;            /* names the [VK] tier lines */
     int layers, experts, hidden, inter, topk;
@@ -152,15 +174,21 @@ typedef struct {
     /* Optional: at most this many experts resident whatever the budget holds (0 = no
      * cap); for an engine whose users already size its device tier in experts. */
     int max_experts;
+    /* Optional, for streaming (a big prefill step's cold experts computed on the device,
+     * see "streaming" below): get an expert's bytes as the engine's CPU path would (its
+     * RAM cache, else the disk), valid until release(ctx, *h). 1 = *src filled; 0 = not
+     * to be had (the CPU computes it). Called on the engine thread, from vkt_issue and
+     * vkt_stream_prefetch, one expert at a time. Without it the tier never streams. */
+    int  (*load)(void *ctx, int layer, int eid, VktExpertSrc *src, void **h);
+    void (*release)(void *ctx, void *h);
+    void *load_ctx;
+    /* Optional, with load: n experts at once (an engine whose reads run in parallel),
+     * srcs[i] and h[i] as load's, each released on its own; returns how many it loaded,
+     * the first ones in order. A partial batch is consumed and released before the
+     * next batch; 0 falls back to load for the next expert. */
+    int  (*load_batch)(void *ctx, int layer, const int *eids, int n, VktExpertSrc *srcs, void **h);
 } VktConfig;
 
-/* One expert as it sits in RAM: codes and scales of gate, up, down (float scales,
- * or ue8m0 bytes for VKT_SRC_MXFP4_E8M0; NULL for bf16/f32). Read during the call
- * only: the tier copies what it keeps. */
-typedef struct {
-    const void *g, *u, *d;
-    const void *gs, *us, *ds;
-} VktExpertSrc;
 
 #ifdef COLI_VULKAN
 /* 1 unless COLI_VK_TIER=0: whether an engine with routed experts will try the tier
@@ -192,6 +220,16 @@ void vkt_begin_forward(void);
 void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long long disk_loads);
 /* Sizing helpers for engines: bytes one expert takes on the device in a source format. */
 size_t vkt_expert_bytes(int hidden, int inter, VktFmt gate_up, VktFmt down);
+/* Streaming: how many rows an engine hands one vkt_issue for a step of S rows whose
+ * blocks are otherwise `block` rows: S when the tier streams steps of that size (the
+ * whole step, so each expert's rows meet in one GEMM), else min(S, block). */
+int  vkt_step_rows(int S, int block);
+/* Streaming, optional: layer's experts the next step will likely stream, loaded and
+ * uploaded now, while the device runs the layer's attention (the engine calls this
+ * after submitting that frame and before waiting for it). The prediction is the
+ * layer's routing in the previous big step (else the history); an expert it misses
+ * is streamed after the routing, one it adds costs an upload. Returns how many. */
+int  vkt_stream_prefetch(int layer, int S);
 #else
 static inline int  vkt_wanted(void){return 0;}
 static inline int  vkt_init(const VktConfig *c, uint32_t *const *h){(void)c;(void)h;return 0;}
@@ -209,6 +247,8 @@ static inline int  vkt_resident(int l,int e){(void)l;(void)e;return 0;}
 static inline void vkt_begin_forward(void){}
 static inline void vkt_report(const char *s,unsigned long long r,unsigned long long d){(void)s;(void)r;(void)d;}
 static inline size_t vkt_expert_bytes(int h,int i,VktFmt a,VktFmt b){(void)h;(void)i;(void)a;(void)b;return 0;}
+static inline int  vkt_step_rows(int S,int b){return S<b?S:b;}
+static inline int  vkt_stream_prefetch(int l,int S){(void)l;(void)S;return 0;}
 #endif
 
 #endif

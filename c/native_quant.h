@@ -97,6 +97,16 @@ typedef int (*ColiV4VkMatmul)(int fmt, const void *data, const float *scales,
                               const float *input, int batch);
 extern ColiV4VkMatmul coli_v4_vk_matmul;
 
+/* With the dense weights on the device only (COLI_VK_DENSE_HOST), a matrix may have no
+ * host copy: the CPU paths call this before they read one, and it is read back from disk
+ * at its own address (deepseek_v4_internal.h, coli_v4_layer_host_restore). NULL when no
+ * device holds a matrix alone. */
+typedef int (*ColiV4VkHost)(const void *data);
+extern ColiV4VkHost coli_v4_vk_host;
+static inline void coli_v4_vk_host_ensure(const void *data) {
+    if (coli_v4_vk_host && data) coli_v4_vk_host(data);
+}
+
 /* An fp8 view on the device, fed the activation the CPU kernel would read
  * (already rounded to E4M3 per 128 by coli_fp8_activation_qdq_ref). */
 static inline int coli_v4_vk_fp8(float *output, const ColiTensorView *weight,

@@ -7,15 +7,24 @@
 #   bash tests/vulkan_engines.sh glm | glm-sanitize   # GLM-5.2 (colibri) and GLM-5.3 Flash (glm53)
 #   bash tests/vulkan_engines.sh shader    # the qmatmul formats, the expert batch and the tier, no engine
 #   bash tests/vulkan_engines.sh qwen-chain | qwen-chain-sanitize   # the dense chain (COLI_VK_CHAIN=1)
+#   bash tests/vulkan_engines.sh qwen-spec | qwen-spec-sanitize     # MTP and prompt-lookup verifies (docs/speculative.md)
 #   bash tests/vulkan_engines.sh mimo-chain | mimo-chain-sanitize   # MiMo-V2.6's dense chain
 #   bash tests/vulkan_engines.sh inkling-olmoe-chain | inkling-olmoe-chain-sanitize
 #   bash tests/vulkan_engines.sh glm-chain | glm-chain-sanitize     # the same for colibri and glm53
 #   bash tests/vulkan_engines.sh kimi-chain | kimi-chain-sanitize   # the same for Kimi K3
 #   bash tests/vulkan_engines.sh deepseek-chain | deepseek-chain-sanitize   # deepseek_v41 and deepseek_v4
+#   bash tests/vulkan_engines.sh prefill-qwen | prefill-qwen-sanitize | prefill-inkling-olmoe | prefill-mimo-kimi
+#   bash tests/vulkan_engines.sh prefill-glm | prefill-deepseek   # big prompt chunks and expert streaming
+#   bash tests/vulkan_engines.sh kv-split | kv-split-sanitize   # the KV cache split between the device and
+#                                                  # the host past the device's budget, every chain engine
+#   bash tests/vulkan_engines.sh kv-split-deepseek | kv-split-deepseek-sanitize   # the same for DeepSeek's
 #   bash tests/vulkan_engines.sh staged    # staged uploads: the same bits as mapped memory, the decision
 #   bash tests/vulkan_engines.sh <family>-staged   # a family with COLI_VK_STAGED=1 (qwen-staged: and
 #                                                  # an engine under an emulated small window)
 #   bash tests/vulkan_engines.sh staged-faults | staged-faults-sanitize   # staged uploads failing
+#   bash tests/vulkan_engines.sh dense-only-<group> | dense-only-<group>-sanitize   # the dense weights
+#        on the device only (COLI_VK_DENSE_HOST=0), tests/vulkan_dense_only_<group>.sh
+#   bash tests/vulkan_engines.sh decide | decide-sanitize   # Laya, GLiNER2.5-Decide and Clef's DECIDE
 #
 # Needs libvulkan-dev, glslc and mesa-vulkan-drivers, plus the Python packages of
 # the family's tiny fixtures (see the vulkan-engines job in .github/workflows/ci.yml).
@@ -571,9 +580,11 @@ EOF
   # The warm start: a CPU run writes the history (inkling's PIN=<file>, olmoe's
   # COLI_USAGE), and the tier's run fills the device from it before the first token.
   rm -f tier.hist
-  PIN=tier.hist SNAP=tiny_inkling ./inkling 8 -p "The capital of France is" -n 8 > cpu.log 2>&1
-  PIN=tier.hist COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 SNAP=tiny_inkling ./inkling 8 -p "The capital of France is" -n 8 > vk.log 2>&1
-  $PY - cpu.log vk.log <<'PY' || { cat vk.log; fail "inkling tier warm start: the text differs from the CPU's"; }
+  # Streaming can report its first device batch after the prompt has been printed.
+  # Keep diagnostics separate so the exact text comparison measures stdout alone.
+  PIN=tier.hist SNAP=tiny_inkling ./inkling 8 -p "The capital of France is" -n 8 > cpu.log 2> cpu.err
+  PIN=tier.hist COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 SNAP=tiny_inkling ./inkling 8 -p "The capital of France is" -n 8 > vk.log 2> vk.err
+  $PY - cpu.log vk.log <<'PY' || { cat cpu.log vk.log vk.err; fail "inkling tier warm start: the text differs from the CPU's"; }
 import re, sys
 def text(p):
     m = re.search(rb"\[\d+ prompt tokens\](.*?)\n\[prefill", open(p, "rb").read(), re.S)
@@ -581,9 +592,9 @@ def text(p):
 a, b = text(sys.argv[1]), text(sys.argv[2])
 sys.exit(0 if a is not None and a == b else 1)
 PY
-  grep -qa '^\[VK\] tier inkling: warm start, [1-9]' vk.log || { cat vk.log; fail "inkling tier: no warm start"; }
-  [ "$(tier_count inkling vk.log)" -gt 0 ] || { cat vk.log; fail "inkling tier warm start: no routed expert ran on the device"; }
-  echo "OK inkling tier warm start: text = CPU, $(grep -a -o 'warm start, [0-9]* experts' vk.log), $(grep -a -o 'device [0-9]* of [0-9]* routed experts' vk.log | tail -1)"
+  grep -qa '^\[VK\] tier inkling: warm start, [1-9]' vk.err || { cat vk.err; fail "inkling tier: no warm start"; }
+  [ "$(tier_count inkling vk.err)" -gt 0 ] || { cat vk.err; fail "inkling tier warm start: no routed expert ran on the device"; }
+  echo "OK inkling tier warm start: text = CPU, $(grep -a -o 'warm start, [0-9]* experts' vk.err), $(grep -a -o 'device [0-9]* of [0-9]* routed experts' vk.err | tail -1)"
   rm -f tier.hist
   COLI_USAGE=tier.hist SNAP=olmoe_tiny_c ./olmoe 8 8 $OR > cpu.log 2>&1
   COLI_USAGE=tier.hist COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 SNAP=olmoe_tiny_c ./olmoe 8 8 $OR > vk.log 2>&1
@@ -1209,10 +1220,12 @@ family_mimo_chain() {
   # off the chain's logits are the same bytes whatever the blocks -- one row reading the
   # ring in place, blocks of 3, of the window's 8 and of 9 rows gathering it, the whole
   # prompt -- so a row's window is the same rows in the same order on every path.
+  # Keep the per-row attention too: blocked attention has its own reduction order;
+  # the default blocked path's numerical gates above remain enabled.
   for c in window long image; do
     local x=(); [ $c = image ] && x=(--image mimo_tiny/patches.f32 --grid $MGRID)
     for ch in 64 1 3 8 9; do
-      COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER=0 COLI_VK_GEMM_MIN_S=0 MIMO_DENSE_BITS=32 MIMO_CHUNK=$ch MIMO_LOGITS=blk$ch.f32 \
+      COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER=0 COLI_VK_GEMM_MIN_S=0 COLI_VK_ATTN_BLOCK=0 MIMO_DENSE_BITS=32 MIMO_CHUNK=$ch MIMO_LOGITS=blk$ch.f32 \
         ./mimo mimo_tiny --ids "$(mimo_ids $c greedy_full_ids)" --ngen 0 "${x[@]}" > /dev/null 2> mimo-vk.err
       [ "$(chain_count mimo mimo-vk.err)" -gt 0 ] || { cat mimo-vk.err; fail "chain mimo blocks $ch $c: the chain never ran"; }
       [ $ch = 64 ] || cmp -s blk64.f32 blk$ch.f32 || fail "chain mimo $c: blocks of $ch are not the bytes of one block"
@@ -1232,7 +1245,7 @@ family_mimo_chain() {
   # the prefix-reuse contract and Brio photos (the rings restored into the device's
   # mirrors), compared bit for bit with a cold engine: the per-row GEMV and no tier, so
   # a resumed prompt's rows get the bits of the same rows computed cold
-  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER=0 COLI_VK_GEMM_MIN_S=0 $PY -m unittest tests.test_mimo_prefix_serve
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER=0 COLI_VK_GEMM_MIN_S=0 COLI_VK_ATTN_BLOCK=0 $PY -m unittest tests.test_mimo_prefix_serve
   # a serve session against the CPU's, frame for frame, in both modes and with the
   # device lost mid-session. The fixture's logits run to 300 (its head is scaled for wide
   # greedy margins), so its logprobs compare within 1e-3: about 3e-6 of the largest logit
@@ -1659,6 +1672,111 @@ family_qwen_chain_sanitize() {
   make clean >/dev/null 2>&1 || true
 }
 
+# Speculative decoding with deeper verifies (docs/speculative.md): the MTP head's drafts
+# up to 3 per verify (qwen38, Q38_MTP_DRAFTS) and prompt-lookup drafts up to 5 (qwen38
+# and qwen36, COLI_LOOKUP=1), a verify of up to 6 rows with the recurrent state copied
+# after each row; and colibri's n-gram drafts from the same lookup and gate. tests/spec_drafts_harness.py (make spec-drafts-check) compares every
+# run with drafts against the same run without, tokens and last logits byte for byte:
+#   - on the CPU (this VK=1 build with COLI_VULKAN unset);
+#   - in the dense chain, the tier off (with it on, the tier's residency follows the
+#     routed rows, the rejected drafts' included, and an expert on the device sums in
+#     another order than on the CPU, so the last bits depend on the history); and the
+#     chain in chunks of 3 rows (a verify of 6 rows split over two chunks), the
+#     per-matrix path (a verify's rows one GEMV at a time) and prompts only
+#     (COLI_VK_CHAIN=2: verifies on the per-matrix path);
+#   - against the CPU with the tier on (chain_gate: the CPU's tokens, logits within
+#     tolerance), and the device lost inside a deep verify (rebuilt on the CPU).
+spec_fixtures() {
+  $PY tools/make_qwen38_tiny.py --out qwen38_tiny_mtp --mtp
+  $PY tools/make_edge_tiny_tokenizer.py --vocab-size 64 ./qwen38_tiny_mtp   # serve speaks text
+  $PY tools/make_qwen38_tiny.py --out qwen38_tiny_int4_mtp --fp8-experts --int4-experts --expert-gain 3 --mtp
+  make qwen36-tiny-v128-generate
+}
+family_qwen_spec() {
+  make qwen36 qwen38 tests/test_spec_draft VK=1
+  make spec-drafts-check VK=1
+  local chain="--env COLI_VULKAN=1 --env COLI_VK_CHAIN=1 --env COLI_VK_TIER=0 --env COLI_VK_TIER_SYNC=1"
+  make spec-drafts-run VK=1 SPEC_ENV="$chain"
+  local h="$PY tests/spec_drafts_harness.py" e
+  for e in "--env COLI_VULKAN=1 --env COLI_VK_CHAIN=1 --env COLI_VK_TIER=0 --env COLI_VK_CHAIN_ROWS=3" \
+           "--env COLI_VULKAN=1 --env COLI_VK_CHAIN=0 --env COLI_VK_DENSE=1 --env COLI_VK_TIER=0" \
+           "--env COLI_VULKAN=1 --env COLI_VK_CHAIN=2 --env COLI_VK_TIER=0"; do
+    $h --engine ./qwen38 --kind qwen38 --fixture ./qwen38_tiny_mtp --mtp --quick $e
+    $h --engine ./qwen36 --kind qwen36 --fixture ./qwen36_tiny_v128_c --ref ./qwen36_tiny_v128/ref_full.json \
+      --cap 8 --n-new 64 --quick --env COLI_DENSE_I8=0 $e
+  done
+  # A six-row verify crosses several one-row KV chunks. Rollback must lower both
+  # the mirror and split-cache validity, including rejected rows already uploaded.
+  # Keep the same attention kernel in plain/speculative arms for byte comparisons.
+  e="$chain --env COLI_VK_KV_DEVICE_ROWS=8 --env COLI_VK_KV_BLOCK=2 --env COLI_VK_CHAIN_ROWS=1 --env COLI_VK_ATTN_BLOCK=0"
+  $h --engine ./qwen38 --kind qwen38 --fixture ./qwen38_tiny_mtp --mtp --serve --quick --require-kv-split $e
+  $h --engine ./qwen36 --kind qwen36 --fixture ./qwen36_tiny_v128_c --ref ./qwen36_tiny_v128/ref_full.json \
+    --cap 8 --n-new 64 --serve --quick --require-kv-split --env COLI_DENSE_I8=0 $e
+  # A completed MTP chunk has already returned its hidden streams. A loss in
+  # the next chunk must restart the CPU replay from the original embeddings.
+  $h --engine ./qwen38 --kind qwen38 --fixture ./qwen38_tiny_mtp --mtp --n-new 32 \
+    --device-loss --require-kv-split --env COLI_VK_DENSE_HOST=0 $e
+  local f
+  for f in cycle row2 row3; do
+    chain_gate qwen38 "spec chain qwen38 MTP depth 3 $f, tier on" 1 OMP_NUM_THREADS=2 Q38_MTP=1 Q38_MTP_DRAFTS=3 \
+      Q38_MTP_FORCE=$f SNAP=qwen38_tiny_mtp -- 2 8 qwen38_tiny_mtp/ref.json
+    chain_gate qwen36 "spec chain qwen36 lookup $f, tier on" 1 COLI_DENSE_I8=0 COLI_LOOKUP=1 COLI_SPEC_GATE=0 \
+      COLI_LOOKUP_FORCE=$f SNAP=qwen36_tiny_v128_c -- 8 8 qwen36_tiny_v128/ref_full.json
+  done
+  chain_gate qwen38 "spec chain qwen38 lookup row4, int4 experts, tier on" 1 OMP_NUM_THREADS=2 Q38_EXPERT_INT4=1 \
+    COLI_VK_TIER_BALANCE=0 COLI_LOOKUP=1 COLI_SPEC_GATE=0 COLI_LOOKUP_FORCE=row4 SNAP=qwen38_tiny_int4_mtp -- 2 8 \
+    qwen38_tiny_int4_mtp/ref_int4.json
+  # colibri (GLM-5.2): its n-gram drafts from spec_draft.h under COLI_LOOKUP=1, on the
+  # CPU and in the chain, against the oracle (every token) and against DRAFT=0
+  make colibri VK=1
+  $PY tools/make_glm_oracle.py > /dev/null
+  local v base
+  base=$(env OMP_NUM_THREADS=2 SNAP=glm_tiny REF=ref_glm.json DRAFT=0 ./colibri 64 16 16 2>/dev/null | grep -a '^GLM C engine')
+  for v in "" "COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER=0" "COLI_VULKAN=1 COLI_VK_CHAIN=1"; do
+    for e in "COLI_SPEC_GATE=0" "COLI_SPEC_GATE=0 DRAFT=2" ""; do
+      # shellcheck disable=SC2086
+      env OMP_NUM_THREADS=2 SNAP=glm_tiny REF=ref_glm.json COLI_USAGE=chain.usage COLI_LOOKUP=1 $e $v ./colibri 64 16 16 > vk.log 2>&1 \
+        || { cat vk.log; fail "spec colibri lookup $e $v: misses the oracle"; }
+      [ "$(grep -a '^GLM C engine' vk.log)" = "$base" ] || { cat vk.log; fail "spec colibri lookup $e $v: tokens differ from DRAFT=0"; }
+      grep -q "colibri lookup\] acceptance" vk.log || { cat vk.log; fail "spec colibri lookup $e $v: no lookup line"; }
+      echo "OK spec colibri lookup ${e:-gated} ${v:-CPU}: oracle and DRAFT=0's tokens, $(grep -o 'acceptance [^|]*' vk.log | head -1)"
+    done
+  done
+  lost_late qwen38 "spec chain qwen38 device lost mid-decode, verifies of 4 rows" 15 rebuild OMP_NUM_THREADS=2 Q38_MTP=1 \
+    Q38_MTP_DRAFTS=3 Q38_MTP_FORCE=cycle SNAP=qwen38_tiny_mtp -- 2 8 qwen38_tiny_mtp/ref.json
+  lost_late qwen36 "spec chain qwen36 device lost mid-decode, lookup verifies" 20 rebuild COLI_DENSE_I8=0 COLI_LOOKUP=1 \
+    COLI_SPEC_GATE=0 COLI_LOOKUP_FORCE=cycle SNAP=qwen36_tiny_v128_c -- 8 8 qwen36_tiny_v128/ref_full.json
+}
+# The same under ASan and UBSan: every run of the harness's quick subset (depth 3
+# rejected at rows 1 and 2 and cycling, lookup cycling and at row 3, a serve session
+# per source) on the CPU and in the chain, sanitizer-clean and still equal to its own
+# plain decoding.
+family_qwen_spec_sanitize() {
+  make clean >/dev/null 2>&1 || true
+  make qwen36 qwen38 tests/test_spec_draft tests/test_qwen38_spec_alloc VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
+  ./tests/test_spec_draft > san.log 2>&1 || true
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log || ! tail -1 san.log | grep -q "behave as"; then cat san.log; fail "asan: spec_draft.h"; fi
+  echo "OK asan: spec_draft.h"
+  ./tests/test_qwen38_spec_alloc > san.log 2>&1 || { cat san.log; fail "asan: speculative allocation"; }
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan: speculative allocation"; fi
+  echo "OK asan: speculative allocation"
+  spec_fixtures
+  local h="$PY tests/spec_drafts_harness.py --sanitize --quick" e
+  for e in "" "--env COLI_VULKAN=1 --env COLI_VK_CHAIN=1 --env COLI_VK_TIER=0" \
+           "--require-kv-split --env COLI_VULKAN=1 --env COLI_VK_CHAIN=1 --env COLI_VK_TIER=0 --env COLI_VK_KV_DEVICE_ROWS=8 --env COLI_VK_KV_BLOCK=2 --env COLI_VK_CHAIN_ROWS=1 --env COLI_VK_ATTN_BLOCK=0"; do
+    $h --engine ./qwen38 --kind qwen38 --fixture ./qwen38_tiny_mtp --mtp --serve $e
+    $h --engine ./qwen38 --kind qwen38 --fixture ./qwen38_tiny_int4_mtp --ref ./qwen38_tiny_int4_mtp/ref_int4.json \
+      --mtp --env Q38_EXPERT_INT4=1 --env Q38_TRUNK_MIN_KB=0 $e
+    $h --engine ./qwen36 --kind qwen36 --fixture ./qwen36_tiny_v128_c --ref ./qwen36_tiny_v128/ref_full.json \
+      --cap 8 --n-new 64 --serve --env COLI_DENSE_I8=0 $e
+  done
+  $h --engine ./qwen38 --kind qwen38 --fixture ./qwen38_tiny_mtp --mtp --n-new 32 --device-loss \
+    --require-kv-split --env COLI_VULKAN=1 --env COLI_VK_CHAIN=1 --env COLI_VK_TIER=0 --env COLI_VK_DENSE_HOST=0 \
+    --env COLI_VK_KV_DEVICE_ROWS=8 --env COLI_VK_KV_BLOCK=2 --env COLI_VK_CHAIN_ROWS=1 --env COLI_VK_ATTN_BLOCK=0
+  make clean >/dev/null 2>&1 || true
+}
+
 # inkling's and olmoe's fixtures for their dense chain: the family inkling-olmoe's (the
 # bf16 copy of the f32 snapshot, the dense-int4g64 container, the expert containers and
 # the tokenizers), and Inkling at its real width (--wide: D = 6144, head dim 128).
@@ -1808,10 +1926,11 @@ family_inkling_olmoe_chain() {
   COLI_VK_CHAIN=2 $PY tests/vulkan_chain_serve.py ./olmoe olmoe_tiny_c
   # (these compare a warm session's logprobs with a cold one's to the last printed
   # digit: no history file and COLI_VK_TIER_BALANCE=0, so both sessions split their
-  # experts between the device and the CPU alike)
-  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 INKLING_TINY=tiny_inkling \
+  # experts between the device and the CPU alike. Use per-row attention on both:
+  # a cold prefill and a short suffix must share a reduction order for exact bits.)
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 COLI_VK_ATTN_BLOCK=0 INKLING_TINY=tiny_inkling \
     $PY -m unittest tests.test_inkling_prefix_serve tests.test_inkling_dashboard_hits
-  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 OLMOE_TINY=olmoe_tiny_c \
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 COLI_VK_ATTN_BLOCK=0 OLMOE_TINY=olmoe_tiny_c \
     $PY -m unittest tests.test_olmoe_prefix_serve tests.test_olmoe_dashboard_hits tests.test_brio_serve
 }
 
@@ -2052,7 +2171,10 @@ family_glm_chain_sanitize() {
 # |logit|, the logprobs of the serve sessions within 2e-2, the tokens exactly. With the CPU's int8 expert activations
 # (K3_IDOT=1) a rounding that flips an int8 step moves the logits further (8e-3, the
 # tokens unchanged): that configuration gates on its tokens (TOKENS=1).
-k3c_ids() { $PY -c "import json,sys;print(' '.join(map(str,json.load(open('kimi_k3_tiny/ref.json'))['cases'][sys.argv[1]]['prompt_ids'])))" "$1"; }
+k3c_ids() {   # case "ids": the prompt K3C_IDS holds (a prompt past the oracle's)
+  if [ "$1" = ids ] && [ -n "${K3C_IDS:-}" ]; then echo "$K3C_IDS"; return; fi
+  $PY -c "import json,sys;print(' '.join(map(str,json.load(open('kimi_k3_tiny/ref.json'))['cases'][sys.argv[1]]['prompt_ids'])))" "$1"
+}
 k3c_close() {  # <cpu.f32> <vk.f32>: max |diff| within 2e-3 of the largest |logit|
   $PY - "$1" "$2" <<'PY'
 import array, sys
@@ -2152,8 +2274,8 @@ family_kimi_chain() {
   # the device lost: 9 frames a forward on this fixture (two per sparse layer and the
   # head); the long prompt is three forwards (32, 32 and 8 rows), then 7 decode steps
   FAULT_BACK=3 REBUILD=1 k3c_gate "chain kimi_k3 device lost mid-decode" $O
-  K3C_CASES=long FAULT_BACK=86 k3c_gate "chain kimi_k3 device lost in the first prompt chunk" $O
-  K3C_CASES=long FAULT_BACK=77 REBUILD=1 k3c_gate "chain kimi_k3 device lost in a later prompt chunk" $O
+  K3C_CASES=long FAULT_BACK=86 k3c_gate "chain kimi_k3 device lost in the first prompt chunk" $O K3_CHUNK=32
+  K3C_CASES=long FAULT_BACK=77 REBUILD=1 k3c_gate "chain kimi_k3 device lost in a later prompt chunk" $O K3_CHUNK=32
   # in chain chunks of 5 rows (seven chunks a 32-row forward), the loss in the third
   # chunk of the second forward: the state its first chunks advanced is not used
   K3C_CASES=long FAULT_BACK=124 REBUILD=1 k3c_gate "chain kimi_k3 device lost inside a chunked forward" $O COLI_VK_CHAIN_ROWS=5
@@ -2668,6 +2790,1162 @@ family_deepseek_chain_sanitize() {
   make clean >/dev/null 2>&1 || true
 }
 
+# ---- the dense weights on the device only (COLI_VK_DENSE_HOST=0; docs/vulkan.md,
+# "Dense weights on the device only"): one file per engine group,
+# tests/vulkan_dense_only_<group>.sh, each defining dho_family_<group> and
+# dho_family_<group>_sanitize (run as dense-only-<group> and dense-only-<group>-sanitize).
+#
+# dho_dropped <log>: matrices the engine placed on the device only (its startup line)
+dho_dropped() {
+  local n; n=$(sed -n 's/^\[VK\] [a-z0-9_]*: \([0-9][0-9]*\) dense matrices on the device only.*/\1/p' "$1" | tail -1)
+  echo "${n:-0}"
+}
+# dho_reloaded <log>: host copies read back from disk for the CPU (the exit line)
+dho_reloaded() {
+  local n; n=$(sed -n 's/^\[VK\] [a-z0-9_]*: dense weights at exit: .*), \([0-9][0-9]*\) read back from disk.*/\1/p' "$1" | tail -1)
+  echo "${n:--1}"
+}
+# dho_rss <log>: the resident set the exit line reports, in GiB
+dho_rss() { sed -n 's/^\[VK\] [a-z0-9_]*: dense weights at exit: .*; RSS \([0-9.]*\) GiB$/\1/p' "$1" | tail -1; }
+# dho_gate <engine> <tag> <tol 0|1|2> <env...> -- <argv...>: one configuration three
+# times, on the CPU, on the device keeping its host copies (COLI_VK_DENSE_HOST=1) and on
+# the device only (=0), the tier deterministic (COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0)
+# and each run from a fresh history. Gates: the CPU's tokens; matrices dropped and none read
+# back; with the chain asked for (CHAINMODE, default 1; 0 = the per-matrix path alone with
+# COLI_VK_DENSE=1), chain forwards; tol 2: the logits the bytes of the host-copy run (what
+# runs on the device is the same), 1: within 1e-4 of the CPU's largest logit (logits_close),
+# 0: tokens only. CPUENV: the CPU arm's own settings; DUMPENV: the variable the engine
+# writes its logits to (default DUMP).
+dho_gate() {
+  local eng=$1 tag=$2 tol=$3; shift 3
+  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  local dv=${DUMPENV:-DUMP} mode=${CHAINMODE:-1}
+  local vk=(COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 COLI_VULKAN=1 COLI_VK_CHAIN=$mode)
+  [ "$mode" = 0 ] && vk+=(COLI_VK_DENSE=1)
+  rm -f chain.usage cpu.f32 vk.f32 host.f32
+  env "${envs[@]}" ${CPUENV:-} $dv=cpu.f32 ./"$eng" "$@" > cpu.log 2>&1 || true
+  env "${envs[@]}" "${vk[@]}" COLI_USAGE=chain.usage COLI_VK_DENSE_HOST=1 $dv=host.f32 ./"$eng" "$@" > host.log 2>&1 || true
+  rm -f chain.usage
+  env "${envs[@]}" "${vk[@]}" COLI_USAGE=chain.usage COLI_VK_DENSE_HOST=0 $dv=vk.f32 ./"$eng" "$@" > vk.log 2>&1 || true
+  rm -f chain.usage
+  same_tokens cpu.log vk.log "$tag"
+  same_tokens cpu.log host.log "$tag (host copies)"
+  local n; n=$(dho_dropped vk.log)
+  [ "$n" -gt 0 ] || { cat vk.log; fail "$tag: no dense matrix went to the device only"; }
+  [ "$(dho_reloaded vk.log)" = 0 ] || { grep '^\[VK\]' vk.log; fail "$tag: a matrix was read back from disk without a lost device"; }
+  if [ "$mode" != 0 ]; then [ "$(chain_count "$eng" vk.log)" -gt 0 ] || { cat vk.log; fail "$tag: the chain did not stay on"; }; fi
+  local lg=""
+  case $tol in
+    2) cmp -s host.f32 vk.f32 || fail "$tag: the logits differ from the run that keeps its host copies"; lg=", logits = the host-copy run's" ;;
+    1) lg=$(logits_close cpu.f32 vk.f32) || { echo "$lg"; fail "$tag: logits"; }; lg=", $lg" ;;
+  esac
+  echo "OK $tag: tokens = CPU$lg, $n matrices on the device only, $(chain_count "$eng" vk.log) chain forwards"
+}
+# dho_lost <engine> <tag> <frames back> <env...> -- <argv...>: device only, the device lost
+# `back` frames before the end of a run (COLI_VK_CHAIN_FAULT, counted on a probe run): the
+# CPU's tokens, and the matrices the CPU then needed read back from disk.
+dho_lost() {
+  local eng=$1 tag=$2 back=$3; shift 3
+  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  local vk=(COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_DENSE_HOST=0)
+  rm -f chain.usage
+  env "${envs[@]}" ./"$eng" "$@" > cpu.log 2>&1 || true
+  env "${envs[@]}" "${vk[@]}" COLI_USAGE=chain.usage ./"$eng" "$@" > vk.log 2>&1 || true
+  local f; f=$(sed -n "s/^\[VK\] $eng chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p" vk.log | tail -1)
+  { [ -n "$f" ] && [ "$f" -gt "$back" ]; } || { cat vk.log; fail "$tag: the probe run reports no frames"; }
+  rm -f chain.usage
+  env "${envs[@]}" "${vk[@]}" COLI_VK_CHAIN_FAULT=$((f - back)) COLI_USAGE=chain.usage ./"$eng" "$@" > vk.log 2>&1 || true
+  rm -f chain.usage
+  same_tokens cpu.log vk.log "$tag"
+  local r; r=$(dho_reloaded vk.log)
+  [ "$r" -gt 0 ] || { grep '^\[VK\]' vk.log; fail "$tag: nothing was read back for the CPU"; }
+  echo "OK $tag: tokens = CPU after the loss, $r matrices read back from disk"
+}
+# dho_rss_gate <engine> <tag> <MiB at least> <env...> -- <argv...>: the resident set at
+# exit falls by most of what was dropped (the device copies are host memory on a CPU
+# device, the host copies are not there twice): RSS(host copies) - RSS(device only) is at
+# least the given MiB.
+dho_rss_gate() {
+  local eng=$1 tag=$2 mib=$3; shift 3
+  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  local vk=(COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=${CHAINMODE:-1})
+  rm -f chain.usage
+  env "${envs[@]}" "${vk[@]}" COLI_USAGE=chain.usage COLI_VK_DENSE_HOST=1 ./"$eng" "$@" > host.log 2>&1 || true
+  rm -f chain.usage
+  env "${envs[@]}" "${vk[@]}" COLI_USAGE=chain.usage COLI_VK_DENSE_HOST=0 ./"$eng" "$@" > vk.log 2>&1 || true
+  rm -f chain.usage
+  local a b; a=$(dho_rss host.log); b=$(dho_rss vk.log)
+  { [ -n "$a" ] && [ -n "$b" ]; } || { grep '^\[VK\]' host.log vk.log; fail "$tag: no exit line with the resident set"; }
+  $PY - "$a" "$b" "$mib" <<'PY' || { grep '^\[VK\].*dense' host.log vk.log; fail "$tag: the resident set did not fall"; }
+import sys
+a, b, mib = float(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3])
+print(f"RSS at exit {a:.2f} GiB with the host copies, {b:.2f} GiB on the device only")
+sys.exit(0 if (a - b) * 1024 >= mib else 1)
+PY
+  echo "OK $tag: $(grep -o 'given back.*' vk.log | head -1)"
+}
+for f in tests/vulkan_dense_only_*.sh; do [ -e "$f" ] && . "$f"; done
+# ---- big prompt chunks and expert streaming (docs/vulkan.md, "Big prompt chunks and
+# expert streaming") ----
+# Every engine with the chain, on a prompt longer than its usual block, against its CPU
+# run with the same snapshot and settings:
+#   default   the chunk from the budget (the whole prompt in one chunk here) and the cold
+#             experts the rule streams: the CPU's tokens and logits, the chunk's line,
+#             and one tier step of the whole prompt;
+#   forced    a small chunk cap and a forced streaming threshold (PF_FORCE: chunks of
+#             PF_ROWS rows, a tier of a few experts, cold experts with 3 rows or more
+#             streamed through four slots in sub-batches of 24 rows, so experts are cut
+#             into parts): the CPU's tokens and logits, streamed experts counted, and the
+#             later chunks' prefetch from the earlier ones' routing (PF_PREFETCH=1);
+#   staged    the forced configuration with COLI_VK_STAGED=1 (the staging slots filled
+#             through host images): the same, nothing resident left in host memory;
+#   off       COLI_VK_CHAIN_ROWS=512 COLI_VK_TIER_STREAM=0 COLI_VK_ATTN_BLOCK=0, the
+#             build before's behaviour: the CPU's tokens, nothing streamed.
+# <family>-sanitize runs the forced configurations under ASan and UBSan.
+PF_FORCE="COLI_VK_TIER_STREAM_ROWS=3 COLI_VK_TIER_STREAM_SLOTS=4 COLI_VK_TIER_STREAM_HALF=24"
+PF_OFF="COLI_VK_CHAIN_ROWS=512 COLI_VK_TIER_STREAM=0 COLI_VK_ATTN_BLOCK=0"
+stream_count() {   # <engine> <log>: cold experts streamed in the run (the last report)
+  local n; n=$(sed -n "s/^\[VK\] tier $1 run: .* stream: [0-9]* steps, \([0-9]*\) cold experts.*/\1/p" "$2" | tail -1)
+  echo "${n:-0}"
+}
+prefetch_count() {
+  local n; n=$(sed -n "s/^\[VK\] tier $1 run: .* prefetched \([0-9]*\) (\([0-9]*\) used).*/\2/p" "$2" | tail -1)
+  echo "${n:-0}"
+}
+# pf_check <engine> <log> <tag> <kind> [rows]: what the run must show besides the CPU's tokens
+pf_check() {
+  local eng=$1 log=$2 tag=$3 kind=$4 rows=${5:-}
+  case $kind in
+    default)
+      grep -q "^\[VK\] $eng chain: prompt chunks of up to 8192 rows" "$log" || { grep '\[VK\]' "$log"; fail "$tag: the chunk is not the budget's"; }
+      if [ -n "$rows" ]; then grep -q "^\[VK\] tier $eng stream: a step of $rows rows" "$log" ||
+        { grep '\[VK\] tier' "$log"; fail "$tag: no tier step of the whole prompt ($rows rows)"; }; fi ;;
+    forced|staged)
+      [ "$(stream_count "$eng" "$log")" -gt 0 ] || { grep '\[VK\] tier' "$log"; fail "$tag: nothing streamed"; }
+      if [ "${PF_PREFETCH:-0}" = 1 ]; then [ "$(prefetch_count "$eng" "$log")" -gt 0 ] ||
+        { grep '\[VK\] tier' "$log"; fail "$tag: no prefetched expert was used"; }; fi
+      if [ $kind = staged ]; then staged_check "$log" "$tag"; fi ;;
+    off)
+      ! grep -q "^\[VK\] tier $eng stream:" "$log" || { grep '\[VK\] tier' "$log"; fail "$tag: streamed with the feature off"; } ;;
+  esac
+  echo "   $tag: $(grep -o 'stream: [0-9]* steps, [0-9]* cold experts[^|]*' "$log" | tail -1 | cut -c1-160)"
+}
+# pf_runs <gate> <engine> <tag> <log> <rows> <budget env> <env...>: the four runs above.
+# <gate> is a command line (eval'd: its quotes hold) taking <tag> <tol> <env...> after it.
+pf_runs() {
+  local g=$1 eng=$2 tag=$3 log=$4 rows=$5 bud=$6; shift 6
+  local rw="COLI_VK_CHAIN_ROWS=${PF_ROWS:-64}"
+  eval "$g"' "pf $tag default" 1 "$@"'; pf_check "$eng" "$log" "pf $tag default" default "$rows"
+  eval "$g"' "pf $tag forced" 1 $PF_FORCE $bud $rw "$@"'; pf_check "$eng" "$log" "pf $tag forced" forced
+  eval "$g"' "pf $tag staged" 1 $PF_FORCE $bud $rw COLI_VK_STAGED=1 "$@"'; pf_check "$eng" "$log" "pf $tag staged" staged
+  eval "$g"' "pf $tag off" 1 $PF_OFF "$@"'; pf_check "$eng" "$log" "pf $tag off" off
+}
+# the engines' gates in pf_runs' calling convention: <fixed args...> <tag> <tol> <env...>
+pf_chain() {  # <engine> <argv as one string> <tag> <tol> <env...>
+  local eng=$1 argv=$2 tag=$3 tol=$4; shift 4
+  # shellcheck disable=SC2086
+  chain_gate "$eng" "$tag" "$tol" "$@" -- $argv
+}
+pf_mla() {  # <engine> <argv as one string> <tag> <tol> <env...>
+  local eng=$1 argv=$2 tag=$3 tol=$4; shift 4
+  # shellcheck disable=SC2086
+  mla_gate "$eng" "$tag" "$tol" "$@" -- $argv
+}
+pf_ids() { $PY -c "print(','.join(str($2 + (i * 37) % $3) for i in range($1)))"; }
+# a long prompt's ref.json for the engines whose oracle reads one: the ids and a few more
+pf_ref() {  # <out> <n> <first id> <span>
+  $PY - "$1" "$2" "$3" "$4" <<'PY'
+import json, sys
+out, n, lo, span = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+p = [lo + (i * 37) % span for i in range(n)]
+full = p + [lo] * 8
+json.dump({"prompt_ids": p, "full_ids": full, "tf_pred": full[1:] + [lo]}, open(out, "w"))
+PY
+}
+# MiMo on a prompt of ids (its cases are at most 72 tokens): tokens with --ngen 6, every
+# position's logits with --ngen 0, against the CPU
+pf_mimo() {  # <ids> <tag> <tol> <env...>
+  local ids=$1 tag=$2; shift 3
+  env "$@" COLI_TEMP=0 ./mimo mimo_tiny --ids "$ids" --ngen 6 > mimo-cpu.txt 2>/dev/null
+  env "$@" COLI_TEMP=0 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 ./mimo mimo_tiny --ids "$ids" --ngen 6 > mimo-vk.txt 2> mimo-vk.err
+  [ -s mimo-cpu.txt ] && cmp -s mimo-cpu.txt mimo-vk.txt || { cat mimo-cpu.txt mimo-vk.txt mimo-vk.err; fail "$tag: tokens differ from the CPU"; }
+  rm -f cpu.f32 vk.f32
+  env "$@" MIMO_LOGITS=cpu.f32 ./mimo mimo_tiny --ids "$ids" --ngen 0 > /dev/null 2>&1
+  env "$@" MIMO_LOGITS=vk.f32 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 ./mimo mimo_tiny --ids "$ids" --ngen 0 > /dev/null 2> mimo-vk2.err
+  local lg; lg=$(logits_close cpu.f32 vk.f32) || { echo "$lg"; fail "$tag: logits"; }
+  echo "OK $tag: tokens = CPU, $lg, $(chain_count mimo mimo-vk.err) chain forwards"
+}
+pf_k3() {  # <ids> <tag> <tol> <env...>: k3c_gate on one prompt of ids
+  local ids=$1 tag=$2; shift 3
+  K3C_IDS="$ids" K3C_CASES=ids k3c_gate "$tag" "$@"
+}
+pf_v41() {  # <snap> <tag> <tol> <env...>
+  local snap=$1 tag=$2; shift 3
+  v41_gate "$tag" SNAP="$snap" "$@" -- 2 "$snap"/ref.json
+}
+pf_v4() {  # <fixture> <case> <tag> <tol> <env...>
+  local fx=$1 c=$2 tag=$3; shift 4
+  v4_chain_gate "$tag" "$fx" "$c" "$@"
+}
+
+family_prefill_qwen() {
+  make qwen36 qwen38 tests/test_vk_chain tests/test_vk_tier VK=1
+  ./tests/test_vk_tier shaders/qmatmul.spv | tee vk_tier.log
+  tail -1 vk_tier.log | grep -qx PASS || fail "the tier (its streaming section)"
+  ./tests/test_vk_chain shaders/qmatmul.spv | tee vk_chain.log
+  tail -1 vk_chain.log | grep -qx PASS || fail "the chain's ops (the blocked attention)"
+  $PY tools/make_qwen36_tiny.py --out qwen36_tiny --ref-mode full --emit-ref qwen36_tiny/ref_full.json
+  $PY tools/convert_qwen36.py --model qwen36_tiny --out qwen36_tiny_c --ebits 8
+  $PY tools/make_qwen36_tiny.py --out qwen36_tiny64 --ref-mode full --inter 64 --emit-ref qwen36_tiny64/ref_full.json
+  $PY tools/convert_qwen36.py --model qwen36_tiny64 --out qwen36_tiny64_c --ebits 4 --gs 64
+  pf_ref qwen36_tiny/ref_long.json 300 1 250
+  local ids; ids=$(pf_ids 110 1 60)
+  $PY tools/make_qwen38_tiny.py --out qwen38_long_int4 --prompt-ids "$ids" --fp8-experts --int4-experts --expert-gain 3
+  $PY tools/make_qwen38_tiny.py --out qwen38_long --prompt-ids "$ids"
+  export OMP_NUM_THREADS=2
+  pf_runs "pf_chain qwen36 '8 8 qwen36_tiny/ref_long.json'" qwen36 "qwen36 int8 experts" vk.log 300 COLI_VK_TIER_GB=0.00015 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c
+  pf_runs "pf_chain qwen36 '2 4 qwen36_tiny/ref_long.json'" qwen36 "qwen36 planar int4-g64, cap 2" vk.log 300 COLI_VK_TIER_GB=0.0003 QWEN_EXPERT_ACT=f32 COLI_DENSE_I8=0 SNAP=qwen36_tiny64_c
+  pf_runs "pf_chain qwen38 '4 8 qwen38_long/ref.json'" qwen38 "qwen38 bf16" vk.log 110 COLI_VK_TIER_GB=0.00005 SNAP=qwen38_long
+  pf_runs "pf_chain qwen38 '2 8 qwen38_long_int4/ref_int4.json'" qwen38 "qwen38 int4 sidecar" vk.log 110 COLI_VK_TIER_GB=0.00005 SNAP=qwen38_long_int4
+  PF_PREFETCH=1 chain_gate qwen36 "pf qwen36 prefetch across chunks" 1 $PF_FORCE COLI_VK_TIER_GB=0.00015 COLI_VK_CHAIN_ROWS=100 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_long.json
+  PF_PREFETCH=1 pf_check qwen36 vk.log "pf qwen36 prefetch across chunks" forced
+  PF_PREFETCH=1 chain_gate qwen38 "pf qwen38 prefetch across chunks" 1 $PF_FORCE COLI_VK_TIER_GB=0.00005 COLI_VK_CHAIN_ROWS=40 SNAP=qwen38_long_int4 -- 2 8 qwen38_long_int4/ref_int4.json
+  PF_PREFETCH=1 pf_check qwen38 vk.log "pf qwen38 prefetch across chunks" forced
+  # the CPU's prefill batching off (Q38_PREFILL_BATCH=0): the chain's MoE step still whole
+  chain_gate qwen38 "pf qwen38 batch=0" 1 Q38_PREFILL_BATCH=0 COLI_VK_TIER_GB=0.00005 COLI_VK_TIER_STREAM_ROWS=3 SNAP=qwen38_long -- 4 8 qwen38_long/ref.json
+  # the device lost while a chunk's streamed sub-batches are in flight: the state rebuilt
+  # on the CPU, the run finishes there
+  lost_late qwen36 "pf qwen36 device lost in a streamed prompt" 60 rebuild $PF_FORCE COLI_VK_TIER_GB=0.00015 COLI_VK_CHAIN_ROWS=64 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_long.json
+  unset OMP_NUM_THREADS
+}
+family_prefill_qwen_sanitize() {
+  make clean >/dev/null 2>&1 || true
+  make qwen36 qwen38 tests/test_vk_tier VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
+  ./tests/test_vk_tier shaders/qmatmul.spv > san.log 2>&1 || true
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log || ! tail -1 san.log | grep -qx PASS; then cat san.log; fail "asan: the tier"; fi
+  echo "OK asan: the tier, its streaming section included"
+  COLI_VK_STAGED=1 ./tests/test_vk_tier shaders/qmatmul.spv > san.log 2>&1 || true
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log || ! tail -1 san.log | grep -qx PASS; then cat san.log; fail "asan: the tier staged"; fi
+  echo "OK asan: the tier staged"
+  $PY tools/make_qwen36_tiny.py --out qwen36_tiny --ref-mode full --emit-ref qwen36_tiny/ref_full.json
+  $PY tools/convert_qwen36.py --model qwen36_tiny --out qwen36_tiny_c --ebits 8
+  pf_ref qwen36_tiny/ref_long.json 300 1 250
+  local ids; ids=$(pf_ids 110 1 60)
+  $PY tools/make_qwen38_tiny.py --out qwen38_long_int4 --prompt-ids "$ids" --fp8-experts --int4-experts --expert-gain 3
+  export OMP_NUM_THREADS=2
+  pfsan qwen36 "asan pf qwen36 forced" COLI_VK_TIER_GB=0.00015 COLI_VK_CHAIN_ROWS=64 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c ./qwen36 8 8 qwen36_tiny/ref_long.json
+  pfsan qwen36 "asan pf qwen36 forced, staged" COLI_VK_STAGED=1 COLI_VK_TIER_GB=0.00015 COLI_VK_CHAIN_ROWS=64 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c ./qwen36 8 8 qwen36_tiny/ref_long.json
+  pfsan qwen38 "asan pf qwen38 forced" COLI_VK_TIER_GB=0.00005 COLI_VK_CHAIN_ROWS=40 SNAP=qwen38_long_int4 ./qwen38 2 8 qwen38_long_int4/ref_int4.json
+  unset OMP_NUM_THREADS
+  make clean >/dev/null 2>&1 || true
+}
+# pfsan <engine> <tag> <env and argv...>: the forced configuration under the sanitizers
+pfsan() {
+  local eng=$1 tag=$2; shift 2
+  rm -f chain.usage
+  # shellcheck disable=SC2086
+  env $PF_FORCE COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 "$@" > san.log 2>&1 || true
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+  [ "$(chain_count "$eng" san.log)" -gt 0 ] || { cat san.log; fail "$tag: the chain never ran"; }
+  [ "$(stream_count "$eng" san.log)" -gt 0 ] || { grep '\[VK\]' san.log; fail "$tag: nothing streamed"; }
+  echo "OK $tag: sanitizers clean, $(chain_count "$eng" san.log) chain forwards, $(stream_count "$eng" san.log) experts streamed"
+}
+
+family_prefill_inkling_olmoe() {
+  export OMP_NUM_THREADS=2
+  make inkling olmoe VK=1
+  $PY tools/make_tiny_inkling.py tiny_inkling
+  $PY tools/make_olmoe_tiny.py --output olmoe_tiny --force
+  $PY tools/convert_olmoe_merged.py --model olmoe_tiny --out olmoe_tiny_c
+  pf_ref tiny_inkling/ref_long.json 200 1 250
+  pf_ref olmoe_tiny/ref_long.json 200 1 120
+  pf_runs "pf_chain inkling '8 0 tiny_inkling/ref_long.json'" inkling "inkling f32" vk.log 200 COLI_VK_TIER_GB=0.0001 SNAP=tiny_inkling
+  pf_runs "pf_chain inkling '2 8 tiny_inkling/ref_long.json'" inkling "inkling runtime int8, cap 2" vk.log 200 COLI_VK_TIER_GB=0.0001 SNAP=tiny_inkling
+  pf_runs "pf_chain olmoe '8 8 olmoe_tiny/ref_long.json'" olmoe "olmoe" vk.log 200 COLI_VK_TIER_GB=0.0001 SNAP=olmoe_tiny_c
+  pf_runs "pf_chain olmoe '1 4 olmoe_tiny/ref_long.json'" olmoe "olmoe 4-bit experts, cap 1" vk.log 200 COLI_VK_TIER_GB=0.0001 SNAP=olmoe_tiny_c
+  PF_PREFETCH=1 chain_gate olmoe "pf olmoe prefetch across chunks" 1 $PF_FORCE COLI_VK_TIER_GB=0.0001 COLI_VK_CHAIN_ROWS=64 SNAP=olmoe_tiny_c -- 8 8 olmoe_tiny/ref_long.json
+  PF_PREFETCH=1 pf_check olmoe vk.log "pf olmoe prefetch across chunks" forced
+  chain_gate olmoe "pf olmoe PILOT" 1 PILOT=1 WIDE=2 $PF_FORCE COLI_VK_TIER_GB=0.0001 SNAP=olmoe_tiny_c -- 2 8 olmoe_tiny/ref_long.json
+  pf_check olmoe vk.log "pf olmoe PILOT" forced
+  # sanitizers
+  make clean >/dev/null 2>&1 || true
+  make inkling olmoe VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
+  pfsan inkling "asan pf inkling forced" COLI_VK_TIER_GB=0.0001 COLI_VK_CHAIN_ROWS=64 SNAP=tiny_inkling ./inkling 2 8 tiny_inkling/ref_long.json
+  pfsan olmoe "asan pf olmoe forced, staged" COLI_VK_STAGED=1 COLI_VK_TIER_GB=0.0001 COLI_VK_CHAIN_ROWS=64 SNAP=olmoe_tiny_c ./olmoe 1 8 olmoe_tiny/ref_long.json
+  unset OMP_NUM_THREADS
+  make clean >/dev/null 2>&1 || true
+}
+
+family_prefill_mimo_kimi() {
+  export OMP_NUM_THREADS=2
+  make mimo kimi_k3 VK=1
+  $PY tools/make_mimo_tiny.py --output ./mimo_tiny --force --vision
+  $PY tools/make_kimi_k3_tiny.py --output ./kimi_k3_tiny --force
+  local mids kids
+  mids=$(pf_ids 200 1 300 | tr ',' ' '); kids=$(pf_ids 200 1 300 | tr ',' ' ')
+  pf_runs "pf_mimo '$mids'" mimo "mimo f32" mimo-vk.err 200 MIMO_VK_EXPERTS=6 MIMO_DENSE_BITS=32
+  pf_runs "pf_mimo '$mids'" mimo "mimo fp8/bf16" mimo-vk.err 200 MIMO_VK_EXPERTS=6 MIMO_DENSE_BITS=0
+  local O="K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 COLI_TEMP=0"
+  # shellcheck disable=SC2086
+  pf_runs "pf_k3 '$kids'" kimi_k3 "kimi_k3 f32" vk.log 200 COLI_VK_TIER_GB=0.0005 $O
+  PF_PREFETCH=1 pf_mimo "$mids" "pf mimo prefetch across chunks" 1 $PF_FORCE MIMO_VK_EXPERTS=6 MIMO_DENSE_BITS=32 COLI_VK_CHAIN_ROWS=50
+  PF_PREFETCH=1 pf_check mimo mimo-vk.err "pf mimo prefetch across chunks" forced
+  # shellcheck disable=SC2086
+  PF_PREFETCH=1 pf_k3 "$kids" "pf kimi_k3 prefetch across chunks" 1 $PF_FORCE COLI_VK_TIER_GB=0.0005 COLI_VK_CHAIN_ROWS=50 $O
+  PF_PREFETCH=1 pf_check kimi_k3 vk.log "pf kimi_k3 prefetch across chunks" forced
+  make clean >/dev/null 2>&1 || true
+  make mimo kimi_k3 VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
+  pfsan mimo "asan pf mimo forced" MIMO_VK_EXPERTS=6 MIMO_DENSE_BITS=32 COLI_VK_CHAIN_ROWS=50 COLI_TEMP=0 ./mimo mimo_tiny --ids "$mids" --ngen 4
+  # shellcheck disable=SC2086
+  pfsan kimi_k3 "asan pf kimi_k3 forced, staged" COLI_VK_STAGED=1 COLI_VK_TIER_GB=0.0005 COLI_VK_CHAIN_ROWS=50 $O ./kimi_k3 kimi_k3_tiny --ids "$kids" --ngen 4
+  unset OMP_NUM_THREADS
+  make clean >/dev/null 2>&1 || true
+}
+
+family_prefill_glm() {
+  export OMP_NUM_THREADS=2 CAP_RAISE=0
+  make colibri glm53 VK=1
+  glm_fixtures
+  pf_ref glm_tiny/ref_long.json 200 1 250
+  local ids; ids=$(pf_ids 200 2 120)
+  pf_runs "pf_mla colibri '64 16 16'" colibri "colibri f32, teacher-forced" vk.log 208 COLI_VK_TIER_GB=0.0003 SNAP=glm_tiny REF=glm_tiny/ref_long.json TF=1
+  pf_runs "pf_mla colibri '2 16 16'" colibri "colibri int4-g64 experts" vk.log 200 COLI_VK_TIER_GB=0.0012 SNAP=glm_tiny_fmt4 REF=glm_tiny/ref_long.json
+  pf_runs "pf_mla glm53 '--model glm53_stream-i4 --ids $ids --greedy 4'" glm53 "glm53 f32 trunk" vk.log 200 COLI_VK_TIER_GB=0.0002 GLM53_BITS=32
+  pf_runs "pf_mla glm53 '--model glm53_stream-i4 --ids $ids --greedy 4'" glm53 "glm53 int4 trunk" vk.log 200 COLI_VK_TIER_GB=0.0002 GLM53_BITS=4
+  PF_PREFETCH=1 mla_gate colibri "pf colibri prefetch across chunks" 1 $PF_FORCE COLI_VK_TIER_GB=0.0003 COLI_VK_CHAIN_ROWS=64 SNAP=glm_tiny REF=glm_tiny/ref_long.json TF=1 -- 2 16 16
+  PF_PREFETCH=1 pf_check colibri vk.log "pf colibri prefetch across chunks" forced
+  PF_PREFETCH=1 mla_gate glm53 "pf glm53 prefetch across chunks" 1 $PF_FORCE COLI_VK_TIER_GB=0.0002 COLI_VK_CHAIN_ROWS=64 GLM53_BITS=4 GLM53_PREFILL_CHUNK=200 -- --model glm53_stream-i4 --ids "$ids" --greedy 4
+  PF_PREFETCH=1 pf_check glm53 vk.log "pf glm53 prefetch across chunks" forced
+  make clean >/dev/null 2>&1 || true
+  make colibri glm53 VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
+  pfsan colibri "asan pf colibri forced" COLI_VK_TIER_GB=0.0003 COLI_VK_CHAIN_ROWS=64 SNAP=glm_tiny REF=glm_tiny/ref_long.json TF=1 ./colibri 2 16 16
+  pfsan glm53 "asan pf glm53 forced, staged" COLI_VK_STAGED=1 COLI_VK_TIER_GB=0.0002 COLI_VK_CHAIN_ROWS=64 GLM53_BITS=4 ./glm53 --model glm53_stream-i4 --ids "$ids" --greedy 4
+  unset OMP_NUM_THREADS CAP_RAISE
+  make clean >/dev/null 2>&1 || true
+}
+
+family_prefill_deepseek() {
+  export OMP_NUM_THREADS=2
+  make deepseek_v41 VK=1
+  make deepseek-v4 VK=1
+  $PY tools/make_dsv41_tiny.py --out dsv41_vlong --emit-ref dsv41_vlong/ref.json --prompt-len 160 --max-new 6 > /dev/null
+  pf_v4_fixture
+  local ids; ids=$(pf_ids 300 3 120)
+  pf_runs "pf_v41 dsv41_vlong" deepseek_v41 "deepseek_v41" vk.log 160 COLI_VK_TIER_GB=0.0005
+  pf_runs "pf_v4 deepseek_v4_tiny_p ids:$ids:4" deepseek_v4 "deepseek_v4" v4-vk.err 300 COLI_VK_TIER_GB=0.0005
+  PF_PREFETCH=1 v41_gate "pf deepseek_v41 prefetch across chunks" SNAP=dsv41_vlong $PF_FORCE COLI_VK_TIER_GB=0.0005 COLI_VK_CHAIN_ROWS=64 -- 2 dsv41_vlong/ref.json
+  PF_PREFETCH=1 pf_check deepseek_v41 vk.log "pf deepseek_v41 prefetch across chunks" forced
+  PF_PREFETCH=1 v4_chain_gate "pf deepseek_v4 prefetch across chunks" deepseek_v4_tiny_p "ids:$ids:4" $PF_FORCE COLI_VK_TIER_GB=0.0005 COLI_VK_CHAIN_ROWS=100
+  PF_PREFETCH=1 pf_check deepseek_v4 v4-vk.err "pf deepseek_v4 prefetch across chunks" forced
+  make clean >/dev/null 2>&1 || true
+  make deepseek-v4-clean >/dev/null 2>&1 || true
+  local SAN="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  make deepseek_v41 VK=1 EXTRA_CFLAGS="$SAN"
+  make deepseek-v4 VK=1 LTO=0 EXTRA_CFLAGS="$SAN" EXTRA_LDFLAGS="$SAN"
+  export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
+  pfsan deepseek_v41 "asan pf deepseek_v41 forced" COLI_VK_TIER_GB=0.0005 COLI_VK_CHAIN_ROWS=64 SNAP=dsv41_vlong ./deepseek_v41 2 dsv41_vlong/ref.json
+  pfsan deepseek_v4 "asan pf deepseek_v4 forced, staged" COLI_VK_STAGED=1 COLI_VK_TIER_GB=0.0005 COLI_VK_CHAIN_ROWS=100 ./deepseek_v4 ./deepseek_v4_tiny_p \
+    "$(v4_chain_prompt deepseek_v4_tiny_p "ids:$ids:4")" --raw-prompt --max-tokens 4
+  unset OMP_NUM_THREADS
+  make clean >/dev/null 2>&1 || true
+  make deepseek-v4-clean >/dev/null 2>&1 || true
+}
+# DeepSeek V4's tiny model at 512 positions, 8 experts: room for a prompt past its 128-row block
+pf_v4_fixture() {
+  $PY - tools/make_deepseek_v4_tiny.py <<'PY' > /dev/null
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("gen", sys.argv[1])
+gen = importlib.util.module_from_spec(spec); spec.loader.exec_module(gen)
+gen.EXPERTS = 8; gen.MAX_POSITIONS = 512
+sys.argv = ["make_deepseek_v4_tiny.py", "--output", "deepseek_v4_tiny_p", "--force"]
+gen.main()
+PY
+}
+# ---- the KV cache split between the device and the host (vk_kvsplit.h) ----------------
+# Past the device's budget each chain engine keeps a few blocks of every attention
+# layer's cache on the device and attends over the rest on the CPU, the two parts merged
+# through their softmax statistics. The tiny fixtures emulate a small device with
+# COLI_VK_KV_DEVICE_ROWS (rows a layer keeps) and COLI_VK_KV_BLOCK (positions a block),
+# over prompts and generations long enough that most steps have a host part.
+# kv_hostparts <engine> <log>: M from "[VK] <engine> chain: KV split: N layer steps, M with a host part"
+kv_hostparts() {
+  local n
+  n=$(sed -n "s/^\[VK\] $1 chain: KV split: [0-9]* layer steps, \([0-9]*\) with a host part.*/\1/p" "$2" | tail -1)
+  echo "${n:-0}"
+}
+# kv_gate <engine> <tag> <tol 0|1> <rows> <block> <env...> -- <argv...>: chain_gate (the
+# CPU's tokens, logits within 1e-4 of the largest with tol 1) with the split on, which
+# must have run steps with a host part.
+kv_gate() {
+  local eng=$1 tag=$2 tol=$3 rows=$4 blk=$5; shift 5
+  chain_gate "$eng" "$tag" "$tol" COLI_VK_KV_DEVICE_ROWS=$rows COLI_VK_KV_BLOCK=$blk "$@"
+  [ "$(kv_hostparts "$eng" vk.log)" -gt 0 ] || { cat vk.log; fail "$tag: the split never ran a host part"; }
+  echo "   $tag: $(grep -a "KV split:" vk.log | tail -1 | sed 's/.*KV split: //')"
+}
+# kv_san <engine> <tag> <env and argv...>: a sanitized run under the split (the build is
+# the caller's): no diagnostic, and steps with a host part
+kv_san() {
+  local eng=$1 tag=$2; shift 2
+  rm -f chain.usage
+  env OMP_NUM_THREADS=2 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 "$@" > san.log 2>&1 || true
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+  [ "$(kv_hostparts "$eng" san.log)" -gt 0 ] || { cat san.log; fail "$tag: the split never ran a host part"; }
+  echo "OK $tag: sanitizers clean, $(kv_hostparts "$eng" san.log) layer steps with a host part"
+}
+
+# qwen36: the hybrid and the dense geometry, a 40-token prompt and 40 new tokens
+kv_qwen36_fixtures() {
+  local P; P=$($PY -c "print(','.join(str(3 + i * 7 % 60) for i in range(40)))")
+  $PY tools/make_qwen36_tiny.py --out qwen36_kv --ref-mode full --prompt-ids "$P" --max-new 40 --emit-ref qwen36_kv/ref_full.json
+  $PY tools/convert_qwen36.py --model qwen36_kv --out qwen36_kv_c --ebits 8
+  $PY tools/make_qwen36_tiny.py --geometry qwen38-27b-dense --out qwen38_27b_kv --ref-mode full --prompt-ids "$P" --max-new 40 \
+    --emit-ref qwen38_27b_kv/ref_full.json
+  $PY tools/convert_qwen36.py --model qwen38_27b_kv --out qwen38_27b_kv_c --ebits 8
+  $PY tools/make_qwen36_tiny.py --out qwen36_tiny --ref-mode full --emit-ref qwen36_tiny/ref_full.json
+  $PY tools/convert_qwen36.py --model qwen36_tiny --out qwen36_tiny_c --ebits 8
+}
+kv_split_qwen36() {
+  kv_qwen36_fixtures
+  local R=qwen36_kv/ref_full.json
+  kv_gate qwen36 "kv qwen36 16 rows on the device" 1 16 4 COLI_DENSE_I8=0 SNAP=qwen36_kv_c -- 8 8 $R
+  kv_gate qwen36 "kv qwen36 two blocks on the device" 1 8 4 COLI_DENSE_I8=0 SNAP=qwen36_kv_c -- 8 8 $R
+  kv_gate qwen36 "kv qwen36 prefill in chunks of 3" 1 16 4 COLI_VK_CHAIN_ROWS=3 COLI_DENSE_I8=0 SNAP=qwen36_kv_c -- 8 8 $R
+  kv_gate qwen36 "kv qwen36 cap 1, blocks of 8" 1 24 8 COLI_DENSE_I8=0 SNAP=qwen36_kv_c -- 1 8 $R
+  kv_gate qwen36 "kv qwen36 tier off, tiled GEMM" 1 24 4 COLI_VK_TIER=0 COLI_VK_GEMM_MIN_S=2 COLI_DENSE_I8=0 SNAP=qwen36_kv_c -- 8 8 $R
+  CPUENV=COLI_DENSE_IDOT=0 kv_gate qwen36 "kv qwen36 int8 trunk" 1 16 4 SNAP=qwen36_kv_c -- 8 8 $R
+  kv_gate qwen36 "kv qwen36 dense model" 1 16 4 COLI_DENSE_I8=0 SNAP=qwen38_27b_kv_c -- 8 8 qwen38_27b_kv/ref_full.json
+  CHAINMODE=2 kv_gate qwen36 "kv qwen36 prompts only" 1 16 4 COLI_DENSE_I8=0 SNAP=qwen36_kv_c -- 8 8 $R
+  # COLI_VK_KV_SPLIT=0: the whole mirrors, as before the split
+  chain_gate qwen36 "kv qwen36 split off" 1 COLI_VK_KV_SPLIT=0 COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 COLI_DENSE_I8=0 SNAP=qwen36_kv_c -- 8 8 $R
+  if grep -qa 'KV cache split' vk.log; then cat vk.log; fail "kv qwen36 split off: the split ran"; fi
+  # the device lost mid-decode with the split on: the DeltaNet state rebuilt on the CPU
+  lost_late qwen36 "kv qwen36 device lost" 20 rebuild COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 COLI_DENSE_I8=0 SNAP=qwen36_kv_c -- 8 8 $R
+  # serve sessions (pins, prompt-cache extensions, a divergent prompt, logprobs) and the
+  # prefix-reuse contract across the split
+  QWEN36_TINY=$PWD/qwen36_tiny_c COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4 \
+    COLI_USAGE=$PWD/chain.usage $PY tests/test_qwen36_prefix_serve.py
+  CHAIN_SERVE_EXPECT='KV split: [0-9]+ layer steps, [1-9][0-9]* with a host part' \
+    $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4
+}
+kv_split_qwen36_sanitize() {
+  kv_qwen36_fixtures
+  kv_san qwen36 "asan kv qwen36" COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4 COLI_DENSE_I8=0 SNAP=qwen36_kv_c ./qwen36 8 8 qwen36_kv/ref_full.json
+  kv_san qwen36 "asan kv qwen36 chunks of 3" COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 COLI_VK_CHAIN_ROWS=3 SNAP=qwen36_kv_c \
+    ./qwen36 8 8 qwen36_kv/ref_full.json
+  kv_san qwen36 "asan kv qwen36 dense model" COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 COLI_DENSE_I8=0 SNAP=qwen38_27b_kv_c \
+    ./qwen36 8 8 qwen38_27b_kv/ref_full.json
+  $PY -c "import sys; sys.path.insert(0, 'tests'); from prefix_serve_harness import ensure_byte_tokenizer as t; from pathlib import Path; t(Path('qwen36_tiny_c'))"
+  CHAIN_SERVE_EXPECT='KV split: [0-9]+ layer steps, [1-9][0-9]* with a host part' \
+    $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4 > san.log 2>&1 || { cat san.log; fail "asan kv qwen36 serve"; }
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan kv qwen36 serve: sanitizer diagnostic"; fi
+  echo "OK asan kv qwen36 serve: $(tail -1 san.log)"
+}
+
+# qwen38: a 40-token prompt and 40 new tokens (the generation the transformers reference
+# and the CPU agree on), with and without the MTP head; the serve fixture with a tokenizer
+kv_qwen38_fixtures() {
+  local P; P=$($PY -c "print(','.join(str(3 + (i * 9 + i * i * 2) % 60) for i in range(40)))")
+  $PY tools/make_qwen38_tiny.py --out qwen38_kv --prompt-ids "$P" --max-new 40
+  $PY tools/make_qwen38_tiny.py --out qwen38_kv_mtp --prompt-ids "$P" --max-new 40 --mtp
+  $PY tools/make_qwen38_tiny.py --out qwen38_tiny_mtp --mtp
+  $PY tools/make_edge_tiny_tokenizer.py --vocab-size 64 ./qwen38_tiny_mtp   # serve speaks text
+}
+kv_split_qwen38() {
+  kv_qwen38_fixtures
+  local R=qwen38_kv/ref.json M=qwen38_kv_mtp/ref.json batch f
+  for batch in 0 1; do
+    kv_gate qwen38 "kv qwen38 16 rows on the device, batch=$batch" 1 16 4 Q38_PREFILL_BATCH=$batch SNAP=qwen38_kv -- 4 8 $R
+  done
+  kv_gate qwen38 "kv qwen38 two blocks on the device" 1 8 4 SNAP=qwen38_kv -- 4 8 $R
+  kv_gate qwen38 "kv qwen38 prefill in chunks of 3" 1 16 4 COLI_VK_CHAIN_ROWS=3 SNAP=qwen38_kv -- 4 8 $R
+  # QSA's lists with blocks pinned by their reads (steps of 4 rows leave the window three
+  # of six slots): the device's part and the host's take the listed positions
+  COLI_VK_KV_PIN=1 kv_gate qwen38 "kv qwen38 blocks pinned by QSA's reads" 1 24 4 COLI_VK_CHAIN_ROWS=4 SNAP=qwen38_kv -- 4 8 $R
+  grep -qa 'KV split: .* [1-9][0-9]* blocks pinned by reads' vk.log || { cat vk.log; fail "kv qwen38: no block was pinned"; }
+  kv_gate qwen38 "kv qwen38 int8 trunk" 0 16 4 Q38_TRUNK_MIN_KB=0 SNAP=qwen38_kv -- 4 8 $R
+  kv_gate qwen38 "kv qwen38 tier off" 1 16 4 COLI_VK_TIER=0 SNAP=qwen38_kv -- 4 8 $R
+  # MTP verify (S = 2) and its rollback across the split: drafts as they come, every
+  # draft rejected, every one accepted, alternating
+  for f in "" reject accept mixed; do
+    kv_gate qwen38 "kv qwen38 MTP ${f:-drafting}" 1 16 4 Q38_MTP=1 Q38_MTP_FORCE=$f SNAP=qwen38_kv_mtp -- 2 8 $M
+  done
+  CHAINMODE=2 kv_gate qwen38 "kv qwen38 prompts only" 1 16 4 SNAP=qwen38_kv -- 4 8 $R
+  CHAINMODE=2 kv_gate qwen38 "kv qwen38 prompts only, MTP" 1 16 4 Q38_MTP=1 Q38_MTP_FORCE=mixed SNAP=qwen38_kv_mtp -- 2 8 $M
+  chain_gate qwen38 "kv qwen38 split off" 1 COLI_VK_KV_SPLIT=0 COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 SNAP=qwen38_kv -- 4 8 $R
+  if grep -qa 'KV cache split' vk.log; then cat vk.log; fail "kv qwen38 split off: the split ran"; fi
+  # the device lost with the split on, between steps and inside an MTP verify: the
+  # DeltaNet, conv and PLE states rebuilt on the CPU from the prefix record
+  lost_late qwen38 "kv qwen38 device lost" 10 rebuild COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 SNAP=qwen38_kv -- 4 8 $R
+  lost_late qwen38 "kv qwen38 device lost in a verify" 15 rebuild COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 Q38_MTP=1 \
+    Q38_MTP_FORCE=mixed SNAP=qwen38_kv_mtp -- 2 8 $M
+  # serve sessions (pins, prompt-cache extensions, a divergent prompt, logprobs) with
+  # and without MTP, and prompts only
+  local E='KV split: [0-9]+ layer steps, [1-9][0-9]* with a host part'
+  CHAIN_SERVE_EXPECT="$E" $PY tests/vulkan_chain_serve.py ./qwen38 qwen38_tiny_mtp Q38_MTP=1 COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4
+  CHAIN_SERVE_EXPECT="$E" $PY tests/vulkan_chain_serve.py ./qwen38 qwen38_tiny_mtp COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4
+  CHAIN_SERVE_EXPECT="$E" COLI_VK_CHAIN=2 $PY tests/vulkan_chain_serve.py ./qwen38 qwen38_tiny_mtp Q38_MTP=1 \
+    COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4
+}
+kv_split_qwen38_sanitize() {
+  kv_qwen38_fixtures
+  kv_san qwen38 "asan kv qwen38" COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4 SNAP=qwen38_kv ./qwen38 4 8 qwen38_kv/ref.json
+  COLI_VK_KV_PIN=1 kv_san qwen38 "asan kv qwen38 pinned blocks, chunks of 4" COLI_VK_KV_DEVICE_ROWS=24 COLI_VK_KV_BLOCK=4 COLI_VK_CHAIN_ROWS=4 \
+    SNAP=qwen38_kv ./qwen38 4 8 qwen38_kv/ref.json
+  kv_san qwen38 "asan kv qwen38 MTP mixed" COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 Q38_MTP=1 Q38_MTP_FORCE=mixed \
+    SNAP=qwen38_kv_mtp ./qwen38 2 8 qwen38_kv_mtp/ref.json
+  CHAIN_SERVE_EXPECT='KV split: [0-9]+ layer steps, [1-9][0-9]* with a host part' \
+    $PY tests/vulkan_chain_serve.py ./qwen38 qwen38_tiny_mtp Q38_MTP=1 COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4 \
+    > san.log 2>&1 || { cat san.log; fail "asan kv qwen38 serve"; }
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan kv qwen38 serve: sanitizer diagnostic"; fi
+  echo "OK asan kv qwen38 serve: $(tail -1 san.log)"
+}
+
+# olmoe: the tiny checkpoint and, from it, a 40-token prompt's 40-token generation by
+# transformers (the oracle the engine's run checks)
+kv_olmoe_fixtures() {
+  $PY tools/make_olmoe_tiny.py --output olmoe_tiny --force
+  $PY tools/convert_olmoe_merged.py --model olmoe_tiny --out olmoe_tiny_c
+  $PY tools/make_edge_tiny_tokenizer.py --vocab-size 128 olmoe_tiny_c
+  $PY - <<'PY'
+import json, torch
+from transformers import OlmoeForCausalLM
+torch.set_num_threads(1)
+m = OlmoeForCausalLM.from_pretrained("olmoe_tiny").eval().float()
+prompt = [(17 + i * 21 + (i * i) % 13) % 125 + 2 for i in range(40)]
+with torch.no_grad():
+    g = m.generate(torch.tensor([prompt]), max_new_tokens=40, do_sample=False, use_cache=True)[0].tolist()
+json.dump({"prompt_ids": prompt, "full_ids": g}, open("olmoe_tiny/ref_olmoe_long.json", "w"))
+PY
+}
+kv_split_olmoe() {
+  kv_olmoe_fixtures
+  local R=olmoe_tiny/ref_olmoe_long.json
+  kv_gate olmoe "kv olmoe 16 rows on the device" 1 16 4 SNAP=olmoe_tiny_c -- 8 8 $R
+  kv_gate olmoe "kv olmoe two blocks on the device" 1 8 4 SNAP=olmoe_tiny_c -- 8 8 $R
+  kv_gate olmoe "kv olmoe prefill in chunks of 3" 1 16 4 COLI_VK_CHAIN_ROWS=3 SNAP=olmoe_tiny_c -- 8 8 $R
+  kv_gate olmoe "kv olmoe cap 1, blocks of 8" 1 24 8 SNAP=olmoe_tiny_c -- 1 8 $R
+  kv_gate olmoe "kv olmoe 4-bit experts" 1 16 4 SNAP=olmoe_tiny_c -- 8 4 $R
+  kv_gate olmoe "kv olmoe PILOT cap 2" 1 16 4 PILOT=1 WIDE=2 SNAP=olmoe_tiny_c -- 2 8 $R
+  kv_gate olmoe "kv olmoe tier off, tiled GEMM" 1 24 4 COLI_VK_TIER=0 COLI_VK_GEMM_MIN_S=2 SNAP=olmoe_tiny_c -- 8 8 $R
+  CHAINMODE=2 kv_gate olmoe "kv olmoe prompts only" 1 16 4 SNAP=olmoe_tiny_c -- 8 8 $R
+  chain_gate olmoe "kv olmoe split off" 1 COLI_VK_KV_SPLIT=0 COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 SNAP=olmoe_tiny_c -- 8 8 $R
+  if grep -qa 'KV cache split' vk.log; then cat vk.log; fail "kv olmoe split off: the split ran"; fi
+  # the device lost mid-decode with the split on: the CPU redoes the step (nothing to rebuild)
+  lost_late olmoe "kv olmoe device lost" 7 redo COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 SNAP=olmoe_tiny_c -- 8 8 $R
+  # serve sessions and the prefix-reuse and dashboard contracts across the split
+  CHAIN_SERVE_EXPECT='KV split: [0-9]+ layer steps, [1-9][0-9]* with a host part' \
+    $PY tests/vulkan_chain_serve.py ./olmoe olmoe_tiny_c COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4
+  CHAIN_SERVE_EXPECT='KV split: [0-9]+ layer steps, [1-9][0-9]* with a host part' \
+    $PY tests/vulkan_chain_serve.py ./olmoe olmoe_tiny_c PILOT=1 WIDE=2 COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4 \
+    OLMOE_TINY=olmoe_tiny_c $PY -m unittest tests.test_olmoe_prefix_serve tests.test_olmoe_dashboard_hits
+}
+kv_split_olmoe_sanitize() {
+  kv_olmoe_fixtures
+  local R=olmoe_tiny/ref_olmoe_long.json
+  kv_san olmoe "asan kv olmoe" COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4 SNAP=olmoe_tiny_c ./olmoe 8 8 $R
+  kv_san olmoe "asan kv olmoe chunks of 3, PILOT" COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 COLI_VK_CHAIN_ROWS=3 PILOT=1 WIDE=2 \
+    SNAP=olmoe_tiny_c ./olmoe 2 8 $R
+  CHAIN_SERVE_EXPECT='KV split: [0-9]+ layer steps, [1-9][0-9]* with a host part' \
+    $PY tests/vulkan_chain_serve.py ./olmoe olmoe_tiny_c COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4 > san.log 2>&1 || { cat san.log; fail "asan kv olmoe serve"; }
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan kv olmoe serve: sanitizer diagnostic"; fi
+  echo "OK asan kv olmoe serve: $(tail -1 san.log)"
+}
+
+# inkling: the tiny model with a 40-token prompt and 40 new tokens (its global layer
+# attends over all 80 positions, the bias bank reaching back 32), its expert containers,
+# the dense-int4g64 container and the model at D = 6144
+kv_inkling_fixtures() {
+  $PY tools/make_tiny_inkling.py tiny_inkling
+  $PY - tiny_inkling <<'PY'
+import json, sys, torch
+from transformers import InklingForCausalLM
+d = sys.argv[1]
+m = InklingForCausalLM.from_pretrained(d).eval().float()
+prompt = [(3 + i * 7) % 250 for i in range(40)]
+with torch.no_grad():
+    full = m.generate(torch.tensor([prompt]), max_new_tokens=40, do_sample=False, use_cache=True)[0].tolist()
+    tf = m(torch.tensor([full])).logits[0].argmax(-1).tolist()
+json.dump({"prompt_ids": prompt, "full_ids": full, "tf_pred": tf}, open(f"{d}/ref_long.json", "w"))
+PY
+  $PY - <<'PY'
+import importlib.util, os, shutil
+from safetensors.torch import load_file, save_file
+spec = importlib.util.spec_from_file_location("conv", "tools/convert_inkling_int4.py")
+conv = importlib.util.module_from_spec(spec); spec.loader.exec_module(conv)
+t = load_file("tiny_inkling/model.safetensors")
+if "model.embed_tokens.embed_norm.weight" in t:
+    t["model.embed_norm.weight"] = t.pop("model.embed_tokens.embed_norm.weight")
+for d in ("tiny_inkling_hf", "tiny_inkling_x-tml", "tiny_inkling_x-pass", "tiny_inkling_x-i4", "tiny_inkling_x-i8"):
+    shutil.rmtree(d, ignore_errors=True)
+os.makedirs("tiny_inkling_hf")
+save_file(t, "tiny_inkling_hf/model.safetensors")
+shutil.copy("tiny_inkling/config.json", "tiny_inkling_hf/")
+conv.selftest_e2e("tiny_inkling_hf", "tiny_inkling_x")          # tiny_inkling_x-i4: int4 experts
+conv.convert_dir("tiny_inkling_x-tml", "tiny_inkling_x-i8", 8)   # int8 experts
+PY
+  rm -rf tiny_inkling_q && cp -r tiny_inkling tiny_inkling_q
+  $PY - tools/convert_inkling_dense_int4.py tiny_inkling_q <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("conv", sys.argv[1])
+conv = importlib.util.module_from_spec(spec); spec.loader.exec_module(conv)
+conv.MIN_ELEMS = 0
+conv.ATTN_BITS = 4
+base = conv.classify
+conv.classify = lambda n, s, d: "int8" if n.endswith(".mlp.down_proj.weight") else base(n, s, d)
+sys.argv = ["convert_inkling_dense_int4.py", "--dir", sys.argv[2]]
+conv.main()
+PY
+  mkdir -p tiny_inkling_q/dense-int4g64
+  mv tiny_inkling_q/dense-int4g64.safetensors tiny_inkling_q/dense-int4g64/dense.safetensors
+  $PY tools/make_tiny_inkling.py tiny_inkling_wide --wide
+  $PY -c 'import sys; from pathlib import Path; sys.path.insert(0, "."); from tests.test_inkling_prefix_serve import ensure_tokenizer; ensure_tokenizer(Path("tiny_inkling"))'
+}
+kv_split_inkling() {
+  kv_inkling_fixtures
+  local R=tiny_inkling/ref_long.json fx
+  kv_gate inkling "kv inkling 16 rows on the device" 1 16 4 SNAP=tiny_inkling -- 8 0 $R
+  kv_gate inkling "kv inkling two blocks on the device" 1 8 4 SNAP=tiny_inkling -- 8 0 $R
+  kv_gate inkling "kv inkling cap 1, blocks of 8" 1 24 8 SNAP=tiny_inkling -- 1 0 $R
+  for fx in tiny_inkling_q tiny_inkling_x-i4 tiny_inkling_x-i8; do
+    kv_gate inkling "kv inkling $fx" 1 16 4 SNAP=$fx -- 8 0 $R
+  done
+  kv_gate inkling "kv inkling runtime int4" 1 16 4 SNAP=tiny_inkling -- 2 4 $R
+  kv_gate inkling "kv inkling TOPP" 1 16 4 TOPP=0.3 SNAP=tiny_inkling_x-i4 -- 2 0 $R
+  kv_gate inkling "kv inkling tier off" 1 16 4 COLI_VK_TIER=0 SNAP=tiny_inkling -- 8 0 $R
+  kv_gate inkling "kv inkling prefill in chunks of 3" 1 16 4 COLI_VK_CHAIN_ROWS=3 SNAP=tiny_inkling -- 8 0 $R
+  kv_gate inkling "kv inkling tiled GEMM" 1 24 4 COLI_VK_GEMM_MIN_S=2 SNAP=tiny_inkling -- 8 0 $R
+  CHAINMODE=2 kv_gate inkling "kv inkling prompts only" 1 16 4 SNAP=tiny_inkling -- 8 0 $R
+  kv_gate inkling "kv inkling D=6144" 1 8 4 SNAP=tiny_inkling_wide -- 8 0 tiny_inkling_wide/ref_inkling.json
+  # COLI_VK_KV_SPLIT=0: the whole mirrors, as before the split
+  chain_gate inkling "kv inkling split off" 1 COLI_VK_KV_SPLIT=0 COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 SNAP=tiny_inkling -- 8 0 $R
+  if grep -qa 'KV cache split' vk.log; then cat vk.log; fail "kv inkling split off: the split ran"; fi
+  # the device lost mid-decode with the split on: K/V and convolution states rebuilt on the CPU
+  lost_late inkling "kv inkling device lost" 20 rebuild COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 SNAP=tiny_inkling -- 8 0 $R
+  # serve sessions (pins, prompt-cache extensions, a divergent prompt, logprobs), prompts
+  # only, and the prefix-reuse and dashboard contracts, across the split
+  CHAIN_SERVE_EXPECT='KV split: [0-9]+ layer steps, [1-9][0-9]* with a host part' \
+    $PY tests/vulkan_chain_serve.py ./inkling tiny_inkling INK_PREFIX_LOG=1 COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4
+  COLI_VK_CHAIN=2 CHAIN_SERVE_EXPECT='KV split: [0-9]+ layer steps, [1-9][0-9]* with a host part' \
+    $PY tests/vulkan_chain_serve.py ./inkling tiny_inkling INK_PREFIX_LOG=1 COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4 \
+    INKLING_TINY=tiny_inkling $PY -m unittest tests.test_inkling_prefix_serve tests.test_inkling_dashboard_hits
+}
+kv_split_inkling_sanitize() {
+  kv_inkling_fixtures
+  local R=tiny_inkling/ref_long.json
+  kv_san inkling "asan kv inkling" COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4 SNAP=tiny_inkling ./inkling 8 0 $R
+  kv_san inkling "asan kv inkling chunks of 3" COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 COLI_VK_CHAIN_ROWS=3 SNAP=tiny_inkling \
+    ./inkling 8 0 $R
+  kv_san inkling "asan kv inkling int4 experts" COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 SNAP=tiny_inkling_x-i4 ./inkling 2 0 $R
+  CHAIN_SERVE_EXPECT='KV split: [0-9]+ layer steps, [1-9][0-9]* with a host part' \
+    $PY tests/vulkan_chain_serve.py ./inkling tiny_inkling INK_PREFIX_LOG=1 COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4 \
+    > san.log 2>&1 || { cat san.log; fail "asan kv inkling serve"; }
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan kv inkling serve: sanitizer diagnostic"; fi
+  echo "OK asan kv inkling serve: $(tail -1 san.log)"
+}
+
+# mimo: its full-attention layers split (the windowed ones keep their rings); the tiny
+# fixture's long case (a 72-token prompt) and the picture's, each with 40 new tokens
+kv_mimo_fixtures() {
+  $PY tools/make_mimo_tiny.py --output ./mimo_tiny --force --vision
+  MGRID=$($PY -c "import json;i=json.load(open('mimo_tiny/ref.json'))['image'];print(i['grid_h'],i['grid_w'])")
+  mimo_served_fixture
+}
+# mimo_kv_gate <tag> <case> <rows> <block> <env...>: the case's prompt and 40 new tokens,
+# the CPU's tokens, then every position's logits over the CPU's whole sequence within
+# 1e-4 of the largest (CHAINMODE: COLI_VK_CHAIN's value); steps with a host part
+mimo_kv_gate() {
+  local tag=$1 c=$2 rows=$3 blk=$4 extra=() P lg; shift 4
+  [ "$c" = image ] && extra=(--image mimo_tiny/patches.f32 --grid $MGRID)
+  P=$(mimo_ids $c prompt_ids)
+  local kv=(COLI_VULKAN=1 COLI_VK_CHAIN=${CHAINMODE:-1} COLI_VK_TIER_SYNC=1 COLI_VK_KV_DEVICE_ROWS=$rows COLI_VK_KV_BLOCK=$blk)
+  env "$@" COLI_TEMP=0 ./mimo mimo_tiny --ids "$P" --ngen 40 "${extra[@]}" > mimo-cpu.txt 2>/dev/null
+  env "$@" "${kv[@]}" COLI_TEMP=0 ./mimo mimo_tiny --ids "$P" --ngen 40 "${extra[@]}" > mimo-vk.txt 2> mimo-vk.err
+  [ -s mimo-cpu.txt ] && cmp -s mimo-cpu.txt mimo-vk.txt || { cat mimo-cpu.txt mimo-vk.txt mimo-vk.err; fail "$tag $c: the chain's tokens differ from the CPU"; }
+  [ "$(kv_hostparts mimo mimo-vk.err)" -gt 0 ] || { cat mimo-vk.err; fail "$tag $c: the split never ran a host part"; }
+  local hp; hp=$(grep -a "KV split:" mimo-vk.err | tail -1 | sed 's/.*KV split: //')
+  rm -f cpu.f32 vk.f32
+  env "$@" MIMO_LOGITS=cpu.f32 ./mimo mimo_tiny --ids "$P $(cat mimo-cpu.txt)" --ngen 0 "${extra[@]}" > /dev/null 2>&1
+  env "$@" "${kv[@]}" MIMO_LOGITS=vk.f32 ./mimo mimo_tiny --ids "$P $(cat mimo-cpu.txt)" --ngen 0 "${extra[@]}" > /dev/null 2> mimo-vk.err
+  lg=$(logits_close cpu.f32 vk.f32) || { echo "$lg"; fail "$tag $c: logits"; }
+  echo "OK $tag $c: tokens = CPU, $lg; $hp"
+}
+kv_split_mimo() {
+  kv_mimo_fixtures
+  local bits c
+  for bits in 32 0 8; do mimo_kv_gate "kv mimo bits=$bits, 16 rows on the device" long 16 4 MIMO_DENSE_BITS=$bits; done
+  mimo_kv_gate "kv mimo two blocks on the device" long 8 4 MIMO_DENSE_BITS=32
+  mimo_kv_gate "kv mimo a picture" image 16 4 MIMO_DENSE_BITS=0
+  mimo_kv_gate "kv mimo one token at a time" long 16 4 MIMO_DENSE_BITS=32 MIMO_CHUNK=1
+  mimo_kv_gate "kv mimo blocks of 3" long 16 4 MIMO_DENSE_BITS=32 MIMO_CHUNK=3
+  mimo_kv_gate "kv mimo chunks of 3 rows" long 24 8 MIMO_DENSE_BITS=32 COLI_VK_CHAIN_ROWS=3
+  mimo_kv_gate "kv mimo tier off, tiled GEMM" long 16 4 MIMO_DENSE_BITS=0 COLI_VK_TIER=0 COLI_VK_GEMM_MIN_S=2
+  CHAINMODE=2 mimo_kv_gate "kv mimo prompts only" long 16 4 MIMO_DENSE_BITS=32
+  # COLI_VK_KV_SPLIT=0: the whole mirrors, as before the split
+  mimo_chain_gate "kv mimo split off" long MIMO_DENSE_BITS=32 COLI_VK_KV_SPLIT=0 COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4
+  if grep -qa 'KV cache split' mimo-vk.err; then cat mimo-vk.err; fail "kv mimo split off: the split ran"; fi
+  # the device lost with the split on (mid-decode; inside a prompt in chunks of 3): the
+  # host's caches hold whole steps, the CPU runs on from where they end
+  mimo_lost_gate "kv mimo device lost mid-decode" long 3 MIMO_DENSE_BITS=32 COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4
+  mimo_lost_gate "kv mimo device lost inside a chunked prompt" long 100 MIMO_DENSE_BITS=32 COLI_VK_CHAIN_ROWS=3 \
+    COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4
+  # serve sessions (photos restored, prompt-cache extensions, a divergent prompt,
+  # logprobs) frame for frame within the family's 1e-3, both modes and a lost device
+  local k
+  for k in 1 2; do
+    CHAIN_SERVE_EXPECT='KV split: [0-9]+ layer steps, [1-9][0-9]* with a host part' CHAIN_SERVE_TOL=1e-3 COLI_VK_CHAIN=$k \
+      $PY tests/vulkan_chain_serve.py ./mimo mimo_tiny_served OMP_NUM_THREADS=2 COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4
+  done
+  CHAIN_SERVE_TOL=1e-3 $PY tests/vulkan_chain_serve.py ./mimo mimo_tiny_served OMP_NUM_THREADS=2 COLI_VK_CHAIN_FAULT=60 \
+    COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4
+}
+kv_split_mimo_sanitize() {
+  kv_mimo_fixtures
+  local P; P=$(mimo_ids long prompt_ids)
+  kv_san mimo "asan kv mimo" COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4 MIMO_DENSE_BITS=32 COLI_TEMP=0 ./mimo mimo_tiny --ids "$P" --ngen 20
+  kv_san mimo "asan kv mimo blocks of 3, the FP8 trunk" COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 MIMO_DENSE_BITS=0 MIMO_CHUNK=3 \
+    COLI_TEMP=0 ./mimo mimo_tiny --ids "$P" --ngen 10
+  CHAIN_SERVE_EXPECT='KV split: [0-9]+ layer steps, [1-9][0-9]* with a host part' CHAIN_SERVE_TOL=1e-3 \
+    $PY tests/vulkan_chain_serve.py ./mimo mimo_tiny_served OMP_NUM_THREADS=2 COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4 \
+    > san.log 2>&1 || { cat san.log; fail "asan kv mimo serve"; }
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan kv mimo serve: sanitizer diagnostic"; fi
+  echo "OK asan kv mimo serve: $(tail -1 san.log)"
+}
+
+# kv_mla_gate <engine> <tag> <tol 0|1> <rows> <block> <env...> -- <argv...>: mla_gate (the
+# CPU's tokens, logits within 1e-4 with tol 1; FAULT_BACK, REBUILD as there) with the
+# split on, which must have run steps with a host part (PINNED=1: and pinned blocks)
+kv_mla_gate() {
+  local eng=$1 tag=$2 tol=$3 rows=$4 blk=$5; shift 5
+  mla_gate "$eng" "$tag" "$tol" COLI_VK_KV_DEVICE_ROWS=$rows COLI_VK_KV_BLOCK=$blk "$@"
+  [ "$(kv_hostparts "$eng" vk.log)" -gt 0 ] || { cat vk.log; fail "$tag: the split never ran a host part"; }
+  if [ "${PINNED:-0}" = 1 ]; then grep -qa 'KV split: .* [1-9][0-9]* blocks pinned by reads' vk.log || { cat vk.log; fail "$tag: no block was pinned"; }; fi
+  echo "   $tag: $(grep -a "KV split:" vk.log | tail -1 | sed 's/.*KV split: //')"
+}
+# colibri (GLM-5.2): the 32-token oracle over 8 or 16 rows on the device; DSA's lists
+kv_split_colibri() {
+  [ -f glm_tiny_serve/tokenizer.json ] || glm_chain_fixtures
+  export CAP_RAISE=0
+  local G="SNAP=glm_tiny REF=ref_glm.json"
+  kv_mla_gate colibri "kv colibri decode, 8 rows on the device" 1 8 4 $G -- 64 16 16
+  kv_mla_gate colibri "kv colibri cap 1, blocks of 2" 1 8 2 $G -- 1 16 16
+  kv_mla_gate colibri "kv colibri prefill in chunks of 3" 1 8 4 $G TF=1 COLI_VK_CHAIN_ROWS=3 -- 64 16 16
+  kv_mla_gate colibri "kv colibri 4-bit trunk and experts" 1 8 4 $G IDOT=0 -- 2 4 4
+  kv_mla_gate colibri "kv colibri i4 container" 1 8 4 SNAP=glm_tiny_i4 REF=glm_tiny_i4/ref_glm.json IDOT=0 -- 1 4 4
+  # DSA's lists: the device skips the positions it does not hold, the host takes them,
+  # and the blocks the lists read most are pinned (chunks of 3 leave room for them)
+  COLI_VK_KV_PIN=1 PINNED=1 kv_mla_gate colibri "kv colibri DSA top-4, pinned blocks" 1 16 4 $G DSA_TOPK=4 COLI_VK_CHAIN_ROWS=3 -- 64 16 16
+  kv_mla_gate colibri "kv colibri DSA top-4, prefill in chunks of 5" 1 8 4 $G DSA_TOPK=4 TF=1 COLI_VK_CHAIN_ROWS=5 -- 64 16 16
+  kv_mla_gate colibri "kv colibri DSA_FORCE" 1 8 4 $G DSA_FORCE=1 -- 64 16 16
+  # drafts: the verify rows over the split, rejected rows rewritten
+  kv_mla_gate colibri "kv colibri n-gram drafts" 1 8 4 $G DRAFT=3 -- 64 16 16
+  kv_mla_gate colibri "kv colibri MTP depth 2" 1 8 4 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 -- 64 16 16
+  kv_mla_gate colibri "kv colibri tier off" 1 8 4 $G COLI_VK_TIER=0 -- 64 16 16
+  # prompts only: the prompt and the drafts' verify rows on the device, decode on the CPU
+  CHAINMODE=2 kv_mla_gate colibri "kv colibri prompts only, drafts" 1 8 4 $G DRAFT=3 -- 64 16 16
+  # COLI_VK_KV_SPLIT=0: the whole mirrors, as before the split
+  mla_gate colibri "kv colibri split off" 1 COLI_VK_KV_SPLIT=0 COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4 $G -- 64 16 16
+  if grep -qa 'KV cache split' vk.log; then cat vk.log; fail "kv colibri split off: the split ran"; fi
+  FAULT_BACK=12 kv_mla_gate colibri "kv colibri device lost mid-decode" 1 8 4 $G -- 64 16 16
+  # serve sessions frame for frame: pins, the prompt cache, the prefill read-out, two KV
+  # slots taking the device in turn, DSA's lists with drafts
+  local E='KV split: [0-9]+ layer steps, [1-9][0-9]* with a host part' K="COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4"
+  # shellcheck disable=SC2086
+  {
+    CHAIN_SERVE_EXPECT="$E" CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 $K
+    CHAIN_SERVE_EXPECT="$E" CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 DSA_TOPK=4 DRAFT=3 $K
+    CHAIN_SERVE_EXPECT="$E" CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 KV_SLOTS=2 $K
+  }
+  unset CAP_RAISE
+}
+kv_split_colibri_sanitize() {
+  [ -f glm_tiny_serve/tokenizer.json ] || glm_chain_fixtures
+  export CAP_RAISE=0
+  local K="COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4 USAGE_SAVE=0"
+  # shellcheck disable=SC2086
+  {
+    kv_san colibri "asan kv colibri decode" $K SNAP=glm_tiny REF=ref_glm.json ./colibri 64 16 16
+    COLI_VK_KV_PIN=1 kv_san colibri "asan kv colibri DSA top-4, pinned, chunks of 3" COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 USAGE_SAVE=0 SNAP=glm_tiny \
+      REF=ref_glm.json DSA_TOPK=4 COLI_VK_CHAIN_ROWS=3 ./colibri 64 16 16
+    kv_san colibri "asan kv colibri MTP depth 2" $K SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 ./colibri 64 16 16
+    CHAIN_SERVE_EXPECT='KV split: [0-9]+ layer steps, [1-9][0-9]* with a host part' CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=colibri \
+      $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 KV_SLOTS=2 $K > san.log 2>&1 \
+      || { cat san.log; fail "asan kv colibri serve"; }
+  }
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan kv colibri serve: sanitizer diagnostic"; fi
+  echo "OK asan kv colibri serve: $(tail -1 san.log)"
+  unset CAP_RAISE
+}
+
+# glm53 (GLM-5.3 Flash): its MLA layer's latent rows split, the k-pooled lists through
+# the split, the KDA layers untouched; the 100-token prompt and 8-token decodes
+kv_split_glm53() {
+  [ -f glm53_serve/tokenizer.json ] || glm_chain_fixtures
+  local ids bits M="--model glm53_stream-i4"
+  ids=$($PY -c "print(','.join(str((i*37+5)%120+2) for i in range(100)))")
+  kv_mla_gate glm53 "kv glm53 decode, 8 rows on the device" 1 8 4 GLM53_BITS=32 -- $M --ids 5,7,9,11,13,17,19,23 --greedy 8
+  for bits in 32 8 4; do
+    kv_mla_gate glm53 "kv glm53 100-token prompt, ${bits}-bit trunk" 1 16 4 GLM53_BITS=$bits -- $M --ids $ids --greedy 8
+  done
+  COLI_VK_KV_PIN=1 PINNED=1 kv_mla_gate glm53 "kv glm53 chain chunks of 3, pinned blocks" 1 16 4 GLM53_BITS=32 COLI_VK_CHAIN_ROWS=3 -- $M --ids $ids --greedy 8
+  kv_mla_gate glm53 "kv glm53 prefill chunks of 7, one cache slot" 1 16 4 GLM53_BITS=4 GLM53_PREFILL_CHUNK=7 GLM53_EXPERT_GB=0.000001 \
+    -- $M --ids $ids --greedy 4
+  kv_mla_gate glm53 "kv glm53 blocks of 2" 1 6 2 GLM53_BITS=32 -- $M --ids $ids --greedy 6
+  kv_mla_gate glm53 "kv glm53 resident experts" 1 16 4 GLM53_BITS=32 -- --model glm53_tiny --ids $ids --greedy 6
+  kv_mla_gate glm53 "kv glm53 tier off" 1 16 4 GLM53_BITS=32 COLI_VK_TIER=0 -- $M --ids $ids --greedy 6
+  kv_mla_gate glm53 "kv glm53 an image" 1 4 2 GLM53_BITS=32 -- --model glm53_mm_tiny --ids 103,117,268,268,268,268,120,121 \
+    --patches glm53_mm_tiny/patches.f32 --grid 4x4 --greedy 4
+  CHAINMODE=2 kv_mla_gate glm53 "kv glm53 prompts only" 1 16 4 GLM53_BITS=32 GLM53_PREFILL_CHUNK=16 -- $M --ids $ids --greedy 6
+  # COLI_VK_KV_SPLIT=0: the whole mirrors, as before the split
+  mla_gate glm53 "kv glm53 split off" 1 COLI_VK_KV_SPLIT=0 COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 GLM53_BITS=32 -- $M --ids $ids --greedy 4
+  if grep -qa 'KV cache split' vk.log; then cat vk.log; fail "kv glm53 split off: the split ran"; fi
+  FAULT_BACK=7 REBUILD=1 kv_mla_gate glm53 "kv glm53 device lost, the KDA state rebuilt" 1 16 4 GLM53_BITS=32 GLM53_PREFILL_CHUNK=16 \
+    -- $M --ids $ids --greedy 6
+  # serve sessions frame for frame (pins, the prompt cache, read-outs), two sessions
+  # taking the device in turn; a pin restored over rows another branch rewrote
+  local E='KV split: [0-9]+ layer steps, [1-9][0-9]* with a host part' K="COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4"
+  # shellcheck disable=SC2086
+  {
+    CHAIN_SERVE_EXPECT="$E" CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=32 $K
+    CHAIN_SERVE_EXPECT="$E" CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=4 COLI_VK_CHAIN_ROWS=3 $K
+    CHAIN_SERVE_EXPECT="$E" CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=32 KV_SLOTS=2 $K
+    env $K COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_USAGE=$PWD/chain.usage $PY tests/glm53_pin_branch_harness.py --binary ./glm53 --fixture glm53_mm_tiny
+  }
+}
+kv_split_glm53_sanitize() {
+  [ -f glm53_serve/tokenizer.json ] || glm_chain_fixtures
+  local ids K="COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 USAGE_SAVE=0"
+  ids=$($PY -c "print(','.join(str((i*37+5)%120+2) for i in range(100)))")
+  # shellcheck disable=SC2086
+  {
+    kv_san glm53 "asan kv glm53 100-token prompt" $K GLM53_BITS=32 ./glm53 --model glm53_stream-i4 --ids $ids --greedy 6
+    COLI_VK_KV_PIN=1 kv_san glm53 "asan kv glm53 int4 trunk, chunks of 3, pinned" $K GLM53_BITS=4 COLI_VK_CHAIN_ROWS=3 ./glm53 --model glm53_stream-i4 --ids $ids --greedy 6
+    kv_san glm53 "asan kv glm53 device lost, rebuilt" $K GLM53_BITS=32 GLM53_PREFILL_CHUNK=16 COLI_VK_CHAIN_FAULT=20 ./glm53 \
+      --model glm53_stream-i4 --ids $ids --greedy 6
+    CHAIN_SERVE_EXPECT='KV split: [0-9]+ layer steps, [1-9][0-9]* with a host part' CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=numeric \
+      $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=32 KV_SLOTS=2 COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4 > san.log 2>&1 \
+      || { cat san.log; fail "asan kv glm53 serve"; }
+  }
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan kv glm53 serve: sanitizer diagnostic"; fi
+  echo "OK asan kv glm53 serve: $(tail -1 san.log)"
+}
+
+# kv_k3c_gate <tag> <rows> <block> <env...>: k3c_gate (kimi's three cases, logits within
+# 2e-3 of the largest) with the split on; the last case run (long, 72 prompt tokens)
+# must have had steps with a host part
+kv_k3c_gate() {
+  local tag=$1 rows=$2 blk=$3; shift 3
+  k3c_gate "$tag" "$@" COLI_VK_KV_DEVICE_ROWS=$rows COLI_VK_KV_BLOCK=$blk
+  [ "$(kv_hostparts kimi_k3 vk.log)" -gt 0 ] || { cat vk.log; fail "$tag: the split never ran a host part"; }
+  echo "   $tag: $(grep -a "KV split:" vk.log | tail -1 | sed 's/.*KV split: //')"
+}
+# kimi_k3: its gated MLA layers (NoPE) split, the KDA layers untouched
+kv_split_kimi() {
+  [ -f kimi_k3_tiny/model.safetensors ] || $PY tools/make_kimi_k3_tiny.py --output ./kimi_k3_tiny --force
+  k3c_serve_fixture
+  local O="K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 COLI_TEMP=0" b
+  # shellcheck disable=SC2086
+  {
+    kv_k3c_gate "kv kimi_k3 f32, 16 rows on the device" 16 4 $O
+    kv_k3c_gate "kv kimi_k3 f32, blocks of 2" 8 2 $O
+    kv_k3c_gate "kv kimi_k3 f32, tier off" 16 4 $O COLI_VK_TIER=0
+    for b in 8 4; do kv_k3c_gate "kv kimi_k3 ${b}-bit trunk" 16 4 K3_BITS=$b K3_MLA_BITS=$b K3_HEAD_BITS=$b K3_IDOT=0 COLI_TEMP=0; done
+    kv_k3c_gate "kv kimi_k3 prefill one token at a time" 16 4 $O K3_CHUNK=1
+    kv_k3c_gate "kv kimi_k3 chain chunks of 3" 16 4 $O COLI_VK_CHAIN_ROWS=3
+    CHAINMODE=2 kv_k3c_gate "kv kimi_k3 prompts only" 16 4 $O
+    # COLI_VK_KV_SPLIT=0: the whole mirrors, as before the split
+    K3C_CASES=long k3c_gate "kv kimi_k3 split off" $O COLI_VK_KV_SPLIT=0 COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4
+    if grep -qa 'KV cache split' vk.log; then cat vk.log; fail "kv kimi_k3 split off: the split ran"; fi
+    # the device lost: mid-decode (the KDA state rebuilt), and inside the long prompt
+    FAULT_BACK=3 REBUILD=1 kv_k3c_gate "kv kimi_k3 device lost mid-decode" 16 4 $O
+    K3C_CASES=long FAULT_BACK=150 kv_k3c_gate "kv kimi_k3 device lost in the prompt" 16 4 $O
+  }
+  # serve sessions frame for frame with recurrent-state checkpoints, and the checkpoint
+  # tests, across the split
+  local S="K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 K3_PREFIX_LOG=1 USAGE_SAVE=0" K="COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4"
+  local E='KV split: [0-9]+ layer steps, [1-9][0-9]* with a host part'
+  # shellcheck disable=SC2086
+  {
+    CHAIN_SERVE_TOL=2e-2 CHAIN_SERVE_EXPECT="$E" $PY tests/vulkan_chain_serve.py ./kimi_k3 kimi_k3_serve $S $K
+    CHAIN_SERVE_TOL=2e-2 CHAIN_SERVE_EXPECT="$E" $PY tests/vulkan_chain_serve.py ./kimi_k3 kimi_k3_serve $S COLI_K3_CKPT=4 $K
+    CHAIN_SERVE_TOL=2e-2 CHAIN_SERVE_EXPECT="$E" $PY tests/vulkan_chain_serve.py ./kimi_k3 kimi_k3_serve K3_BITS=4 K3_IDOT=0 K3_PREFIX_LOG=1 \
+      USAGE_SAVE=0 COLI_VK_CHAIN_ROWS=3 $K
+    env $K COLI_USAGE=$PWD/k3c.usage USAGE_SAVE=0 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 \
+      $PY tests/test_kimi_k3_ckpt.py --binary ./kimi_k3 --fixture ./kimi_k3_tiny
+  }
+}
+kv_split_kimi_sanitize() {
+  [ -f kimi_k3_tiny/model.safetensors ] || $PY tools/make_kimi_k3_tiny.py --output ./kimi_k3_tiny --force
+  k3c_serve_fixture
+  local O="K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 COLI_TEMP=0 USAGE_SAVE=0" K="COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4" ids
+  ids=$(k3c_ids long)
+  # shellcheck disable=SC2086
+  {
+    kv_san kimi_k3 "asan kv kimi_k3 f32" $K $O ./kimi_k3 kimi_k3_tiny --ids "$ids" --ngen 8
+    kv_san kimi_k3 "asan kv kimi_k3 int4 trunk, chunks of 3" $K K3_BITS=4 K3_IDOT=0 USAGE_SAVE=0 COLI_VK_CHAIN_ROWS=3 ./kimi_k3 kimi_k3_tiny \
+      --ids "$ids" --ngen 8
+    kv_san kimi_k3 "asan kv kimi_k3 prompts only" $K $O COLI_VK_CHAIN=2 ./kimi_k3 kimi_k3_tiny --ids "$ids" --ngen 8
+    CHAIN_SERVE_TOL=2e-2 CHAIN_SERVE_EXPECT='KV split: [0-9]+ layer steps, [1-9][0-9]* with a host part' \
+      $PY tests/vulkan_chain_serve.py ./kimi_k3 kimi_k3_serve K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 K3_PREFIX_LOG=1 \
+      USAGE_SAVE=0 COLI_K3_CKPT=4 COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4 > san.log 2>&1 || { cat san.log; fail "asan kv kimi_k3 serve"; }
+  }
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan kv kimi_k3 serve: sanitizer diagnostic"; fi
+  echo "OK asan kv kimi_k3 serve: $(tail -1 san.log)"
+}
+
+# deepseek_v41: the compressed rows of its kv_source layers split (ratios 2 and 1 in the
+# fixtures; the window ring and the index keys stay whole on the device). kv_v41_gate:
+# v41_gate (the CPU's tokens, every forward's logits within 1e-4 of the largest) under an
+# emulated small device, which must have run attention steps with a host part.
+kv_v41_gate() {  # <tag> <rows> <block> <env...> -- <argv...>
+  local tag=$1 rows=$2 blk=$3; shift 3
+  v41_gate "$tag" COLI_VK_KV_DEVICE_ROWS=$rows COLI_VK_KV_BLOCK=$blk "$@"
+  if [ -z "${FAULT_BACK:-}" ]; then
+    [ "$(kv_hostparts deepseek_v41 vk.log)" -gt 0 ] || { cat vk.log; fail "$tag: the split never ran a host part"; }
+  fi
+  echo "   $tag: $(grep -a "KV split:" vk.log | tail -1 | sed 's/.*KV split: //')"
+}
+kv_split_deepseek_v41() {
+  v41_chain_fixtures
+  local cap f K=(COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=2)
+  for cap in 2 8; do kv_v41_gate "kv deepseek_v41 40-token prompt cap=$cap" 16 4 SNAP=dsv41_long -- $cap dsv41_long/ref.json; done
+  kv_v41_gate "kv deepseek_v41 four blocks of 2" 8 2 SNAP=dsv41_long -- 8 dsv41_long/ref.json
+  COLI_VK_KV_PIN=1 kv_v41_gate "kv deepseek_v41 eight blocks of 4, four pinned" 32 4 SNAP=dsv41_long -- 8 dsv41_long/ref.json
+  kv_v41_gate "kv deepseek_v41 12-token prompt" 8 2 SNAP=dsv41_tiny -- 8 dsv41_tiny/ref.json
+  # DSpark: a verify is one chunk, and a chunk's new compressed rows fit the window (four
+  # blocks of 4 take a verify of 4 rows, eight blocks one of 12)
+  for f in 1 3; do kv_v41_gate "kv deepseek_v41 DSpark spec=$f" 16 4 SNAP=dsv41_long V41_DSPARK=1 V41_SPEC_FORCE=$f -- 8 dsv41_long/ref.json; done
+  kv_v41_gate "kv deepseek_v41 DSpark spec=5" 32 4 SNAP=dsv41_long V41_DSPARK=1 V41_SPEC_FORCE=5 -- 8 dsv41_long/ref.json
+  kv_v41_gate "kv deepseek_v41 prompt in chunks of 3" 16 4 SNAP=dsv41_long COLI_VK_CHAIN_ROWS=3 -- 8 dsv41_long/ref.json
+  CHAINMODE=2 kv_v41_gate "kv deepseek_v41 prompts only" 8 2 SNAP=dsv41_long -- 8 dsv41_long/ref.json
+  kv_v41_gate "kv deepseek_v41 tier off" 16 4 SNAP=dsv41_long COLI_VK_TIER=0 -- 8 dsv41_long/ref.json
+  kv_v41_gate "kv deepseek_v41 V41_INDEX_OWNER=1" 16 4 SNAP=dsv41_long V41_INDEX_OWNER=1 -- 8 dsv41_long/ref.json
+  # COLI_VK_KV_SPLIT=0: the whole mirrors, as before the split
+  v41_gate "kv deepseek_v41 split off" SNAP=dsv41_long COLI_VK_KV_SPLIT=0 "${K[@]}" -- 8 dsv41_long/ref.json
+  if grep -qa 'KV cache split' vk.log; then cat vk.log; fail "kv deepseek_v41 split off: the split ran"; fi
+  FAULT_BACK=5 kv_v41_gate "kv deepseek_v41 device lost mid-decode" 8 2 SNAP=dsv41_long -- 8 dsv41_long/ref.json
+  FAULT_BACK=60 kv_v41_gate "kv deepseek_v41 device lost in the prompt" 8 2 SNAP=dsv41_long -- 8 dsv41_long/ref.json
+  CHAIN_SERVE_EXPECT='KV split: [0-9]+ layer steps, [1-9][0-9]* with a host part' \
+    $PY tests/vulkan_chain_serve.py ./deepseek_v41 dsv41_tiny V41_DSPARK=0 "${K[@]}"
+  CHAIN_SERVE_EXPECT='KV split: [0-9]+ layer steps, [1-9][0-9]* with a host part' \
+    $PY tests/vulkan_chain_serve.py ./deepseek_v41 dsv41_tiny V41_DSPARK=1 "${K[@]}"
+  env "${K[@]}" COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_USAGE=$PWD/chain.usage \
+    COLI_DSV41_FIXTURE=$PWD/dsv41_tiny $PY -m unittest tests.test_dsv41_prefix_serve tests.test_dsv41_dspark_serve
+  rm -f chain.usage chain-serve.usage
+}
+kv_split_deepseek_v41_sanitize() {
+  v41_chain_fixtures
+  local K=(COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=2)
+  kv_san deepseek_v41 "asan kv deepseek_v41 40-token prompt" "${K[@]}" SNAP=dsv41_long ./deepseek_v41 8 dsv41_long/ref.json
+  COLI_VK_KV_PIN=1 kv_san deepseek_v41 "asan kv deepseek_v41 pinned blocks, chunks of 3" COLI_VK_KV_DEVICE_ROWS=32 COLI_VK_KV_BLOCK=4 \
+    COLI_VK_CHAIN_ROWS=3 SNAP=dsv41_long ./deepseek_v41 2 dsv41_long/ref.json
+  kv_san deepseek_v41 "asan kv deepseek_v41 DSpark spec=5" COLI_VK_KV_DEVICE_ROWS=32 COLI_VK_KV_BLOCK=4 SNAP=dsv41_long \
+    V41_DSPARK=1 V41_SPEC_FORCE=5 ./deepseek_v41 8 dsv41_long/ref.json
+  CHAIN_SERVE_EXPECT='KV split: [0-9]+ layer steps, [1-9][0-9]* with a host part' \
+    $PY tests/vulkan_chain_serve.py ./deepseek_v41 dsv41_tiny V41_DSPARK=1 "${K[@]}" > san.log 2>&1 || { cat san.log; fail "asan kv deepseek_v41 serve"; }
+  echo "OK asan kv deepseek_v41 serve: $(tail -1 san.log)"
+  rm -f chain.usage chain-serve.usage
+}
+
+# DeepSeek's split keeps sparse attention in its original order on the device:
+# only selected missing compressed rows are staged from RAM. The exact chunk and
+# decode-versus-teacher-forced checks therefore apply unchanged, including V4 bf16.
+kv_v4_gate() {  # <tag> <rows> <block> <fixture> <case> <env...>
+  local tag=$1 rows=$2 blk=$3 fx=$4 c=$5; shift 5
+  v4_chain_gate "$tag" "$fx" "$c" COLI_VK_KV_DEVICE_ROWS=$rows COLI_VK_KV_BLOCK=$blk "$@"
+  if [ -z "${FAULT_BACK:-}" ]; then
+    [ "$(kv_hostparts deepseek_v4 v4-vk.err)" -gt 0 ] || { cat v4-vk.err; fail "$tag: the split never ran a host part"; }
+  fi
+  echo "   $tag: $(grep -a "KV split:" v4-vk.err | tail -1 | sed 's/.*KV split: //')"
+}
+kv_split_deepseek_v4() {
+  v4_chain_fixtures
+  local c fx
+  # the compressed case makes 6 rows at ratio 4 (four blocks of 1 on the device: a split
+  # holds three blocks at least), the long one 19 (four blocks of 2)
+  for fx in deepseek_v4_tiny_t deepseek_v4_tiny_e8; do
+    kv_v4_gate "kv deepseek_v4 $fx compressed" 4 1 $fx compressed
+    kv_v4_gate "kv deepseek_v4 $fx long" 8 2 $fx long
+  done
+  COLI_VK_KV_PIN=1 kv_v4_gate "kv deepseek_v4 eight blocks of 2, four pinned" 16 2 deepseek_v4_tiny_t long
+  kv_v4_gate "kv deepseek_v4 2 output groups" 8 2 deepseek_v4_tiny_g2 long
+  kv_v4_gate "kv deepseek_v4 a window of 4, ratios 4 and 2" 8 2 deepseek_v4_tiny_w4 long
+  kv_v4_gate "kv deepseek_v4 an indexer of 64 heads of 128" 8 2 deepseek_v4_tiny_ix long
+  kv_v4_gate "kv deepseek_v4 tier off" 8 2 deepseek_v4_tiny_t long COLI_VK_TIER=0 COLI_VK_DENSE=0
+  kv_v4_gate "kv deepseek_v4 chain chunks of 3" 16 2 deepseek_v4_tiny_e8 long COLI_VK_CHAIN_ROWS=3
+  kv_v4_gate "kv deepseek_v4 prefill chunks of 7" 16 2 deepseek_v4_tiny_t long V4_PREFILL_CHUNK=7
+  CHAINMODE=2 kv_v4_gate "kv deepseek_v4 prompts only" 8 2 deepseek_v4_tiny_t long
+  # n-gram drafts (V4_DRAFT): accepted and rejected, every one rejected, a mix
+  local A=ids:20,21,22,23,24,25,26,27,28,29,20,21,22:12 R=ids:20,21,22,23,50,51,52,20,21,22:12
+  local M=ids:30,31,32,33,34,35,60,61,30,31,32,33,34,35,36,37,38,39,40,41,30,31,32:12
+  kv_v4_gate "kv deepseek_v4 n-gram drafts accepted and rejected" 4 1 deepseek_v4_tiny_t $A V4_DRAFT=4 V4_NGRAM_PARTIAL_KEEP=1
+  kv_v4_gate "kv deepseek_v4 an n-gram draft rejected" 4 1 deepseek_v4_tiny_t $R V4_DRAFT=4 V4_NGRAM_PARTIAL_KEEP=1
+  kv_v4_gate "kv deepseek_v4 n-gram drafts, a window of 4" 4 2 deepseek_v4_tiny_w4 $M V4_DRAFT=4 V4_NGRAM_PARTIAL_KEEP=1
+  # The same model arithmetic with full mirrors, a split, different chunking and
+  # read-based pins. These comparisons are bit-exact and have no logit tolerance.
+  local K=(COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=2)
+  v4_chain_same "kv deepseek_v4 split = full mirror" deepseek_v4_tiny_t long "COLI_VK_KV_SPLIT=0" "COLI_VK_KV_SPLIT=1" "${K[@]}"
+  v4_chain_same "kv deepseek_v4 chunks 1 = 3" deepseek_v4_tiny_t long "COLI_VK_CHAIN_ROWS=1" "COLI_VK_CHAIN_ROWS=3" "${K[@]}"
+  v4_chain_same "kv deepseek_v4 pinned residency" deepseek_v4_tiny_e8 long "COLI_VK_KV_PIN=0" "COLI_VK_KV_PIN=1" "${K[@]}"
+  v4_chain_same "kv deepseek_v4 draft chunks" deepseek_v4_tiny_w4 $M "COLI_VK_CHAIN_ROWS=1" "COLI_VK_CHAIN_ROWS=3" "${K[@]}" V4_DRAFT=4 V4_NGRAM_PARTIAL_KEEP=1
+  # COLI_VK_KV_SPLIT=0: the whole mirrors, as before the split
+  v4_chain_gate "kv deepseek_v4 split off" deepseek_v4_tiny_t long COLI_VK_KV_SPLIT=0 COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=2
+  if grep -qa 'KV cache split' v4-vk.err; then cat v4-vk.err; fail "kv deepseek_v4 split off: the split ran"; fi
+  FAULT_BACK=3 kv_v4_gate "kv deepseek_v4 device lost mid-decode" 8 2 deepseek_v4_tiny_t long
+  FAULT_BACK=40 kv_v4_gate "kv deepseek_v4 device lost in the prompt" 8 2 deepseek_v4_tiny_t long
+  # serve: a pin, its extension, a read-only prompt, a shorter one (texts and reuse =
+  # CPU, logprobs within 0.5)
+  COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=2 v4_chain_serve deepseek_v4_tiny_t
+  rm -rf deepseek_v4_tiny_t deepseek_v4_tiny_e8 deepseek_v4_tiny_g2 deepseek_v4_tiny_w4 deepseek_v4_tiny_ix chain.usage
+  rm -f cpu.f32 vk.f32 v4-*.f32 v4-*.json v4-*.err v4-tf.txt
+}
+kv_split_deepseek_v4_sanitize() {
+  # the V4 sanitized build as its chain family makes it (no LTO, the sanitizers at the link)
+  local SAN="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  make deepseek-v4-clean >/dev/null 2>&1 || true
+  make deepseek-v4 VK=1 LTO=0 EXTRA_CFLAGS="$SAN" EXTRA_LDFLAGS="$SAN"
+  v4_chain_fixtures
+  local p K=(COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=2)
+  p=$(v4_chain_prompt deepseek_v4_tiny_t long)
+  kv_v4_san() {  # <tag> <env and argv...>: v4_chain_san, and steps with a host part
+    v4_chain_san "$@"
+    [ -n "${FAULT_BACK:-}" ] || [ "$(kv_hostparts deepseek_v4 san.log)" -gt 0 ] || { cat san.log; fail "$1: the split never ran a host part"; }
+  }
+  kv_v4_san "asan kv deepseek_v4 long, 4 experts" "${K[@]}" ./deepseek_v4 ./deepseek_v4_tiny_t "$p" --raw-prompt --max-tokens 4
+  kv_v4_san "asan kv deepseek_v4 chunks of 3, a window of 4" "${K[@]}" COLI_VK_CHAIN_ROWS=3 ./deepseek_v4 ./deepseek_v4_tiny_w4 \
+    "$(v4_chain_prompt deepseek_v4_tiny_w4 long)" --raw-prompt --max-tokens 4
+  COLI_VK_KV_PIN=1 kv_v4_san "asan kv deepseek_v4 pinned blocks, 64 index heads" COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=2 ./deepseek_v4 \
+    ./deepseek_v4_tiny_ix "$(v4_chain_prompt deepseek_v4_tiny_ix long)" --raw-prompt --max-tokens 4
+  kv_v4_san "asan kv deepseek_v4 drafts" COLI_VK_KV_DEVICE_ROWS=4 COLI_VK_KV_BLOCK=1 V4_DRAFT=4 V4_NGRAM_PARTIAL_KEEP=1 ./deepseek_v4 \
+    ./deepseek_v4_tiny_w4 "$(v4_chain_prompt x ids:30,31,32,33,34,35,60,61,30,31,32,33,34,35,36,37,38,39,40,41,30,31,32)" --raw-prompt --max-tokens 12
+  FAULT_BACK=10 kv_v4_san "asan kv deepseek_v4 device lost" "${K[@]}" ./deepseek_v4 ./deepseek_v4_tiny_t "$p" --raw-prompt --max-tokens 4
+  COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=2 v4_chain_serve deepseek_v4_tiny_t > san.log 2>&1 || { cat san.log; fail "asan kv deepseek_v4 served"; }
+  echo "OK asan kv deepseek_v4 served: $(tail -1 san.log | cut -c1-120)"
+  rm -rf deepseek_v4_tiny_t deepseek_v4_tiny_e8 deepseek_v4_tiny_g2 deepseek_v4_tiny_w4 deepseek_v4_tiny_ix san.json san.log
+  make deepseek-v4-clean >/dev/null 2>&1 || true
+}
+
+# kv-split: every chain engine but DeepSeek's (whose fixtures want another transformers)
+family_kv_split() {
+  export OMP_NUM_THREADS=2
+  make qwen36 qwen38 olmoe inkling mimo colibri glm53 kimi_k3 tests/test_vk_chain VK=1
+  ./tests/test_vk_chain shaders/qmatmul.spv | tee vk_chain.log
+  tail -1 vk_chain.log | grep -qx PASS || fail "the chain's ops"
+  grep -a 'kvs ' vk_chain.log
+  kv_split_qwen36; kv_split_qwen38; kv_split_olmoe; kv_split_inkling; kv_split_mimo
+  kv_split_colibri; kv_split_glm53; kv_split_kimi
+  unset OMP_NUM_THREADS
+}
+family_kv_split_sanitize() {
+  make clean >/dev/null 2>&1 || true
+  make qwen36 qwen38 olmoe inkling mimo colibri glm53 kimi_k3 tests/test_vk_chain VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
+  ./tests/test_vk_chain shaders/qmatmul.spv > san.log 2>&1 || true
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log || ! tail -1 san.log | grep -qx PASS; then cat san.log; fail "asan: the chain's ops"; fi
+  echo "OK asan: the chain's ops, the split KV cache's among them"
+  kv_split_qwen36_sanitize; kv_split_qwen38_sanitize; kv_split_olmoe_sanitize; kv_split_inkling_sanitize
+  kv_split_mimo_sanitize; kv_split_colibri_sanitize; kv_split_glm53_sanitize; kv_split_kimi_sanitize
+  make clean >/dev/null 2>&1 || true
+}
+family_kv_split_deepseek() {
+  export OMP_NUM_THREADS=2
+  make deepseek_v41 deepseek-v4 VK=1
+  kv_split_deepseek_v41; kv_split_deepseek_v4
+  unset OMP_NUM_THREADS
+}
+family_kv_split_deepseek_sanitize() {
+  make clean >/dev/null 2>&1 || true
+  # deepseek_v4's sanitized build is its own (no LTO, the sanitizers at the link too):
+  # kv_split_deepseek_v4_sanitize makes it, as v4_chain_family_sanitize does
+  make deepseek_v41 VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
+  kv_split_deepseek_v41_sanitize; kv_split_deepseek_v4_sanitize
+  make clean >/dev/null 2>&1 || true
+}
+
+# The decision engines (docs/vulkan.md, "The decision engines"): laya and gliner_decide
+# with their forward on the device (COLI_VK_CHAIN=1, chain_enc.comp) and matrix by matrix
+# (COLI_VK_CHAIN=0), Clef's DECIDE on qwen36's per-matrix path and its chain, in f32, int8
+# and f16 (fmt 14), the rows read in place and copied. Each configuration against the CPU
+# (tests/vulkan_decide_compare.py: every case of the fixture, the same decisions, the
+# probabilities within 1e-5 and the logits within 1e-4 of the largest, matmuls on the
+# device); the tiny oracles through the device; the device opened with every path off,
+# byte for byte the CPU's; a device lost mid-run (the rest of the forwards on the CPU);
+# the serve tests and TypeSafe's SDKs (where installed) through the device, checked by
+# the engines' own lines. SAN=1 (decide-sanitize): a sanitized build, the comparisons
+# and the serve tests, UBSan halting on its first report.
+decide_vk_lines() {  # <log> <tag>: every decision engine's forwards ran on the device
+  local e
+  for e in laya gliner_decide; do
+    grep -qE "^\[VK\] $e chain: [1-9][0-9]* forwards on the device" "$1" || { tail -50 "$1"; fail "$2: $e never ran on the device"; }
+  done
+  grep -qE "^\[VK\] qwen36 chain: [1-9][0-9]* forwards" "$1" || { tail -50 "$1"; fail "$2: Clef never ran on the device"; }
+}
+family_decide() {
+  local SANF=""
+  if [ -n "${SAN:-}" ]; then
+    SANF="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+    make clean >/dev/null 2>&1 || true
+    export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
+  fi
+  make laya gliner_decide qwen36 tests/test_qwen36_weight_alloc VK=1 EXTRA_CFLAGS="$SANF"
+  COLI_VULKAN=0 ./tests/test_qwen36_weight_alloc
+  COLI_VULKAN=1 ./tests/test_qwen36_weight_alloc
+  make laya-tiny-generate gliner-decide-tiny-generate clef-tiny-generate
+  export OMP_NUM_THREADS=2
+  local c e
+  local -a cmp=(
+    "laya COLI_VK_CHAIN=1" "laya COLI_VK_CHAIN=0" "gliner COLI_VK_CHAIN=1" "gliner COLI_VK_CHAIN=0"
+    "laya COLI_VK_CHAIN=1 COLI_VK_STAGED=1" "gliner COLI_VK_CHAIN=1 COLI_VK_STAGED=1"
+    "laya COLI_VK_CHAIN=1 COLI_VK_CHAIN_FAULT=10" "gliner COLI_VK_CHAIN=1 COLI_VK_CHAIN_FAULT=10"
+    "clef" "clef COLI_VK_CHAIN=1"
+    "clef COLI_VK_CHAIN=1 COLI_VK_CHAIN_ROWS=1 COLI_VK_CHAIN_FAULT=10 COLI_VK_DENSE_HOST=0"
+    "clef COLI_DENSE_I8=1 COLI_DENSE_BITS=16 COLI_VK_CHAIN=1 COLI_VK_CHAIN_ROWS=1 COLI_VK_CHAIN_FAULT=10 COLI_VK_DENSE_HOST=0 COLI_VK_IMPORT=0"
+    "clef COLI_DENSE_I8=1 COLI_DENSE_IDOT=0 COLI_VK_CHAIN=1 COLI_VK_DENSE_HOST=0"
+    "clef COLI_DENSE_I8=1 COLI_DENSE_BITS=16 COLI_VK_CHAIN=1 COLI_VK_DENSE_HOST=0"
+    "clef COLI_DENSE_I8=1 COLI_DENSE_IDOT=0" "clef COLI_DENSE_I8=1 COLI_DENSE_IDOT=0 COLI_VK_CHAIN=1"
+    "clef COLI_DENSE_I8=1 COLI_DENSE_IDOT=0 COLI_VK_IMPORT=0"
+    "clef COLI_DENSE_I8=1 COLI_DENSE_BITS=16" "clef COLI_DENSE_I8=1 COLI_DENSE_BITS=16 COLI_VK_CHAIN=1"
+    "clef COLI_DENSE_I8=1 COLI_DENSE_BITS=16 COLI_VK_IMPORT=0")
+  for c in "${cmp[@]}"; do
+    # shellcheck disable=SC2086
+    $PY tests/vulkan_decide_compare.py $c > cmp.log 2>&1 || { cat cmp.log; fail "decide: $c"; }
+    tail -1 cmp.log
+  done
+  for e in laya gliner clef; do
+    $PY tests/vulkan_decide_compare.py --off $e COLI_VK_CHAIN=0 COLI_VK_DENSE=0 > cmp.log 2>&1 || { cat cmp.log; fail "decide: $e with every path off"; }
+    tail -1 cmp.log
+  done
+  [ -n "${SAN:-}" ] || for c in 0 1; do
+    COLI_VULKAN=1 COLI_VK_CHAIN=$c LAYA_TINY_REQUIRED=1 GLINER_DECIDE_TINY_REQUIRED=1 CLEF_TINY_REQUIRED=1 \
+      $PY -m unittest tests.test_laya_tiny tests.test_gliner_decide_tiny tests.test_clef_tiny > oracle.log 2>&1 \
+      || { cat oracle.log; fail "decide: the tiny oracles through the device, COLI_VK_CHAIN=$c"; }
+    echo "OK decide: the tiny oracles (Laya, GLiNER2.5-Decide, Clef) through the device, COLI_VK_CHAIN=$c"
+  done
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 LAYA_TINY_REQUIRED=1 GLINER_DECIDE_TINY_REQUIRED=1 CLEF_TINY_REQUIRED=1 \
+    $PY -m unittest tests.test_decision_serve > serve.log 2>&1 || { tail -80 serve.log; fail "decide: the serve tests through the device"; }
+  decide_vk_lines serve.log "decide serve"
+  echo "OK decide: the serve tests (tests.test_decision_serve) through the device: $(tail -1 serve.log)"
+  if [ -z "${SAN:-}" ] && $PY -c "import typesafe_sdk" 2>/dev/null && [ -d "${JEV_TS_SDK_DIR:-tools/jev-sdk}/node_modules" ]; then
+    make mimo VK=1 mimo-tiny-generate
+    rm -f sdk-serve.log
+    COLI_VULKAN=1 COLI_VK_CHAIN=1 JEV_SDK_REQUIRED=1 JEV_SDK_SERVE_LOG=sdk-serve.log \
+      $PY -m unittest tests.test_jev_sdk > sdk.log 2>&1 || { tail -80 sdk.log; fail "decide: TypeSafe's SDKs through the device"; }
+    decide_vk_lines sdk-serve.log "decide SDKs"
+    echo "OK decide: TypeSafe's Python and TypeScript SDKs (tests.test_jev_sdk) through the device"
+  elif [ -z "${SAN:-}" ]; then
+    echo "SKIP decide: TypeSafe's SDKs are not installed (tools/requirements-jev-sdk.txt, npm ci in tools/jev-sdk)"
+  fi
+  rm -f cmp.log oracle.log serve.log sdk.log sdk-serve.log
+  unset OMP_NUM_THREADS
+  [ -z "${SAN:-}" ] || make clean >/dev/null 2>&1 || true
+}
+
 case "${1:-}" in
   shader)         shader_formats ;;
   qwen)           family_qwen ;;
@@ -2685,6 +3963,8 @@ case "${1:-}" in
   glm-sanitize)   family_glm_sanitize ;;
   qwen-chain)     family_qwen_chain ;;
   qwen-chain-sanitize) family_qwen_chain_sanitize ;;
+  qwen-spec)      family_qwen_spec ;;
+  qwen-spec-sanitize) family_qwen_spec_sanitize ;;
   inkling-olmoe-chain) family_inkling_olmoe_chain ;;
   inkling-olmoe-chain-sanitize) family_inkling_olmoe_chain_sanitize ;;
   glm-chain)      family_glm_chain ;;
@@ -2693,6 +3973,16 @@ case "${1:-}" in
   kimi-chain-sanitize) family_kimi_chain_sanitize ;;
   deepseek-chain) family_deepseek_chain ;;
   deepseek-chain-sanitize) family_deepseek_chain_sanitize ;;
+  prefill-qwen)   family_prefill_qwen ;;
+  prefill-qwen-sanitize) family_prefill_qwen_sanitize ;;
+  prefill-inkling-olmoe) family_prefill_inkling_olmoe ;;
+  prefill-mimo-kimi) family_prefill_mimo_kimi ;;
+  prefill-glm)    family_prefill_glm ;;
+  prefill-deepseek) family_prefill_deepseek ;;
+  kv-split)       family_kv_split ;;
+  kv-split-sanitize) family_kv_split_sanitize ;;
+  kv-split-deepseek) family_kv_split_deepseek ;;
+  kv-split-deepseek-sanitize) family_kv_split_deepseek_sanitize ;;
   staged)         family_staged ;;
   *-staged)       # COLI_VK_STAGED unset for the window's run, then the whole family staged
                   if [ "$1" = qwen-staged ]; then env -u COLI_VK_STAGED bash tests/vulkan_engines.sh staged-window; fi
@@ -2700,5 +3990,10 @@ case "${1:-}" in
   staged-window)  staged_window ;;
   staged-faults)  family_staged_faults ;;
   staged-faults-sanitize) SAN=1 family_staged_faults ;;
-  *) echo "usage: $0 staged|<family>-staged|shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize|mimo-chain|mimo-chain-sanitize|inkling-olmoe-chain|inkling-olmoe-chain-sanitize|glm-chain|glm-chain-sanitize|kimi-chain|kimi-chain-sanitize|deepseek-chain|deepseek-chain-sanitize" >&2; exit 2 ;;
+  decide)         family_decide ;;
+  decide-sanitize) SAN=1 family_decide ;;
+  dense-only-*)   g=${1#dense-only-}; fn=dho_family_${g//-/_}
+                  declare -F "$fn" >/dev/null || { echo "no dense-only group ${g}" >&2; exit 2; }
+                  "$fn" ;;
+  *) echo "usage: $0 decide|decide-sanitize|staged|<family>-staged|shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize|qwen-spec|qwen-spec-sanitize|mimo-chain|mimo-chain-sanitize|inkling-olmoe-chain|inkling-olmoe-chain-sanitize|glm-chain|glm-chain-sanitize|kimi-chain|kimi-chain-sanitize|deepseek-chain|deepseek-chain-sanitize|dense-only-<group>[-sanitize]|prefill-qwen|prefill-qwen-sanitize|prefill-inkling-olmoe|prefill-mimo-kimi|prefill-glm|prefill-deepseek|kv-split|kv-split-sanitize|kv-split-deepseek|kv-split-deepseek-sanitize" >&2; exit 2 ;;
 esac

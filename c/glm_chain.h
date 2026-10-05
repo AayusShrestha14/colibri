@@ -35,6 +35,11 @@
  *     (glmc_kv_reset), a slot adopting another's rows (glmc_host_rows), a different KV
  *     state bound (the owner check). The mirror grows with the context (powers of two
  *     up to the host's max_t), and a grown mirror is filled again from the host.
+ * Past the device's budget (vk_kvsplit.h) each layer keeps only some blocks of its
+ * latent and rope rows on the device: the window of the newest, and the blocks the DSA
+ * selection reads most. The attention core then runs over those on the device and over
+ * the rest on the CPU (from the host's canonical cache) at once, merged through the
+ * softmax statistics; the index keys, which every row scores every step, stay whole.
  * MLA has no recurrent state: a rejected draft is rows the next step rewrites, prefix
  * reuse is rows below the watermark, and a device lost mid-forward leaves nothing to
  * rebuild: the forward runs again on the CPU from its input rows (still on the host)
@@ -50,11 +55,15 @@
  * above 128, qk_nope above 1024; an indexer above 64 heads or 4096 query floats). The
  * MTP head runs on the CPU, as before: its own KV row is not mirrored. */
 #include "vk_chain.h"
+#include "vk_kvsplit.h"
 
 typedef struct {
     int ok, failed;
     int rows;                                  /* scratch capacity in rows */
-    int cap;                                   /* device KV rows a layer */
+    int cap;                                   /* host positions the mirror covers */
+    int dev_rows;                              /* device latent/rope rows a layer: cap, or the split's */
+    VkcKvSplit ks;                             /* the split past the device's budget (ks.on) */
+    VkcMlaCache kvtmp;                         /* the split: a step's new rows before their slots */
     KVState *owner;                            /* the KV state the mirror holds */
     VkcBuf *prm;                               /* norm weights */
     size_t *o_in, *o_post, *o_ixw, *o_ixb;
@@ -71,11 +80,6 @@ typedef struct {
 
 static int g_vk_chain = 0;     /* COLI_VK_CHAIN decided on, and the chain's pipelines are up */
 static int g_glmc_inited = 0; /* vkc_init ran: vkc_shutdown at exit, whatever came after */
-static int glmc_chunk_rows(void) {
-    const char *e = getenv("COLI_VK_CHAIN_ROWS");
-    int v = e && *e ? atoi(e) : 512;
-    return v < 1 ? 1 : v > 65535 ? 65535 : v;
-}
 
 /* The device's copy of a resident QT, uploaded once (the per-matrix path's own copy
  * when COLI_VK_DENSE put it there); f32 goes up as the backend's fmt 10. NULL: no
@@ -104,19 +108,24 @@ static void glmc_cpu_rows(Model *m, int layer, KVState *const *kvs, const int *p
         KVState *ks = kvs ? kvs[s] : m->kv;
         int pos = positions ? positions[s] : pos_base + s;
         if (ks == ch->owner && ch->kv_valid[layer] > pos) ch->kv_valid[layer] = pos;
+        if (ks == ch->owner) vkc_kv_lower(&ch->ks, layer, pos);
     }
 }
 /* Rows from `from` of every layer of k were written on the host. */
 static void glmc_host_rows(Model *m, KVState *k, int from) {
     GlmChain *ch = (GlmChain *)m->vkchain;
     if (!ch || !ch->kv_valid || k != ch->owner) return;
-    for (int i = 0; i < m->c.n_layers; i++) if (ch->kv_valid[i] > from) ch->kv_valid[i] = from < 0 ? 0 : from;
+    for (int i = 0; i < m->c.n_layers; i++) {
+        if (ch->kv_valid[i] > from) ch->kv_valid[i] = from < 0 ? 0 : from;
+        vkc_kv_lower(&ch->ks, i, from < 0 ? 0 : from);
+    }
 }
 /* kv_alloc gave the bound state new arrays: nothing on the device is theirs. */
 static void glmc_kv_reset(Model *m) {
     GlmChain *ch = (GlmChain *)m->vkchain;
     if (!ch || !ch->kv_valid) return;
     for (int i = 0; i < m->c.n_layers; i++) ch->kv_valid[i] = 0;
+    vkc_kv_reset(&ch->ks);
     ch->owner = NULL;
 }
 
@@ -185,7 +194,33 @@ static int glmc_setup(Model *m) {
     return 1;
 }
 
-static int glmc_res(VkcBuf **b, size_t floats, int kind) { return vkc_reserve(b, (floats ? floats : 1) * sizeof(float), kind); }
+/* glmc_res counts instead of reserving while g_glmc_count >= 0 (the chunk's sizing) */
+static long long g_glmc_count = -1;
+static int glmc_res(VkcBuf **b, size_t floats, int kind) {
+    if (g_glmc_count >= 0) { g_glmc_count += (long long)(floats ? floats : 1) * (long long)sizeof(float); return 1; }
+    return vkc_reserve(b, (floats ? floats : 1) * sizeof(float), kind);
+}
+static int glmc_scratch(GlmChain *ch, Model *m, int rows, int ctx);
+/* Prompt rows per chunk (vkc_chunk_rows): the chain's scratch a row, counted from the
+ * reservations (the MLA scratch as vkc_mla_scratch sizes it; the DSA scores at the
+ * model's context), and the routed experts' outputs (the tier's rows, the CPU's
+ * contributions, and the host's sum). */
+static int glmc_chunk_rows(GlmChain *ch, Model *m) {
+    if (!vkc_chunk_auto()) return vkc_chunk_rows("colibri", 0);
+    const VkcMla *a = &ch->mla[0];
+    size_t mla = (size_t)(a->q_lora > 0 ? a->q_lora : 1) + (size_t)a->H * (a->Q + a->R) + (size_t)(a->K + a->R) +
+                 (size_t)a->H * a->K + (size_t)a->H * a->K + (size_t)a->H * a->V;
+    size_t ksz = (size_t)ch->kvd_layer;
+    g_glmc_count = 0; glmc_scratch(ch, m, 1, m->max_t); long long b1 = g_glmc_count;
+    g_glmc_count = 0; glmc_scratch(ch, m, 2, m->max_t); long long b2 = g_glmc_count;
+    g_glmc_count = -1; ch->kvd_layer = ksz;
+    size_t row = (size_t)(b2 - b1) + mla * sizeof(float) + (size_t)(2 * m->c.topk + 2) * m->c.hidden * sizeof(float);
+    /* moe_vk's CPU expert gather/gate/up/output workspace, plus the optional
+     * second device's packed inputs and outputs. */
+    row += 2 * ((size_t)m->c.hidden + m->c.moe_inter) * sizeof(float);
+    if (g_vk_reg_n2 > 0) row += 2 * (size_t)m->c.topk * m->c.hidden * sizeof(float);
+    return vkc_chunk_rows("colibri", row);
+}
 
 /* scratch for `rows` rows at contexts up to `ctx` positions */
 static int glmc_scratch(GlmChain *ch, Model *m, int rows, int ctx) {
@@ -193,18 +228,27 @@ static int glmc_scratch(GlmChain *ch, Model *m, int rows, int ctx) {
     int SI = c->moe_inter * c->n_shared, DI = c->dense_inter, MI = SI > DI ? SI : DI;
     size_t r = (size_t)rows;
     ch->kvd_layer = r * (c->kv_lora + c->qk_rope + (m->has_dsa ? ID : 0));
-    int ok = vkc_mla_scratch(&ch->sc, &ch->mla[0], rows) &&
+    int ok = (g_glmc_count >= 0 || vkc_mla_scratch(&ch->sc, &ch->mla[0], rows)) &&
              glmc_res(&ch->x, r * D, VKC_DEV) && glmc_res(&ch->nrm, r * D, VKC_DEV) && glmc_res(&ch->tmp, r * D, VKC_DEV) &&
              glmc_res(&ch->h2, r * D, VKC_DEV) && glmc_res(&ch->gs, r * MI, VKC_DEV) && glmc_res(&ch->us, r * MI, VKC_DEV) &&
              glmc_res(&ch->hs, r * MI, VKC_DEV) && glmc_res(&ch->ds, r * D, VKC_DEV) &&
              glmc_res(&ch->h2d, r * D, VKC_DOWN) && glmc_res(&ch->kvd, (size_t)L * ch->kvd_layer, VKC_DOWN) &&
              glmc_res(&ch->xd, r * D, VKC_DOWN) && glmc_res(&ch->routed, r * D, VKC_UP) &&
              glmc_res(&ch->cs, r * (c->qk_rope > 0 ? c->qk_rope : 2), VKC_UP);
+    if (ok && ch->ks.on && g_glmc_count >= 0)
+        g_glmc_count += (long long)r * (3LL * c->n_heads * (c->kv_lora + 2) +
+                           (long long)c->n_heads * (c->kv_lora + c->qk_rope) + c->kv_lora + c->qk_rope +
+                           (m->has_dsa ? 1 + c->index_topk : 0)) * sizeof(float);
+    else if (ok && ch->ks.on)   /* the split: the partial results, a step's new rows before their slots */
+        ok = vkc_kv_parts(&ch->ks, r * c->n_heads * (c->kv_lora + 2)) &&
+             (ch->kvtmp.cap >= rows || (glmc_res(&ch->kvtmp.lat, r * c->kv_lora, VKC_DEV) &&
+                                        (c->qk_rope == 0 || glmc_res(&ch->kvtmp.rope, r * c->qk_rope, VKC_DEV)) &&
+                                        (ch->kvtmp.cap = rows)));
     if (ok && m->has_dsa)
         ok = glmc_res(&ch->ikd, r * ID, VKC_DEV) && glmc_res(&ch->iq, r * IH * ID, VKC_DEV) &&
              glmc_res(&ch->ihw, r * IH, VKC_DEV) && glmc_res(&ch->isc, r * (size_t)ctx, VKC_DEV) &&
              glmc_res(&ch->sel, r * (1 + (size_t)c->index_topk), VKC_DEV);
-    if (!ok) return 0;
+    if (!ok || g_glmc_count >= 0) return ok;   /* counting: the buffers only */
     if (ch->rows < rows) {
         float *hr = realloc(ch->host_routed, r * D * sizeof(float));
         if (!hr) return 0;
@@ -214,34 +258,50 @@ static int glmc_scratch(GlmChain *ch, Model *m, int rows, int ctx) {
 }
 
 /* The device's KV mirror: room for `need` positions of the bound state, and the
- * watermarks reset when the state is not the one mirrored. */
-static int glmc_mirror(GlmChain *ch, Model *m, int need) {
+ * watermarks reset when the state is not the one mirrored. A mirror that grows is
+ * planned again (vkc_kv_plan): whole when it fits the device's budget, else the split
+ * (latent and rope rows; the index keys stay whole), for steps of `rows` rows. */
+static int glmc_mirror(GlmChain *ch, Model *m, int need, int rows) {
     Cfg *c = &m->c; int L = c->n_layers;
-    if (ch->owner != m->kv) { for (int i = 0; i < L; i++) ch->kv_valid[i] = 0; ch->owner = m->kv; }
+    if (ch->owner != m->kv) { for (int i = 0; i < L; i++) ch->kv_valid[i] = 0; ch->owner = m->kv; vkc_kv_reset(&ch->ks); }
     if (ch->cap >= need) return 1;
     int cap = 256; while (cap < need) cap *= 2;
     if (cap > m->max_t) cap = m->max_t;
     if (cap < need) return 0;
+    size_t row = (size_t)(c->kv_lora + c->qk_rope) * sizeof(float);
+    if (!vkc_kv_plan(&ch->ks, "colibri", L, row, cap, rows, m->has_dsa, (size_t)L * ch->dev_rows * row)) return 0;
+    int dr = ch->ks.on ? ch->ks.rows : cap;
     for (int i = 0; i < L; i++) {
         vkc_free(ch->kv[i].lat); vkc_free(ch->kv[i].rope); vkc_free(ch->ik[i]);
         ch->kv[i] = (VkcMlaCache){NULL, NULL, 0}; ch->ik[i] = NULL; ch->kv_valid[i] = 0;
     }
-    ch->cap = 0;
+    ch->cap = 0; ch->dev_rows = 0;
     for (int i = 0; i < L; i++) {
-        ch->kv[i].lat = vkc_buf((size_t)cap * c->kv_lora * sizeof(float), VKC_DEV);
-        ch->kv[i].rope = c->qk_rope > 0 ? vkc_buf((size_t)cap * c->qk_rope * sizeof(float), VKC_DEV) : NULL;
-        ch->kv[i].cap = cap;
+        ch->kv[i].lat = vkc_buf((size_t)dr * c->kv_lora * sizeof(float), VKC_DEV);
+        ch->kv[i].rope = c->qk_rope > 0 ? vkc_buf((size_t)dr * c->qk_rope * sizeof(float), VKC_DEV) : NULL;
+        ch->kv[i].cap = dr;
         if (glmc_full(m, i)) ch->ik[i] = vkc_buf((size_t)cap * c->index_hd * sizeof(float), VKC_DEV);
         if (!ch->kv[i].lat || (c->qk_rope > 0 && !ch->kv[i].rope) || (glmc_full(m, i) && !ch->ik[i])) return 0;
     }
-    ch->cap = cap;
+    ch->cap = cap; ch->dev_rows = dr;
     return 1;
 }
 
-/* Record the uploads that make the mirror the host's below pos_base. */
-static int glmc_push_kv(GlmChain *ch, Model *m, int pos_base) {
+/* Record the uploads that make the mirror the host's below pos_base, for a step of
+ * n_rows rows (the split: its window placed first). */
+static int glmc_push_kv(GlmChain *ch, Model *m, int pos_base, int n_rows) {
     Cfg *c = &m->c; int ok = 1, K = c->kv_lora, R = c->qk_rope, ID = c->index_hd;
     for (int i = 0; i < c->n_layers && ok; i++) {
+        if (ch->ks.on) {      /* the split: the window placed, its rows below pos_base uploaded */
+            VkcKvPart pt[2] = {{1, K, m->Lc[i], 0, ch->kv[i].lat, 0}, {1, R, m->Rc[i], 0, ch->kv[i].rope, 0}};
+            vkc_kv_place(&ch->ks, i, pos_base, n_rows);
+            ok = vkc_kv_push(&ch->ks, i, pt, R ? 2 : 1, pos_base);
+            int t0 = ch->kv_valid[i], n = pos_base - t0;   /* the index keys stay whole */
+            if (ok && n > 0 && glmc_full(m, i))
+                ok = vkc_write(ch->ik[i], (size_t)t0 * ID, coli_kv_row(m->Ic[i], t0, ID), (size_t)n * ID * sizeof(float));
+            ch->kv_valid[i] = pos_base;
+            continue;
+        }
         int t0 = ch->kv_valid[i], n = pos_base - t0;
         if (n <= 0) continue;
         ok = vkc_write(ch->kv[i].lat, (size_t)t0 * K, coli_kv_row(m->Lc[i], t0, K), (size_t)n * K * sizeof(float)) &&
@@ -317,13 +377,15 @@ static int glmc_forward(Model *m, float *xh, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden, L = c->n_layers, R = c->qk_rope;
     if (!m->Lc || !m->Rc || (m->has_dsa && !m->Ic)) return 0;
     for (int i = 0; i < L; i++) if (m->kv_start[i] != 0 || !m->Lc[i]) return 0;
-    int CH = glmc_chunk_rows();
+    int mirror_ok = glmc_mirror(ch, m, pos_base + S, 1);
+    int CH = mirror_ok ? glmc_chunk_rows(ch, m) : 1;
     if (m->has_dsa && (pos_base + S > c->index_topk || g_dsa_force)) {   /* the scores' scratch: rows x context */
         int64_t lim = ((int64_t)32 << 20) / (pos_base + S);
         if (lim < CH) CH = lim < 1 ? 1 : (int)lim;
     }
     int rows = S < CH ? S : CH;
-    if (!glmc_mirror(ch, m, pos_base + S) || !glmc_scratch(ch, m, rows, pos_base + S)) {
+    if (ch->ks.on && rows > ch->ks.chunk) rows = ch->ks.chunk;   /* a step's rows fit the split's window */
+    if (!mirror_ok || !glmc_scratch(ch, m, rows, pos_base + S)) {
         fprintf(stderr, "[VK] colibri chain: device memory for %d rows at %d positions refused; per-matrix path\n",
                 rows, pos_base + S);
         ch->failed = 1;
@@ -345,7 +407,7 @@ static int glmc_forward(Model *m, float *xh, int S, int pos_base) {
                 cs[0] = cosf(ang); cs[1] = sinf(ang);
             }
         if (!vkc_begin() || !vkc_write(ch->x, 0, xh + (size_t)c0 * D, (size_t)n * D * sizeof(float)) ||
-            !glmc_push_kv(ch, m, pb)) goto lost;
+            !glmc_push_kv(ch, m, pb, n)) goto lost;
         int ok = 1, pending = 0, pulled = 0, sel_on = 0;
         for (int i = 0; i < L && ok; i++) {
             Layer *l = &m->L[i];
@@ -353,10 +415,16 @@ static int glmc_forward(Model *m, float *xh, int S, int pos_base) {
                 for (int z = 0; z < m->enr[i]; z++) if (!(n <= 4 && vk_reg_served(i, m->eroute[i][z]))) expert_prefetch(m, i, m->eroute[i][z]);
             if (pending) { ok = glmc_combine(ch, m, n); pending = 0; }
             ok = ok && glmc_norm(ch->x, ch->prm, ch->o_in[i], ch->nrm, n, D, c->eps) &&
-                 vkc_mla_qkv(&ch->mla[i], &ch->sc, ch->nrm, 0, n, pb, ch->cs, &ch->kv[i], ch->kvd, (size_t)i * ch->kvd_layer);
+                 (ch->ks.on ? vkc_kv_mla_qkv(&ch->ks, i, &ch->mla[i], &ch->sc, ch->nrm, 0, n, pb, ch->cs, &ch->kv[i], &ch->kvtmp,
+                                             ch->kvd, (size_t)i * ch->kvd_layer)
+                            : vkc_mla_qkv(&ch->mla[i], &ch->sc, ch->nrm, 0, n, pb, ch->cs, &ch->kv[i], ch->kvd,
+                                          (size_t)i * ch->kvd_layer));
             if (ok && glmc_full(m, i)) ok = glmc_dsa(ch, m, i, n, pb, &sel_on);
-            ok = ok && vkc_mla_attn(&ch->mla[i], &ch->sc, n, pb, 0, &ch->kv[i], sel_on ? ch->sel : NULL, 0,
-                                    1 + c->index_topk, NULL, 0, ch->tmp, 0);
+            if (ok && ch->ks.on)   /* the split: the core over the device's blocks and the host's rows */
+                ok = vkc_kv_mla_attn(&ch->ks, i, &ch->mla[i], &ch->sc, n, pb, 0, &ch->kv[i], sel_on ? ch->sel : NULL, 0,
+                                     1 + c->index_topk, NULL, 0, ch->tmp, 0, m->Lc[i], m->Rc[i]);
+            else ok = ok && vkc_mla_attn(&ch->mla[i], &ch->sc, n, pb, 0, &ch->kv[i], sel_on ? ch->sel : NULL, 0,
+                                         1 + c->index_topk, NULL, 0, ch->tmp, 0);
             VkcEw add = {VKC_EW_ADD, n * D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
             ok = ok && vkc_ew(ch->x, ch->x, ch->tmp, NULL, NULL, &add) &&
                  glmc_norm(ch->x, ch->prm, ch->o_post[i], ch->h2, n, D, c->eps);
@@ -366,7 +434,11 @@ static int glmc_forward(Model *m, float *xh, int S, int pos_base) {
                      vkc_ew(ch->x, ch->x, ch->tmp, NULL, NULL, &add);
                 continue;
             }
-            ok = vkc_copy(ch->h2d, 0, ch->h2, 0, (size_t)n * D) && vkc_submit(1);   /* A1 */
+            /* A1; while it runs, the tier loads the experts this layer will likely
+             * stream (a big prompt chunk only) */
+            ok = vkc_copy(ch->h2d, 0, ch->h2, 0, (size_t)n * D) && vkc_submit(0);
+            if (ok) vkt_stream_prefetch(i, n);
+            ok = ok && vkc_finish();
             if (!ok) break;
             glmc_pull_kv(ch, m, pulled, i + 1, pb, n); pulled = i + 1;
             /* A2: the shared expert, while the host computes the routed experts */
@@ -383,7 +455,7 @@ static int glmc_forward(Model *m, float *xh, int S, int pos_base) {
         if (!ok) goto lost;
         glmc_pull_kv(ch, m, pulled, L, pb, n);
         memcpy(outs + (size_t)c0 * D, vkc_ptr(ch->xd), (size_t)n * D * sizeof(float));
-        for (int i = 0; i < L; i++) ch->kv_valid[i] = pb + n;
+        for (int i = 0; i < L; i++) { ch->kv_valid[i] = pb + n; vkc_kv_done(&ch->ks, i, pb + n); }
     }
     memcpy(xh, outs, (size_t)S * D * sizeof(float));
     free(inv); free(outs);
@@ -405,6 +477,7 @@ static void glmc_report(Model *m) {
     fprintf(stderr, "[VK] colibri chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
                     "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %.1f MiB on the device\n",
             ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms, st.dev_bytes / 1048576.0);
+    vkc_kv_report(&ch->ks);
     vkc_prof_print();
 }
 static Model *g_glmc_model;

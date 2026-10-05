@@ -159,7 +159,10 @@ typedef struct { int fmt; float *f; int8_t *q8; uint8_t *q4; float *s; int O, I,
                  void *vk;    /* ColiVkTensor* once uploaded (K3_VK); NULL = CPU only */
                  void *metal; /* ColiMetalTensor* once registered (K3_METAL); NULL = CPU only */
                  st_mapped_raw data_map, scale_map;
-                 int mapped; } W;
+                 int mapped;
+                 /* COLI_VULKAN: how to read it back from disk (k3_w_reload), and 1 while the
+                  * device holds it alone (COLI_VK_DENSE_HOST, the host copy dropped) */
+                 char *vk_name; int vk_bits, vk_gone; } W;
 
 typedef struct {                          /* KDA layer */
     W q, k, v, o, g;
@@ -168,6 +171,7 @@ typedef struct {                          /* KDA layer */
     float *bp;                            /* beta proj f32 [heads,hidden] */
     float *dt, *A, *onw;                  /* dt_bias[proj], exp(A_log)[heads], o_norm[hd] */
     void   *metal_fa, *metal_fb, *metal_bp; /* Metal tensor wrappers for f32 weights */
+    void   *vk_fa, *vk_fb, *vk_bp;          /* COLI_VK_DENSE_HOST: the chain's device copies, for the per-matrix path */
 } Kda;
 
 typedef struct {                          /* gated MLA layer */
@@ -181,6 +185,7 @@ typedef struct {                          /* gated MLA layer */
 
 typedef struct {                          /* LatentMoE */
     float *router, *rbias, *lat_norm;     /* [E,hidden] f32, [E], [latent] */
+    void  *vk_router;                     /* COLI_VK_DENSE_HOST: the chain's device copy, for the per-matrix path */
     W lat_down, lat_up, sh_gate, sh_up, sh_down;
 } Moe;
 
@@ -405,6 +410,17 @@ static int dsa_score_single(int *sel, int maxsel, const float *qi, const float *
 #ifdef COLI_VULKAN
 #include "backend_vulkan.h"
 static int g_k3_vk=0;                     /* the device is open */
+/* COLI_VK_DENSE_HOST: the dense matrices on the device only (k3_dho_*): every W the
+ * chain does not run goes to the device through w_matmul, prompts included */
+static int g_k3_dho=0;
+static void k3_w_reload(W *w);            /* below, beside w_load */
+static int k3_in_par(void){
+#ifdef _OPENMP
+    return omp_in_parallel();
+#else
+    return 0;
+#endif
+}
 /* Did the run ask for the device? K3_VK, when set, decides (0: never, any other
  * number: yes, as COLI_VULKAN=1); unset, COLI_VULKAN does, as for every engine. */
 static int k3_vk_requested(void){
@@ -491,9 +507,14 @@ static void w_matmul(float *y, const float *x, const W *w, int S){
     }
 #endif
 #ifdef COLI_VULKAN
-    if(g_k3_vk&&S==1&&w->vk&&
+    if(g_k3_vk&&S==1&&w->vk&&!g_k3_dho&&
        coli_vk_matmul((ColiVkTensor**)&((W*)w)->vk,y,x,NULL,NULL,k3_vk_fmt(w),1,w->I,w->O,w->gs))
         return;
+    /* device only: every row count, from the main thread (one command buffer) */
+    if(g_k3_dho&&g_k3_vk&&w->vk&&S>=1&&S<=65535&&!k3_in_par()&&
+       coli_vk_matmul((ColiVkTensor**)&((W*)w)->vk,y,x,NULL,NULL,k3_vk_fmt(w),S,w->I,w->O,w->gs))
+        return;
+    if(w->vk_gone) k3_w_reload((W*)w);    /* the CPU needs a matrix the device held alone (a lost device) */
 #endif
     if(w->fmt==0)      matmul(y,x,w->f,S,w->I,w->O);
     else if(w->fmt==1) matmul_q(y,x,w->q8,w->s,S,w->I,w->O);
@@ -591,6 +612,9 @@ static void w_release_host(W *w){
     if(!w) return;
     if(w->mapped){ st_unmap_raw(&w->scale_map); st_unmap_raw(&w->data_map); }
     else { free(w->f); free(w->q8); free(w->q4); free(w->s); }
+#ifdef COLI_VULKAN
+    free(w->vk_name);
+#endif
     memset(w,0,sizeof(*w));
 }
 
@@ -599,6 +623,10 @@ static void w_load(Model *m, W *w, const char *name, int O, int I, int bits){
     st_tensor *t=st_find(&m->S,nm);
     if(!t) st_die_missing(&m->S,nm);
     memset(w,0,sizeof(*w)); w->O=O; w->I=I;
+#ifdef COLI_VULKAN
+    w->vk_name=strdup(name); w->vk_bits=bits;   /* to read it back as it is read now (k3_w_reload) */
+    if(!w->vk_name){fprintf(stderr,"OOM weight name\n");exit(1);}
+#endif
     if(t->dtype==3){
         /* repacked container (tools/k3_repack.py): pre-quantized U8 + .qs f32
          * scales — no load-time quantization, K3_BITS is ignored for these
@@ -705,6 +733,102 @@ static float *f32_load(Model *m, const char *name, int64_t want){
     if(want>0 && t->numel!=want){ fprintf(stderr,"%s: numel %lld != %lld\n",nm,(long long)t->numel,(long long)want); exit(1); }
     float *p=falloc(t->numel); st_read_f32(&m->S,nm,p,0); return p;
 }
+
+#ifdef COLI_VULKAN
+/* ---- the dense matrices on the device only (COLI_VK_DENSE_HOST) -----------------
+ * Decided once the device is open and before the expert cache is sized (k3_dho_decide),
+ * so the cache counts the dense weights out of RAM; placed in k3_vk_tier_start: every W
+ * goes up into its own vk (the chain adopts those copies), then its host copy is
+ * dropped, and the f32 matrices only the chain multiplies on the device (the routers,
+ * the KDA decay and beta projections) are dropped once the chain holds them. The CPU
+ * reads a matrix back from disk when it needs it after all: w_matmul after a lost
+ * device, the CPU MLA path's kv_b rows, the CPU KDA and router matmuls (k3_f32_need). */
+static Model *g_k3_dho_model;
+static size_t g_k3_dho_bytes;             /* what will be dropped: RAM the expert cache may count on */
+static pthread_mutex_t g_k3_dho_mx=PTHREAD_MUTEX_INITIALIZER;
+static size_t k3_w_host_bytes(const W *w){
+    if(w->fmt==0) return w->f?(size_t)w->O*w->I*4:0;
+    if(w->fmt==1) return w->q8?(size_t)w->O*w->I+(size_t)w->O*4:0;
+    if(w->fmt==4) return w->q4?(size_t)w->O*((w->I+1)/2)+(size_t)w->O*((w->I+w->gs-1)/w->gs)*4:0;
+    return 0;
+}
+static void k3_w_reload(W *w){
+    pthread_mutex_lock(&g_k3_dho_mx);
+    if(w->vk_gone){
+        Model *m=g_k3_dho_model;
+        if(!m||!w->vk_name){fprintf(stderr,"[VK] kimi_k3: a dense matrix the device held alone cannot be read back\n");exit(1);}
+        W t; w_load(m,&t,w->vk_name,w->O,w->I,w->vk_bits);
+        if(t.fmt!=w->fmt||t.gs!=w->gs){fprintf(stderr,"[VK] kimi_k3: %s came back in another form\n",w->vk_name);exit(1);}
+        w->f=t.f; w->q8=t.q8; w->q4=t.q4; w->s=t.s;
+        free(t.vk_name);
+        w->vk_gone=0;
+        coli_vk_dense_host_reloaded(k3_w_host_bytes(w));
+    }
+    pthread_mutex_unlock(&g_k3_dho_mx);
+}
+/* The f32 matrices the chain holds on the device: where each lives, and its name. */
+typedef struct { float **p; char name[160]; int64_t n; } K3F32Home;
+static K3F32Home *g_k3_f32; static int g_k3_f32_n;
+/* A dropped f32 matrix the CPU needs: read it back (NULL is "dropped": loaded ones never are). */
+static void k3_f32_need(float **p){
+    if(*p) return;
+    pthread_mutex_lock(&g_k3_dho_mx);
+    if(!*p){
+        for(int i=0;i<g_k3_f32_n;i++) if(g_k3_f32[i].p==p){
+            *p=f32_load(g_k3_dho_model,g_k3_f32[i].name,g_k3_f32[i].n);
+            coli_vk_dense_host_reloaded((size_t)g_k3_f32[i].n*4);
+            break;
+        }
+        if(!*p){fprintf(stderr,"[VK] kimi_k3: an f32 matrix the device held alone cannot be read back\n");exit(1);}
+    }
+    pthread_mutex_unlock(&g_k3_dho_mx);
+}
+#define K3_F32_NEED(p) k3_f32_need(&(p))
+/* y = x W^T on the device with the chain's copy of an f32 matrix (the device only: the CPU
+ * may hold none); 0 = the CPU multiplies, reading the matrix back first if it must. */
+static int k3_f32_dev(void *t, float *y, const float *x, int S, int I, int O){
+    return g_k3_dho&&g_k3_vk&&t&&S>=1&&S<=65535&&!k3_in_par()&&
+           coli_vk_matmul((ColiVkTensor**)&t,y,x,NULL,NULL,10,S,I,O,0);
+}
+#define K3_F32_DEV(t,y,x,S,I,O) k3_f32_dev(t,y,x,S,I,O)
+/* Every W of the model, in a fixed order. */
+static void k3_dho_each(Model *m, void (*f)(W *, size_t *, int *), size_t *b, int *n){
+    for(int i=0;i<m->c.n_layers;i++){
+        Layer *l=&m->L[i];
+        if(l->kda){ Kda *a=&l->a; W *ws[]={&a->q,&a->k,&a->v,&a->g,&a->o}; for(size_t k=0;k<5;k++) f(ws[k],b,n); }
+        else { Mla *a=&l->m; W *ws[]={&a->qa,&a->qb,&a->kva,&a->kvb,&a->o,&a->g,&a->wk,&a->wq,&a->wp}; for(size_t k=0;k<9;k++) f(ws[k],b,n); }
+        if(l->sparse){ Moe *o=&l->moe; W *ws[]={&o->lat_down,&o->lat_up,&o->sh_gate,&o->sh_up,&o->sh_down}; for(size_t k=0;k<5;k++) f(ws[k],b,n); }
+        else { W *ws[]={&l->d_gate,&l->d_up,&l->d_down}; for(size_t k=0;k<3;k++) f(ws[k],b,n); }
+    }
+    if(m->has_head) f(&m->lm_head,b,n);
+}
+static void k3_dho_count(W *w, size_t *b, int *n){ size_t x=k3_w_host_bytes(w); if(x&&!w->mapped&&k3_vk_fmt(w)>0){ *b+=x; (*n)++; } }
+/* The f32 matrices the chain multiplies on the device: the routers, the KDA decay pair and beta. */
+static size_t k3_dho_f32_bytes(const Model *m){
+    const Cfg *c=&m->c; size_t b=0;
+    for(int i=0;i<c->n_layers;i++){
+        const Layer *l=&m->L[i];
+        if(l->sparse&&l->moe.router) b+=(size_t)c->n_experts*c->hidden*4;
+        if(l->kda&&l->a.fa) b+=((size_t)c->kda_hd*c->hidden+(size_t)c->kda_proj*c->kda_hd+(size_t)c->kda_heads*c->hidden)*4;
+    }
+    return b;
+}
+/* Once the device is open and before the expert cache is sized: the decision, with the
+ * chain's own decision asked silently (k3c_start prints it later). The cache counts the
+ * W matrices out of RAM; the f32 ones only leave once the chain has them, so it does not
+ * count on those. */
+static void k3_dho_decide(Model *m, int tier_on, int cuda_on){
+    if(!g_k3_vk) return;
+    int chain=!cuda_on&&!k3_dsa_indexer_on()&&coli_vk_chain_decide(NULL,tier_on,COLI_VK_CHAIN_UNMEASURED)!=COLI_VK_CHAIN_OFF;
+    size_t b=0; int n=0;
+    k3_dho_each(m,k3_dho_count,&b,&n);
+    if(!coli_vk_dense_host_decide("kimi_k3",coli_vk_dense()||chain,b+(chain?k3_dho_f32_bytes(m):0))) return;
+    g_k3_dho=1; g_k3_dho_model=m; g_k3_dho_bytes=b;
+}
+#else
+#define K3_F32_NEED(p) ((void)0)
+#define K3_F32_DEV(t,y,x,S,I,O) 0
+#endif
 
 /* ---------- config ---------- */
 static double req_num(jval *r, const char *k){
@@ -1014,6 +1138,7 @@ static void model_init_range(Model *m, const char *snap, int layer_begin,
         cuda_on=g_k3_cuda;
 #endif
         g_k3_vk=coli_vk_init_env_tier("kimi_k3",vkt_wanted()&&any_sparse&&!cuda_on);
+        k3_dho_decide(m,vkt_wanted()&&any_sparse&&!cuda_on,cuda_on);   /* COLI_VK_DENSE_HOST, before the cache is sized */
     }
 #endif
 #ifdef COLI_METAL
@@ -1068,6 +1193,16 @@ static void model_init_range(Model *m, const char *snap, int layer_begin,
     {
         double resident = rss_gb();
         double avail_now = k3_mem_avail();
+#ifdef COLI_VULKAN
+        double resident_host = resident, avail_host = avail_now;   /* with the host copies in */
+        /* the dense weights on the device only: their host copies go once the device has
+         * them (k3_vk_tier_start); on a discrete GPU that RAM comes back to the machine,
+         * on one that shares it the device copy takes it */
+        if(g_k3_dho){
+            resident -= g_k3_dho_bytes/1e9;
+            if(!coli_vk_device_shares_ram()) avail_now += g_k3_dho_bytes/1e9;
+        }
+#endif
         double ram_env = getenv("RAM_GB") ? atof(getenv("RAM_GB")) : 0.0;
         /* Explicit --ram is a ceiling on the WHOLE process. Absent, take 88% of
          * what the OS still offers and add what we already hold -- the same
@@ -1095,6 +1230,16 @@ static void model_init_range(Model *m, const char *snap, int layer_begin,
         double slot_gb = (double)m->e_slot/1e9;
         int cap_fit = k3_cap_for_ram(budget, resident, reserve, slot_gb,
                                      nmoe, cap, c->n_experts, &for_experts);
+#ifdef COLI_VULKAN
+        if(g_k3_dho){   /* the same plan with the host copies kept, for the line */
+            double fe_host = 0.0, budget_host = ram_env > 0 ? ram_env : resident_host + avail_host*0.88;
+            int fit_host = k3_cap_for_ram(budget_host, resident_host, reserve, slot_gb, nmoe, cap, c->n_experts, &fe_host);
+            int cap_dev = cap_fit < cap ? (cap_fit > 0 ? cap_fit : 1) : cap, cap_host = fit_host < cap ? (fit_host > 0 ? fit_host : 1) : cap;
+            fprintf(stderr,"[K3] dense weights on the device only: %.4f GB of host copies out of the resident %.4f GB "
+                "(reserve %.4f GB): %.4f GB for experts instead of %.4f, expert cache %d/layer instead of %d\n",
+                g_k3_dho_bytes/1e9, resident_host, reserve, for_experts, fe_host, cap_dev, cap_host);
+        }
+#endif
 
         if(cap_fit < cap){
             /* Name every term. The user's number is not being ignored, it is
@@ -1248,9 +1393,12 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
         fflush(stderr); } }
     w_matmul(q,x,&a->q,C); w_matmul(k,x,&a->k,C); w_matmul(v,x,&a->v,C);
     w_matmul(gp,x,&a->g,C);
-    k3_matmul_f32((void*)&a->metal_fa, t1, x, a->fa, C, c->hidden, c->kda_hd);
-    k3_matmul_f32((void*)&a->metal_fb, graw, t1, a->fb, C, c->kda_hd, P);
-    k3_matmul_f32((void*)&a->metal_bp, braw, x, a->bp, C, c->hidden, H);
+    if(!K3_F32_DEV(a->vk_fa,t1,x,C,c->hidden,c->kda_hd)){
+        K3_F32_NEED(a->fa); k3_matmul_f32((void*)&a->metal_fa, t1, x, a->fa, C, c->hidden, c->kda_hd); }
+    if(!K3_F32_DEV(a->vk_fb,graw,t1,C,c->kda_hd,P)){
+        K3_F32_NEED(a->fb); k3_matmul_f32((void*)&a->metal_fb, graw, t1, a->fb, C, c->kda_hd, P); }
+    if(!K3_F32_DEV(a->vk_bp,braw,x,C,c->hidden,H)){
+        K3_F32_NEED(a->bp); k3_matmul_f32((void*)&a->metal_bp, braw, x, a->bp, C, c->hidden, H); }
     float qscale=1.f/sqrtf((float)hd);
     for(int t=0;t<C;t++){
         float *qt=q+(int64_t)t*P, *kt=k+(int64_t)t*P, *tv=v+(int64_t)t*P;
@@ -1460,6 +1608,9 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
         }
     }
     w_matmul(gv,x,&a->g,C);
+#ifdef COLI_VULKAN
+    if(a->kvb.vk_gone) k3_w_reload(&a->kvb);   /* its rows are read on the CPU below */
+#endif
     for(int tt=0;tt<C;tt++){
         int nt=pos0+tt+1;
         const float *qvt=qv+(int64_t)tt*H*qh, *gvt=gv+(int64_t)tt*H*vh;
@@ -1926,6 +2077,9 @@ static void k3c_adopt_shared(Model *m);
 static void k3c_report(void);
 static int g_k3c_on;
 static int k3_vk_in_ram(void *ctx, int li, int e){ return slot_indexed((Model*)ctx,li,e)!=NULL; }
+static int  k3_vk_load(void *ctx,int li,int e,VktExpertSrc *src,void **h);
+static int  k3_vk_load_batch(void *ctx,int li,const int *e,int n,VktExpertSrc *srcs,void **h);
+static void k3_vk_unhold(void *ctx,void *h);
 static size_t k3_w_bytes(const W *w){
     int fmt=k3_vk_fmt(w);
     if(fmt==10) return (size_t)w->O*w->I*4;
@@ -1949,6 +2103,56 @@ static int k3_expert_on_disk(const Model *m, int li, int e){
     for(int k=0;k<6;k++) if(er->fd[k]<0) return 0;
     return 1;
 }
+static void k3_dho_upload(W *w, size_t *b, int *n){ (void)b; if(k3_w_host_bytes(w)&&!w->mapped&&w_vk_upload(w)) (*n)++; }
+static void k3_dho_drop(W *w, size_t *b, int *n){
+    if(!w->vk||w->vk_gone||!w->vk_name||w->mapped) return;
+    size_t x=k3_w_host_bytes(w);
+    if(!x) return;
+    free(w->f); free(w->q8); free(w->q4); free(w->s);
+    w->f=NULL; w->q8=NULL; w->q4=NULL; w->s=NULL; w->vk_gone=1;
+    coli_vk_dense_host_dropped(x);
+    *b+=x; (*n)++;
+}
+static ColiVkTensor *k3c_f32_tensor(int li, int which);   /* kimi_k3_chain.h */
+static void k3_dho_f32_drop(Model *m, float **p, const char *name, int64_t n){
+    if(!*p) return;
+    g_k3_f32=realloc(g_k3_f32,(size_t)(g_k3_f32_n+1)*sizeof(*g_k3_f32));
+    if(!g_k3_f32){fprintf(stderr,"OOM f32 home\n");exit(1);}
+    K3F32Home *h=&g_k3_f32[g_k3_f32_n++];
+    h->p=p; h->n=n; snprintf(h->name,sizeof h->name,"%s",name);
+    free(*p); *p=NULL;
+    coli_vk_dense_host_dropped((size_t)n*4);
+    (void)m;
+}
+/* The W matrices up first, into their own vk, so the chain adopts the same copies; the
+ * host copies go once the chain is set up, and the f32 ones the chain holds with them. */
+static void k3_dho_place(Model *m){
+    size_t b=0; int n=0;
+    k3_dho_each(m,k3_dho_drop,&b,&n);
+    if(g_k3c_on){
+        const Cfg *c=&m->c; char nm[200];
+        for(int i=0;i<c->n_layers;i++){
+            Layer *l=&m->L[i];
+            if(l->sparse){
+                snprintf(nm,sizeof nm,"model.layers.%d.block_sparse_moe.gate.weight",i);
+                l->moe.vk_router=k3c_f32_tensor(i,0);
+                k3_dho_f32_drop(m,&l->moe.router,nm,(int64_t)c->n_experts*c->hidden);
+            }
+            if(l->kda){
+                l->a.vk_fa=k3c_f32_tensor(i,1); l->a.vk_fb=k3c_f32_tensor(i,2); l->a.vk_bp=k3c_f32_tensor(i,3);
+                snprintf(nm,sizeof nm,"model.layers.%d.self_attn.f_a_proj.weight",i);
+                k3_dho_f32_drop(m,&l->a.fa,nm,(int64_t)c->kda_hd*c->hidden);
+                snprintf(nm,sizeof nm,"model.layers.%d.self_attn.f_b_proj.weight",i);
+                k3_dho_f32_drop(m,&l->a.fb,nm,(int64_t)c->kda_proj*c->kda_hd);
+                snprintf(nm,sizeof nm,"model.layers.%d.self_attn.b_proj.weight",i);
+                k3_dho_f32_drop(m,&l->a.bp,nm,(int64_t)c->kda_heads*c->hidden);
+            }
+        }
+    }
+    coli_vk_dense_host_placed("kimi_k3",g_k3c_on
+        ? "the embedding (read from disk per token), norms, vectors and the AttnRes weights"
+        : "the embedding (read from disk per token), norms, vectors, the AttnRes weights, the routers and the KDA decay and beta projections (f32: without the chain the CPU computes them)");
+}
 static void k3_vk_tier_start(Model *m){
     Cfg *c=&m->c;
     if(!g_k3_vk) return;
@@ -1957,7 +2161,9 @@ static void k3_vk_tier_start(Model *m){
 #ifdef COLI_CUDA
     cuda_on=g_k3_cuda;
 #endif
+    if(g_k3_dho){ size_t b=0; int n=0; k3_dho_each(m,k3_dho_upload,&b,&n); }   /* COLI_VK_DENSE_HOST: every W into its own vk first */
     k3c_start(m,nmoe&&vkt_wanted()&&!cuda_on);   /* COLI_VK_CHAIN: the trunk on the device, before the tier sizes itself */
+    if(g_k3_dho) k3_dho_place(m);                /* then the host copies go, before the tier sizes its budget */
     if(cuda_on) fprintf(stderr,"[VK] tier kimi_k3: the CUDA expert tier is on and wins; the Vulkan tier stays off\n");
     else if(nmoe&&vkt_wanted()){
         VktConfig vc={.engine="kimi_k3",.layers=c->n_layers,.experts=c->n_experts,
@@ -1966,8 +2172,9 @@ static void k3_vk_tier_start(Model *m){
                       .act=VKT_ACT_SITU,.act_a=c->situ_b1,.act_b=c->situ_b2,
                       .max_rows=K3_VK_ROWS*c->topk,
                       .ram_reserve=(size_t)(m->e_slot+8192)*(size_t)cap*(size_t)nmoe,
-                      .dense_bytes=coli_vk_dense()&&!g_k3c_on?k3_vk_dense_bytes(m):0,   /* the chain's are there already */
-                      .in_ram=k3_vk_in_ram,.ram_ctx=m};
+                      .dense_bytes=coli_vk_dense()&&!g_k3c_on&&!g_k3_dho?k3_vk_dense_bytes(m):0,   /* the chain's are there already */
+                      .in_ram=k3_vk_in_ram,.ram_ctx=m,
+                      .load=k3_vk_load,.release=k3_vk_unhold,.load_ctx=m,.load_batch=k3_vk_load_batch};
         atexit(coli_vk_shutdown);   /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
         if(vkt_init(&vc,rt_counts_all())){
             atexit(vkt_shutdown);
@@ -2027,6 +2234,60 @@ static float *k3_shared(Model *m, Moe *o, const float *x, int C){
 }
 
 #ifdef COLI_VULKAN
+/* The tier's streaming (a big prompt chunk's cold experts on the device): a group of
+ * experts as experts_apply_union resolves them -- the layer cache, the misses read into
+ * the working-set slots in parallel -- each valid until the tier gives it back; the
+ * misses then join the LRU as experts_apply_union's do, when the group's last one is
+ * given back (before anything else can reuse the working set). */
+static int g_k3s_layer=-1, g_k3s_nmiss=0, g_k3s_held=0;
+static void k3_vk_promote(Model *m){
+    int li=g_k3s_layer, nmiss=g_k3s_nmiss;
+    g_k3s_layer=-1; g_k3s_nmiss=0; g_k3s_held=0;
+    if(li<0 || nmiss<=0) return;
+    LCache *lc=&m->ecache[li];
+    int promo = nmiss<lc->cap ? nmiss : lc->cap;
+    for(int a=0;a<promo;a++){
+        int q=nmiss-1-a; Slot *dst;
+        if(lc->n<lc->cap) dst=&lc->s[lc->n++];
+        else {
+            int lru=-1;
+            for(int i=0;i<lc->n;i++){
+                if(lc->s[i].pinned) continue;
+                if(lru<0 || lc->s[i].used<lc->s[lru].used) lru=i;
+            }
+            if(lru<0) break;
+            dst=&lc->s[lru];
+        }
+        cache_promote(m,li,dst,&m->ws[q]);
+    }
+}
+static int k3_vk_load_batch(void *ctx,int li,const int *e,int n,VktExpertSrc *srcs,void **h){
+    Model *m=ctx;
+    k3_vk_promote(m);
+    if(n<1) return 0;
+    if(n>LP_MAX) n=LP_MAX;
+    if(n>64) n=64;
+    Slot *use[64]; int miss[64], nmiss=0;
+    for(int j=0;j<n;j++){
+        ehit_mark(m,li,e[j]);
+        use[j]=slot_find(m,li,e[j]);
+        if(!use[j]){ m->miss++; use[j]=&m->ws[nmiss]; miss[nmiss++]=j; }
+    }
+    if(nmiss){
+        double t0=now_s();
+        #pragma omp parallel for schedule(dynamic,1)
+        for(int q=0;q<nmiss;q++) expert_read(m,li,e[miss[q]],&m->ws[q]);
+        m->t_eload+=now_s()-t0;
+        m->ebytes+=(uint64_t)nmiss*(uint64_t)m->e_slot;
+    }
+    for(int j=0;j<n;j++){ srcs[j]=k3_vk_src(m,use[j]->buf); h[j]=m; }
+    g_k3s_layer=li; g_k3s_nmiss=nmiss; g_k3s_held=n;
+    return n;
+}
+static int k3_vk_load(void *ctx,int li,int e,VktExpertSrc *src,void **h){
+    return k3_vk_load_batch(ctx,li,&e,1,src,h)==1;
+}
+static void k3_vk_unhold(void *ctx,void *h){ (void)h; if(g_k3s_held>0 && --g_k3s_held==0) k3_vk_promote((Model *)ctx); }
 /* ---- the shared Vulkan routed-expert tier, one MoE layer step -------------
  * k3_vk_issue hands the step's (position, rank) pairs whose expert is resident
  * on the device to one asynchronous batch (vkt_issue) as soon as z is known.
@@ -2244,7 +2505,7 @@ static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float
     Cfg *c=&m->c; Moe *o=&l->moe;
     int E=c->n_experts, K=c->topk, LT=c->latent;
     float *sco=falloc((int64_t)C*E);
-    matmul(sco,x,o->router,C,c->hidden,E);
+    if(!K3_F32_DEV(o->vk_router,sco,x,C,c->hidden,E)){ K3_F32_NEED(o->router); matmul(sco,x,o->router,C,c->hidden,E); }
     int *idxs=malloc((size_t)C*K*sizeof(int)); float *wsels=falloc((int64_t)C*K);
     int *keff=malloc((size_t)C*sizeof(int));
     if(!idxs||!keff){fprintf(stderr,"OOM moe sel\n");exit(1);}
@@ -3361,6 +3622,9 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
     }
     int chunk=getenv("K3_CHUNK")?atoi(getenv("K3_CHUNK")):32;
     if(chunk<1) chunk=1; if(chunk>512) chunk=512;
+#ifdef COLI_VULKAN
+    { int r=k3c_prefill_rows(m); if(r>0 && !g_lfp) chunk=r; }   /* the chain's chunk from the budget: big MoE steps */
+#endif
     double t0=now_s(), a0=m->t_attn, e0=m->t_moe, d0=m->t_eload, h0=m->t_head;
     uint64_t hit0=m->hits, miss0=m->miss;
     float *lo=NULL;
@@ -3617,6 +3881,9 @@ int main(int argc, char **argv){
     int chunk=getenv("K3_CHUNK")?atoi(getenv("K3_CHUNK")):32;
     if(chunk<1) chunk=1;
     if(chunk>512) chunk=512;
+#ifdef COLI_VULKAN
+    { int r=k3c_prefill_rows(&m); if(r>0 && !g_lfp) chunk=r; }   /* the chain's chunk from the budget: big MoE steps */
+#endif
     if(m.trace && chunk>1){
         chunk=1;                       /* trace rows are token-major by contract */
         fprintf(stderr,"[K3] K3_TRACE set: prefill chunk forced to 1\n");

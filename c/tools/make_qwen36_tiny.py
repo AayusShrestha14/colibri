@@ -325,8 +325,11 @@ def main():
     # --hidden/--inter override the preset's toy widths (qwen36-35b: 64/32). The
     # shared expert kernel (expert_ffn.h) needs hidden and inter multiples of
     # 64: --inter 64 exercises it (the CI's A/B step does exactly that).
+    # --vocab 128: every id is an ASCII byte of the byte tokenizer tests/prefix_serve_harness.py
+    # gives a fixture without one, so a serve test can resend a reply as text and the
+    # engine reads back the very ids it generated (tests/spec_drafts_harness.py)
     for name in ("layers", "experts", "topk", "q-heads", "kv-heads", "hidden", "inter",
-                 "dn-key-heads", "dn-value-heads"):
+                 "dn-key-heads", "dn-value-heads", "vocab"):
         ap.add_argument(f"--{name}", type=int, default=None,
                         help=f"override the preset's {name.replace('-', '_')}")
     ap.add_argument("--fused-experts", action="store_true", default=None,
@@ -338,7 +341,7 @@ def main():
     for arg, key in (("layers", "n_layers"), ("experts", "n_experts"), ("topk", "topk"),
                      ("q_heads", "q_heads"), ("kv_heads", "kv_heads"), ("hidden", "hidden"),
                      ("inter", "inter"), ("dn_key_heads", "dn_key_heads"),
-                     ("dn_value_heads", "dn_value_heads"), ("fused_experts", "fused_experts"),
+                     ("dn_value_heads", "dn_value_heads"), ("vocab", "vocab"), ("fused_experts", "fused_experts"),
                      ("mtp", "mtp")):
         if getattr(args, arg) is not None:
             geo[key] = getattr(args, arg)

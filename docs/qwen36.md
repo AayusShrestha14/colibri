@@ -107,6 +107,18 @@ measurements and what they leave out are in
 9.94 tok/s against the CPU's 6.01 and the 512-token prompt 9.5 s
 ([vulkan.md](vulkan.md#the-chain-on-a-radeon-780m)).
 
+## Prompt-lookup drafts (`COLI_LOOKUP=1`, off by default)
+
+When the recent tokens repeat an n-gram of the prompt or the output (a code edit, a
+quote, repeated structure), `COLI_LOOKUP=1` drafts the up to 5 tokens that followed it
+and checks them in one verify forward. The DeltaNet state is copied after each verify
+row, so a rejected draft rolls back by swapping a copy in. A gate drafts only where the
+measured acceptance and verify cost say it pays. The output is that of plain decoding,
+greedy or sampled, on the CPU and in the Vulkan dense chain. Lookup stays off under the
+CUDA tier, `CACHE_ROUTE` and a qpack container, whose results depend on what is
+resident. On a code edit, Qwen3.6-35B-A3B decoded 7.90 tok/s with lookup against 7.42 without (1.56 tokens per forward); on a chat prompt the gate declined every proposal and the speed was unchanged. How it works, the gate, the settings and the tests:
+[speculative.md](speculative.md).
+
 ## The expert kernel
 
 Routed experts run through `c/expert_ffn.h`, a header shared with the other

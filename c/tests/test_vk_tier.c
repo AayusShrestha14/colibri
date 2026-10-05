@@ -17,7 +17,12 @@
  *            the join (no failed upload, the budget holds);
  *   books    device + CPU = routed, resident <= budget, no failed upload;
  *   v4       DeepSeek V4's activation (route weight on the device, its bf16 and E4M3
- *            roundings): device rows against the engine's CPU arithmetic.
+ *            roundings): device rows against the engine's CPU arithmetic;
+ *   stream   big prefill steps with streaming (vkt_issue's sub-batches, the staging
+ *            slots, prefetch, experts cut into parts): every device row, resident or
+ *            streamed, equals the reference, the sum the all-CPU sum, the cold experts
+ *            below the rule's rows stay on the CPU, and the resident set is the warm
+ *            start's before and after (streaming promotes nothing).
  *
  *   make tests/test_vk_tier VK=1 && VK_ICD_FILENAMES=.../lvp_icd.json ./tests/test_vk_tier */
 #include <stdio.h>
@@ -509,20 +514,206 @@ static void v4_act(void) {
     vkt_shutdown(); model_free();
 }
 
+/* ---- streaming ----------------------------------------------------------------------
+ * The engine's load hook: the expert's bytes as its RAM holds them. */
+static int g_loads, g_batch_left, g_partial_serial;
+static int load_cb(void *ctx, int layer, int eid, VktExpertSrc *src, void **h) {
+    if (g_batch_left >= 2) g_partial_serial++;
+    if (g_batch_left) g_batch_left--;
+    (void)ctx; *src = src_of(&ex[layer][eid]); *h = &ex[layer][eid]; g_loads++; return 1;
+}
+static void release_cb(void *ctx, void *h) { (void)ctx; (void)h; }
+/* An engine with two RAM slots: a device upload group needs several batches. */
+static int g_batches;
+static int load_batch_cb(void *ctx, int layer, const int *eids, int n, VktExpertSrc *srcs, void **h) {
+    (void)ctx; g_batches++;
+    int got = n < 2 ? n : 2;
+    g_batch_left = n - got;
+    for (int i = 0; i < got; i++) { srcs[i] = src_of(&ex[layer][eids[i]]); h[i] = &ex[layer][eids[i]]; g_loads++; }
+    return got;
+}
+/* One big step (vk_tier.h step 3, with the prefetch while "attention" runs); the device
+ * rows of cold experts counted apart. */
+static double stream_step(int layer, int S, const int *idx, const float *w, int v4, Books *bk,
+                          unsigned long long *streamed, unsigned long long *kept, int prefetch) {
+    float *x = calloc((size_t)S * H, sizeof(float)), *xq = calloc((size_t)S * H, sizeof(float));
+    float *cpu = calloc((size_t)S * K * H, sizeof(float)), *out = calloc((size_t)S * H, sizeof(float));
+    float *ref = calloc((size_t)S * H, sizeof(float)), *y = malloc(sizeof(float) * H);
+    uint8_t *taken = malloc((size_t)S * K); const float **dev = malloc(sizeof(*dev) * S * K);
+    uint8_t *res = malloc((size_t)S * K);
+    for (int i = 0; i < S * H; i++) x[i] = frnd() * (v4 ? 4.0f : 1.0f);
+    memcpy(xq, x, sizeof(float) * S * H);
+    if (v4) for (int s = 0; s < S; s++) qdq128(xq + (size_t)s * H, H);
+    for (int i = 0; i < S * K; i++) res[i] = (uint8_t)vkt_resident(layer, idx[i]);
+    if (prefetch) vkt_stream_prefetch(layer, S);
+    int n = v4 ? vkt_issue_w(layer, xq, S, K, idx, w, taken) : vkt_issue(layer, xq, S, K, idx, taken);
+    for (int i = 0; i < S * K; i++) {
+        if (taken[i]) continue;
+        if (v4) expert_v4(&ex[layer][idx[i]], xq + (size_t)(i / K) * H, w[i], 10.0f, cpu + (size_t)i * H);
+        else expert_ref(&ex[layer][idx[i]], xq + (size_t)(i / K) * H, cpu + (size_t)i * H);
+        VktExpertSrc s = src_of(&ex[layer][idx[i]]); vkt_note(layer, idx[i], &s);
+        (*kept)++;
+    }
+    int joined = n ? vkt_join(dev) : 1;
+    CHECK(joined, "stream: join failed");
+    double worst = 0;
+    for (int s = 0; s < S; s++)
+        for (int k = 0; k < K; k++) {
+            int i = s * K + k;
+            if (v4) expert_v4(&ex[layer][idx[i]], xq + (size_t)s * H, w[i], 10.0f, y);
+            else expert_ref(&ex[layer][idx[i]], xq + (size_t)s * H, y);
+            float dr[H];
+            const float *c = cpu + (size_t)i * H;
+            if (taken[i] && joined) {
+                for (int d = 0; d < H; d++) dr[d] = v4 ? bf16r(dev[i][d]) : dev[i][d];
+                c = dr;
+                double r = rel(c, y, H); if (r > worst) worst = r;
+                if (!res[i]) (*streamed)++;
+            }
+            for (int d = 0; d < H; d++) { ref[(size_t)s * H + d] += (v4 ? 1.0f : w[i]) * y[d]; out[(size_t)s * H + d] += (v4 ? 1.0f : w[i]) * c[d]; }
+            bk->routed++; bk->dev += taken[i] != 0;
+        }
+    double r = rel(out, ref, S * H);
+    if (r > worst) worst = r;
+    free(x); free(xq); free(cpu); free(out); free(ref); free(y); free(taken); free(dev); free(res);
+    return worst;
+}
+static void stream(void) {
+    struct { VktFmt gu, dn; int act; const char *name; } cs[] = {
+        {{VKT_SRC_I4U_PLANAR64, 64}, {VKT_SRC_I4U_PLANAR64, 64}, VKT_ACT_SWIGLU, "planar int4-g64"},
+        {{VKT_SRC_I8_AS_I4_GS, 64}, {VKT_SRC_I8_GS, 32}, VKT_ACT_SWIGLU, "unpacked int4 gs64, int8 down"},
+        {{VKT_SRC_FP8_BLOCK, 128}, {VKT_SRC_FP8_BLOCK, 128}, VKT_ACT_SWIGLU, "fp8 128x128 blocks"},
+        {{VKT_SRC_MXFP4_E8M0, 32}, {VKT_SRC_MXFP4_E8M0, 32}, VKT_ACT_SITU, "MXFP4 ue8m0, SiTU-GLU"},
+        {{VKT_SRC_BF16, 0}, {VKT_SRC_BF16, 0}, VKT_ACT_SWIGLU, "bf16"},
+        {{VKT_SRC_MXFP4_E8M0, 32}, {VKT_SRC_MXFP4_E8M0, 32}, VKT_ACT_SWIGLU_V4, "MXFP4, DeepSeek V4 roundings"},
+    };
+    for (size_t c = 0; c < sizeof cs / sizeof *cs; c++) {
+        int v4 = cs[c].act == VKT_ACT_SWIGLU_V4;
+        model_make(cs[c].gu, cs[c].dn); g_act = cs[c].act; g_limit = 0;
+        /* Eight residents at most, four warm; batch cases have eight upload slots
+         * but only two RAM slots, so a group must continue after a partial load. */
+        set_budget(c % 2 ? 16 : 12, cs[c].gu, cs[c].dn);
+        setenv("COLI_VK_TIER_RATE", "0", 1);
+        setenv("COLI_VK_TIER_STREAM_SLOTS", c % 2 ? "8" : "4", 1);
+        setenv("COLI_VK_TIER_STREAM_ROWS", "3", 1);    /* a cold expert with 3 rows or more streams */
+        setenv("COLI_VK_TIER_STREAM_HALF", "40", 1);   /* sub-batches of 40 rows: several a step, experts in parts */
+        VktConfig vc = cfg_of(cs[c].gu, cs[c].dn, cs[c].act, v4 ? 10.0f : 0.f);
+        vc.load = load_cb; vc.release = release_cb;
+        if (c % 2) vc.load_batch = load_batch_cb;   /* half the cases: the batch hook too */
+        g_batches = g_batch_left = g_partial_serial = 0;
+        uint32_t hist[L][E], *rows[L];
+        for (int l = 0; l < L; l++) { rows[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = e < 2 ? 100 - e : 0; }
+        int on = vkt_init(&vc, rows);
+        unsetenv("COLI_VK_TIER_STREAM_HALF");
+        CHECK(on, "stream %s: the tier did not start", cs[c].name);
+        if (!on) { model_free(); continue; }
+        int pl[L * E], pe[L * E], np = vkt_plan(pl, pe, L * E);
+        for (int i = 0; i < np; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+        vkt_put_done();
+        uint8_t before[L][E];
+        for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) before[l][e] = (uint8_t)vkt_resident(l, e);
+        Books bk = {0, 0}; unsigned long long streamed = 0, kept = 0; double worst = 0;
+        g_loads = 0;
+        static const int Ss[] = {48, 33, 1, 64, 2, 40};
+        for (int t = 0; t < 6; t++)
+            for (int l = 0; l < L; l++) {
+                int S = Ss[t], idx[64 * K]; float w[64 * K];
+                route(S, 0, E, idx, w);
+                vkt_begin_forward();
+                double r = stream_step(l, S, idx, w, v4, &bk, &streamed, &kept, t >= 3);
+                if (r > worst) worst = r;
+            }
+        int same = 1;
+        for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) same &= before[l][e] == (uint8_t)vkt_resident(l, e);
+        printf("  %-34s device %3llu of %3llu assignments (%llu streamed), %llu on the CPU, %d loads (%d batches), %d warm, worst %.2e\n",
+               cs[c].name, bk.dev, bk.routed, streamed, kept, g_loads, g_batches, np, worst);
+        vkt_report("test", 0, 0);
+        CHECK(np == 4, "stream %s: %d warm experts", cs[c].name, np);
+        CHECK(!(c % 2) || g_batches > 0, "stream %s: the batch hook was never called", cs[c].name);
+        CHECK(g_partial_serial == 0, "stream %s: %d reads serialized after a partial batch", cs[c].name, g_partial_serial);
+        CHECK(streamed > 0, "stream %s: nothing streamed", cs[c].name);
+        CHECK(kept > 0, "stream %s: no cold expert stayed on the CPU", cs[c].name);
+        CHECK(same, "stream %s: the resident set moved", cs[c].name);
+        CHECK(worst < (v4 ? 2e-2 : 2e-3), "stream %s: device rows off the reference (%.3g)", cs[c].name, worst);
+        vkt_shutdown(); model_free();
+        unsetenv("COLI_VK_TIER_STREAM_SLOTS"); unsetenv("COLI_VK_TIER_STREAM_ROWS");
+    }
+}
+
+/* A large requested step under a deliberately tiny scratch budget: reserve a
+ * smaller batch before allocating, then keep the backend usable for the format
+ * and streaming reference checks below. Reusing those buffers needs no growth. */
+static void scratch_budget(void) {
+    CHECK(coli_vk_xb_init(H, F, COLI_VK_ACT_SWIGLU, 0, 0, 0), "scratch budget: init failed");
+    const size_t budget = 512 * 1024;
+    ColiVkXbStats before, after; coli_vk_xb_stats(&before);
+    int rows = coli_vk_xb_sub_fit(4096, 2, budget);
+    CHECK(rows > 0 && rows < 4096, "scratch budget: got %d rows", rows);
+    CHECK(rows > 0 && coli_vk_xb_sub_reserve(rows, 2), "scratch budget: reserve failed");
+    coli_vk_xb_stats(&after);
+    CHECK(after.scratch_bytes > before.scratch_bytes && after.scratch_bytes - before.scratch_bytes <= budget,
+          "scratch budget: grew from %zu to %zu beyond %zu bytes", before.scratch_bytes, after.scratch_bytes, budget);
+    CHECK(coli_vk_xb_sub_fit(rows, 2, 0) == rows, "scratch budget: existing buffers should need no extra bytes");
+    printf("scratch budget: %d of 4096 rows, %zu additional bytes (limit %zu)\n", rows,
+           after.scratch_bytes - before.scratch_bytes, budget);
+}
+
+/* A failed multi-expert upload may have copied only one projection. None of
+ * that group may run; its complete CPU replay must be exact. Reusing the same
+ * staging slots on the next step must replace every matrix before publishing. */
+static void stream_commit_failure(const char *spv) {
+    setenv("COLI_VK_STAGED", "1", 1);
+    setenv("COLI_VK_STAGED_FAULT", "commit:1", 1);
+    int ready = coli_vk_init(spv);
+    CHECK(ready && coli_vk_staged(), "stream fault: staged device did not start");
+    if (!ready) return;
+    VktFmt f = {VKT_SRC_FP8_BLOCK, 128};
+    model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    set_budget(12, f, f);
+    setenv("COLI_VK_TIER_RATE", "0", 1);
+    setenv("COLI_VK_TIER_STREAM_SLOTS", "4", 1);
+    setenv("COLI_VK_TIER_STREAM_ROWS", "1", 1);
+    VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+    vc.load = load_cb; vc.release = release_cb; vc.load_batch = load_batch_cb;
+    int on = vkt_init(&vc, NULL);
+    CHECK(on, "stream fault: tier did not start");
+    if (on) {
+        enum { S = 32 };
+        int idx[S * K]; float w[S * K];
+        for (int i = 0; i < S * K; i++) { idx[i] = i % 2; w[i] = 1.0f / K; }
+        Books books = {0, 0}; unsigned long long streamed = 0, kept = 0;
+        double error = stream_step(0, S, idx, w, 0, &books, &streamed, &kept, 0);
+        CHECK(books.dev == 0 && kept == S * K && error == 0,
+              "stream fault: partial upload used (GPU %llu, CPU %llu, error %.3g)", books.dev, kept, error);
+        books = (Books){0, 0}; streamed = kept = 0;
+        vkt_begin_forward();
+        error = stream_step(0, S, idx, w, 0, &books, &streamed, &kept, 0);
+        CHECK(books.dev == S * K && !kept && error < 2e-3,
+              "stream fault: refill did not recover (GPU %llu, CPU %llu, error %.3g)", books.dev, kept, error);
+        puts("stream fault: whole group replayed on CPU, staging slots refilled correctly");
+    }
+    vkt_shutdown(); model_free(); coli_vk_shutdown();
+    unsetenv("COLI_VK_STAGED_FAULT");
+    unsetenv("COLI_VK_TIER_STREAM_SLOTS"); unsetenv("COLI_VK_TIER_STREAM_ROWS");
+}
+
 int main(int argc, char **argv) {
     char buf[1024];
     const char *spv = argc > 1 ? argv[1] : coli_vk_shader_path(buf, sizeof buf);
     if (!coli_vk_init(spv)) { printf("FAIL: no Vulkan device (shaders %s)\n", spv); return 1; }
     setenv("COLI_VK_TIER_RESERVE_GB", "0", 1);
+    scratch_budget();
     printf("formats:\n"); formats();
     printf("warm:\n"); warm();
     printf("adapt:\n"); adapt();
     printf("partial:\n"); partial();
     printf("sync:\n"); sync_evict();
     printf("DeepSeek V4:\n"); v4_act();
+    printf("stream:\n"); stream();
     ColiVkPoolStats ps; coli_vk_pool_stats(1, &ps);
     CHECK(ps.live == 0, "%d tier ranges still live after every shutdown", ps.live);
     coli_vk_shutdown();   /* with staged uploads: where the experts were ("[VK] memory at exit") */
+    stream_commit_failure(spv);
     printf(fails ? "FAIL (%d)\n" : "PASS\n", fails);
     return fails != 0;
 }

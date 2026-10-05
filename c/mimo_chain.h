@@ -45,10 +45,18 @@
  * the position the host's caches end at (no rebuild, a turn with a picture included).
  * COLI_VK_CHAIN_FAULT=n (vk_chain.c) fakes the loss at the n-th frame, for tests.
  *
+ * Past the device's budget (vk_kvsplit.h) each full-attention layer keeps a window of
+ * the newest blocks on the device (the windowed layers keep their rings, which are
+ * small): the step's attention runs there, sink included, and on the CPU over the older
+ * positions of the host's cache at once, merged through the softmax statistics. The
+ * host's caches hold every position before the step (each chunk commits its rows), so
+ * the host's part always reads them there.
+ *
  * The chain declines (the per-matrix path or the CPU runs) when a dense matrix did not
  * reach the device, for geometry outside chain_attn (a head dim above 256) and under
  * MIMO_TRACE (the CPU's per-layer dump). */
 #include "vk_chain.h"
+#include "vk_kvsplit.h"
 
 typedef struct {
     int ok, failed;
@@ -58,6 +66,8 @@ typedef struct {
     size_t *o_ln1, *o_ln2, *o_sink, o_final;
     VkcBuf **kc, **vc;                         /* the device's caches, per layer */
     int *kv_valid;
+    int *kvi;                                  /* a full layer's index in the split (ks), -1 windowed */
+    VkcKvSplit ks;                             /* the full layers' split past the device's budget (ks.on) */
     size_t *o_kvd;                             /* a layer's new K rows in kvd (V after cap rows) */
     VkcBuf *x, *nrm, *tmp, *qkv, *kn, *vn, *wk, *wv, *ctx, *g, *u, *fin;
     VkcBuf *h2d, *kvd, *outd, *routed, *cs;
@@ -68,11 +78,6 @@ typedef struct {
 
 static int g_vk_chain = 0;     /* COLI_VK_CHAIN decided on, and the chain's pipelines are up */
 
-static int mc_chunk_rows(void) {
-    const char *e = getenv("COLI_VK_CHAIN_ROWS");
-    int v = e && *e ? atoi(e) : 512;
-    return v < 1 ? 1 : v > 65535 ? 65535 : v;
-}
 
 /* the geometry of layer li's attention */
 typedef struct { int k, nh, kvh, hd, vd, qd, kd, vdd, rw, half, rows, swa; } McGeo;
@@ -89,10 +94,16 @@ static McGeo mc_geo(const Model *m, int li) {
 
 static int mc_ctensor(DW *d) { return dw_upload(d) && d->vk; }
 
-/* the device's KV caches, in bytes (the tier's budget leaves them room) */
+/* the device's KV caches, in bytes (the tier's budget leaves them room); a full layer
+ * holds COLI_VK_KV_DEVICE_ROWS rows when that asks for fewer than the context */
 static size_t mc_kv_bytes(const Model *m) {
     size_t b = 0;
-    for (int i = 0; i < m->c.n_layers; i++) { McGeo g = mc_geo(m, i); b += (size_t)g.rows * (g.kd + g.vdd) * sizeof(float); }
+    long forced = vkc_kv_env("COLI_VK_KV_DEVICE_ROWS", 0);
+    for (int i = 0; i < m->c.n_layers; i++) {
+        McGeo g = mc_geo(m, i);
+        size_t rows = !g.swa && forced > 0 && forced < g.rows ? (size_t)forced : (size_t)g.rows;
+        b += rows * (g.kd + g.vdd) * sizeof(float);
+    }
     return b;
 }
 
@@ -112,9 +123,9 @@ static MimoChain *mc_setup(Model *m) {
             return NULL;
         }
     ch->o_ln1 = calloc(L, sizeof(size_t)); ch->o_ln2 = calloc(L, sizeof(size_t)); ch->o_sink = calloc(L, sizeof(size_t));
-    ch->o_kvd = calloc(L, sizeof(size_t)); ch->kv_valid = calloc(L, sizeof(int));
+    ch->o_kvd = calloc(L, sizeof(size_t)); ch->kv_valid = calloc(L, sizeof(int)); ch->kvi = calloc(L, sizeof(int));
     ch->kc = calloc(L, sizeof(void *)); ch->vc = calloc(L, sizeof(void *));
-    if (!ch->o_ln1 || !ch->o_ln2 || !ch->o_sink || !ch->o_kvd || !ch->kv_valid || !ch->kc || !ch->vc) return NULL;
+    if (!ch->o_ln1 || !ch->o_ln2 || !ch->o_sink || !ch->o_kvd || !ch->kv_valid || !ch->kvi || !ch->kc || !ch->vc) return NULL;
     size_t n = 0;
     for (int i = 0; i < L; i++) {
         ch->o_ln1[i] = n; n += H; ch->o_ln2[i] = n; n += H;
@@ -142,10 +153,25 @@ static MimoChain *mc_setup(Model *m) {
     }
     ok = ok && mc_ctensor(&m->head);
     if (!ok) { fprintf(stderr, "[VK] mimo chain: a dense matrix did not reach the device; per-matrix path\n"); return NULL; }
-    /* the caches, in the host's layout and at its size */
+    /* the caches, in the host's layout and at its size; the full layers' split past the
+     * device's budget (a window of blocks a layer, the rest in the host's cache) */
+    int nfull = 0, frows = 0;
+    size_t frow = 0;
+    for (int i = 0; i < L; i++) {
+        McGeo g = mc_geo(m, i);
+        ch->kvi[i] = g.swa ? -1 : nfull++;
+        if (!g.swa) { frows = g.rows; frow = (size_t)(g.kd + g.vdd) * sizeof(float); }
+    }
+    /* KV placement is row-anchored; its legacy chunk argument is not used. The
+     * actual prompt chunk is sized after setup and clamped to ks.chunk. */
+    if (nfull && !vkc_kv_plan(&ch->ks, "mimo", nfull, frow, frows, 1, 0, 0)) {
+        fprintf(stderr, "[VK] mimo chain: the KV split's tables refused; per-matrix path\n");
+        return NULL;
+    }
     size_t kv = 0;
     for (int i = 0; i < L; i++) {
         McGeo g = mc_geo(m, i);
+        if (!g.swa && ch->ks.on) g.rows = ch->ks.rows;
         ch->kc[i] = vkc_buf((size_t)g.rows * g.kd * sizeof(float), VKC_DEV);
         ch->vc[i] = vkc_buf((size_t)g.rows * g.vdd * sizeof(float), VKC_DEV);
         if (!ch->kc[i] || !ch->vc[i]) {
@@ -162,7 +188,25 @@ static MimoChain *mc_setup(Model *m) {
     return ch;
 }
 
-static int mc_res(VkcBuf **b, size_t floats, int kind) { return vkc_reserve(b, (floats ? floats : 1) * sizeof(float), kind); }
+/* mc_res counts instead of reserving while g_mc_count >= 0 (the chunk's sizing) */
+static long long g_mc_count = -1;
+static int mc_res(VkcBuf **b, size_t floats, int kind) {
+    if (g_mc_count >= 0) { g_mc_count += (long long)(floats ? floats : 1) * (long long)sizeof(float); return 1; }
+    return vkc_reserve(b, (floats ? floats : 1) * sizeof(float), kind);
+}
+static int mc_scratch(MimoChain *ch, Model *m, int rows, int out);
+/* Prompt rows per chunk (vkc_chunk_rows): the chain's scratch a row, counted from the
+ * reservations (mc_scratch stops at its first host allocation in this mode), and the
+ * routed experts' outputs (the tier's rows, the CPU's, the host's sum) for it. */
+static int mc_chunk_rows(MimoChain *ch, Model *m) {
+    g_mc_count = 0; mc_scratch(ch, m, 1, 1); long long b1 = g_mc_count;
+    g_mc_count = 0; mc_scratch(ch, m, 2, 1); long long b2 = g_mc_count;
+    g_mc_count = -1;
+    size_t row = (size_t)(b2 - b1) + (size_t)(2 * m->c.topk + 1) * m->c.hidden * sizeof(float);
+    /* moe_cpu retains a whole chunk's gathered inputs and gate/up outputs. */
+    row += (size_t)m->c.topk * ((size_t)m->c.hidden + 2 * (size_t)m->c.moe_inter) * sizeof(float);
+    return vkc_chunk_rows("mimo", row);
+}
 
 /* scratch for `rows` rows, `out` rows of logits */
 static int mc_scratch(MimoChain *ch, Model *m, int rows, int out) {
@@ -185,6 +229,12 @@ static int mc_scratch(MimoChain *ch, Model *m, int rows, int out) {
         dense |= !c->moe[i];
     }
     ch->rd_off[0] = 0; ch->rd_off[1] = rows * 2 * (c->rope_dim[0] / 2);
+    if (ch->ks.on) {   /* the split's partial results: a full layer's heads */
+        size_t part = 0;
+        for (int i = 0; i < L; i++) { McGeo g = mc_geo(m, i); if (!g.swa && (size_t)g.nh * (g.vd + 2) > part) part = (size_t)g.nh * (g.vd + 2); }
+        if (g_mc_count >= 0) g_mc_count += (long long)r * (3 * part + rw) * sizeof(float);
+        else if (!vkc_kv_parts(&ch->ks, r * part)) return 0;
+    }
     size_t cs = r * 2 * (size_t)(c->rope_dim[0] / 2 + c->rope_dim[1] / 2);
     int ok = mc_res(&ch->x, r * H, VKC_DEV) && mc_res(&ch->nrm, r * H, VKC_DEV) && mc_res(&ch->tmp, r * H, VKC_DEV) &&
              mc_res(&ch->qkv, r * rw, VKC_DEV) && mc_res(&ch->kn, r * kd, VKC_DEV) && mc_res(&ch->vn, r * vdd, VKC_DEV) &&
@@ -194,7 +244,7 @@ static int mc_scratch(MimoChain *ch, Model *m, int rows, int out) {
              mc_res(&ch->cs, cs, VKC_UP);
     if (ok && wkd) ok = mc_res(&ch->wk, ((size_t)win + r) * wkd, VKC_DEV) && mc_res(&ch->wv, ((size_t)win + r) * wvd, VKC_DEV);
     if (ok && dense) ok = mc_res(&ch->g, r * c->dense_inter, VKC_DEV) && mc_res(&ch->u, r * c->dense_inter, VKC_DEV);
-    if (!ok) return 0;
+    if (!ok || g_mc_count >= 0) return ok;   /* counting: the buffers only */
     if (ch->rows < rows) {
         float *ho = realloc(ch->host_out, r * H * sizeof(float));
         if (!ho) return 0;
@@ -209,7 +259,10 @@ static int mc_scratch(MimoChain *ch, Model *m, int rows, int out) {
 static void mc_cpu_step(Model *m, int pos_base) {
     MimoChain *ch = (MimoChain *)m->vkchain;
     if (!ch || !ch->ok) return;
-    for (int i = 0; i < m->c.n_layers; i++) if (ch->kv_valid[i] > pos_base) ch->kv_valid[i] = pos_base;
+    for (int i = 0; i < m->c.n_layers; i++) {
+        if (ch->kv_valid[i] > pos_base) ch->kv_valid[i] = pos_base;
+        if (ch->kvi[i] >= 0) vkc_kv_lower(&ch->ks, ch->kvi[i], pos_base);
+    }
 }
 /* The host's rings were replaced (a photo restored): the device's no longer match. */
 static void mc_rings_rewritten(Model *m) {
@@ -239,15 +292,20 @@ static int mc_ring_copy(VkcBuf *ring, VkcBuf *lin, int R, int base, int t0, int 
     }
     return ok;
 }
-/* Record the uploads that make the device's caches the host's, as the step at pos_base
- * reads them. */
-static int mc_push_state(MimoChain *ch, Model *m, int pos_base) {
+/* Record the uploads that make the device's caches the host's, as the step of n rows at
+ * pos_base reads them. */
+static int mc_push_state(MimoChain *ch, Model *m, int pos_base, int n_rows) {
     Cfg *c = &m->c; int ok = 1;
     for (int i = 0; i < c->n_layers && ok; i++) {
         McGeo g = mc_geo(m, i);
         Layer *l = &m->L[i];
         if (ch->kv_valid[i] > pos_base) ch->kv_valid[i] = pos_base;
-        if (g.swa) {
+        if (!g.swa && ch->ks.on) {     /* the split: its window placed, the rows below pos_base uploaded */
+            VkcKvPart pt[2] = {{1, g.kd, l->K, 0, ch->kc[i], 0}, {1, g.vdd, l->V, 0, ch->vc[i], 0}};
+            vkc_kv_lower(&ch->ks, ch->kvi[i], pos_base);
+            vkc_kv_place(&ch->ks, ch->kvi[i], pos_base, n_rows);
+            ok = vkc_kv_push(&ch->ks, ch->kvi[i], pt, 2, pos_base);
+        } else if (g.swa) {
             /* the positions the window still sees must be in the host's ring, as the
              * CPU's attention() demands */
             int lo = pos_base - (c->window - 1) > 0 ? pos_base - (c->window - 1) : 0;
@@ -305,6 +363,18 @@ static int mc_attention(MimoChain *ch, Model *m, int i, int n, int pb) {
     a.vd = g.vd; a.kv_pm = 1;
     a.sink = l->sink != NULL; a.sink_off = (int)ch->o_sink[i];
     VkcBuf *kc = ch->kc[i], *vc = ch->vc[i];
+    if (!g.swa && ch->ks.on) {         /* the split: the rows into their window slots, the attention in two parts */
+        VkcKvPart pk = {1, g.kd, l->K, 0, kc, 0}, pv = {1, g.vdd, l->V, 0, vc, 0};
+        VkcKvGqa ga = {&ch->ks, ch->kvi[i], ch->qkv, kc, vc, NULL, NULL, l->sink ? ch->prm : NULL, ch->ctx,
+                       n, g.nh, g.kvh, g.hd, g.vd, pb, 0, 1, l->sink != NULL, (int)ch->o_sink[i],
+                       g.rw, g.hd, 0, 0, 0, 0, g.nh * g.vd, 0, 0, 1.0f / sqrtf((float)g.hd),
+                       l->K, l->V, (size_t)g.hd, (size_t)g.kd, (size_t)g.vd, (size_t)g.vdd};
+        ok = vkc_kv_store(&ch->ks, ch->kvi[i], &pk, ch->kn, 0, (size_t)g.kd, 0, pb, n) &&
+             vkc_kv_store(&ch->ks, ch->kvi[i], &pv, ch->vn, 0, (size_t)g.vdd, 0, pb, n) &&
+             vkc_copy(ch->kvd, ch->o_kvd[i], ch->kn, 0, (size_t)n * g.kd) &&
+             vkc_copy(ch->kvd, ch->o_kvd[i] + (size_t)ch->rows * g.kd, ch->vn, 0, (size_t)n * g.vdd);
+        return ok && vkc_kv_gqa(&ga) && vkc_matmul((ColiVkTensor *)l->o.vk, ch->ctx, 0, ch->tmp, 0, n);
+    }
     if (!g.swa) {                      /* full attention: the rows in at pb, then every position */
         ok = vkc_copy(kc, (size_t)pb * g.kd, ch->kn, 0, (size_t)n * g.kd) &&
              vkc_copy(vc, (size_t)pb * g.vdd, ch->vn, 0, (size_t)n * g.vdd);
@@ -358,6 +428,7 @@ static void mc_commit(MimoChain *ch, Model *m, int n, int pb) {
             if (g.swa) l->ring_pos[slot] = p;
         }
         ch->kv_valid[i] = pb + n;
+        if (ch->kvi[i] >= 0) vkc_kv_done(&ch->ks, ch->kvi[i], pb + n);
     }
 }
 
@@ -372,7 +443,8 @@ static int mc_forward(Model *m, const float *h, int S, int pos_base, float *logi
     MimoChain *ch = mc_setup(m);
     if (!ch || ch->failed) return 0;
     Cfg *c = &m->c; int H = c->hidden, L = c->n_layers, V = c->vocab;
-    int CH = mc_chunk_rows(), rows = S < CH ? S : CH;
+    int CH = mc_chunk_rows(ch, m), rows = S < CH ? S : CH;
+    if (ch->ks.on && rows > ch->ks.chunk) rows = ch->ks.chunk;   /* a step's rows fit the split's window */
     int out = logits && all_rows ? rows : 1;
     if (!mc_scratch(ch, m, rows, out)) {
         fprintf(stderr, "[VK] mimo chain: device memory for %d rows refused; per-matrix path\n", rows);
@@ -384,7 +456,7 @@ static int mc_forward(Model *m, const float *h, int S, int pos_base, float *logi
     for (int c0 = 0; c0 < S; c0 += rows) {
         int n = S - c0 < rows ? S - c0 : rows, pb = pos_base + c0, last = c0 + n == S;
         if (!vkc_begin() || !vkc_write(ch->x, 0, h + (size_t)c0 * H, (size_t)n * H * sizeof(float)) ||
-            !mc_push_state(ch, m, pb)) goto lost;
+            !mc_push_state(ch, m, pb, n)) goto lost;
         float *cs = (float *)vkc_ptr(ch->cs);   /* the CPU's angles, cosines and sines (rope()) */
         for (int k = 0; k < 2; k++) {
             int rd = c->rope_dim[k], half = rd / 2;
@@ -406,7 +478,11 @@ static int mc_forward(Model *m, const float *h, int S, int pos_base, float *logi
             else if (ok) {
                 ok = vkc_copy(ch->h2d, 0, ch->nrm, 0, (size_t)n * H);
                 double t0 = now_s();
-                ok = ok && vkc_submit(1);
+                /* while the frame runs, the tier loads the experts this layer will likely
+                 * stream (a big prompt chunk only) */
+                ok = ok && vkc_submit(0);
+                if (ok) vkt_stream_prefetch(i, n);
+                ok = ok && vkc_finish();
                 ch->frames++; ch->wait_ms += (now_s() - t0) * 1e3;
                 if (!ok) break;
                 double t1 = now_s();
@@ -448,5 +524,6 @@ static void mc_report(Model *m, const char *what) {
                     "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %.1f MiB on the device (%s)\n",
             ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, ch->wait_ms, ch->host_ms,
             st.dev_bytes / 1048576.0, what);
+    vkc_kv_report(&ch->ks);
     vkc_prof_print();
 }
