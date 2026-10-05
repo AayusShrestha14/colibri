@@ -114,7 +114,7 @@ the shared expert tier ([below](#the-routed-expert-tier-vk_tierc)).
 | Engine | On the device | Weight formats | Stays on the CPU |
 |---|---|---|---|
 | qwen36 (Qwen3.6, Qwen3-Coder, Qwen3.8-27B, Clef) | the dense trunk; routed experts on the expert tier | int8 rows; int4-g64 with `COLI_DENSE_BITS=4`; f16 (fmt 14) with `COLI_DENSE_BITS=16`; f32 with `COLI_DENSE_I8=0`; experts int4-g64, int4 per row, int8 per row or gs64 | DeltaNet `dn_a`/`dn_b`, vision tower, Clef's joint head, the experts the tier does not hold |
-| qwen38 (Qwen3.8 Flash Next) | the trunk; routed experts on the expert tier | int8 trunk rows, bf16, f32 (`Q38_NATIVE_BF16=0`); experts int4-g64 (sidecar), FP8 128x128 blocks, bf16 | the MTP head's experts, the experts the tier does not hold |
+| qwen38 (Qwen3.8 Flash Next) | the trunk; routed experts on the expert tier, the MTP head's too on a discrete GPU | int8 trunk rows, bf16, f32 (`Q38_NATIVE_BF16=0`); experts int4-g64 (sidecar), FP8 128x128 blocks, bf16 | the experts the tier does not hold |
 | inkling | dense and shared-expert matrices; routed experts on the expert tier | int8 and int4-g64 (dense-int4g64 container), f32, bf16; experts int4 or int8 per row (container or runtime quantization), f32 | embedding and audio lookups, CUDA residents (with CUDA or Metal on, the experts too); bf16 on CPUs with the AVX512-BF16 dot (see below); the experts the tier does not hold |
 | olmoe | attention q/k/v/o, router, lm_head; routed experts on the expert tier | f32; experts int8 per row | embedding, the experts the tier does not hold |
 | kimi_k3 (Kimi K3) | the shared experts' matrices (one row at a time: decode); routed experts on the expert tier | shared experts int8 rows, int4-g64, f32 (`K3_BITS`); experts MXFP4 with ue8m0 scales (fmt 7), SiTU-GLU in the latent space | KDA, MLA, the latent projections, router, head, prefill's shared experts, the experts the tier does not hold |
@@ -451,7 +451,7 @@ order its CPU-only run does, and keeps a history for the warm start where it has
 | Engine | Experts in RAM (`VktSrc`), device format | Activation | Warm start from | Of its own |
 |---|---|---|---|---|
 | qwen36 (Qwen3.6, Qwen3-Coder, the 2.4T geometry) | int8 per row `I8_ROW` or gs64 `I8_GS` (fmt 1, 13); int4 per row or gs64 from the int8-slot kernel, `I8_AS_I4_ROW` / `I8_AS_I4_GS` (fmt 2, 4); planar int4-g64 from the int4 kernel, `I4U_PLANAR64` (fmt 4); the mixed container's int4 gate/up and int8 down | SwiGLU | `COLI_USAGE` (default `<snap>/.coli_usage`), kept only while the tier is on | the tier's experts match `QWEN_EXPERT_ACT=f32` (the default kernel rounds activations to int8) |
-| qwen38 (Qwen3.8 Flash Next) | the int4-g64 sidecar `I4U_PLANAR64` (fmt 4); the release's FP8 in 128x128 blocks `FP8_BLOCK` (fmt 12); `BF16` (fmt 11); `F32` (fmt 10) | SwiGLU | `COLI_USAGE` (default `<snap>/.coli_usage`), always kept | the MTP head's layer stays on the CPU (its experts are FP8 beside an int4 sidecar) |
+| qwen38 (Qwen3.8 Flash Next) | the int4-g64 sidecar `I4U_PLANAR64` (fmt 4); the release's FP8 in 128x128 blocks `FP8_BLOCK` (fmt 12); `BF16` (fmt 11); `F32` (fmt 10) | SwiGLU | `COLI_USAGE` (default `<snap>/.coli_usage`), always kept | the MTP head's layer is an extra layer of its own form (FP8 beside an int4 sidecar), [below](#the-mtp-heads-layer-on-the-tier-coli_vk_tier_mtp) |
 | inkling | int4 container `I4U_PAIRS_ROW` (fmt 2); int8 container `I8_ROW` (fmt 1); runtime int8 rows, `I8_AS_I4_ROW` at 2 to 4 bits (fmt 2) and `I8_ROW` above; `F32` at `bits=0` (fmt 10). Gate and up come from the fused `gate_up` tensor, up I rows in | SwiGLU | `<snap>/.coli_usage` or `PIN=<path>`, in the generate and serve modes; the ref.json oracle reads none | [Inkling and OLMoE](#inkling-and-olmoe) |
 | olmoe | int8 rows `I8_ROW` (fmt 1), gate, up and down as the merged container holds them | SwiGLU | `COLI_USAGE` only | [Inkling and OLMoE](#inkling-and-olmoe) |
 | kimi_k3 (Kimi K3) | the checkpoint's MXFP4 with ue8m0 scales `MXFP4_E8M0` 32 (fmt 7): gate `w1`, up `w3`, down `w2`, in the latent space | SiTU-GLU (`VKT_ACT_SITU`) | `COLI_USAGE` (default `<snap>/.coli_usage`) | [Kimi K3 and MiMo](#kimi-k3-and-mimo) |
@@ -563,6 +563,57 @@ copies.
 The `dev2` families' `excl` and `noexcl` cases run every engine with a RAM cache of a slot
 or two against its CPU run. On DeepSeek V4's 16-expert fixture with 6 slots a layer, the
 run with it gave up 21 RAM copies and read 46 experts from disk, against 51 without it.
+
+### The MTP head's layer on the tier (`COLI_VK_TIER_MTP`)
+
+Qwen3.8's MTP head drafts with a MoE layer of its own (index `layers`), whose experts the
+snapshot keeps in their own form: FP8 in 128x128 blocks beside the int4-g64 sidecar, which
+covers the model's layers only. With `COLI_VK_TIER_MTP=1`, the default on a discrete GPU,
+the tier takes that layer as an extra layer (`VktConfig.extra_layers`, with
+`extra_gate_up` and `extra_down`): its experts are promoted
+as the drafts pass by, served by the same batches as any layer's, and given up to the
+exclusive RAM cache the same way. What differs:
+
+- **A pool of its own.** An FP8 expert is about twice an int4 one, and in one pool the
+  holes an evicted int4 expert leaves are too small for it. The extra layer's experts sit
+  in a pool of their own on the primary device, where a newcomer displaces only another
+  extra expert, so each pool holds one size. The pool gets every extra expert when the
+  budget holds them beside every main one, else the extra layers' share of the budget
+  (their layers over all the layers, at least one expert), and its bytes leave the main
+  experts' count. They never go to a second device.
+- **No history, no streaming.** The history and the warm start cover the model's layers;
+  the drafts fill the extra layer, with `COLI_VK_TIER_RATE` promotions per token of its
+  own. It comes last in a forward, after the model's layers have spent theirs: on the
+  release they always do, and with one shared rate the head's layer got no expert at
+  all. Big prompt steps never reach it (the head drafts a few rows at a time), so it
+  takes no streaming slots.
+- **The lines.** The startup line adds `; the extra layers' experts (1, fmt 12): X of S
+  in a pool of P`, the run's line `| extra layers (1): N of M routed experts on the
+  device, resident R (budget X)`.
+
+**Measured** on the Radeon 780M of [speculative.md](speculative.md#measured) with the same
+command as its Vulkan runs (the tier alone, int4-g64 sidecar, three drafts, cap 170, the
+code-edit prompt, 128 tokens, the same starting history, model pages evicted before every
+run), three runs each, alternating:
+
+| MTP head's experts | tok/s | head's routed experts on the device | model's layers on the device |
+|---|---|---|---|
+| on the CPU (`COLI_VK_TIER_MTP=0`) | 3.48, 3.49, 3.46 | | 90382-90410 of 176640 |
+| on the tier (`COLI_VK_TIER_MTP=1`) | 3.44, 3.44, 3.46 | 1095-1160 of 4280 (31 resident, 4.8 MiB each) | 89773-90343 of 176640 |
+
+All six answers were byte-identical, and so was the head's acceptance (95 of 95 drafts).
+On this integrated GPU the head's experts on the device bought nothing: their pool (149
+MiB) came out of the model's layers' budget, whose share on the device fell a little. So
+the default puts them on the tier on a discrete GPU only;
+`COLI_VK_TIER_MTP=1` or `0` decides either way. A discrete GPU was not measured here.
+
+When the head's experts have no device form (`[VK] tier qwen38: the extra layers' expert
+format ... has no device form`), mix formats or find no room, they stay on the CPU. The tokens are the CPU run's either way:
+the MTP layer's experts join the row in rank order like the others'.
+`tests/test_vk_tier`'s `extra` case gates the pools (an f32 extra layer, eight times an
+int4 expert: each pool evicts its own kind, no upload refused, an extra expert gets in
+beside a full main pool on its own promotions), and the `qwen` family runs the head's
+layer on the device on both MTP fixtures.
 
 ### A second device (`COLI_VK_DEV2`)
 
@@ -959,7 +1010,9 @@ partial-qwen36-olmoe` gates it on Lavapipe ([below](#olmoe-and-inkling)).
 
 **What stays on the CPU.** The routed experts the tier does not hold, the router's
 top-k, the embedding gather and the vision tower's rows, Qwen3.8's n-gram table reads
-and the MTP head (its experts are FP8 beside the int4 sidecar, a few rows per draft).
+and the MTP head's layer apart from its matrices (with the full chain the per-matrix path
+runs those on the device, and its routed experts are on the expert tier as an extra
+layer).
 The chain declines, and the per-matrix path runs with the state synced first, under
 the CUDA expert tier (CUDA keeps its priority), a qpack container, PILOT prefetch, or
 a geometry outside its shaders (head dim above 256, a DeltaNet value head above 128 or
@@ -2166,7 +2219,9 @@ in short:
    (`VKT_ACT_SWIGLU` with an optional clamp, `VKT_ACT_SITU`, `VKT_ACT_SWIGLU_V4`), the most assignments a
    step carries, the RAM the expert cache may still take and the dense bytes still to
    come to the device; optionally `.max_experts`, a count the engine's users already
-   size its device tier in (GLM-5.2's `COLI_VK_EXPERTS`). `atexit(coli_vk_shutdown)`,
+   size its device tier in (GLM-5.2's `COLI_VK_EXPERTS`), and `.extra_layers` with
+   their own `VktFmt` for layers past the model's whose experts RAM holds in another
+   form (an MTP head's: [above](#the-mtp-heads-layer-on-the-tier-coli_vk_tier_mtp)). `atexit(coli_vk_shutdown)`,
    then `vkt_init(&cfg, rt_counts_all())` after the device and the history, then
    `atexit(vkt_shutdown)` when it succeeds: at exit the tier lets go of its experts
    first and the device is destroyed before the drivers unload, whether or not the

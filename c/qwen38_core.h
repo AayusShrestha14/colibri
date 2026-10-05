@@ -2694,9 +2694,9 @@ static void q38_tier_start(Model *m,int cap) {
  * The tier computes the resident experts of a step on the device while the CPU
  * computes the rest; every expert's output then joins the row in rank order, the
  * device's and the CPU's alike, so the sum's order is the CPU run's whatever was
- * resident. The model's layers only: the MTP head's layer keeps its FP8 experts on
- * the CPU (the sidecar's int4 covers the model's layers). A slot's bytes are what
- * the tier reads when it promotes the expert: codes and scales of each matrix. */
+ * resident. The MTP head's layer too (index c.layers, the tier's extra layer), with
+ * the experts the snapshot keeps (FP8 beside the sidecar's int4). A slot's bytes are
+ * what the tier reads when it promotes the expert: codes and scales of each matrix. */
 static VktExpertSrc q38_vk_src(const Slot *ex) {
     VktExpertSrc s={ex->gate.data,ex->up.data,ex->down.data,ex->gate.scales,ex->up.scales,ex->down.scales};
     return s;
@@ -2718,7 +2718,7 @@ static void q38_moe_decode_ex(Model *m,Layer *l,int layer,const float *x,int S,f
     Cfg *c=&m->c;int H=c->hidden,E=c->experts,K=c->topk,I=c->inter,SI=c->shared_inter;
     float *logits=falloc(E),*sg=falloc(SI),*su=falloc(SI),*sh=falloc(SI),*shared=falloc(H);
     float *eg=falloc(I),*eu=falloc(I),*eh=falloc(I),*eo=falloc(H);
-    int vk=vkt_ready()&&layer<c->layers;      /* the Vulkan tier: outputs buffered per rank */
+    int vk=vkt_ready()&&layer<vkt_layers();   /* the Vulkan tier: outputs buffered per rank */
     float *ebuf=vk?falloc((int64_t)K*H):NULL;
     for(int s=0;s<S;s++){
         const float *xs=x+(int64_t)s*H;float *ys=out+(int64_t)s*H;memset(ys,0,(size_t)H*sizeof(float));
@@ -2870,7 +2870,7 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
     }
 
     /* the Vulkan tier: per assignment, whether the device takes it and its output */
-    int vk=vkt_ready()&&layer<c->layers;
+    int vk=vkt_ready()&&layer<vkt_layers();
     int *vk_idx=vk?(int*)malloc((size_t)max_assign*sizeof(int)):NULL;
     uint8_t *vk_taken=vk?(uint8_t*)calloc((size_t)max_assign,1):NULL;
     const float **vk_dev=vk?(const float**)malloc((size_t)max_assign*sizeof(*vk_dev)):NULL;

@@ -473,12 +473,25 @@ family_qwen() {
   EVICT=1 tier_gate qwen38 "qwen38 tier, a budget of two experts" OMP_NUM_THREADS=2 Q38_PREFILL_BATCH=0 COLI_VK_TIER_GB=0.0000065 SNAP=qwen38_tiny_fp8 -- 1 8 qwen38_tiny_fp8/ref.json
   $PY tools/make_qwen38_tiny.py --out qwen38_tiny_fp8_mtp --fp8-experts --mtp
   $PY tools/make_qwen38_tiny.py --out qwen38_tiny_int4_mtp --fp8-experts --int4-experts --expert-gain 3 --mtp
+  # the MTP head's layer as the tier's extra layer (COLI_VK_TIER_MTP=1; the default on a
+  # discrete GPU): its experts (FP8, beside the int4 sidecar on the second fixture) run
+  # on the device too. Lavapipe shares the RAM, where the default keeps them on the CPU;
+  # the tokens are the same either way.
   for fx in qwen38_tiny_fp8_mtp qwen38_tiny_int4_mtp; do
     for batch in 0 1; do
       D=; [ $batch = 1 ] && D=COLI_VK_DENSE=1
-      tier_gate qwen38 "qwen38 tier MTP $fx batch=$batch" OMP_NUM_THREADS=2 $D Q38_MTP=1 Q38_PREFILL_BATCH=$batch SNAP=$fx -- 2 8 $fx/ref.json
+      tier_gate qwen38 "qwen38 tier MTP $fx batch=$batch" OMP_NUM_THREADS=2 $D Q38_MTP=1 COLI_VK_TIER_MTP=1 Q38_PREFILL_BATCH=$batch SNAP=$fx -- 2 8 $fx/ref.json
+      mtp_on_device "qwen38 tier MTP $fx batch=$batch"
     done
   done
+  tier_gate qwen38 "qwen38 tier MTP head on the CPU (shared RAM default)" OMP_NUM_THREADS=2 Q38_MTP=1 Q38_PREFILL_BATCH=0 SNAP=qwen38_tiny_int4_mtp -- 2 8 qwen38_tiny_int4_mtp/ref.json
+  ! grep -aq 'extra layers' vk.log || { grep -a '\[VK\] tier' vk.log; fail "shared RAM: the MTP head's layer went on the tier by default"; }
+  echo "OK shared RAM: the MTP head's experts on the CPU by default"
+}
+mtp_on_device() {  # <tag>: vk.log's tier served experts of the MTP head's layer
+  local n; n=$(grep -a -o 'extra layers (1): [0-9]*' vk.log | tail -1 | grep -o '[0-9]*$')
+  [ "${n:-0}" -gt 0 ] || { grep -a '\[VK\] tier' vk.log; fail "$1: no expert of the MTP head's layer ran on the device"; }
+  echo "OK $1: $(grep -a -o 'extra layers (1): [0-9]* of [0-9]* routed experts on the device' vk.log | tail -1)"
 }
 
 # The routed-expert tier under ASan and UBSan: a sanitized VK=1 build of both qwen
@@ -522,7 +535,8 @@ family_qwen_sanitize() {
     san qwen38 "asan qwen38 int4 batch=$b" $D Q38_PREFILL_BATCH=$b SNAP=qwen38_tiny_int4 ./qwen38 1 8 qwen38_tiny_int4/ref_int4.json
   done
   san qwen38 "asan qwen38 eviction" Q38_PREFILL_BATCH=0 COLI_VK_TIER_GB=0.0000065 SNAP=qwen38_tiny_fp8 ./qwen38 1 8 qwen38_tiny_fp8/ref.json
-  san qwen38 "asan qwen38 MTP" COLI_VK_DENSE=1 Q38_MTP=1 Q38_PREFILL_BATCH=0 SNAP=qwen38_tiny_int4_mtp ./qwen38 2 8 qwen38_tiny_int4_mtp/ref.json
+  san qwen38 "asan qwen38 MTP" COLI_VK_DENSE=1 Q38_MTP=1 COLI_VK_TIER_MTP=1 Q38_PREFILL_BATCH=0 SNAP=qwen38_tiny_int4_mtp ./qwen38 2 8 qwen38_tiny_int4_mtp/ref.json
+  cp san.log vk.log; mtp_on_device "asan qwen38 MTP"
   san qwen38 "asan qwen38 tier alone" COLI_VK_DENSE=0 SNAP=qwen38_tiny_int4 ./qwen38 4 8 qwen38_tiny_int4/ref_int4.json
   make clean >/dev/null 2>&1 || true
 }
