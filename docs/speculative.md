@@ -228,6 +228,16 @@ enabled, every verify used MTP and lookup supplied no drafts. Their gains theref
 do not add. The small differences between MTP alone and the combined mode are not
 evidence of a lookup benefit.
 
+A subsequent three-run comparison on commit
+`2f33f211ea6e28186d62cf9c00d511df826590a0` isolated `Q38_MTP=0` versus `1`, with
+`Q38_MTP_DRAFTS=3` fixed and the expert-tier configuration above. The samples were
+2.93, 2.93 and 2.90 tok/s without MTP, and 3.49, 3.50 and 3.47 with it: median
+2.93 to 3.49 tok/s (+19.1%, including prefill). All six outputs were byte-identical.
+The [validated experiment manifest](experiments/vulkan-qwen38-mtp-2026-10-05/manifest.json)
+links the raw logs and records the command, hardware, cache policy, prompt and starting
+history. It measures MTP on this workload, not the combined effect of every Vulkan
+change.
+
 The tier-only run took 44.2 seconds without drafts and 36.7 seconds with MTP 3;
 time to first token was 16.99 and 17.44 seconds respectively. Subtracting those rounded
 times gives approximately 4.67 and 6.59 tokens/s after the first token. The dense
