@@ -37,6 +37,7 @@ FILES = [
     "coli_cuda.dll", "coli_cuda.lib", "coli_cuda.exp",
     # hipcc emits an import library, export file and PDB alongside the DLL.
     "coli_hip.dll", "coli_hip.lib", "coli_hip.exp", "coli_hip.pdb",
+    "tests/compat_prefetch_module.dll",
     "deepseek_v4", "deepseek_v4.exe", "deepseek_v4.cflags", "deepseek_v4.cudaflags",
     "deepseek_v41", "deepseek_v41.exe",
     "mimo", "mimo.exe",
