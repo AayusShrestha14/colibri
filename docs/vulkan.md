@@ -2223,10 +2223,26 @@ whole mirrors), and the whole of a block that just got its slot.
 
 **The partition, and why it is the row's own.** A row at position `pos` attends on the
 device over the blocks `pos/B - anchor .. pos/B` (and, from a list, the pinned blocks),
-and on the CPU over the rest. A step writes at most `chunk` rows (an eighth of the
-window), so every block of a row's share is in the window while any step holds the row,
-and the share covers the step's earlier rows, which reach the host's cache only after the
-step. Because the share depends on the row's position only, and the host's part is cut
+and on the CPU over the rest. A step writes at most `chunk` rows, so every block of a
+row's share is in the window while any step holds the row, and the share covers the
+step's earlier rows, which reach the host's cache only after the step. `chunk` is the
+largest both allow, half the window less a block: a prompt's chunk is a step, and each
+chunk carries its own frames and expert loads.
+
+| Qwen3.6-35B-A3B, 7579-token prompt, Radeon 780M, the chain | first token after |
+|---|---|
+| the whole mirrors | 77 s |
+| 1024 positions a layer on the device, chunks of an eighth of the window (before) | 170 s |
+| the same, a quarter | 141 s |
+| the same, half the window less a block (now) | 122 s |
+| 4096 positions a layer, an eighth (before) | 183 s |
+| 4096 positions, a quarter | 165 s |
+| 4096 positions, half less a block (now) | 142 s |
+
+(`COLI_VK_KV_DEVICE_ROWS` forced the split, `OMP_NUM_THREADS=8`, cap 256, 32 new tokens,
+the model in the page cache; two runs of the eighth agreed within 1%, one run each of the
+others.) A row's share shrinks with it (896 of 1024 positions before, 576 now), so a
+decode step's host part grows; the 31 decode tokens took 3.4 to 3.6 s either way. Because the share depends on the row's position only, and the host's part is cut
 into chunks fixed by position and joined in order, a row gets the same bits however a
 forward is cut into steps: a prompt in one chunk or many, a decode step, a verify, a
 resumed prefix or a cold one. Pins follow the history of reads, so a listed row's bits
@@ -2268,7 +2284,7 @@ turns the split off (past the budget the chain declines as before), `COLI_VK_KV_
 enables read-based pins. The line says what was decided:
 
 ```
-[VK] qwen36 chain: the KV cache split past the device's budget: 4096 of 65568 positions a layer on the device (64 blocks of 64, 0 for pins by reads; a row's newest 3584 positions on the device), the rest in RAM (160.0 MiB on the device instead of 2561.2)
+[VK] qwen36 chain: the KV cache split past the device's budget: 4096 of 65568 positions a layer on the device (64 blocks of 64, 0 for pins by reads; a row's newest 2112 positions on the device), the rest in RAM (160.0 MiB on the device instead of 2561.2)
 ```
 
 and each run reports the split's steps: `[VK] <engine> chain: KV split: N layer steps, M
