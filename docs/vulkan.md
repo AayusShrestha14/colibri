@@ -2117,6 +2117,22 @@ first matrix. RADV places them in system RAM instead, where every access crosses
 **Staged uploads** put resident data in a DEVICE_LOCAL memory type the host does not map
 and copy it there from a host staging buffer with `vkCmdCopyBuffer`.
 
+**Straight from host memory.** Where the device has `VK_EXT_external_memory_host`, a
+staged upload skips the staging buffer: the source pages are imported as a transfer
+source and the device copies from them directly, so the CPU does not copy the bytes a
+second time. It applies to:
+- the tier's experts (and the streaming slots' refills), from the host image they are
+  converted in, which is allocated aligned to the device's import alignment;
+- the trunk's rows from the weights themselves, when they need no padding.
+
+An import lives until its command buffer's fence. Pages the driver will not import (some
+file-backed mappings, a refusal) are staged as before. The second device (`COLI_VK_DEV2`)
+does the same. `COLI_VK_UP_IMPORT=0` stages every copy; a `[VK] staged uploads: copied
+straight from host memory` line says imports are on, and the exit report counts the
+imported bytes and copies and the refused ones. On Lavapipe the results are the same bits
+either way. On a discrete card it removes a host copy of every uploaded byte, which matters
+most for the tier's warm start and the trunk's placement; its speed there was not measured.
+
 **The rule** (`place_decide` in `backend_vulkan.c`). `COLI_VK_STAGED=1` stages,
 `COLI_VK_STAGED=0` keeps the mapped path. Unset: staged when the host-visible
 device-local heap holds less than a quarter of the largest device-local heap, or there is
