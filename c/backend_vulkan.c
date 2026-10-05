@@ -5135,9 +5135,9 @@ static int run_xbatch(int fmt, int dfmt, int gs, int D, int I, int act, float li
     for (int c = 0; c < K; c++) {
         int slot = gemm_slot(rows[c]);
         if (g_xb[0].gemm_rows && rows[c] >= g_xb[0].gemm_rows && g_xb[0].p_mm[slot])
-            coop_expected += (xb_coop_slot(mg[c].t, rows[c], slot) >= 0) +
-                             (xb_coop_slot(mu[c].t, rows[c], slot) >= 0) +
-                             (xb_coop_slot(md[c].t, rows[c], slot) >= 0);
+            coop_expected += (xb_coop_slot(&g_xb[0], mg[c].t, rows[c], slot) >= 0) +
+                             (xb_coop_slot(&g_xb[0], mu[c].t, rows[c], slot) >= 0) +
+                             (xb_coop_slot(&g_xb[0], md[c].t, rows[c], slot) >= 0);
     }
     if (!coli_vk_xb_issue(ex, rows, K, xr) || !coli_vk_xb_join(yr, &dms)) { printf("xbatch fmt=%d/%d: issue/join failed\n", fmt, dfmt); bad = 1; }
     unsigned long long coop_done = g_xb[0].cooperative_matmuls - coop_before;
