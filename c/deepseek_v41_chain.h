@@ -409,8 +409,11 @@ static int v41c_setup(Model *m) {
     ch->ok = 1;
     int nsrc = 0, nidx = 0, neng = 0;
     for (int i = 0; i < N; i++) { nsrc += c->kv_source[i]; nidx += c->index_source[i] && c->compress_ratio[i] > 0; neng += m->L[i].engram_index >= 0; }
+    size_t bytes = 0, tensors = 0;
+    coli_vk_mem_info(&bytes, &tensors);
     fprintf(stderr, "[VK] deepseek_v41 chain: %d layers on the device (%d compressing, %d indexing, %d engram), %d streams, "
-                    "%.1f MiB of parameters\n", N, nsrc, nidx, neng, H, n * 4 / 1048576.0);
+                    "%.1f MiB of parameters, %zu matrices (%.1f MiB) on the device\n", N, nsrc, nidx, neng, H, n * 4 / 1048576.0,
+            tensors, bytes / 1048576.0);
     vkc_fit_placed("deepseek_v41", &g_v41_fit);
     return 1;
 }
