@@ -1455,6 +1455,7 @@ static void q38_pin_state_free(void *v){
 static int q38_pin_state_copy(Model *m, Q38PinState **slot, int to_state){
     const Cfg *c = &m->c;
     size_t rec = 0, conv = 0, ple = 0;
+    if (to_state) q38_dn_gpu_pull_all(m);   /* the card may be ahead of the host copy */
 #ifdef COLI_VULKAN
     if (to_state) q38c_sync_host(m);   /* the dense chain keeps the newest state on the device */
 #endif
@@ -1507,6 +1508,7 @@ static int q38_pin_state_copy(Model *m, Q38PinState **slot, int to_state){
         }
     }
     q38_mtp_state_copy(m, st->mtp_pend, &st->mtp_len, &st->mtp_pend_n, st->mtp_pend_tok, to_state);
+    if (!to_state) q38_dn_gpu_invalidate(m);   /* restored on the host: the card's copy is from another prompt */
 #ifdef COLI_VULKAN
     if (!to_state) q38c_host_wrote(m, 0);   /* up to the device before the next chain step */
 #endif
@@ -1609,6 +1611,7 @@ static int q38_prefix_ids_reserve(int len){
 }
 
 static void q38_prefix_copy_state(Model *m,int to_cache){
+    if(to_cache)q38_dn_gpu_pull_all(m); else q38_dn_gpu_invalidate(m);
 #ifdef COLI_VULKAN
     if(to_cache)q38c_sync_host(m);
     else q38c_host_wrote(m,0);

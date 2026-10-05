@@ -93,6 +93,11 @@ int  qt_dnproj_matmul_batch(int layer, float *y, const float *x, int S, int I, i
 int  qt_dn_gpu_init(int layer, int vh, int vk, int kdim, int vdim, int conv_dim, int convk, int hidden,
                     const float *conv_w, const float *norm_w, float eps, int dnout_handle_plus1);
 int  qt_dn_gpu_ready(int layer);
+/* the same from three dense handles (in_proj qkv, in_proj z, out_proj), all on one
+ * device -- qwen38's trunk items; gate_sigmoid: the gated norm's gate (1 = sigmoid(z)) */
+int  qt_dn_gpu_init_dense(int layer, int vh, int vk, int kdim, int vdim, int conv_dim, int convk, int hidden,
+                          const float *conv_w, const float *norm_w, float eps, int gate_sigmoid,
+                          int proj_handle_plus1, int projz_handle_plus1, int dnout_handle_plus1);
 int  qt_dn_gpu_set_state(int layer, const float *ring, const float *rec);   /* NULL = zero */
 int  qt_dn_gpu_get_state(int layer, float *ring, float *rec);
 int  qt_dn_gpu_step(int layer, const float *x, float *out, const float *egh, const float *beta);
@@ -173,6 +178,7 @@ static inline int  qt_dnproj_ready(int a){(void)a;return 0;}
 static inline int  qt_dnproj_matmul_batch(int a,float*b,const float*c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
 static inline int  qt_dn_gpu_init(int a,int b,int c,int d,int e,int f,int g,int i,const float*j,const float*k,float l,int m){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)i;(void)j;(void)k;(void)l;(void)m;return 0;}
 static inline int  qt_dn_gpu_ready(int a){(void)a;return 0;}
+static inline int  qt_dn_gpu_init_dense(int a,int b,int c,int d,int e,int f,int g,int i,const float*j,const float*k,float l,int m,int n,int o,int p){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)i;(void)j;(void)k;(void)l;(void)m;(void)n;(void)o;(void)p;return 0;}
 static inline int  qt_dn_gpu_set_state(int a,const float*b,const float*c){(void)a;(void)b;(void)c;return 0;}
 static inline int  qt_dn_gpu_get_state(int a,float*b,float*c){(void)a;(void)b;(void)c;return 0;}
 static inline int  qt_dn_gpu_step(int a,const float*b,float*c,const float*d,const float*e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}

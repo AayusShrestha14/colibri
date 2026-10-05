@@ -521,12 +521,13 @@ TEST_RULES  := $(patsubst tests/%,%,$(filter tests/test_%,$(RULE_NAMES)))
 # since a bare invocation exits 2 -- and tests/test_e8x4g64_mint_load.py is what
 # actually drives it end to end.
 # test_qwen38_tier_engine drives qwen38.c over the generated FP8 fixture
-# (qwen38_tiny_fp8, gitignored); it runs from qwen38-tier-engine-check.
+# (qwen38_tiny_fp8, gitignored); it runs from qwen38-tier-engine-check. test_qwen38_dn_gpu does the same from
+# qwen38-dn-gpu-check.
 TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_framing \
 	test_segment_adapters_registration test_segment_adapters_real \
 	test_edge_adapters_registration test_edge_adapters_real \
 	test_xdna_execution test_xdna_failure \
-	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41 test_st_f16_bf16_simd_sse41 test_qwen38_tier_engine \
+	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41 test_st_f16_bf16_simd_sse41 test_qwen38_tier_engine test_qwen38_dn_gpu \
 	test_e8x4g64_loader test_qwenimage_vae test_vk_tier \
 	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract
 TEST_EXCLUDE += test_vk_chain
@@ -1456,6 +1457,9 @@ qwen38-tiny-fp8-check: qwen38-tiny-fp8-generate qwen38$(EXE)
 
 qwen38-tier-engine-check: qwen38-tiny-fp8-generate tests/test_qwen38_tier_engine$(EXE)
 	./tests/test_qwen38_tier_engine$(EXE)
+
+qwen38-dn-gpu-check: qwen38-tiny-fp8-generate tests/test_qwen38_dn_gpu$(EXE)
+	./tests/test_qwen38_dn_gpu$(EXE)
 
 # The routed experts as int4-g64: tools/convert_qwen38_experts_int4.py writes
 # the experts-int4g64/ sidecar next to the FP8 shards and qwen38 picks it up.
@@ -2569,6 +2573,10 @@ tests/test_qwen36_tier_int8_decode$(EXE): tests/test_qwen36_tier_int8_decode.c q
 # from the FP8 fixture, reduced CPU list, qt_note on recycled slots, oracle
 # tokens unchanged. Needs the fixture (qwen38-tiny-fp8-generate).
 tests/test_qwen38_tier_engine$(EXE): tests/test_qwen38_tier_engine.c qwen38.c qwen36_tier.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# Q38_DN_GPU=1 on the tiny FP8 fixture (fake backend, oracle): runs from qwen38-dn-gpu-check.
+tests/test_qwen38_dn_gpu$(EXE): tests/test_qwen38_dn_gpu.c qwen38.c qwen36_tier.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_serve_poll$(EXE): tests/test_serve_poll.c
