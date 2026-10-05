@@ -6103,13 +6103,44 @@ class _DeadlineReader:
             raise TimeoutError("request read deadline exceeded")
         self._sock.settimeout(min(self._per_read, left))
 
-    def readline(self, *args):
-        self._arm()
-        return self._raw.readline(*args)
+    def readline(self, size=-1):
+        chunks = []
+        remaining = size
+        while remaining != 0:
+            self._arm()
+            # peek() does at most one raw socket read. Consume only bytes it
+            # already buffered, so readline cannot renew one socket timeout
+            # internally while a peer drips an unfinished header.
+            buffered = self._raw.peek(1)
+            if not buffered:
+                break
+            newline = buffered.find(b"\n")
+            take = newline + 1 if newline >= 0 else len(buffered)
+            if remaining > 0:
+                take = min(take, remaining)
+            chunk = self._raw.read1(take)
+            chunks.append(chunk)
+            if remaining > 0:
+                remaining -= len(chunk)
+            if chunk.endswith(b"\n"):
+                break
+        return b"".join(chunks)
 
-    def read(self, *args):
-        self._arm()
-        return self._raw.read(*args)
+    def read(self, size=-1):
+        chunks = []
+        remaining = size
+        while remaining != 0:
+            self._arm()
+            # BufferedReader.read(size) can perform many recv calls, each
+            # renewing the same socket timeout. read1() does at most one;
+            # arm the shrinking absolute budget again before the next.
+            chunk = self._raw.read1(min(remaining, 65536) if remaining > 0 else 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if remaining > 0:
+                remaining -= len(chunk)
+        return b"".join(chunks)
 
     def __getattr__(self, name):
         return getattr(self._raw, name)
@@ -6164,6 +6195,8 @@ class APIHandler(BaseHTTPRequestHandler):
                                      self.timeout, self.READ_DEADLINE)
         try:
             super().handle_one_request()
+            if not self.close_connection:
+                self._drain_request_body()
         except TimeoutError:
             # The read budget ran out. Say so and close; do not answer, because
             # we never received a complete request to answer.
@@ -6192,8 +6225,6 @@ class APIHandler(BaseHTTPRequestHandler):
             # writes in the streaming path, which is where Ctrl-C lands.
             self.close_connection = True
             return
-        if not self.close_connection:
-            self._drain_request_body()
 
     def send_response(self, code, message=None):
         """Single choke point for "the status line is out". Overriding here rather than
@@ -6496,7 +6527,14 @@ class APIHandler(BaseHTTPRequestHandler):
         try:
             self._check_host()
             self.require_auth()
-            body = self.read_json()
+            try:
+                body = self.read_json()
+            except TimeoutError:
+                # Only request intake is on this deadline. A later timeout
+                # from the engine keeps the existing structured 500 response.
+                self.close_connection = True
+                self.log_error("request read deadline exceeded")
+                return
             path = urlsplit(self.path).path
             # A client written for Jev sends "jev-latest": on that route the
             # served model answers whatever name was asked for.
