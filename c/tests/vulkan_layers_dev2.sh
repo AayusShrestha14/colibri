@@ -296,7 +296,8 @@ ld2_glm53() {
   ld2_lost glm53 "ld2 glm53 second device lost after an image" 2 1 6 $G -- $M --greedy 4
   # a pin's branch over the image fixture, its KDA state on both devices (layer 2 on the second)
   rm -f chain.usage
-  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=2 COLI_VK_CHAIN_LAYERS2=1 COLI_USAGE=$PWD/chain.usage COLI_VK_TIER=0 \
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_GEMM_MIN_S=0 COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=2 COLI_VK_CHAIN_LAYERS2=1 \
+    COLI_USAGE=$PWD/chain.usage COLI_VK_TIER=0 \
     $PY tests/glm53_pin_branch_harness.py --binary ./glm53 --fixture glm53_mm_tiny --tol 1e-5
   rm -f chain.usage
   # serve sessions: pins, the prompt cache, two KV slots
@@ -308,9 +309,87 @@ ld2_glm53() {
     $PY tests/vulkan_chain_serve.py ./glm53 glm53_l6_serve GLM53_BITS=32 KV_SLOTS=2 COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=3 COLI_VK_CHAIN_LAYERS2=3
 }
 
+# kimi_k3: k3c_gate (the CPU's tokens, every logits row within 2e-3 of the largest) for
+# each of the oracle's prompts, with the split forced; the second device's chain ran
+ld2_k3_gate() {   # <tag> <n0> <n1> <env...>
+  local tag=$1 n0=$2 n1=$3 c; shift 3
+  for c in ${K3C_CASES:-short chunk long}; do
+    K3C_CASES=$c k3c_gate "$tag" COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=$n0 COLI_VK_CHAIN_LAYERS2=$n1 COLI_VK_TIER_BALANCE=0 "$@"
+    ld2_ran kimi_k3 "$tag $c" vk.log
+  done
+}
+# ld2_k3_lost <tag> <n0> <n1> <back> <env...>: the long prompt, the second device lost
+# <back> of its frames before the end of the same run without a fault (back = 0: at its
+# first frame, its setup); the CPU's tokens, and LD2_EXPECT=setup (its layers on the CPU
+# from the start), rebuild (both devices' KDA state rebuilt) or current (the host's state
+# current: nothing to rebuild)
+ld2_k3_lost() {
+  local tag=$1 n0=$2 n1=$3 back=$4 frames k ids; shift 4
+  local D2=(COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=$n0 COLI_VK_CHAIN_LAYERS2=$n1 COLI_VK_TIER_BALANCE=0 COLI_USAGE=$PWD/k3c.usage USAGE_SAVE=0)
+  ids=$(k3c_ids long)
+  rm -f k3c.usage
+  env "$@" COLI_USAGE=$PWD/k3c.usage USAGE_SAVE=0 ./kimi_k3 kimi_k3_tiny --ids "$ids" --ngen 8 2> cpu.log | sed 's/ *TUNE.*//' > cpu.tok
+  k=1
+  if [ "$back" -gt 0 ]; then
+    env "$@" "${D2[@]}" COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 ./kimi_k3 kimi_k3_tiny --ids "$ids" --ngen 8 2> vk.log > /dev/null
+    frames=$(sed -n 's/^\[VK\] kimi_k3 dev2 chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p' vk.log | tail -1)
+    [ -n "$frames" ] && [ "$frames" -gt "$back" ] || { cat vk.log; fail "$tag: no fault-free run to count frames from"; }
+    k=$((frames - back + 1))
+  fi
+  env "$@" "${D2[@]}" COLI_VK_CHAIN_FAULT2=$k COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 \
+    ./kimi_k3 kimi_k3_tiny --ids "$ids" --ngen 8 2> vk.log | sed 's/ *TUNE.*//' > vk.tok
+  { [ -s cpu.tok ] && cmp -s cpu.tok vk.tok; } || { cat cpu.tok vk.tok; tail -20 vk.log; fail "$tag: the tokens differ from the CPU"; }
+  grep -q "COLI_VK_CHAIN_FAULT2" vk.log || { cat vk.log; fail "$tag: the second device's fault never fired"; }
+  case ${LD2_EXPECT:-rebuild} in
+    setup)   grep -q "^\[VK\] kimi_k3 dev2 chain: 0 of [0-9]* layers on the device: the chain stays off (layer 0 did not reach the device: the device was lost" vk.log ||
+               { cat vk.log; fail "$tag: the second device's layers did not go to the CPU"; } ;;
+    rebuild) grep -q "kimi_k3 dev2 chain: the device was lost; rebuilding the state of [1-9]" vk.log || { cat vk.log; fail "$tag: no state was rebuilt"; } ;;
+    current) grep -q "kimi_k3 dev2 chain: the device was lost; the host's state is current" vk.log || { cat vk.log; fail "$tag: the loss was not taken over"; } ;;
+  esac
+  echo "OK $tag: tokens = CPU (fault at the second device's frame $k), $(grep -o 'rebuilding the state of [0-9]* positions\|the host.s state is current\|the chain stays off' vk.log | head -1)"
+}
+ld2_kimi_k3() {
+  $PY tools/make_kimi_k3_tiny.py --output ./kimi_k3_tiny --force
+  k3c_serve_fixture
+  local O="K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 COLI_TEMP=0" s b
+  for s in "2 4" "1 2" "3 1" "2 2"; do ld2_k3_gate "ld2 kimi_k3 f32 ${s/ / + }" ${s% *} ${s#* } $O; done
+  for b in 8 4; do
+    ld2_k3_gate "ld2 kimi_k3 ${b}-bit trunk" 2 4 K3_BITS=$b K3_MLA_BITS=$b K3_HEAD_BITS=$b K3_IDOT=0 COLI_TEMP=0
+  done
+  ld2_k3_gate "ld2 kimi_k3 prefill one token at a time" 1 3 $O K3_CHUNK=1
+  ld2_k3_gate "ld2 kimi_k3 chain chunks of 3" 2 4 $O COLI_VK_CHAIN_ROWS=3
+  ld2_k3_gate "ld2 kimi_k3 tier off" 2 4 $O COLI_VK_TIER=0
+  ld2_k3_gate "ld2 kimi_k3 shared experts by COLI_VK_DENSE=1" 2 4 $O COLI_VK_DENSE=1
+  ld2_k3_gate "ld2 kimi_k3 K3_TOPP=0.6" 2 2 $O K3_TOPP=0.6
+  CHAINMODE=2 ld2_k3_gate "ld2 kimi_k3 prompts only" 2 4 $O
+  K3C_CASES=long ld2_k3_gate "ld2 kimi_k3 KV split on both" 3 3 $O COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4
+  [ "$(kv_hostparts kimi_k3 vk.log)" -gt 0 ] && [ "$(kv_hostparts "kimi_k3 dev2" vk.log)" -gt 0 ] ||
+    { cat vk.log; fail "ld2 kimi_k3 KV split on both: a device's split ran no host part"; }
+  # the second device lost (a setup frame, then 9 frames a forward; the long prompt in
+  # forwards of 32, 32 and 8 rows, then 7 decode steps): at its setup, in the last decode
+  # step, in the second prompt forward, in the third chain chunk of the second prompt
+  # forward in chunks of 5 (the state its first chunks advanced not used); both devices'
+  # KDA state rebuilt from the token ids
+  LD2_EXPECT=setup ld2_k3_lost "ld2 kimi_k3 second device lost at its setup" 2 4 0 $O K3_CHUNK=32
+  ld2_k3_lost "ld2 kimi_k3 second device lost mid-decode" 2 4 3 $O K3_CHUNK=32
+  ld2_k3_lost "ld2 kimi_k3 second device lost in a later prompt chunk" 2 4 77 $O K3_CHUNK=32
+  ld2_k3_lost "ld2 kimi_k3 second device lost inside a chunked forward" 2 4 122 $O K3_CHUNK=32 COLI_VK_CHAIN_ROWS=5
+  # serve sessions frame for frame, the KDA state across turns on both devices: photos
+  # taken from both and restored to both
+  local SV="K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 K3_PREFIX_LOG=1 USAGE_SAVE=0 COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=2 COLI_VK_CHAIN_LAYERS2=4"
+  export CHAIN_SERVE_TOL=2e-2 CHAIN_SERVE_EXPECT='kimi_k3 dev2 chain: [1-9][0-9]* forwards'
+  # shellcheck disable=SC2086
+  {
+    $PY tests/vulkan_chain_serve.py ./kimi_k3 kimi_k3_serve $SV
+    $PY tests/vulkan_chain_serve.py ./kimi_k3 kimi_k3_serve $SV COLI_K3_CKPT=4
+    $PY tests/vulkan_chain_serve.py ./kimi_k3 kimi_k3_serve $SV COLI_K3_CKPT=2 COLI_VK_CHAIN_ROWS=3
+  }
+  unset CHAIN_SERVE_TOL CHAIN_SERVE_EXPECT
+}
+
 family_layers_dev2() {
   export OMP_NUM_THREADS=2
-  make qwen36 qwen38 olmoe mimo inkling colibri glm53 tests/test_vk_chain VK=1
+  make qwen36 qwen38 olmoe mimo inkling colibri glm53 kimi_k3 tests/test_vk_chain VK=1
   COLI_VK_DEV2=0 ./tests/test_vk_chain shaders/qmatmul.spv | tee vk_chain.log
   tail -1 vk_chain.log | grep -qx PASS || fail "the chain's ops on two devices"
   ld2_qwen36
@@ -320,6 +399,7 @@ family_layers_dev2() {
   ld2_inkling
   ld2_colibri
   ld2_glm53
+  ld2_kimi_k3
   unset OMP_NUM_THREADS
 }
 family_layers_dev2_sanitize() {
