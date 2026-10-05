@@ -590,13 +590,32 @@ static void load_cfg(Cfg *c, const char *snap) {
 
 /* The parameters of an automatic cache size (cap <= 0), for olm_dho_grow_cap: with the
  * dense weights on the device only, the RAM they held goes to the experts. */
-typedef struct { int on; double ram_arg, resident, kv_gb, slot_gb; int layers; } OlmAutoCap;
+typedef struct { int on; double ram_arg, resident, slot_gb; int layers; } OlmAutoCap;
 static OlmAutoCap g_olm_auto_cap;
 
-static float *load_t(Model *m, const char *name) {
-    int64_t n = st_numel(&m->S, name);
-    if (n < 0) { fprintf(stderr, "missing %s\n", name); exit(1); }
-    float *p = falloc(n);
+/* rows x columns is the shape the forward uses the tensor with, counted from
+ * the config: q/k/v/o are [hidden, hidden], the router [num_experts, hidden],
+ * embed_tokens and lm_head [vocab_size, hidden], a norm [hidden] (columns 0).
+ * Allocated from the header's element count instead, a tensor shorter than
+ * that was read past its end, and one of another shape was used as if it had
+ * this one. Exact, like the experts in load_expert_merged(). */
+static float *load_t(Model *m, const char *name, int64_t rows, int64_t columns) {
+    st_tensor *t = st_find(&m->S, name);
+    if (!t) { fprintf(stderr, "missing %s\n", name); exit(1); }
+    if (t->rank != (columns ? 2 : 1) || t->shape[0] != rows || (columns && t->shape[1] != columns)) {
+        char got[192] = "[";
+        for (int k = 0; k < t->rank; k++)
+            snprintf(got + strlen(got), sizeof(got) - strlen(got), "%s%lld", k ? ", " : "",
+                     (long long)t->shape[k]);
+        strncat(got, "]", sizeof(got) - strlen(got) - 1);
+        char want[64];
+        if (columns) snprintf(want, sizeof(want), "[%lld, %lld]", (long long)rows, (long long)columns);
+        else         snprintf(want, sizeof(want), "[%lld]", (long long)rows);
+        fprintf(stderr, "%s: shape %s, expected %s from config.json, refusing (untrusted container)\n",
+                name, got, want);
+        exit(1);
+    }
+    float *p = falloc(t->numel);
     st_read_f32(&m->S, name, p, 0);   /* densa: niente DONTNEED, resta residente */
     return p;
 }
@@ -625,21 +644,23 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     }
     double t0 = now_s();
     if (load_boundaries) {
-        m->embed      = load_t(m, "model.embed_tokens.weight");
-        m->lm_head    = load_t(m, "lm_head.weight");
-        m->final_norm = load_t(m, "model.norm.weight");
+        m->embed      = load_t(m, "model.embed_tokens.weight", c->vocab, c->hidden);
+        m->lm_head    = load_t(m, "lm_head.weight", c->vocab, c->hidden);
+        m->final_norm = load_t(m, "model.norm.weight", c->hidden, 0);
     }
     m->L = calloc(c->n_layers, sizeof(Layer));
     char nm[256];
+    const int64_t D = c->hidden;
     for (int i = layer_begin; i < layer_end; i++) {
         Layer *l = &m->L[i];
-        #define LD(field, suffix) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t(m,nm)
-        LD(in_ln,  "input_layernorm.weight");
-        LD(post_ln,"post_attention_layernorm.weight");
-        LD(q, "self_attn.q_proj.weight"); LD(k, "self_attn.k_proj.weight");
-        LD(v, "self_attn.v_proj.weight"); LD(o, "self_attn.o_proj.weight");
-        LD(qn,"self_attn.q_norm.weight"); LD(kn,"self_attn.k_norm.weight");
-        LD(gate, "mlp.gate.weight");
+        #define LD(field, suffix, rows, columns) \
+            snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t(m,nm,rows,columns)
+        LD(in_ln,  "input_layernorm.weight", D, 0);
+        LD(post_ln,"post_attention_layernorm.weight", D, 0);
+        LD(q, "self_attn.q_proj.weight", D, D); LD(k, "self_attn.k_proj.weight", D, D);
+        LD(v, "self_attn.v_proj.weight", D, D); LD(o, "self_attn.o_proj.weight", D, D);
+        LD(qn,"self_attn.q_norm.weight", D, 0); LD(kn,"self_attn.k_norm.weight", D, 0);
+        LD(gate, "mlp.gate.weight", c->n_experts, D);
         #undef LD
     }
     /* cap <= 0 is "you decide", the sentinel the launcher sends when nobody
@@ -686,7 +707,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         }
         if (derived > c->n_experts) derived = c->n_experts;
         if (load_boundaries) {   /* the standalone engine: kept for olm_dho_grow_cap */
-            g_olm_auto_cap = (OlmAutoCap){1, ram_arg, resident, kv_gb, slot_gb, layers};
+            g_olm_auto_cap = (OlmAutoCap){1, ram_arg, resident, slot_gb, layers};
         }
         fprintf(stderr, "[cache] %d slots/layer of %d experts: %.1f GB budget "
                         "(%s), %.1f GB dense resident, %.0f MB per expert; "
@@ -1595,7 +1616,7 @@ static void olmoe_echo(const char *id, int pos, int token, const float *lo, int 
  * the embedding (its rows are gathered on the CPU) and the norms. The chain is decided
  * after the tier (olc_start); its decision is taken here silently first, from the same
  * inputs, so the matrices are placed before the tier sizes its budget. */
-typedef struct { void **vk; float **field; int64_t n; char name[96]; } OlmDho;
+typedef struct { void **vk; float **field; int64_t n, rows, columns; char name[96]; } OlmDho;
 static OlmDho *g_olm_dho; static int g_olm_dho_n, g_olm_dho_cap;
 static Model *g_olm_dho_model;
 static pthread_mutex_t g_olm_dho_mx = PTHREAD_MUTEX_INITIALIZER;
@@ -1605,7 +1626,7 @@ static float *olm_dho_reload(void **vk) {
     for (int i = 0; i < g_olm_dho_n && !e; i++) if (g_olm_dho[i].vk == vk) e = &g_olm_dho[i];
     if (!e || !g_olm_dho_model) { fprintf(stderr, "[VK] olmoe: a dense matrix the device held alone cannot be read back\n"); exit(1); }
     if (!*e->field) {
-        *e->field = load_t(g_olm_dho_model, e->name);
+        *e->field = load_t(g_olm_dho_model, e->name, e->rows, e->columns);
         coli_vk_dense_host_reloaded((size_t)e->n * sizeof(float));
     }
     float *w = *e->field;
@@ -1621,7 +1642,7 @@ static void olm_dho_drop(Model *m, float **field, void **vk, const char *name, i
         if (!g_olm_dho) { fprintf(stderr, "OOM dense matrix table\n"); exit(1); }
     }
     OlmDho *e = &g_olm_dho[g_olm_dho_n++];
-    e->vk = vk; e->field = field; e->n = (int64_t)I * O;
+    e->vk = vk; e->field = field; e->n = (int64_t)I * O; e->rows = O; e->columns = I;
     snprintf(e->name, sizeof e->name, "%s", name);
     free(*field); *field = NULL;
     size_t b = (size_t)I * O * sizeof(float);
@@ -1640,7 +1661,10 @@ static void olm_dho_grow_cap(Model *m, size_t dropped) {
     if (!a->on || !m->cache || a->slot_gb <= 0.0) return;
     double resident = a->resident - dropped / 1e9;
     double budget = a->ram_arg > 0.0 ? a->ram_arg : resident + mem_available_gb() * 0.88;
-    double room = budget - resident - a->kv_gb - 0.5;
+    double room = budget - resident - 0.5;
+    /* the room the cache shares with the KV grows with it: kv_room_fit takes slots
+     * back from the new size as positions are written */
+    if (room > 0.0 && (int64_t)(room * 1e9) > m->room_bytes) m->room_bytes = (int64_t)(room * 1e9);
     int derived = room > 0.0 ? (int)(room / a->slot_gb / (double)a->layers) : 1;
     if (derived < 1) derived = 1;
     if (derived > c->n_experts) derived = c->n_experts;
@@ -3094,9 +3118,10 @@ static int olmoe_edge_engine_open(
                                        "out of memory opening OLMoE Edge");
     load_cfg(&engine->model.c, options->model_dir);
     st_init(&engine->model.S, options->model_dir);
-    engine->model.embed = load_t(&engine->model, "model.embed_tokens.weight");
-    engine->model.lm_head = load_t(&engine->model, "lm_head.weight");
-    engine->model.final_norm = load_t(&engine->model, "model.norm.weight");
+    const Cfg *ec = &engine->model.c;
+    engine->model.embed = load_t(&engine->model, "model.embed_tokens.weight", ec->vocab, ec->hidden);
+    engine->model.lm_head = load_t(&engine->model, "lm_head.weight", ec->vocab, ec->hidden);
+    engine->model.final_norm = load_t(&engine->model, "model.norm.weight", ec->hidden, 0);
     char tokenizer_path[4096];
     snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json",
              options->model_dir);
