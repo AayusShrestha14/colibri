@@ -5,6 +5,8 @@
 #ifndef KV_PERSIST_H
 #define KV_PERSIST_H
 
+#include "own_file.h"                            /* the cache file may sit in a downloaded model dir */
+
 static int g_kvsave=1;
 #define KV_MAGIC  "COLIKV1\0"                    /* v1: righe Lc/Rc f32 */
 #define KV_MAGIC2 "COLIKV2\0"                    /* v2 (KV8): righe fp8 e4m3 + scala f32 per riga */
@@ -31,19 +33,24 @@ static int64_t kv_rec_bytes(Model *m){
 static int kv_disk_open(Model *m){
     KVState *k=m->kv;
     if(k->disk_fp) return 1;
-    k->disk_fp=fopen(k->disk_path,"r+b");
+    k->disk_fp=coli_own_fopen(k->disk_path,"r+b");
     if(k->disk_fp){ char mg[8];                 /* formato del file != formato attivo -> riscrivi */
         if(fread(mg,1,8,k->disk_fp)!=8 || memcmp(mg,kv_active_magic(),8)){
             fclose(k->disk_fp); k->disk_fp=NULL; k->disk_nrec=0; }
     }
     if(!k->disk_fp){
-        k->disk_fp=fopen(k->disk_path,"wb");
-        if(!k->disk_fp) return 0;
+        k->disk_fp=coli_own_fopen(k->disk_path,"wb");
+        if(!k->disk_fp){
+            static int said;
+            if(!said++) fprintf(stderr,"[KV] cannot write %s (%s): conversations will not reopen warm\n",
+                                k->disk_path,strerror(errno));
+            return 0;
+        }
         int32_t h[8]; kv_hdr(m,h,0);
         fwrite(kv_active_magic(),1,8,k->disk_fp); fwrite(h,4,8,k->disk_fp);
         fflush(k->disk_fp);
         fclose(k->disk_fp);
-        k->disk_fp=fopen(k->disk_path,"r+b");
+        k->disk_fp=coli_own_fopen(k->disk_path,"r+b");
         if(!k->disk_fp) return 0;
     }
     return 1;
@@ -58,7 +65,7 @@ static void kv_disk_truncate(Model *m, int nrec){
      * record MAI scritti — il load successivo li leggerebbe come spazzatura. */
     if(nrec>k->disk_nrec) nrec=k->disk_nrec;
     if(k->disk_fp){ fclose(k->disk_fp); k->disk_fp=NULL; }
-    FILE *f=fopen(k->disk_path,"r+b");
+    FILE *f=coli_own_fopen(k->disk_path,"r+b");
     if(!f){ k->disk_nrec=0; return; }
     k->disk_nrec=nrec;
     int32_t nr=nrec; fseek(f,8+6*4,SEEK_SET); fwrite(&nr,4,1,f);
@@ -138,7 +145,7 @@ static int kv_disk_load(Model *m, int *hist, int maxctx){
     if(!g_kvsave) return 0;
     KVState *k=m->kv;
     Cfg *c=&m->c;
-    FILE *f=fopen(k->disk_path,"rb"); if(!f) return 0;
+    FILE *f=coli_own_fopen(k->disk_path,"rb"); if(!f) return 0;
     char mg[8]; int32_t h[8], w[8]; kv_hdr(m,w,0);
     int dt=-1;                                        /* dtype del FILE: 0=f32 (v1), 1=fp8 (v2), 2=PolarQuant (v3) */
     if(fread(mg,1,8,f)==8){

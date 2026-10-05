@@ -236,6 +236,13 @@ static void cfg_load(Cfg *c, const char *snap) {
 
     if (c->n_layers < 1 || c->n_layers > V41_MAX_LAYERS) {
         fprintf(stderr, "[cfg] n_layers %d out of range\n", c->n_layers); exit(1); }
+    /* The rope turns the last rope_head_dim floats of every attention row (head_dim long)
+     * and of every index query and key (index_head_dim long): it must fit both, in pairs
+     * (the release: 64 of 512 and of 128). */
+    if (c->head_dim < 1 || c->rope_dim < 0 || (c->rope_dim & 1) || c->rope_dim > c->head_dim ||
+        c->index_head_dim < 0 || (c->index_head_dim > 0 && c->rope_dim > c->index_head_dim)) {
+        fprintf(stderr, "[cfg] rope_head_dim %d does not fit head_dim %d and index_head_dim %d\n",
+                c->rope_dim, c->head_dim, c->index_head_dim); exit(1); }
     int ratios[V41_MAX_LAYERS] = {0};
     int nr = jints(t, "compress_ratios", ratios, V41_MAX_LAYERS);
     if (nr < c->n_layers) {
