@@ -94,6 +94,13 @@ ld2_qwen36() {
     -- 8 8 qwen36_kv/ref_full.json
   [ "$(kv_hostparts qwen36 vk.log)" -gt 0 ] && [ "$(kv_hostparts "qwen36 dev2" vk.log)" -gt 0 ] ||
     { cat vk.log; fail "ld2 qwen36 KV split on both: a device's split ran no host part"; }
+  # with COLI_VK_KV_COLD=device the primary attends its host part on the device; the
+  # second device's stays on the CPU (the import is the primary's)
+  ld2_gate qwen36 "ld2 qwen36 KV split on both, the host's part on the device" 4 4 COLI_VK_KV_COLD=device COLI_VK_KV_DEVICE_ROWS=16 \
+    COLI_VK_KV_BLOCK=4 SNAP=qwen36_kv_c COLI_DENSE_I8=0 -- 8 8 qwen36_kv/ref_full.json
+  [ "$(kv_devcold qwen36 vk.log)" -gt 0 ] || { cat vk.log; fail "ld2 qwen36 COLI_VK_KV_COLD=device: the primary's host part never ran on the device"; }
+  { grep -q "^\[VK\] qwen36 dev2 chain: no shadow for layer" vk.log && [ "$(kv_hostparts "qwen36 dev2" vk.log)" -gt 0 ]; } ||
+    { cat vk.log; fail "ld2 qwen36 COLI_VK_KV_COLD=device: the second device's host part did not stay on the CPU"; }
   # prompt-lookup drafts verified across both devices (rollbacks of both chains' copies)
   local f
   for f in accept mixed cycle row1 row3; do
