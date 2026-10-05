@@ -673,8 +673,15 @@ static void add_rows(float *x, const float *y, size_t n)
     for (size_t i = 0; i < n; i++) x[i] += y[i];
 }
 
+#ifdef COLI_VULKAN
+#include "decide_vk.h"         /* COLI_VULKAN=1: the forward, or its matrices, on a Vulkan device */
+#endif
+
 static void gemm(float *Y, const float *X, int M, const QiMat *W, const float *bias)
 {
+#ifdef COLI_VULKAN
+    if (dvk_gemm(Y, X, M, W, bias)) return;   /* matrix by matrix (COLI_VK_CHAIN=0) */
+#endif
     qi_gemm(Y, X, M, W, bias);
 }
 
@@ -754,6 +761,9 @@ typedef struct {
     double actions[DECIDE_MAX_ACTIONS];
 } SeqOut;
 
+static void forward_tail(Laya *M, Seq *seqs, int S, const float *x, const int *first_row, const int *mark_row,
+                         SeqOut *outs);
+
 /* DecisionModel.forward over a batch of sequences. */
 static void forward(Laya *M, Seq *seqs, int S, SeqOut *outs)
 {
@@ -830,15 +840,31 @@ static void forward(Laya *M, Seq *seqs, int S, SeqOut *outs)
         add_rows(x, h, (size_t)T * d);
     }
 
+    int nm = 0;
+    for (int s = 0; s < S; s++) nm += seqs[s].n_markers;
+    int *mark_row = (int *)xmalloc((size_t)(nm > 0 ? nm : 1) * sizeof(int));
+    for (int s = 0, k = 0; s < S; s++)
+        for (int i = 0; i < seqs[s].n_markers; i++, k++) mark_row[k] = seq_off[s] + seqs[s].markers[i];
+    forward_tail(M, seqs, S, x, seq_off, mark_row, outs);
+    free(mark_row);
+    free(x); free(h); free(att); free(big); free(mid);
+    free(seq_off); free(row_seq); free(row_pos);
+}
+
+/* The scorer at the markers and the act head, on the final rows x: sequence s's first
+ * row is x[first_row[s]], its markers (all sequences' in order) x[mark_row[k]]. */
+static void forward_tail(Laya *M, Seq *seqs, int S, const float *x, const int *first_row, const int *mark_row,
+                         SeqOut *outs)
+{
+    int d = M->d;
     /* scorer at the markers: LayerNorm -> Linear -> GELU -> Linear(d, 1) */
     int nm = 0;
     for (int s = 0; s < S; s++) nm += seqs[s].n_markers;
     float *m = (float *)xmalloc((size_t)(nm > 0 ? nm : 1) * d * sizeof(float));
     float *mn = (float *)xmalloc((size_t)(nm > 0 ? nm : 1) * d * sizeof(float));
     float *m1 = (float *)xmalloc((size_t)(nm > 0 ? nm : 1) * d * sizeof(float));
-    for (int s = 0, k = 0; s < S; s++)
-        for (int i = 0; i < seqs[s].n_markers; i++, k++)
-            memcpy(m + (size_t)k * d, x + (size_t)(seq_off[s] + seqs[s].markers[i]) * d, (size_t)d * sizeof(float));
+    for (int k = 0; k < nm; k++)
+        memcpy(m + (size_t)k * d, x + (size_t)mark_row[k] * d, (size_t)d * sizeof(float));
     layernorm(mn, m, M->sc_ln_w, M->sc_ln_b, nm, d, 1e-5f);
     gemm(m1, mn, nm, &M->sc1, M->sc1_b);
     for (int s = 0, k = 0; s < S; s++) {
@@ -858,7 +884,7 @@ static void forward(Laya *M, Seq *seqs, int S, SeqOut *outs)
     for (int s = 0; s < S; s++) {
         int K = seqs[s].n_markers;
         float *f = feat + (size_t)s * (d + 4);
-        memcpy(f, x + (size_t)seq_off[s] * d, (size_t)d * sizeof(float));
+        memcpy(f, x + (size_t)first_row[s] * d, (size_t)d * sizeof(float));
         float mx = -INFINITY;
         for (int i = 0; i < K; i++) if ((float)outs[s].logits[i] > mx) mx = (float)outs[s].logits[i];
         float *p = (float *)xmalloc((size_t)(K > 0 ? K : 1) * sizeof(float));
@@ -888,9 +914,241 @@ static void forward(Laya *M, Seq *seqs, int S, SeqOut *outs)
     }
 
     free(feat); free(hid); free(m); free(mn); free(m1);
-    free(x); free(h); free(att); free(big); free(mid);
-    free(seq_off); free(row_seq); free(row_pos);
 }
+
+#ifdef COLI_VULKAN
+/* ------------------------------------------- the forward on the device */
+
+/* forward() as frames of the dense chain (decide_vk.h): the embedding rows go up, the
+ * encoder and the head layers run on the device in forward()'s order with its
+ * arithmetic (f32 throughout), and the rows forward_tail() reads come back. The
+ * norms' weights, the biases, the type embedding and the RoPE tables are uploaded once. */
+typedef struct {
+    int ok;
+    VkcBuf *prm, *tab;
+    VkcBuf *x, *h, *big, *mid, *att, *ipos, *rg, *rl, *tid, *down;
+    int emb_w, emb_b, fin_w, fin_b, type_emb;
+    int *an_w, *an_b, *mn_w, *mn_b, *bqkv, *bo, *bi, *bo2;          /* per encoder layer */
+    int *n1w, *n1b, *n2w, *n2b, *inb, *outb, *l1b, *l2b;            /* per head layer */
+    int cos_g, sin_g, cos_l, sin_l;
+} LayaVk;
+static LayaVk g_lvk;
+
+/* Every matrix's device copy now (the first request then pays nothing), and with the
+ * forward on the device, its parameters and tables. */
+static void laya_vk_setup(Laya *M)
+{
+    if (!g_dvk.ready || (!g_dvk.chain && !g_dvk.dense)) return;   /* nothing of it on the device */
+    g_dvk.f16 = 1;   /* the release stores F16: the device reads those values in half the bytes */
+    int n = 0, want = 0;
+    for (int l = 0; l < M->layers; l++) {
+        EncLayer *E = &M->L[l];
+        const QiMat *w[4] = {&E->wqkv, &E->wo, &E->wi, &E->wo2};
+        for (int k = 0; k < 4; k++, want++) n += dvk_tensor(w[k]) != NULL;
+    }
+    for (int l = 0; l < M->head_layers; l++) {
+        HeadLayer *H = &M->H[l];
+        const QiMat *w[4] = {&H->in_proj, &H->out_proj, &H->lin1, &H->lin2};
+        for (int k = 0; k < 4; k++, want++) n += dvk_tensor(w[k]) != NULL;
+    }
+    want += 2;
+    n += dvk_tensor(&M->sc1) != NULL;
+    n += dvk_tensor(&M->act1) != NULL;
+    size_t bytes = 0, tensors = 0;
+    coli_vk_mem_info(&bytes, &tensors);
+    fprintf(stderr, "[VK] laya: %d of %d matrices on the device (%.1f MiB; %u in f16, every value the checkpoint's, "
+            "%u in f32)\n", n, want, bytes / 1048576.0, g_dvk.n_f16, g_dvk.n_f32);
+    if (!g_dvk.chain) return;
+    if (n != want || M->hd > 128 || M->d / M->head_heads > 128 || M->d > 4096) {
+        fprintf(stderr, "[VK] laya: the forward stays on the CPU (%s)\n",
+                n != want ? "a matrix did not reach the device" : "a geometry past the chain's shaders");
+        g_dvk.chain = 0;
+        g_dvk.dense = coli_vk_dense();
+        return;
+    }
+    LayaVk *V = &g_lvk;
+    DvkPrm P = {0};
+    int L = M->layers, HL = M->head_layers > 0 ? M->head_layers : 1, d = M->d;
+    int **lv[8] = {&V->an_w, &V->an_b, &V->mn_w, &V->mn_b, &V->bqkv, &V->bo, &V->bi, &V->bo2};
+    int **hv[8] = {&V->n1w, &V->n1b, &V->n2w, &V->n2b, &V->inb, &V->outb, &V->l1b, &V->l2b};
+    for (int k = 0; k < 8; k++) { *lv[k] = (int *)xcalloc((size_t)L, sizeof(int)); *hv[k] = (int *)xcalloc((size_t)HL, sizeof(int)); }
+    V->emb_w = dvk_prm_add(&P, M->emb_norm_w, d);
+    V->emb_b = dvk_prm_add(&P, M->emb_norm_b, d);
+    V->fin_w = dvk_prm_add(&P, M->final_norm_w, d);
+    V->fin_b = dvk_prm_add(&P, M->final_norm_b, d);
+    V->type_emb = dvk_prm_add(&P, M->type_emb, (size_t)3 * d);
+    for (int l = 0; l < L; l++) {
+        EncLayer *E = &M->L[l];
+        V->an_w[l] = dvk_prm_add(&P, E->attn_norm_w, d);
+        V->an_b[l] = dvk_prm_add(&P, E->attn_norm_b, d);
+        V->mn_w[l] = dvk_prm_add(&P, E->mlp_norm_w, d);
+        V->mn_b[l] = dvk_prm_add(&P, E->mlp_norm_b, d);
+        V->bqkv[l] = dvk_prm_add(&P, E->bqkv, (size_t)3 * d);
+        V->bo[l] = dvk_prm_add(&P, E->bo, d);
+        V->bi[l] = dvk_prm_add(&P, E->bi, (size_t)2 * M->inter);
+        V->bo2[l] = dvk_prm_add(&P, E->bo2, d);
+    }
+    for (int l = 0; l < M->head_layers; l++) {
+        HeadLayer *H = &M->H[l];
+        V->n1w[l] = dvk_prm_add(&P, H->n1w, d);
+        V->n1b[l] = dvk_prm_add(&P, H->n1b, d);
+        V->n2w[l] = dvk_prm_add(&P, H->n2w, d);
+        V->n2b[l] = dvk_prm_add(&P, H->n2b, d);
+        V->inb[l] = dvk_prm_add(&P, H->in_proj_b, (size_t)3 * d);
+        V->outb[l] = dvk_prm_add(&P, H->out_proj_b, d);
+        V->l1b[l] = dvk_prm_add(&P, H->lin1_b, (size_t)4 * d);
+        V->l2b[l] = dvk_prm_add(&P, H->lin2_b, d);
+    }
+    V->prm = dvk_prm_upload(&P);
+    free(P.v);
+    DvkPrm T = {0};
+    size_t tn = (size_t)M->max_pos * (M->hd / 2);
+    V->cos_g = dvk_prm_add(&T, M->rope_g, tn);
+    V->sin_g = dvk_prm_add(&T, M->rope_g + tn, tn);
+    V->cos_l = dvk_prm_add(&T, M->rope_l, tn);
+    V->sin_l = dvk_prm_add(&T, M->rope_l + tn, tn);
+    V->tab = dvk_prm_upload(&T);
+    free(T.v);
+    if (!V->prm || !V->tab) {
+        fprintf(stderr, "[VK] laya: the forward stays on the CPU (no device memory for its parameters)\n");
+        g_dvk.chain = 0;
+        g_dvk.dense = coli_vk_dense();
+        return;
+    }
+    V->ok = 1;
+}
+
+/* x = LN(x + h) with the sum kept in x, or LN(x) alone; into y */
+static int lvk_norm(VkcBuf *x, VkcBuf *h, VkcBuf *y, int T, int d, int w, int b, int add, float eps)
+{
+    VkcEncNorm p = {0, T, d, 0, d, 0, d, 0, d, w, b, add ? VKC_ENC_ADD | VKC_ENC_SUM : 0, eps};
+    return vkc_enc_norm(x, h, g_lvk.prm, y, &p);
+}
+static int lvk_lin(const QiMat *W, VkcBuf *x, VkcBuf *y, int T, int bias, int act)
+{
+    ColiVkTensor *t = dvk_tensor(W);
+    if (!t || !vkc_matmul(t, x, 0, y, 0, T)) return 0;
+    if (bias < 0 && act == VKC_ENC_ACT_NONE) return 1;
+    VkcEncBias p = {0, T * W->N, W->N, 0, W->N, bias, act};
+    return vkc_enc_bias(y, g_lvk.prm, &p);
+}
+
+/* forward() for the S sequences on the device; 0 = the caller runs forward(). */
+static int laya_vk_forward(Laya *M, Seq *seqs, int S, SeqOut *outs)
+{
+    LayaVk *V = &g_lvk;
+    if (!g_dvk.chain || !V->ok || !vkc_ready()) return 0;
+    double t0 = dvk_now_ms();
+    int d = M->d, I = M->inter, T = 0, nm = 0;
+    for (int s = 0; s < S; s++) { T += seqs[s].n; nm += seqs[s].n_markers; }
+    if (T < 1 || T > 65535) return 0;
+    int wide = 3 * d;
+    if (2 * I > wide) wide = 2 * I;
+    if (4 * d > wide) wide = 4 * d;
+    int nread = S + nm;
+    size_t fd = sizeof(float), id = sizeof(int);
+    if (!vkc_reserve(&V->x, (size_t)T * d * fd, VKC_DEV) || !vkc_reserve(&V->h, (size_t)T * d * fd, VKC_DEV) ||
+        !vkc_reserve(&V->att, (size_t)T * d * fd, VKC_DEV) || !vkc_reserve(&V->big, (size_t)T * wide * fd, VKC_DEV) ||
+        !vkc_reserve(&V->mid, (size_t)T * (I > d ? I : d) * fd, VKC_DEV) ||
+        !vkc_reserve(&V->ipos, (size_t)T * id, VKC_DEV) || !vkc_reserve(&V->rg, (size_t)2 * T * id, VKC_DEV) ||
+        !vkc_reserve(&V->rl, (size_t)2 * T * id, VKC_DEV) || !vkc_reserve(&V->tid, (size_t)T * id, VKC_DEV) ||
+        !vkc_reserve(&V->down, (size_t)nread * d * fd, VKC_DOWN))
+        return 0;
+    /* the host's part: the embedding rows, and per row its position, its question type
+     * and the rows its attention sees (the sequence; the window inside it) */
+    float *emb = (float *)xmalloc((size_t)T * d * fd);
+    int *pos = (int *)xmalloc((size_t)T * id), *tid = (int *)xmalloc((size_t)T * id);
+    int *rg = (int *)xmalloc((size_t)2 * T * id), *rl = (int *)xmalloc((size_t)2 * T * id);
+    VkcRegion *reg = (VkcRegion *)xmalloc((size_t)nread * sizeof(VkcRegion));
+    for (int s = 0, r = 0, k = S; s < S; s++) {
+        int start = r, L = seqs[s].n;
+        reg[s] = (VkcRegion){(size_t)s * d, (size_t)start * d, (size_t)d};
+        for (int i = 0; i < seqs[s].n_markers; i++, k++)
+            reg[k] = (VkcRegion){(size_t)k * d, (size_t)(start + seqs[s].markers[i]) * d, (size_t)d};
+        for (int i = 0; i < L; i++, r++) {
+            int id_ = seqs[s].ids[i];
+            if (id_ < 0 || id_ >= M->vocab) id_ = 0;
+            memcpy(emb + (size_t)r * d, M->tok_emb + (size_t)id_ * d, (size_t)d * fd);
+            pos[r] = i; tid[r] = seqs[s].qtype;
+            rg[2 * r] = start; rg[2 * r + 1] = start + L - 1;
+            int lo = i - M->window < 0 ? 0 : i - M->window, hi = i + M->window > L - 1 ? L - 1 : i + M->window;
+            rl[2 * r] = start + lo; rl[2 * r + 1] = start + hi;
+        }
+    }
+    VkcBuf *x = V->x, *h = V->h, *big = V->big, *mid = V->mid, *att = V->att;
+    int ok = vkc_begin() && vkc_write(h, 0, emb, (size_t)T * d * fd) && vkc_write(V->ipos, 0, pos, (size_t)T * id) &&
+             vkc_write(V->tid, 0, tid, (size_t)T * id) && vkc_write(V->rg, 0, rg, (size_t)2 * T * id) &&
+             vkc_write(V->rl, 0, rl, (size_t)2 * T * id);
+    free(emb); free(pos); free(tid); free(rg); free(rl);
+    float eps = M->eps;
+    ok = ok && lvk_norm(h, NULL, x, T, d, V->emb_w, V->emb_b, 0, eps);
+    float scale = 1.0f / sqrtf((float)M->hd);
+    for (int l = 0; ok && l < M->layers; l++) {
+        EncLayer *E = &M->L[l];
+        /* layer 0 has no attention norm; the others' norm joined the previous add below */
+        VkcBuf *in = E->attn_norm_w ? h : x;
+        if (l == 0 && E->attn_norm_w) ok = lvk_norm(x, NULL, h, T, d, V->an_w[l], V->an_b[l], 0, eps);
+        ok = ok && lvk_lin(&E->wqkv, in, big, T, V->bqkv[l], VKC_ENC_ACT_NONE);
+        VkcEncRope rp = {0, T * M->heads * M->hd, M->heads, M->hd, 0, 3 * d, d,
+                         E->global ? V->cos_g : V->cos_l, E->global ? V->sin_g : V->sin_l};
+        ok = ok && vkc_enc_rope(big, V->tab, V->ipos, &rp);
+        VkcEncAttn ap = {0, T, M->heads, M->hd, 0, d, 2 * d, 3 * d, 0, d, 0, 0, 0, 0, 0, scale, 0};
+        ok = ok && vkc_enc_attn(big, NULL, NULL, att, E->global ? V->rg : V->rl, NULL, NULL, &ap);
+        ok = ok && lvk_lin(&E->wo, att, h, T, V->bo[l], VKC_ENC_ACT_NONE);
+        ok = ok && lvk_norm(x, h, h, T, d, V->mn_w[l], V->mn_b[l], 1, eps);     /* x += h; h = mlp_norm(x) */
+        ok = ok && lvk_lin(&E->wi, h, big, T, -1, VKC_ENC_ACT_NONE);
+        VkcEncGeglu gp = {0, T * I, I, 0, 2 * I, 0, I, V->bi[l],
+                          M->gelu_tanh ? VKC_ENC_ACT_GELU_TANH : VKC_ENC_ACT_GELU};
+        ok = ok && vkc_enc_geglu(big, V->prm, mid, &gp);
+        ok = ok && lvk_lin(&E->wo2, mid, h, T, V->bo2[l], VKC_ENC_ACT_NONE);
+        if (l + 1 < M->layers && M->L[l + 1].attn_norm_w)                        /* x += h; h = attn_norm(x) */
+            ok = ok && lvk_norm(x, h, h, T, d, V->an_w[l + 1], V->an_b[l + 1], 1, eps);
+        else if (l + 1 < M->layers) {
+            VkcEw ep = {VKC_EW_ADD, T * d, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.f};
+            ok = ok && vkc_ew(x, x, h, NULL, NULL, &ep);
+        }
+    }
+    /* x += h; the final norm into h, which carries the stream from here (forward()'s swap) */
+    ok = ok && lvk_norm(x, h, h, T, d, V->fin_w, V->fin_b, 1, eps);
+    { VkcBuf *t = x; x = h; h = t; }
+    VkcEncAddRow tp = {0, T * d, d, 0, d, V->type_emb};
+    ok = ok && vkc_enc_addrow(x, V->prm, V->tid, &tp);
+    int hh = M->head_heads, hhd = d / hh;
+    float hscale = 1.0f / sqrtf((float)hhd);
+    for (int l = 0; ok && l < M->head_layers; l++) {
+        HeadLayer *H = &M->H[l];
+        if (l == 0) ok = lvk_norm(x, NULL, h, T, d, V->n1w[l], V->n1b[l], 0, 1e-5f);
+        ok = ok && lvk_lin(&H->in_proj, h, big, T, V->inb[l], VKC_ENC_ACT_NONE);
+        VkcEncAttn ap = {0, T, hh, hhd, 0, d, 2 * d, 3 * d, 0, d, 0, 0, 0, 0, 0, hscale, 0};
+        ok = ok && vkc_enc_attn(big, NULL, NULL, att, V->rg, NULL, NULL, &ap);
+        ok = ok && lvk_lin(&H->out_proj, att, h, T, V->outb[l], VKC_ENC_ACT_NONE);
+        ok = ok && lvk_norm(x, h, h, T, d, V->n2w[l], V->n2b[l], 1, 1e-5f);     /* x += h; h = norm2(x) */
+        ok = ok && lvk_lin(&H->lin1, h, big, T, V->l1b[l], VKC_ENC_ACT_RELU);
+        ok = ok && lvk_lin(&H->lin2, big, h, T, V->l2b[l], VKC_ENC_ACT_NONE);
+        if (l + 1 < M->head_layers)                                             /* x += h; h = norm1(x) */
+            ok = ok && lvk_norm(x, h, h, T, d, V->n1w[l + 1], V->n1b[l + 1], 1, 1e-5f);
+        else {
+            VkcEw ep = {VKC_EW_ADD, T * d, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.f};
+            ok = ok && vkc_ew(x, x, h, NULL, NULL, &ep);
+        }
+    }
+    ok = ok && vkc_copy_regions(V->down, x, reg, nread) && vkc_submit(1);
+    free(reg);
+    if (!ok) {
+        if (vkc_lost()) fprintf(stderr, "[VK] laya: the device was lost: the forward runs on the CPU\n");
+        else vkc_finish();
+        return 0;
+    }
+    int *first = (int *)xmalloc((size_t)S * id), *mark = (int *)xmalloc((size_t)(nm > 0 ? nm : 1) * id);
+    for (int s = 0; s < S; s++) first[s] = s;
+    for (int k = 0; k < nm; k++) mark[k] = S + k;
+    forward_tail(M, seqs, S, (const float *)vkc_ptr(V->down), first, mark, outs);
+    free(first); free(mark);
+    g_dvk.fwd_dev++; g_dvk.rows_dev += (unsigned long long)T;
+    g_dvk.dev_ms += dvk_now_ms() - t0;
+    return 1;
+}
+#endif
 
 /* ------------------------------------------------------------ calibration */
 
@@ -945,9 +1203,16 @@ static int laya_decide(void *opaque, const DecideRecord *rec, DecideAnswer *answ
     for (int start = 0; start < Q;) {
         int end = start, rows = 0;
         while (end < Q && (end == start || rows + seqs[end].n <= LAYA_MAX_BATCH_ROWS)) rows += seqs[end++].n;
+#ifdef COLI_VULKAN
+        if (laya_vk_forward(M, seqs + start, end - start, outs + start)) { start = end; continue; }
+        if (g_dvk.chain) g_dvk.fwd_cpu++;
+#endif
         forward(M, seqs + start, end - start, outs + start);
         start = end;
     }
+#ifdef COLI_VULKAN
+    dvk_report();
+#endif
     int total = 0;
     for (int q = 0; q < Q; q++) {
         DecideAnswer *a = &answers[q];
@@ -1110,6 +1375,9 @@ int main(int argc, char **argv)
     fprintf(stderr, "[laya] %s: ModernBERT %d layers x %d, %d heads; head %d layers; max_len %d "
             "(head %d); loaded in %.1f s\n", M->model_name, M->layers, M->d, M->heads,
             M->head_layers, M->max_len, M->head_max_len, (now_ms() - t0) / 1e3);
+#ifdef COLI_VULKAN
+    if (!tokenize) { dvk_init("laya"); laya_vk_setup(M); }   /* COLI_VULKAN=1: the device */
+#endif
     if (tokenize) return run_tokenize(M, tokenize);
     if (records) return run_records(M, records, dump_ids);
     if (!serving) die("nothing to do: set SERVE=1, or pass --records / --tokenize");

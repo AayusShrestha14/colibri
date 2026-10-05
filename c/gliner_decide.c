@@ -946,6 +946,19 @@ static int log_bucket(int rel, int bucket_size, int max_position)
 
 static inline float gelu(float x) { return 0.5f * x * (1.0f + erff(x * 0.70710678118654752f)); }
 
+#ifdef COLI_VULKAN
+#include "decide_vk.h"         /* COLI_VULKAN=1: the forward, or its matrices, on a Vulkan device */
+#endif
+
+/* Y = X W^T + bias: the encoder's and the classifier's matrices */
+static void gemm(float *Y, const float *X, int M, const QiMat *W, const float *bias)
+{
+#ifdef COLI_VULKAN
+    if (dvk_gemm(Y, X, M, W, bias)) return;   /* matrix by matrix (COLI_VK_CHAIN=0) */
+#endif
+    qi_gemm(Y, X, M, W, bias);
+}
+
 static void add_rows(float *x, const float *y, size_t n)
 {
     #pragma omp parallel for schedule(static)
@@ -1051,6 +1064,19 @@ static void attention(const Gl *M, const GlLayer *E, const float *qkv, float *ou
     }
 }
 
+/* The classifier (Linear -> ReLU -> Linear(., 1)) on the nm marker rows m: logits[nm]. */
+static void classify(const Gl *M, float *m, int nm, double *logits)
+{
+    float *m1 = (float *)xmalloc((size_t)(nm > 0 ? nm : 1) * M->cls_hidden * sizeof(float));
+    if (nm > 0) gemm(m1, m, nm, &M->cls1, M->cls1_b);
+    for (int k = 0; k < nm; k++) {
+        float *row = m1 + (size_t)k * M->cls_hidden;
+        for (int j = 0; j < M->cls_hidden; j++) if (row[j] < 0.f) row[j] = 0.f;
+        logits[k] = (double)(dot_f32_lanes(row, M->cls2_w, M->cls_hidden) + M->cls2_b);
+    }
+    free(m1);
+}
+
 /* DebertaV2Model.forward on ids[0..T), then the classifier at the rows in
  * marks[0..nm): logits[nm]. */
 static void forward(const Gl *M, const int *ids, int T, const int *marks, int nm, double *logits)
@@ -1072,31 +1098,194 @@ static void forward(const Gl *M, const int *ids, int T, const int *marks, int nm
     layernorm(x, h, M->emb_ln_w, M->emb_ln_b, T, d, M->eps);
     for (int l = 0; l < M->layers; l++) {
         const GlLayer *E = &M->L[l];
-        qi_gemm(big, x, T, &E->wqkv, E->bqkv);
+        gemm(big, x, T, &E->wqkv, E->bqkv);
         attention(M, E, big, att, T, &A);
-        qi_gemm(h, att, T, &E->wo, E->bo);
+        gemm(h, att, T, &E->wo, E->bo);
         add_rows(h, x, (size_t)T * d);
         layernorm(x, h, E->ln1_w, E->ln1_b, T, d, M->eps);       /* x = attention_output */
-        qi_gemm(big, x, T, &E->wi, E->bi);
+        gemm(big, x, T, &E->wi, E->bi);
         #pragma omp parallel for schedule(static)
         for (size_t i = 0; i < (size_t)T * I; i++) big[i] = gelu(big[i]);
-        qi_gemm(h, big, T, &E->wo2, E->bo2);
+        gemm(h, big, T, &E->wo2, E->bo2);
         add_rows(h, x, (size_t)T * d);
         layernorm(x, h, E->ln2_w, E->ln2_b, T, d, M->eps);
     }
-    /* classifier: Linear -> ReLU -> Linear(., 1) at each [L] */
     float *m = (float *)xmalloc((size_t)(nm > 0 ? nm : 1) * d * sizeof(float));
-    float *m1 = (float *)xmalloc((size_t)(nm > 0 ? nm : 1) * M->cls_hidden * sizeof(float));
     for (int k = 0; k < nm; k++) memcpy(m + (size_t)k * d, x + (size_t)marks[k] * d, (size_t)d * sizeof(float));
-    if (nm > 0) qi_gemm(m1, m, nm, &M->cls1, M->cls1_b);
-    for (int k = 0; k < nm; k++) {
-        float *row = m1 + (size_t)k * M->cls_hidden;
-        for (int j = 0; j < M->cls_hidden; j++) if (row[j] < 0.f) row[j] = 0.f;
-        logits[k] = (double)(dot_f32_lanes(row, M->cls2_w, M->cls_hidden) + M->cls2_b);
-    }
-    free(m); free(m1); free(x); free(h); free(att); free(big);
+    classify(M, m, nm, logits);
+    free(m); free(x); free(h); free(att); free(big);
     free(A.p2c); free(A.vt); free(A.ridx);
 }
+
+#ifdef COLI_VULKAN
+/* ------------------------------------------- the forward on the device */
+
+/* forward() as frames of the dense chain (decide_vk.h): the embedding rows go up, the
+ * 24 layers run on the device in forward()'s order with its arithmetic (f32; the
+ * disentangled attention with both relative terms, chain_enc.comp mode 5), and the [L]
+ * rows come back for classify(). The relative embeddings' projections (pos_q, pos_k),
+ * the norms' weights and the biases are uploaded once. */
+typedef struct {
+    int ok;
+    VkcBuf *prm, *pos;
+    VkcBuf *x, *h, *big, *att, *rng, *ridx, *ipos, *down, *c2p, *p2c;
+    int emb_w, emb_b;
+    int *bqkv, *bo, *ln1w, *ln1b, *bi, *bo2, *ln2w, *ln2b, *pq, *pk;
+} GlVk;
+static GlVk g_gvk;
+
+static void gl_vk_setup(Gl *M)
+{
+    if (!g_dvk.ready || (!g_dvk.chain && !g_dvk.dense)) return;   /* nothing of it on the device */
+    int n = 0, want = 0;
+    for (int l = 0; l < M->layers; l++) {
+        GlLayer *E = &M->L[l];
+        const QiMat *w[4] = {&E->wqkv, &E->wo, &E->wi, &E->wo2};
+        for (int k = 0; k < 4; k++, want++) n += dvk_tensor(w[k]) != NULL;
+    }
+    want++;
+    n += dvk_tensor(&M->cls1) != NULL;
+    size_t bytes = 0, tensors = 0;
+    coli_vk_mem_info(&bytes, &tensors);
+    fprintf(stderr, "[VK] gliner_decide: %d of %d matrices on the device (%.1f MiB)\n", n, want, bytes / 1048576.0);
+    if (!g_dvk.chain) return;
+    if (n != want || M->hd > 128 || M->d > 4096) {
+        fprintf(stderr, "[VK] gliner_decide: the forward stays on the CPU (%s)\n",
+                n != want ? "a matrix did not reach the device" : "a geometry past the chain's shaders");
+        g_dvk.chain = 0;
+        g_dvk.dense = coli_vk_dense();
+        return;
+    }
+    GlVk *V = &g_gvk;
+    int L = M->layers, d = M->d, R = 2 * M->span;
+    int **lv[10] = {&V->bqkv, &V->bo, &V->ln1w, &V->ln1b, &V->bi, &V->bo2, &V->ln2w, &V->ln2b, &V->pq, &V->pk};
+    for (int k = 0; k < 10; k++) *lv[k] = (int *)xcalloc((size_t)L, sizeof(int));
+    DvkPrm P = {0}, Q = {0};
+    V->emb_w = dvk_prm_add(&P, M->emb_ln_w, d);
+    V->emb_b = dvk_prm_add(&P, M->emb_ln_b, d);
+    for (int l = 0; l < L; l++) {
+        GlLayer *E = &M->L[l];
+        V->bqkv[l] = dvk_prm_add(&P, E->bqkv, (size_t)3 * d);
+        V->bo[l] = dvk_prm_add(&P, E->bo, d);
+        V->ln1w[l] = dvk_prm_add(&P, E->ln1_w, d);
+        V->ln1b[l] = dvk_prm_add(&P, E->ln1_b, d);
+        V->bi[l] = dvk_prm_add(&P, E->bi, M->inter);
+        V->bo2[l] = dvk_prm_add(&P, E->bo2, d);
+        V->ln2w[l] = dvk_prm_add(&P, E->ln2_w, d);
+        V->ln2b[l] = dvk_prm_add(&P, E->ln2_b, d);
+        V->pq[l] = dvk_prm_add(&Q, E->pos_q, (size_t)R * d);
+        V->pk[l] = dvk_prm_add(&Q, E->pos_k, (size_t)R * d);
+    }
+    V->prm = dvk_prm_upload(&P);
+    V->pos = dvk_prm_upload(&Q);
+    free(P.v); free(Q.v);
+    if (!V->prm || !V->pos) {
+        fprintf(stderr, "[VK] gliner_decide: the forward stays on the CPU (no device memory for its parameters)\n");
+        g_dvk.chain = 0;
+        g_dvk.dense = coli_vk_dense();
+        return;
+    }
+    V->ok = 1;
+}
+
+static int gvk_lin(const QiMat *W, VkcBuf *x, VkcBuf *y, int T, int bias, int act)
+{
+    ColiVkTensor *t = dvk_tensor(W);
+    if (!t || !vkc_matmul(t, x, 0, y, 0, T)) return 0;
+    VkcEncBias p = {0, T * W->N, W->N, 0, W->N, bias, act};
+    return vkc_enc_bias(y, g_gvk.prm, &p);
+}
+
+/* forward() on the device; 0 = the caller runs forward(). */
+static int gl_vk_forward(const Gl *M, const int *ids, int T, const int *marks, int nm, double *logits)
+{
+    GlVk *V = &g_gvk;
+    if (!g_dvk.chain || !V->ok || !vkc_ready() || T < 1 || T > 65535) return 0;
+    double t0 = dvk_now_ms();
+    int d = M->d, I = M->inter, R = 2 * M->span;
+    int wide = 3 * d > I ? 3 * d : I, nread = nm > 0 ? nm : 1;
+    size_t fd = sizeof(float), id = sizeof(int);
+    if (!vkc_reserve(&V->x, (size_t)T * d * fd, VKC_DEV) || !vkc_reserve(&V->h, (size_t)T * d * fd, VKC_DEV) ||
+        !vkc_reserve(&V->att, (size_t)T * d * fd, VKC_DEV) || !vkc_reserve(&V->big, (size_t)T * wide * fd, VKC_DEV) ||
+        !vkc_reserve(&V->rng, (size_t)2 * T * id, VKC_DEV) || !vkc_reserve(&V->ridx, (size_t)2 * T * id, VKC_DEV) ||
+        !vkc_reserve(&V->ipos, (size_t)T * id, VKC_DEV) || !vkc_reserve(&V->down, (size_t)nread * d * fd, VKC_DOWN))
+        return 0;
+    /* the buckets a step can reach: ridx of delta -(T-1) .. T-1, which only grows */
+    int rlo_ = 0, rhi_ = R - 1;
+    {
+        int b = M->bucket_size > 0 && M->max_position > 0 ? log_bucket(-(T - 1), M->bucket_size, M->max_position) : -(T - 1);
+        int e = M->bucket_size > 0 && M->max_position > 0 ? log_bucket(T - 1, M->bucket_size, M->max_position) : T - 1;
+        rlo_ = b + M->span < 0 ? 0 : b + M->span > R - 1 ? R - 1 : b + M->span;
+        rhi_ = e + M->span < 0 ? 0 : e + M->span > R - 1 ? R - 1 : e + M->span;
+    }
+    int nr = rhi_ - rlo_ + 1;
+    if ((M->c2p && !vkc_reserve(&V->c2p, (size_t)M->heads * T * nr * fd, VKC_DEV)) ||
+        (M->p2c && !vkc_reserve(&V->p2c, (size_t)M->heads * T * nr * fd, VKC_DEV)))
+        return 0;
+    /* the host's part: the embedding rows; every row sees the whole sequence; the
+     * bucketed relative position of every delta, attention()'s ridx */
+    float *emb = (float *)xmalloc((size_t)T * d * fd);
+    int *rng = (int *)xmalloc((size_t)2 * T * id), *ridx = (int *)xmalloc((size_t)2 * T * id);
+    int *pos = (int *)xmalloc((size_t)T * id);
+    for (int r = 0; r < T; r++) {
+        int t = ids[r];
+        if (t < 0 || t >= M->vocab) t = 0;
+        memcpy(emb + (size_t)r * d, M->tok_emb + (size_t)t * d, (size_t)d * fd);
+        rng[2 * r] = 0; rng[2 * r + 1] = T - 1; pos[r] = r;
+    }
+    for (int delta = -(T - 1); delta <= T - 1; delta++) {
+        int b = M->bucket_size > 0 && M->max_position > 0 ? log_bucket(delta, M->bucket_size, M->max_position) : delta;
+        int r = b + M->span;
+        ridx[delta + T - 1] = r < 0 ? 0 : r > R - 1 ? R - 1 : r;
+    }
+    ridx[2 * T - 1] = 0;
+    VkcRegion *reg = (VkcRegion *)xmalloc((size_t)nread * sizeof(VkcRegion));
+    for (int k = 0; k < nm; k++) reg[k] = (VkcRegion){(size_t)k * d, (size_t)marks[k] * d, (size_t)d};
+    VkcBuf *x = V->x, *h = V->h, *big = V->big, *att = V->att;
+    int ok = vkc_begin() && vkc_write(h, 0, emb, (size_t)T * d * fd) && vkc_write(V->rng, 0, rng, (size_t)2 * T * id) &&
+             vkc_write(V->ridx, 0, ridx, (size_t)2 * T * id) && vkc_write(V->ipos, 0, pos, (size_t)T * id);
+    free(emb); free(rng); free(ridx); free(pos);
+    VkcEncNorm np = {0, T, d, 0, d, 0, d, 0, d, V->emb_w, V->emb_b, 0, M->eps};
+    ok = ok && vkc_enc_norm(h, NULL, V->prm, x, &np);
+    int sf = 1 + M->c2p + M->p2c;
+    float inv = 1.0f / sqrtf((float)(M->hd * sf));
+    int flags = (M->c2p ? VKC_ENC_C2P : 0) | (M->p2c ? VKC_ENC_P2C : 0);
+    for (int l = 0; ok && l < M->layers; l++) {
+        const GlLayer *E = &M->L[l];
+        ok = gvk_lin(&E->wqkv, x, big, T, V->bqkv[l], VKC_ENC_ACT_NONE);
+        /* the relative terms' products first, attention()'s c2p (q against the keys of
+         * the relative embeddings) and p2c (k against their queries), for the buckets
+         * this step reaches */
+        VkcEncRel rc = {0, T, M->heads, M->hd, 0, 3 * d, V->pk[l], d, 0, nr, rlo_};
+        VkcEncRel rp = {0, T, M->heads, M->hd, d, 3 * d, V->pq[l], d, 0, nr, rlo_};
+        if (M->c2p) ok = ok && vkc_enc_rel(big, V->pos, V->c2p, &rc);
+        if (M->p2c) ok = ok && vkc_enc_rel(big, V->pos, V->p2c, &rp);
+        VkcEncAttn ap = {0, T, M->heads, M->hd, 0, d, 2 * d, 3 * d, 0, d, flags, 0, 0, nr, T - 1, inv, rlo_};
+        ok = ok && vkc_enc_attn(big, V->c2p, V->p2c, att, V->rng, V->ridx, V->ipos, &ap);
+        ok = ok && gvk_lin(&E->wo, att, h, T, V->bo[l], VKC_ENC_ACT_NONE);
+        VkcEncNorm n1 = {0, T, d, 0, d, 0, d, 0, d, V->ln1w[l], V->ln1b[l], VKC_ENC_ADD, M->eps};   /* x = LN(h + x) */
+        ok = ok && vkc_enc_norm(h, x, V->prm, x, &n1);
+        ok = ok && gvk_lin(&E->wi, x, big, T, V->bi[l], VKC_ENC_ACT_GELU);
+        ok = ok && gvk_lin(&E->wo2, big, h, T, V->bo2[l], VKC_ENC_ACT_NONE);
+        VkcEncNorm n2 = {0, T, d, 0, d, 0, d, 0, d, V->ln2w[l], V->ln2b[l], VKC_ENC_ADD, M->eps};
+        ok = ok && vkc_enc_norm(h, x, V->prm, x, &n2);
+    }
+    ok = ok && (nm == 0 || vkc_copy_regions(V->down, x, reg, nm)) && vkc_submit(1);
+    free(reg);
+    if (!ok) {
+        if (vkc_lost()) fprintf(stderr, "[VK] gliner_decide: the device was lost: the forward runs on the CPU\n");
+        else vkc_finish();
+        return 0;
+    }
+    float *m = (float *)xmalloc((size_t)nread * d * fd);
+    memcpy(m, vkc_ptr(V->down), (size_t)nm * d * fd);
+    classify(M, m, nm, logits);
+    free(m);
+    g_dvk.fwd_dev++; g_dvk.rows_dev += (unsigned long long)T;
+    g_dvk.dev_ms += dvk_now_ms() - t0;
+    return 1;
+}
+#endif
 
 /* ------------------------------------------------------- the rendering */
 
@@ -1231,7 +1420,15 @@ static int gl_decide(void *opaque, const DecideRecord *rec, DecideAnswer *answer
     Rendered r;
     if (!render(M, rec, &r, err, cap)) { rendered_free(&r); return 0; }
     double *logits = (double *)xcalloc((size_t)(r.n_marks > 0 ? r.n_marks : 1), sizeof(double));
+#ifdef COLI_VULKAN
+    if (!gl_vk_forward(M, r.ids.v, r.ids.n, r.label_marks, r.n_marks, logits)) {
+        if (g_dvk.chain) g_dvk.fwd_cpu++;
+        forward(M, r.ids.v, r.ids.n, r.label_marks, r.n_marks, logits);
+    }
+    dvk_report();
+#else
     forward(M, r.ids.v, r.ids.n, r.label_marks, r.n_marks, logits);
+#endif
     for (int q = 0; q < rec->n_questions; q++) {
         const DecideQuestion *Q = &rec->questions[q];
         DecideAnswer *a = &answers[q];
@@ -1430,6 +1627,10 @@ int main(int argc, char **argv)
             "max_len %d; loaded in %.1f s\n", M->model_name, M->layers, M->d, M->heads, M->span,
             M->max_len, (now_ms() - t0) / 1e3);
     if (tokenize) return run_tokenize(M, tokenize);
+#ifdef COLI_VULKAN
+    dvk_init("gliner_decide");   /* COLI_VULKAN=1: the device */
+    gl_vk_setup(M);
+#endif
     if (records) return run_records(M, records, dump_ids);
     if (!serving) die("nothing to do: set SERVE=1, or pass --records / --tokenize / --split");
     int slots = getenv("KV_SLOTS") ? atoi(getenv("KV_SLOTS")) : 1;

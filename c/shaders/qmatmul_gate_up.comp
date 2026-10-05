@@ -73,6 +73,9 @@ float act_v4(float g, float u, float limit) {
     return g * s * u;
 }
 
+// Preserve small SiTU inputs; tanh(x) rounds to x below 2^-12 in f32.
+float situ_tanh(float x) { return abs(x) < 0.000244140625 ? x : tanh(x); }
+
 void main() {
     int s   = int(gl_WorkGroupID.y);
     int tid = int(gl_LocalInvocationID.x);
@@ -180,7 +183,7 @@ void main() {
         if (p.fmt == 1 || p.fmt == 2) { gt *= gscale[o]; ut *= uscale[o]; }   // per-row formats only
         float h;
         if (p.act == 1) {
-            h = p.a * tanh(gt / p.a) * (1.0 / (1.0 + exp(-gt))) * (p.b * tanh(ut / p.b));
+            h = p.a * situ_tanh(gt / p.a) * (1.0 / (1.0 + exp(-gt))) * (p.b * situ_tanh(ut / p.b));
         } else if (p.act == 2) {
             h = act_v4(gt, ut, p.limit);
         } else {

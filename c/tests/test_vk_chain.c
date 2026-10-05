@@ -48,6 +48,11 @@
  *            window and compressed rows (V4's bf16 roundings too), interleaved RoPE
  *            both ways, the compressor's ring (V4's overlapping form), the indexer's
  *            scores, candidate blocks and top-k slot for slot, the engram gate
+ *   kvs      the KV cache split between the device and the host (vk_kvsplit.h): decode
+ *            and prefill steps over a device holding a few blocks, the device's part, the
+ *            host's and their merge against the full attention, GQA (a gate, a sink,
+ *            position-major rows, a window, lists with pinned blocks) and MLA (NoPE, a
+ *            nonzero start, lists, latents up to 1024)
  *   dsv4 rounding  DeepSeek V4's roundings (deepseek_v4.c): bf16, E4M3 and E2M1 per block,
  *            the Hadamard transform, bit for bit; its SwiGLU within one bf16 step
  *
@@ -59,6 +64,7 @@
 #include <float.h>
 #include "../backend_vulkan.h"
 #include "../vk_chain.h"
+#include "../vk_kvsplit.h"        /* the KV cache split between the device and the host */
 #include "../delta_attention.h"      /* the KDA step the KDA ops follow */
 #include "../hyper_connections.h"    /* the mHC arithmetic */
 #include "../sparse_index.h"         /* GLM-5.3's k-pooled indexer */
@@ -192,9 +198,23 @@ static void test_rope(void) {
     vkc_free(xb); vkc_free(cb); free(x); free(ref); free(cs); free(y);
 }
 
+/* An automatic chunk must not force 64 rows when even one row exhausts the
+ * measured budget. Explicit overrides and small caps remain exact. */
+static void test_chunk_rows(void) {
+    setenv("COLI_VK_CHAIN_ROWS", "auto", 1);
+    setenv("COLI_VK_CHAIN_ROWS_MAX", "8192", 1);
+    CHECK(vkc_chunk_rows("test-tight-memory", SIZE_MAX / 4) == 1,
+          "automatic chunk exceeded a one-row memory budget");
+    setenv("COLI_VK_CHAIN_ROWS_MAX", "7", 1);
+    CHECK(vkc_chunk_rows("test-small-cap", 1) == 7, "automatic chunk exceeded its cap");
+    setenv("COLI_VK_CHAIN_ROWS", "3", 1);
+    CHECK(vkc_chunk_rows("test-explicit", SIZE_MAX / 4) == 3, "explicit chunk ignored");
+    unsetenv("COLI_VK_CHAIN_ROWS"); unsetenv("COLI_VK_CHAIN_ROWS_MAX");
+}
+
 /* ---- attention ---------------------------------------------------------------------- */
-static void test_attn(int S, int pos_base, int hd, int use_list) {
-    int H = 4, KVH = 2, cap = 300, gsz = hd, qseg = hd + gsz, koff = 64;
+static void test_attn_hk(int S, int pos_base, int H, int KVH, int hd, int use_list) {
+    int cap = 300, gsz = hd, qseg = hd + gsz, koff = 64;
     int T = pos_base + S;
     size_t kn = (size_t)koff + (size_t)KVH * cap * hd;
     float *q = fvec((size_t)S * H * qseg, 1.f), *kc = fvec(kn, 1.f), *vc = fvec(kn, 1.f);
@@ -234,10 +254,12 @@ static void test_attn(int S, int pos_base, int hd, int use_list) {
     vkc_begin(); int ok = vkc_attn(qb, kb, vb, ob, qb, lb, &p); vkc_submit(1);
     float *o = vkc_ptr(ob);
     double e = relerr(o, ref, (size_t)S * H * hd, 1e-3);
-    CHECK(ok && e < 2e-5, "attn S %d pos %d hd %d list %d: err %.2e", S, pos_base, hd, use_list, e);
+    CHECK(ok && e < 2e-5, "attn S %d pos %d H %d/%d hd %d list %d (block from %d): err %.2e", S, pos_base, H, KVH, hd,
+          use_list, vkc_attn_block_rows(), e);
     vkc_free(qb); vkc_free(kb); vkc_free(vb); vkc_free(ob); vkc_free(lb);
     free(q); free(kc); free(vc); free(sel); free(ref);
 }
+static void test_attn(int S, int pos_base, int hd, int use_list) { test_attn_hk(S, pos_base, 4, 2, hd, use_list); }
 
 /* MiMo's attention (vkc_attn_w): row s at pos = pos_base + s sees the positions
  * max(0, pos - win + 1)..pos (win 0: from 0); position t sits in row t % ring of the
@@ -280,6 +302,16 @@ static void test_attn_win(int S, int pos_base, int H, int KVH, int hd, int vd, i
     double e = relerr(o, ref, (size_t)S * H * vd, 1e-3);
     CHECK(ok && e < 2e-5, "attn window S %d pos %d hd %d vd %d win %d ring %d sink %d pm %d: err %.2e",
           S, pos_base, hd, vd, win, ring, sink, kv_pm, e);
+    if (S >= 16 && !getenv("COLI_VK_ATTN_SLICE")) {
+        size_t bytes = (size_t)S * H * vd * sizeof(float);
+        float *whole = malloc(bytes); memcpy(whole, o, bytes);
+        setenv("COLI_VK_ATTN_SLICE", "1", 1);
+        vkc_begin(); ok = vkc_attn_w(qb, kb, vb, ob, NULL, NULL, sink ? sb : NULL, &p);
+        ok = vkc_submit(1) && ok;
+        CHECK(ok && memcmp(whole, vkc_ptr(ob), bytes) == 0,
+              "attention slices changed bytes S %d H %d/%d win %d sink %d", S, H, KVH, win, sink);
+        unsetenv("COLI_VK_ATTN_SLICE"); free(whole);
+    }
     vkc_free(qb); vkc_free(kb); vkc_free(vb); vkc_free(sb); vkc_free(ob);
     free(q); free(kc); free(vc); free(snk); free(ref);
 }
@@ -942,6 +974,37 @@ static void test_mla(MlaCase c) {
           "ok %d err %.2e latent %.2e rope %.2e", H, Q, R, V, K, c.q_lora, S, pb, c.kv_start, c.style, c.split, c.list, c.gate,
           c.fq, c.fkv, c.fo, ok, e, el, er);
     if (getenv("VKC_TEST_VERBOSE")) printf("mla case H %d K %d S %d: err %.2e latent %.2e rope %.2e\n", H, K, S, e, el, er);
+    /* the same layer over the split cache (vk_kvsplit.h): a device of a few blocks of 4,
+     * the positions before them in the host's rows (lat, rope as given) */
+    if (vkc_kvs_ready()) {
+        int rows = (c.list ? 16 : 8) * S + 2;   /* blocks of 1, a step of S rows an eighth of the window */
+        char rv[32]; snprintf(rv, sizeof rv, "%d", rows); setenv("COLI_VK_KV_DEVICE_ROWS", rv, 1); setenv("COLI_VK_KV_BLOCK", "1", 1);
+        VkcKvSplit ks; memset(&ks, 0, sizeof ks);
+        int plan = vkc_kv_plan(&ks, "test", 1, (size_t)KR * 4, cap, S, c.list, 0);
+        unsetenv("COLI_VK_KV_DEVICE_ROWS"); unsetenv("COLI_VK_KV_BLOCK");
+        if (plan == 2) {
+            VkcMlaCache dc = {vkc_buf((size_t)ks.rows * K * 4, VKC_DEV), R ? vkc_buf((size_t)ks.rows * R * 4, VKC_DEV) : NULL, ks.rows};
+            VkcMlaCache tc = {vkc_buf((size_t)S * K * 4, VKC_DEV), R ? vkc_buf((size_t)S * R * 4, VKC_DEV) : NULL, S};
+            VkcKvPart pt[2] = {{1, K, lat, 0, dc.lat, 0}, {1, R ? R : 1, rope, 0, dc.rope, 0}};
+            VkcBuf *ob2 = vkc_buf((size_t)S * D * 4, VKC_DEV), *dn2 = vkc_buf((size_t)S * KR * 4, VKC_DOWN);
+            vkc_kv_place(&ks, 0, pb, S);
+            unsigned long long sp = ks.splits;
+            int ok2 = vkc_kv_parts(&ks, (size_t)S * H * (K + 2)) && vkc_begin() && vkc_kv_push(&ks, 0, pt, R ? 2 : 1, pb) &&
+                      vkc_write(sb, 0, sel, (size_t)S * selrow * 4) &&
+                      vkc_kv_mla_qkv(&ks, 0, &m, &scr, xb, 16, S, pb, csb, &dc, &tc, dn2, 0) &&
+                      vkc_kv_mla_attn(&ks, 0, &m, &scr, S, pb, c.kv_start, &dc, c.list ? sb : NULL, 0, selrow, c.gate ? gb : NULL, 0,
+                                      ob2, 0, lat, rope) && vkc_submit(1);
+            float *y2 = down(ob2, 0, (size_t)S * D);
+            double e2 = relerr(y2, ref, (size_t)S * D, 1e-3), el2 = 0;
+            float *nl2 = (float *)vkc_ptr(dn2);
+            for (size_t i = 0; i < (size_t)S * KR; i++) { double d = fabs(nl2[i] - nl[i]); if (d > el2) el2 = d; }
+            CHECK(ok2 && e2 < 2e-5 && el2 == 0 && (pb <= ks.rows || ks.splits > sp),
+                  "mla over the split cache H %d K %d S %d pos %d list %d: ok %d err %.2e, new rows %.2e, %llu host parts",
+                  H, K, S, pb, c.list, ok2, e2, el2, ks.splits - sp);
+            vkc_free(dc.lat); vkc_free(dc.rope); vkc_free(tc.lat); vkc_free(tc.rope); vkc_free(ob2); vkc_free(dn2); free(y2);
+        } else CHECK(cap <= rows, "mla over the split cache: no split for cap %d rows %d", cap, rows);
+        vkc_kv_free(&ks);
+    }
     vkc_mla_scratch_free(&scr);
     vkc_free(cc.lat); vkc_free(cc.rope); vkc_free(xb); vkc_free(csb); vkc_free(gb); vkc_free(ob); vkc_free(dn); vkc_free(sb);
     vkc_free(m.prm);
@@ -1093,14 +1156,18 @@ static void test_mhc(int H, int D, int iters) {
              vkc_mhc(VKC_MHC_COLLAPSE, xb, NULL, hb, NULL, cb, &sp) && vkc_mhc(VKC_MHC_POST, xb, bb, hb, NULL, ob, &po) &&
              vkc_mhc(VKC_MHC_MEAN, xb, NULL, NULL, NULL, eb, &sp) && vkc_submit(1);
     float *hp = down(hb, 0, (size_t)S * hrow), *col = down(cb, 0, (size_t)S * D), *out = down(ob, 0, (size_t)S * HD), *mean = down(eb, 0, (size_t)S * D);
-    /* pre, post and comb from coli_hc_split_sinkhorn on the CPU's own mixes */
+    /* Isolate the nonlinear split from the preceding matrix product: use the
+     * device's raw mixes here. End-to-end pre/post/collapse/write-back references
+     * above still include the CPU matrix product and retain their own bounds. */
     float *rp = malloc((size_t)S * hrow * 4), *mixs = malloc((size_t)nm * 4);
+    float *device_mix = down(mb, 0, (size_t)S * nm);
     for (int s = 0; s < S; s++) {
         float ms = 0; for (int i = 0; i < HD; i++) ms += x[s * HD + i] * x[s * HD + i];
         float ir = 1.f / sqrtf(ms / HD + eps);
-        for (int r = 0; r < nm; r++) { float a = 0; for (int i = 0; i < HD; i++) a += fn[(size_t)r * HD + i] * x[s * HD + i]; mixs[r] = a * ir; }
+        for (int r = 0; r < nm; r++) mixs[r] = device_mix[s * nm + r] * ir;
         coli_hc_split_sinkhorn(rp + s * hrow, rp + s * hrow + H, rp + s * hrow + 2 * H, mixs, prm, prm + 3, H, iters, hce);
     }
+    free(device_mix);
     double epre = 0;
     for (int s = 0; s < S; s++) for (int i = 0; i < hrow; i++) { double d = fabs(hp[s * hrow + i] - rp[s * hrow + i]); if (d > epre) epre = d; }
     free(rp); free(mixs);
@@ -1287,6 +1354,8 @@ static void test_ares(int S, int D, int nb) {
 static void test_situ(float b1, float b2) {
     int n = 777;
     float *ga = fvec(n, 3.f * b1), *ua = fvec(n, 3.f * b2), *rr = malloc((size_t)n * 4);
+    const float tiny[] = {0.f, 0x1p-40f, -0x1p-40f, 0x1p-20f, -0x1p-20f, 0x1p-13f, -0x1p-13f};
+    for (int i = 0; i < 7; i++) { ga[i] = b1 * tiny[i]; ua[i] = b2 * tiny[i]; }
     for (int i = 0; i < n; i++) rr[i] = b1 * tanhf(ga[i] / b1) * sigm(ga[i]) * b2 * tanhf(ua[i] / b2);
     VkcBuf *gb = up(ga, n), *ub = up(ua, n), *yb = vkc_buf((size_t)n * 4 + 64, VKC_DEV);
     VkcSitu sp = {n, 0, 0, 16, b1, b2};
@@ -1294,6 +1363,9 @@ static void test_situ(float b1, float b2) {
     float *y = down(yb, 16, n);
     double e = relerr(y, rr, n, 1e-3);
     CHECK(ok && e < 1e-6 && !bad(y, n), "situ b1 %g b2 %g: ok %d err %.2e", b1, b2, ok, e);
+    for (int i = 0; i < 7; i++)
+        CHECK(fabs((double)y[i] - rr[i]) <= 2e-6 * fabs(rr[i]),
+              "situ tiny b1 %g b2 %g at %d: got %.9g ref %.9g", b1, b2, i, y[i], rr[i]);
     vkc_free(gb); vkc_free(ub); vkc_free(yb); free(ga); free(ua); free(rr); free(y);
 }
 
@@ -1758,6 +1830,481 @@ static void test_frames(void) {
     vkc_free(x); vkc_free(y); free(a); free(acc); free(got);
 }
 
+/* ---- the KV cache split between the device and the host (chain_kvs, vk_kvsplit.h) --
+ * A host cache of every position, a device holding `rows` of them (vkc_kv_plan under
+ * COLI_VK_KV_DEVICE_ROWS), decode or prefill steps one after another as an engine runs
+ * them: the window placed, the rows below the step uploaded, the step's own rows stored
+ * from a scratch, then the device's part (F2) and the host's part (from the queries F1
+ * brought down) merged in F3, or one frame when the device holds every visible position.
+ * Each step's output against a double-precision reference of the full attention. */
+/* row s's positions: its list (count >= 0) or the causal range */
+static int kvs_positions(const int *sel, int sel_row, int s, int lo, int pos, int *out) {
+    if (sel && sel[(size_t)s * sel_row] >= 0) {
+        int n = 0;
+        for (int j = 0; j < sel[(size_t)s * sel_row]; j++) { int t = sel[(size_t)s * sel_row + 1 + j]; if (t >= 0) out[n++] = t; }
+        return n;
+    }
+    int n = 0;
+    for (int t = lo; t <= pos; t++) out[n++] = t;
+    return n;
+}
+
+/* A query value fixed by its position and index (not by the order the steps draw them):
+ * the same row gets the same query however the positions are cut into steps. */
+static float hval(unsigned a, unsigned b) {
+    unsigned x = a * 2654435761u ^ (b + 0x9e3779b9u) * 2246822519u;
+    x ^= x >> 15; x *= 2654435761u; x ^= x >> 13;
+    return (float)((int)(x % 2001u) - 1000) / 1000.0f;
+}
+/* each step's output rows, kept by position (kvs_keep_row floats a position) */
+static float *kvs_keep; static size_t kvs_keep_row;
+static int kvs_start; /* seeded canonical prefix; zero for the sequential tests */
+static float *hvec(size_t n, unsigned seed, float scale) { float *v = malloc(n * sizeof *v); for (size_t i = 0; i < n; i++) v[i] = hval(seed, (unsigned)i) * scale; return v; }
+/* The host's cache as an engine's holds it: a step's rows arrive after the step (the
+ * rows not there yet are NaN, which a host part reading them would carry into the
+ * result). copy rows [t0, t1) of a [seg][T][len] or [T][len] array. */
+static float *kvs_host(size_t n) { float *v = malloc(n * sizeof *v); for (size_t i = 0; i < n; i++) v[i] = NAN; return v; }
+static void kvs_arrive(float *dst, const float *src, int nseg, size_t seg, int len, int t0, int t1) {
+    for (int h = 0; h < nseg; h++) memcpy(dst + h * seg + (size_t)t0 * len, src + h * seg + (size_t)t0 * len, (size_t)(t1 - t0) * len * 4);
+}
+static void kvs_keep_rows(const float *o, int pb, int S) { if (kvs_keep) memcpy(kvs_keep + (size_t)pb * kvs_keep_row, o, (size_t)S * kvs_keep_row * 4); }
+
+/* GQA: steps of `step` rows from position 0 to T, the device holding `rows` positions. */
+static void test_kvs_gqa(int T, int step, int H, int KVH, int hd, int vd, int B, int rows, int win, int sink, int kv_pm,
+                         int gated, int lists, int selects) {
+    char rv[32]; snprintf(rv, sizeof rv, "%d", rows); setenv("COLI_VK_KV_DEVICE_ROWS", rv, 1);
+    char bv[32]; snprintf(bv, sizeof bv, "%d", B); setenv("COLI_VK_KV_BLOCK", bv, 1);
+    VkcKvSplit ks; memset(&ks, 0, sizeof ks);
+    int r = vkc_kv_plan(&ks, "test", 1, (size_t)KVH * (hd + vd) * 4, T, step, selects, 0);
+    unsetenv("COLI_VK_KV_DEVICE_ROWS"); unsetenv("COLI_VK_KV_BLOCK");
+    CHECK(r == 2 && ks.on, "kvs gqa: the plan did not split (%d)", r);
+    if (r != 2) { vkc_kv_free(&ks); return; }
+    if (step > ks.chunk) step = ks.chunk;   /* as the engines clamp a step to the split's */
+    float *Kh = hvec((size_t)T * KVH * hd, 1u << 30, 1.f), *Vh = hvec((size_t)T * KVH * vd, 1u << 29, 1.f), *snk = hvec(H + 3, 1u << 28, 2.f);
+    float *Kx = kvs_host((size_t)T * KVH * hd), *Vx = kvs_host((size_t)T * KVH * vd);
+    int qrow = H * 2 * hd, sel_row = lists ? 1 + T : 0;
+    float scale = 1.f / sqrtf((float)hd);
+    VkcBuf *kc = vkc_buf((size_t)KVH * ks.rows * hd * 4, VKC_DEV), *vc = vkc_buf((size_t)KVH * ks.rows * vd * 4, VKC_DEV);
+    VkcBuf *qb = vkc_buf((size_t)step * qrow * 4, VKC_DEV), *nk = vkc_buf((size_t)step * KVH * hd * 4, VKC_DEV);
+    VkcBuf *nv = vkc_buf((size_t)step * KVH * vd * 4, VKC_DEV), *ob = vkc_buf((size_t)step * H * vd * 4, VKC_DEV);
+    VkcBuf *sb = up(snk, H + 3), *lb = vkc_buf((size_t)step * (sel_row ? sel_row : 1) * 4, VKC_DEV);
+    int ok = vkc_kv_parts(&ks, (size_t)step * H * (vd + 2));
+    double worst = 0; int splits = 0, fins = 0;
+    int *posl = malloc((size_t)(T + 1) * sizeof *posl), *sel = calloc((size_t)step * (sel_row ? sel_row : 1), sizeof *sel);
+    float *ref = malloc((size_t)step * H * vd * sizeof *ref), *nkh = malloc((size_t)step * KVH * hd * 4), *nvh = malloc((size_t)step * KVH * vd * 4);
+    if (kvs_start) {
+        kvs_arrive(Kx, Kh, kv_pm ? 1 : KVH, (size_t)T * hd, kv_pm ? KVH * hd : hd, 0, kvs_start);
+        kvs_arrive(Vx, Vh, kv_pm ? 1 : KVH, (size_t)T * vd, kv_pm ? KVH * vd : vd, 0, kvs_start);
+    }
+    for (int pb = kvs_start; pb < T && ok; pb += step) {
+        int S = T - pb < step ? T - pb : step;
+        float *q = malloc((size_t)S * qrow * 4);
+        for (int s = 0; s < S; s++) for (int i = 0; i < qrow; i++) q[(size_t)s * qrow + i] = hval(pb + s, i);
+        for (int s = 0; s < S; s++) for (int h = 0; h < KVH; h++) {   /* the step's rows, as its projections leave them */
+            const float *ks_ = kv_pm ? Kh + ((size_t)(pb + s) * KVH + h) * hd : Kh + ((size_t)h * T + pb + s) * hd;
+            const float *vs_ = kv_pm ? Vh + ((size_t)(pb + s) * KVH + h) * vd : Vh + ((size_t)h * T + pb + s) * vd;
+            memcpy(nkh + ((size_t)s * KVH + h) * hd, ks_, hd * 4); memcpy(nvh + ((size_t)s * KVH + h) * vd, vs_, vd * 4);
+        }
+        if (lists) for (int s = 0; s < S; s++) {   /* odd rows causal; even rows every third position and a few far ones */
+            int pos = pb + s, n = 0, *rw = sel + (size_t)s * sel_row;
+            if (pos % 2) { rw[0] = -1; continue; }
+            for (int t = 0; t <= pos; t++) if (t % 3 == 0 || t == pos || t < 2 * B) rw[1 + n++] = t;
+            rw[1 + n++] = -1;   /* a skipped entry */
+            rw[0] = n;
+        }
+        for (int s = 0; s < S; s++) for (int h = 0; h < H; h++) {
+            int kvh = h / (H / KVH), pos = pb + s, lo = win ? (pos - win + 1 > 0 ? pos - win + 1 : 0) : 0;
+            int n = kvs_positions(lists ? sel : NULL, sel_row, s, lo, pos, posl);
+            double mx = sink ? snk[3 + h] : -1e300, sum = 0, *sc = malloc((n + 1) * sizeof *sc);
+            for (int j = 0; j < n; j++) {
+                const float *kr = kv_pm ? Kh + ((size_t)posl[j] * KVH + kvh) * hd : Kh + ((size_t)kvh * T + posl[j]) * hd;
+                double a = 0; for (int d = 0; d < hd; d++) a += (double)q[(size_t)s * qrow + h * 2 * hd + d] * kr[d];
+                sc[j] = a * scale; if (sc[j] > mx) mx = sc[j];
+            }
+            if (sink) sum = exp(snk[3 + h] - mx);
+            for (int j = 0; j < n; j++) { sc[j] = exp(sc[j] - mx); sum += sc[j]; }
+            for (int d = 0; d < vd; d++) {
+                double a = 0;
+                for (int j = 0; j < n; j++) {
+                    const float *vr = kv_pm ? Vh + ((size_t)posl[j] * KVH + kvh) * vd : Vh + ((size_t)kvh * T + posl[j]) * vd;
+                    a += sc[j] * vr[d];
+                }
+                double v = sum > 0 ? a / sum : 0;
+                if (gated) v *= sigm(q[(size_t)s * qrow + h * 2 * hd + hd + d]);
+                ref[((size_t)s * H + h) * vd + d] = (float)v;
+            }
+            free(sc);
+        }
+        /* the engine's order: the window placed, the rows below uploaded, the new rows stored */
+        VkcKvPart pk = {kv_pm ? 1 : KVH, kv_pm ? KVH * hd : hd, Kx, (size_t)T * hd, kc, 0};
+        VkcKvPart pv = {kv_pm ? 1 : KVH, kv_pm ? KVH * vd : vd, Vx, (size_t)T * vd, vc, 0};
+        VkcKvPart parts[2] = {pk, pv};
+        vkc_kv_place(&ks, 0, pb, S);
+        ok = vkc_begin() && vkc_kv_push(&ks, 0, parts, 2, pb) &&
+             vkc_write(qb, 0, q, (size_t)S * qrow * 4) && vkc_write(nk, 0, nkh, (size_t)S * KVH * hd * 4) &&
+             vkc_write(nv, 0, nvh, (size_t)S * KVH * vd * 4) && (!lists || vkc_write(lb, 0, sel, (size_t)S * sel_row * 4)) &&
+             vkc_kv_store(&ks, 0, &pk, nk, 0, (size_t)KVH * hd, kv_pm ? 0 : (size_t)hd, pb, S) &&
+             vkc_kv_store(&ks, 0, &pv, nv, 0, (size_t)KVH * vd, kv_pm ? 0 : (size_t)vd, pb, S);
+        unsigned long long sp = ks.splits;
+        VkcKvGqa ga = {&ks, 0, qb, kc, vc, qb, lists ? lb : NULL, sb, ob, S, H, KVH, hd, vd, pb, win, kv_pm, sink, 3,
+                       qrow, 2 * hd, gated, hd, qrow, 2 * hd, H * vd, 0, sel_row, scale,
+                       Kx, Vx, kv_pm ? (size_t)hd : (size_t)T * hd, kv_pm ? (size_t)KVH * hd : (size_t)hd,
+                       kv_pm ? (size_t)vd : (size_t)T * vd, kv_pm ? (size_t)KVH * vd : (size_t)vd};
+        ok = ok && vkc_kv_gqa(&ga);
+        if (ks.splits > sp) splits++; else fins++;
+        ok = ok && vkc_submit(1);
+        vkc_kv_done(&ks, 0, pb + S);
+        if (kv_pm) { kvs_arrive(Kx, Kh, 1, 0, KVH * hd, pb, pb + S); kvs_arrive(Vx, Vh, 1, 0, KVH * vd, pb, pb + S); }
+        else { kvs_arrive(Kx, Kh, KVH, (size_t)T * hd, hd, pb, pb + S); kvs_arrive(Vx, Vh, KVH, (size_t)T * vd, vd, pb, pb + S); }
+        float *o = down(ob, 0, (size_t)S * H * vd);
+        kvs_keep_rows(o, pb, S);
+        double e = relerr(o, ref, (size_t)S * H * vd, 1e-3);
+        if (bad(o, (size_t)S * H * vd)) e = 1e9;   /* a NaN: the host part read a row not there yet */
+        if (e > worst) worst = e;
+        free(o); free(q);
+    }
+    CHECK(ok && worst < 2e-5 && splits > 0, "kvs gqa T %d step %d H %d/%d hd %d vd %d B %d rows %d win %d sink %d pm %d gate %d lists %d: "
+          "err %.2e (%d split steps, %d whole)", T, step, H, KVH, hd, vd, B, rows, win, sink, kv_pm, gated, lists, worst, splits, fins);
+    printf("  kvs gqa T %d step %d rows %d lists %d: rel err %.2e, %d split steps, %d whole, %llu host positions, %llu pinned\n",
+           T, step, rows, lists, worst, splits, fins, ks.host_pos, ks.pins);
+    CHECK(!ks.np || !selects || ks.pins > 0, "kvs gqa lists: no block was pinned");
+    vkc_free(kc); vkc_free(vc); vkc_free(qb); vkc_free(nk); vkc_free(nv); vkc_free(ob); vkc_free(sb); vkc_free(lb);
+    vkc_kv_free(&ks);
+    free(Kh); free(Vh); free(Kx); free(Vx); free(snk); free(posl); free(sel); free(ref); free(nkh); free(nvh);
+}
+
+/* MLA: the latent and the rope key per position; lists with skipped entries; kv_start. */
+static void test_kvs_mla(int T, int step, int H, int K, int R, int B, int rows, int kv_start, int lists) {
+    char rv[32]; snprintf(rv, sizeof rv, "%d", rows); setenv("COLI_VK_KV_DEVICE_ROWS", rv, 1);
+    char bv[32]; snprintf(bv, sizeof bv, "%d", B); setenv("COLI_VK_KV_BLOCK", bv, 1);
+    VkcKvSplit ks; memset(&ks, 0, sizeof ks);
+    int r = vkc_kv_plan(&ks, "test", 2, (size_t)(K + R) * 4, T, step, lists, 0);
+    unsetenv("COLI_VK_KV_DEVICE_ROWS"); unsetenv("COLI_VK_KV_BLOCK");
+    CHECK(r == 2, "kvs mla: the plan did not split (%d)", r);
+    if (r != 2) { vkc_kv_free(&ks); return; }
+    if (step > ks.chunk) step = ks.chunk;
+    float *Lh = hvec((size_t)T * K, 1u << 30, 1.f), *Rh = hvec((size_t)T * (R ? R : 1), 1u << 29, 1.f);
+    float *Lx = kvs_host((size_t)T * K), *Rx = kvs_host((size_t)T * (R ? R : 1));
+    int sel_row = lists ? 1 + T : 0, li = 1;
+    float scale = 0.7f / sqrtf((float)(K + R));
+    VkcBuf *lat = vkc_buf((size_t)ks.rows * K * 4, VKC_DEV), *rope = vkc_buf((size_t)ks.rows * (R ? R : 1) * 4, VKC_DEV);
+    VkcBuf *qab = vkc_buf((size_t)step * H * (K + R) * 4, VKC_DEV), *nl = vkc_buf((size_t)step * (K + R) * 4, VKC_DEV);
+    VkcBuf *ob = vkc_buf((size_t)step * H * K * 4, VKC_DEV), *lb = vkc_buf((size_t)step * (sel_row ? sel_row : 1) * 4, VKC_DEV);
+    int ok = vkc_kv_parts(&ks, (size_t)step * H * (K + 2));
+    double worst = 0; int splits = 0;
+    int *posl = malloc((size_t)(T + 1) * sizeof *posl), *sel = calloc((size_t)step * (sel_row ? sel_row : 1), sizeof *sel);
+    float *ref = malloc((size_t)step * H * K * sizeof *ref), *nh = malloc((size_t)step * (K + R) * 4);
+    for (int pb = 0; pb < T && ok; pb += step) {
+        int S = T - pb < step ? T - pb : step;
+        float *q = malloc((size_t)S * H * (K + R) * 4);   /* qa [S][H][K], then qr [S][H][R] */
+        for (int s = 0; s < S; s++) {
+            for (int i = 0; i < H * K; i++) q[(size_t)s * H * K + i] = hval(pb + s, i);
+            for (int i = 0; i < H * R; i++) q[(size_t)S * H * K + (size_t)s * H * R + i] = hval(pb + s, 100000 + i);
+        }
+        for (int s = 0; s < S; s++) {
+            memcpy(nh + (size_t)s * K, Lh + (size_t)(pb + s) * K, K * 4);
+            if (R) memcpy(nh + (size_t)S * K + (size_t)s * R, Rh + (size_t)(pb + s) * R, R * 4);
+        }
+        if (lists) for (int s = 0; s < S; s++) {
+            int pos = pb + s, n = 0, *rw = sel + (size_t)s * sel_row;
+            if (pos % 3 == 2) { rw[0] = -1; continue; }
+            for (int t = 0; t <= pos; t++) if (t % 4 == 1 || t == pos || (t >= B && t < 3 * B)) rw[1 + n++] = t;
+            rw[1 + n++] = -1;
+            rw[0] = n;
+        }
+        for (int s = 0; s < S; s++) for (int h = 0; h < H; h++) {
+            int n = kvs_positions(lists ? sel : NULL, sel_row, s, kv_start, pb + s, posl);
+            double mx = -1e300, sum = 0, *sc = malloc((n + 1) * sizeof *sc);
+            for (int j = 0; j < n; j++) {
+                double a = 0;
+                for (int d = 0; d < K; d++) a += (double)q[((size_t)s * H + h) * K + d] * Lh[(size_t)posl[j] * K + d];
+                for (int d = 0; d < R; d++) a += (double)q[(size_t)S * H * K + ((size_t)s * H + h) * R + d] * Rh[(size_t)posl[j] * R + d];
+                sc[j] = a * scale; if (sc[j] > mx) mx = sc[j];
+            }
+            for (int j = 0; j < n; j++) { sc[j] = exp(sc[j] - mx); sum += sc[j]; }
+            for (int d = 0; d < K; d++) {
+                double a = 0;
+                for (int j = 0; j < n; j++) a += sc[j] * Lh[(size_t)posl[j] * K + d];
+                ref[((size_t)s * H + h) * K + d] = (float)(sum > 0 ? a / sum : 0);
+            }
+            free(sc);
+        }
+        VkcKvPart pl = {1, K, Lx, 0, lat, 0}, pr = {1, R ? R : 1, Rx, 0, rope, 0};
+        VkcKvPart parts[2] = {pl, pr};
+        vkc_kv_place(&ks, li, pb, S);
+        ok = vkc_begin() && vkc_kv_push(&ks, li, parts, R ? 2 : 1, pb) && vkc_write(qab, 0, q, (size_t)S * H * (K + R) * 4) &&
+             vkc_write(nl, 0, nh, (size_t)S * (K + R) * 4) && (!lists || vkc_write(lb, 0, sel, (size_t)S * sel_row * 4)) &&
+             vkc_kv_store(&ks, li, &pl, nl, 0, (size_t)K, 0, pb, S) &&
+             (!R || vkc_kv_store(&ks, li, &pr, nl, (size_t)S * K, (size_t)R, 0, pb, S));
+        unsigned long long sp = ks.splits;
+        VkcKvMla ma = {&ks, li, qab, qab, lat, rope, lists ? lb : NULL, ob, S, H, K, R, pb, kv_start,
+                       0, H * K, K, S * H * K, H * R, R, 0, H * K, K, 0, sel_row, scale, Lx, Rx, 0};
+        ok = ok && vkc_kv_mla(&ma);
+        if (ks.splits > sp) splits++;
+        ok = ok && vkc_submit(1);
+        vkc_kv_done(&ks, li, pb + S);
+        kvs_arrive(Lx, Lh, 1, 0, K, pb, pb + S);
+        if (R) kvs_arrive(Rx, Rh, 1, 0, R, pb, pb + S);
+        float *o = down(ob, 0, (size_t)S * H * K);
+        kvs_keep_rows(o, pb, S);
+        double e = relerr(o, ref, (size_t)S * H * K, 1e-3);
+        if (bad(o, (size_t)S * H * K)) e = 1e9;   /* a NaN: the host part read a row not there yet */
+        if (e > worst) worst = e;
+        free(o); free(q);
+    }
+    CHECK(ok && worst < 2e-5 && splits > 0, "kvs mla T %d step %d H %d K %d R %d B %d rows %d start %d lists %d: err %.2e (%d split steps)",
+          T, step, H, K, R, B, rows, kv_start, lists, worst, splits);
+    printf("  kvs mla T %d step %d K %d rows %d lists %d: rel err %.2e, %d split steps, %llu host positions, %llu pinned\n",
+           T, step, K, rows, lists, worst, splits, ks.host_pos, ks.pins);
+    CHECK(!lists || ks.pins > 0, "kvs mla lists: no block was pinned");
+    vkc_free(lat); vkc_free(rope); vkc_free(qab); vkc_free(nl); vkc_free(ob); vkc_free(lb);
+    vkc_kv_free(&ks);
+    free(Lh); free(Rh); free(Lx); free(Rx); free(posl); free(sel); free(ref); free(nh);
+}
+/* Inkling's global layer over the split cache: the relative-position bias for distances
+ * below ext, tau per row; steps from position 0 to T. */
+static void test_kvs_rel(int T, int step, int H, int KVH, int hd, int ext, int d_rel, int B, int rows) {
+    char rv[32]; snprintf(rv, sizeof rv, "%d", rows); setenv("COLI_VK_KV_DEVICE_ROWS", rv, 1);
+    char bv[32]; snprintf(bv, sizeof bv, "%d", B); setenv("COLI_VK_KV_BLOCK", bv, 1);
+    VkcKvSplit ks; memset(&ks, 0, sizeof ks);
+    int r = vkc_kv_plan(&ks, "test", 1, (size_t)KVH * hd * 2 * 4, T, step, 0, 0);
+    unsetenv("COLI_VK_KV_DEVICE_ROWS"); unsetenv("COLI_VK_KV_BLOCK");
+    CHECK(r == 2, "kvs rel: the plan did not split (%d)", r);
+    if (r != 2) { vkc_kv_free(&ks); return; }
+    if (step > ks.chunk) step = ks.chunk;
+    float *Kh = hvec((size_t)T * KVH * hd, 1u << 30, 1.f), *Vh = hvec((size_t)T * KVH * hd, 1u << 29, 1.f);
+    float *relp = hvec((size_t)d_rel * ext + 3, 1u << 28, 0.5f);
+    float *Kx = kvs_host((size_t)T * KVH * hd), *Vx = kvs_host((size_t)T * KVH * hd);
+    float scale = 1.f / (float)hd;
+    VkcBuf *kc = vkc_buf((size_t)KVH * ks.rows * hd * 4, VKC_DEV), *vc = vkc_buf((size_t)KVH * ks.rows * hd * 4, VKC_DEV);
+    VkcBuf *qb = vkc_buf((size_t)step * H * hd * 4, VKC_DEV), *rb = vkc_buf((size_t)step * H * (d_rel ? d_rel : 1) * 4, VKC_DEV);
+    VkcBuf *nk = vkc_buf((size_t)step * KVH * hd * 4, VKC_DEV), *nv = vkc_buf((size_t)step * KVH * hd * 4, VKC_DEV);
+    VkcBuf *ob = vkc_buf((size_t)step * H * hd * 4, VKC_DEV), *tb = vkc_buf((size_t)(step + 2) * 4, VKC_UP), *pb_ = up(relp, (size_t)d_rel * ext + 3);
+    int ok = vkc_kv_parts(&ks, (size_t)step * H * (hd + 2));
+    double worst = 0; int splits = 0;
+    float *ref = malloc((size_t)step * H * hd * 4), *nkh = malloc((size_t)step * KVH * hd * 4), *nvh = malloc((size_t)step * KVH * hd * 4);
+    float *tau = malloc((size_t)(step + 2) * 4);
+    for (int pb = 0; pb < T && ok; pb += step) {
+        int S = T - pb < step ? T - pb : step;
+        float *q = malloc((size_t)S * H * hd * 4), *rr = malloc((size_t)S * H * (d_rel ? d_rel : 1) * 4);
+        for (int s = 0; s < S; s++) {
+            for (int i = 0; i < H * hd; i++) q[(size_t)s * H * hd + i] = hval(pb + s, i);
+            for (int i = 0; i < H * (d_rel ? d_rel : 1); i++) rr[(size_t)s * H * (d_rel ? d_rel : 1) + i] = hval(pb + s, 50000 + i);
+        }
+        for (int s = 0; s < S; s++) { tau[2 + s] = 1.f + 0.3f * logf(1.f + (float)(pb + s) / 7.f); }
+        for (int s = 0; s < S; s++) for (int h = 0; h < KVH; h++) {
+            memcpy(nkh + ((size_t)s * KVH + h) * hd, Kh + ((size_t)h * T + pb + s) * hd, hd * 4);
+            memcpy(nvh + ((size_t)s * KVH + h) * hd, Vh + ((size_t)h * T + pb + s) * hd, hd * 4);
+        }
+        for (int s = 0; s < S; s++) for (int h = 0; h < H; h++) {
+            int kvh = h / (H / KVH), pos = pb + s;
+            double mx = -1e300, sum = 0, *sc = malloc((pos + 1) * sizeof *sc);
+            for (int t = 0; t <= pos; t++) {
+                double a = 0; for (int d = 0; d < hd; d++) a += (double)q[((size_t)s * H + h) * hd + d] * Kh[((size_t)kvh * T + t) * hd + d];
+                double bias = 0; int dist = pos - t;
+                if (dist < ext) for (int j = 0; j < d_rel; j++) bias += (double)rr[((size_t)s * H + h) * d_rel + j] * relp[3 + (size_t)j * ext + dist];
+                sc[t] = tau[2 + s] * (a * scale + bias); if (sc[t] > mx) mx = sc[t];
+            }
+            for (int t = 0; t <= pos; t++) { sc[t] = exp(sc[t] - mx); sum += sc[t]; }
+            for (int d = 0; d < hd; d++) {
+                double a = 0; for (int t = 0; t <= pos; t++) a += sc[t] * Vh[((size_t)kvh * T + t) * hd + d];
+                ref[((size_t)s * H + h) * hd + d] = (float)(a / sum);
+            }
+            free(sc);
+        }
+        VkcKvPart pk = {KVH, hd, Kx, (size_t)T * hd, kc, 0}, pv = {KVH, hd, Vx, (size_t)T * hd, vc, 0};
+        VkcKvPart parts[2] = {pk, pv};
+        vkc_kv_place(&ks, 0, pb, S);
+        memcpy(vkc_ptr(tb), tau, (size_t)(S + 2) * 4);
+        ok = vkc_begin() && vkc_kv_push(&ks, 0, parts, 2, pb) && vkc_write(qb, 0, q, (size_t)S * H * hd * 4) &&
+             (!d_rel || vkc_write(rb, 0, rr, (size_t)S * H * d_rel * 4)) &&
+             vkc_write(nk, 0, nkh, (size_t)S * KVH * hd * 4) && vkc_write(nv, 0, nvh, (size_t)S * KVH * hd * 4) &&
+             vkc_kv_store(&ks, 0, &pk, nk, 0, (size_t)KVH * hd, (size_t)hd, pb, S) &&
+             vkc_kv_store(&ks, 0, &pv, nv, 0, (size_t)KVH * hd, (size_t)hd, pb, S);
+        unsigned long long sp = ks.splits;
+        VkcKvRel a = {&ks, 0, qb, kc, vc, rb, tb, pb_, ob, S, H, KVH, hd, pb, ext, d_rel, H * hd, H * d_rel, 3, 2, H * hd, scale,
+                      Kx, Vx, (size_t)T * hd, (size_t)hd, (size_t)T * hd, (size_t)hd, tau + 2, relp + 3, 0};
+        ok = ok && vkc_kv_rel(&a) && vkc_submit(1);
+        if (ks.splits > sp) splits++;
+        vkc_kv_done(&ks, 0, pb + S);
+        kvs_arrive(Kx, Kh, KVH, (size_t)T * hd, hd, pb, pb + S); kvs_arrive(Vx, Vh, KVH, (size_t)T * hd, hd, pb, pb + S);
+        float *o = down(ob, 0, (size_t)S * H * hd);
+        kvs_keep_rows(o, pb, S);
+        double e = relerr(o, ref, (size_t)S * H * hd, 1e-3);
+        if (bad(o, (size_t)S * H * hd)) e = 1e9;   /* a NaN: the host part read a row not there yet */
+        if (e > worst) worst = e;
+        free(o); free(q); free(rr);
+    }
+    CHECK(ok && worst < 2e-5 && splits > 0, "kvs rel T %d step %d H %d/%d hd %d ext %d d_rel %d B %d rows %d: err %.2e (%d split steps)",
+          T, step, H, KVH, hd, ext, d_rel, B, rows, worst, splits);
+    printf("  kvs rel T %d step %d rows %d ext %d: rel err %.2e, %d split steps, %llu host positions\n", T, step, rows, ext, worst, splits, ks.host_pos);
+    vkc_free(kc); vkc_free(vc); vkc_free(qb); vkc_free(rb); vkc_free(nk); vkc_free(nv); vkc_free(ob); vkc_free(tb); vkc_free(pb_);
+    vkc_kv_free(&ks);
+    free(Kh); free(Vh); free(Kx); free(Vx); free(relp); free(ref); free(nkh); free(nvh); free(tau);
+}
+
+/* DeepSeek's sparse attention over a window ring and compressed rows split between the
+ * device and the host: against the scalar kernel (V4's rounding: its reference), and with
+ * every compressed row on the device, bit for bit against vkc_dsv4_attn. */
+static void test_kvs_ds(int S, int H, int hd, int nwin, int ncmp, int cnt, int v4, int B, int rows) {
+    int qrow = H * hd + 3, lrow = cnt + 2, orow = H * hd + 3;
+    float *q = fvec((size_t)S * qrow, 1.f), *win = fvec((size_t)nwin * hd, 1.f), *cmp = fvec((size_t)ncmp * hd, 1.f);
+    float *sink = fvec((size_t)H + 2, 2.f), *ref = calloc((size_t)S * orow, 4), *sc = malloc((size_t)cnt * 4);
+    int *list = malloc((size_t)S * lrow * 4);
+    float *kvall = malloc((size_t)(nwin + ncmp) * hd * 4);
+    memcpy(kvall, win, (size_t)nwin * hd * 4); memcpy(kvall + (size_t)nwin * hd, cmp, (size_t)ncmp * hd * 4);
+    for (int s = 0; s < S; s++)
+        for (int j = 0; j < lrow; j++) {
+            int r = (int)(rnd() % 6);
+            list[s * lrow + j] = r == 0 ? -1 - (int)(rnd() % 7) : r < 2 ? (int)(rnd() % (unsigned)nwin) : nwin + (int)(rnd() % (unsigned)ncmp);
+        }
+    float scale = 1.f / sqrtf((float)hd);
+    for (int s = 0; s < S; s++) for (int h = 0; h < H; h++) {
+        const float *qq = q + (size_t)s * qrow + 1 + h * hd;
+        float *o = ref + (size_t)s * orow + 2 + h * hd;
+        const int *idx = list + s * lrow + 1;
+        if (!v4) { coli_sparse_attend_scalar(o, qq, kvall, idx, cnt, hd, sink[1 + h], scale, sc); continue; }
+        float best = -1e30f;
+        for (int j = 0; j < cnt; j++) {
+            if (idx[j] < 0) { sc[j] = -INFINITY; continue; }
+            float d = 0; for (int i = 0; i < hd; i++) d += qq[i] * kvall[(size_t)idx[j] * hd + i];
+            sc[j] = d * scale; if (sc[j] > best) best = sc[j];
+        }
+        float den = expf(sink[1 + h] - best);
+        for (int i = 0; i < hd; i++) o[i] = 0;
+        for (int j = 0; j < cnt; j++) {
+            if (idx[j] < 0) continue;
+            float w = expf(sc[j] - best); den += w; w = bf16r(w);
+            for (int i = 0; i < hd; i++) o[i] += w * kvall[(size_t)idx[j] * hd + i];
+        }
+        for (int i = 0; i < hd; i++) o[i] = bf16r(o[i] / den);
+    }
+    VkcBuf *qb = up(q, (size_t)S * qrow), *wb = up(win, (size_t)nwin * hd), *cb = up(cmp, (size_t)ncmp * hd);
+    VkcBuf *sb = up(sink, (size_t)H + 2), *lb = vkc_buf((size_t)S * lrow * 4, VKC_DEV);
+    VkcBuf *ow = vkc_buf((size_t)S * orow * 4, VKC_DEV), *os = vkc_buf((size_t)S * orow * 4, VKC_DEV);
+    vkc_begin(); vkc_write(lb, 0, list, (size_t)S * lrow * 4); vkc_submit(1);
+    VkcDsAttn p = {S, H, hd, cnt, 1, lrow, nwin, 0, 0, 1, qrow, 2, orow, 1, v4, scale};
+    int ok = vkc_begin() && vkc_dsv4_attn(qb, wb, cb, lb, sb, ow, &p) && vkc_submit(1);
+    float *whole = down(ow, 0, (size_t)S * orow);
+    /* twice: a device holding `rows` compressed rows (a host part), then all of them (fin) */
+    for (int pass = 0; pass < 2; pass++) {
+        int rws = pass ? B * ((ncmp + B - 1) / B) : rows;
+        char rv[32]; snprintf(rv, sizeof rv, "%d", rws); setenv("COLI_VK_KV_DEVICE_ROWS", rv, 1);
+        char bv[32]; snprintf(bv, sizeof bv, "%d", B); setenv("COLI_VK_KV_BLOCK", bv, 1);
+        VkcKvSplit ks; memset(&ks, 0, sizeof ks);
+        int r = vkc_kv_plan(&ks, "test", 1, (size_t)hd * 4, ncmp + 2 * B, 1, 1, 0);
+        unsetenv("COLI_VK_KV_DEVICE_ROWS"); unsetenv("COLI_VK_KV_BLOCK");
+        CHECK(r == 2, "kvs ds: the plan did not split (%d)", r);
+        if (r != 2) { vkc_kv_free(&ks); continue; }
+        if (pass) { ks.nw = ks.ns; ks.np = 0; }        /* every block in the window */
+        VkcBuf *dc = vkc_buf((size_t)ks.rows * hd * 4, VKC_DEV);
+        VkcKvPart pc = {1, hd, cmp, 0, dc, 0};
+        vkc_kv_place(&ks, 0, ncmp - 1, 1);
+        unsigned long long sp = ks.splits;
+        ok = vkc_kv_parts(&ks, (size_t)S * H * (hd + 2)) && vkc_begin() && vkc_kv_push(&ks, 0, &pc, 1, ncmp);
+        /* The current chunk's resident rows may not have reached canonical RAM
+         * yet. Poison them there: staging must read only nonresident rows. */
+        float *hostcmp = malloc((size_t)ncmp * hd * sizeof(float));
+        memcpy(hostcmp, cmp, (size_t)ncmp * hd * sizeof(float));
+        for (int j = 0; j < ncmp; j++) if (ks.t[0].bt[j / B] >= 0)
+            for (int d = 0; d < hd; d++) hostcmp[(size_t)j * hd + d] = NAN;
+        VkcKvDs a = {&ks, 0, qb, wb, dc, sb, lb, os, S, H, hd, cnt, 1, lrow, nwin, 0, 1, qrow, 1, v4, 2, orow, ncmp, scale, hostcmp};
+        ok = ok && vkc_kv_ds(&a) && vkc_submit(1);
+        float *got = down(os, 0, (size_t)S * orow);
+        double e = 0, ew = 0;
+        for (int s = 0; s < S; s++) {
+            double r1 = relerr(got + (size_t)s * orow + 2, ref + (size_t)s * orow + 2, (size_t)H * hd, 1e-3); if (r1 > e) e = r1;
+            double r2 = relerr(got + (size_t)s * orow + 2, whole + (size_t)s * orow + 2, (size_t)H * hd, 1e-3); if (r2 > ew) ew = r2;
+        }
+        int same = 1;
+        for (int s = 0; s < S; s++) same &= !memcmp(got + (size_t)s * orow + 2, whole + (size_t)s * orow + 2, (size_t)H * hd * 4);
+        double tol = 2e-5;
+        if (pass) CHECK(ok && same && ks.splits == sp, "kvs ds fin S %d H %d hd %d cnt %d v4 %d: not vkc_dsv4_attn's bits (err %.2e)", S, H, hd, cnt, v4, ew);
+        else CHECK(ok && same && e < tol && ks.splits > sp && ks.staged_rows > 0, "kvs ds S %d H %d hd %d cnt %d v4 %d rows %d: err %.2e (%llu host parts)", S, H, hd, cnt, v4, rows, e, ks.splits - sp);
+        printf("  kvs ds S %d hd %d cnt %d v4 %d rows %d: rel err %.2e against the reference, %.2e against the whole op%s\n",
+               S, hd, cnt, v4, rws, e, ew, pass ? (same ? " (its bits)" : " (NOT its bits)") : "");
+        vkc_free(dc); free(got); free(hostcmp);
+        vkc_kv_free(&ks);
+    }
+    vkc_free(qb); vkc_free(wb); vkc_free(cb); vkc_free(sb); vkc_free(lb); vkc_free(ow); vkc_free(os);
+    free(q); free(win); free(cmp); free(sink); free(ref); free(sc); free(list); free(kvall); free(whole);
+}
+/* The same positions in steps of different sizes give the same bits (the split's
+ * partition follows each row's own position): GQA, MLA and Inkling's, causal, and a
+ * list engine's with no pins. */
+static void test_kvs_steps(void) {
+    int T = 70, H = 4, hd = 32;
+    float *a = malloc((size_t)T * H * 64 * 4), *b = malloc((size_t)T * H * 64 * 4);
+    kvs_keep_row = (size_t)H * hd;
+    kvs_keep = a; test_kvs_gqa(T, 1, H, 2, hd, hd, 4, 32, 0, 1, 0, 1, 0, 0);
+    kvs_keep = b; test_kvs_gqa(T, 3, H, 2, hd, hd, 4, 32, 0, 1, 0, 1, 0, 0);
+    CHECK(!memcmp(a, b, (size_t)T * kvs_keep_row * 4), "kvs: GQA rows in steps of 1 and 3 differ");
+    setenv("COLI_VK_KV_SLICE", "20000", 1);   /* the device's rows in slices of a row or two, a submission each */
+    kvs_keep = b; test_kvs_gqa(T, 3, H, 2, hd, hd, 4, 32, 0, 1, 0, 1, 0, 0);
+    unsetenv("COLI_VK_KV_SLICE");
+    CHECK(!memcmp(a, b, (size_t)T * kvs_keep_row * 4), "kvs: GQA rows in slices differ");
+    unsetenv("COLI_VK_KV_PIN");   /* default: a deterministic partition even for lists */
+    kvs_keep = a; test_kvs_gqa(T, 1, H, 2, hd, hd, 4, 32, 0, 0, 0, 1, 1, 1);
+    kvs_keep = b; test_kvs_gqa(T, 4, H, 2, hd, hd, 4, 32, 0, 0, 0, 1, 1, 1);
+    unsetenv("COLI_VK_KV_PIN");
+    CHECK(!memcmp(a, b, (size_t)T * kvs_keep_row * 4), "kvs: listed GQA rows in steps of 1 and 4 (no pins) differ");
+    kvs_keep_row = (size_t)2 * 64;
+    kvs_keep = a; test_kvs_mla(T, 1, 2, 64, 8, 4, 32, 0, 0);
+    kvs_keep = b; test_kvs_mla(T, 2, 2, 64, 8, 4, 32, 0, 0);
+    CHECK(!memcmp(a, b, (size_t)T * kvs_keep_row * 4), "kvs: MLA rows in steps of 1 and 2 differ");
+    kvs_keep_row = (size_t)H * hd;
+    kvs_keep = a; test_kvs_rel(T, 1, H, 2, hd, 16, 4, 4, 32);
+    kvs_keep = b; test_kvs_rel(T, 4, H, 2, hd, 16, 4, 4, 32);
+    CHECK(!memcmp(a, b, (size_t)T * kvs_keep_row * 4), "kvs: Inkling's rows in steps of 1 and 4 differ");
+    kvs_keep = NULL;
+    free(a); free(b);
+    printf("  kvs: the same bits for every position in steps of 1, 2, 3 and 4, and in slices of rows\n");
+}
+static void test_kvs(void) {
+    setenv("COLI_VK_KV_PIN", "1", 1); /* explicitly exercise read-based pins */
+    /* T step H KVH hd vd B rows win sink pm gate lists selects */
+    test_kvs_gqa(40, 1, 4, 2, 32, 32, 4, 12, 0, 0, 0, 1, 0, 0);       /* decode over a window of three blocks, a gate */
+    test_kvs_gqa(41, 3, 4, 2, 32, 32, 4, 8, 0, 0, 0, 1, 0, 0);        /* the smallest device: steps across a block */
+    test_kvs_gqa(70, 7, 4, 2, 48, 32, 8, 32, 0, 1, 1, 0, 0, 0);       /* prefill chunks, MiMo's position-major rows, a sink */
+    test_kvs_gqa(300, 1, 8, 2, 64, 64, 16, 64, 0, 0, 0, 1, 0, 0);     /* past a tile of the device's rows */
+    test_kvs_gqa(600, 50, 4, 4, 16, 16, 16, 128, 0, 0, 0, 0, 0, 0);   /* host tiles of many positions, prefill rows */
+    test_kvs_gqa(60, 3, 4, 2, 32, 32, 4, 24, 0, 0, 0, 1, 1, 1);       /* selection lists, pinned blocks */
+    test_kvs_gqa(50, 2, 4, 2, 256, 256, 4, 16, 0, 0, 0, 1, 1, 1);     /* the largest head */
+    test_kvs_gqa(60, 2, 4, 2, 32, 24, 4, 16, 20, 1, 1, 0, 0, 0);      /* a window wider than the device's rows */
+    test_kvs_gqa(48, 12, 4, 2, 32, 32, 4, 40, 0, 0, 0, 1, 0, 0);      /* prompt chunks on the device whole, then split */
+    /* T step H K R B rows kv_start lists */
+    test_kvs_mla(40, 1, 4, 32, 8, 4, 12, 0, 0);
+    test_kvs_mla(90, 5, 2, 64, 16, 8, 40, 0, 1);
+    test_kvs_mla(60, 4, 3, 48, 0, 4, 16, 0, 0);          /* NoPE */
+    test_kvs_mla(70, 2, 2, 512, 64, 8, 32, 5, 0);        /* GLM-5.2's latent, a nonzero start */
+    test_kvs_mla(40, 3, 1, 1024, 8, 4, 16, 0, 1);        /* the largest latent */
+    /* T step H KVH hd ext d_rel B rows */
+    test_kvs_rel(60, 1, 4, 2, 32, 8, 4, 4, 16);          /* decode: the bias reaches back 8, the device holds 16 */
+    test_kvs_rel(80, 5, 4, 2, 16, 40, 16, 8, 32);        /* the bias reaching into the host's rows */
+    test_kvs_rel(50, 3, 2, 1, 128, 16, 64, 4, 24);       /* the largest bank, Inkling's head */
+    /* S H hd nwin ncmp cnt v4 B rows */
+    test_kvs_ds(1, 4, 64, 8, 40, 30, 0, 4, 12);
+    test_kvs_ds(3, 2, 512, 16, 200, 300, 0, 16, 64);
+    test_kvs_ds(2, 3, 128, 8, 90, 2900, 0, 8, 32);
+    test_kvs_ds(3, 4, 64, 8, 60, 40, 1, 4, 16);          /* DeepSeek V4's roundings */
+    test_kvs_ds(2, 2, 1024, 4, 30, 20, 1, 4, 12);        /* the largest head */
+    unsetenv("COLI_VK_KV_PIN");
+    test_kvs_steps();
+    /* Cross 64K with only 512 device positions, starting from a canonical RAM
+     * prefix. This also crosses host tiles and changes OpenMP task grouping.
+     * Rows not yet produced are NaN, as in the shorter sequential tests. */
+    int T = 65543, first = 65531, H = 2, hd = 16;
+    float *a = calloc((size_t)T * H * hd, sizeof(float));
+    float *b = calloc((size_t)T * H * hd, sizeof(float));
+    kvs_start = first; kvs_keep_row = (size_t)H * hd;
+    kvs_keep = a; test_kvs_gqa(T, 1, H, 1, hd, hd, 64, 512, 0, 0, 0, 0, 0, 0);
+    kvs_keep = b; test_kvs_gqa(T, 7, H, 1, hd, hd, 64, 512, 0, 0, 0, 0, 0, 0);
+    CHECK(!memcmp(a + (size_t)first * H * hd, b + (size_t)first * H * hd,
+                  (size_t)(T - first) * H * hd * sizeof(float)), "kvs: rows crossing 64K differ with chunk size");
+    printf("  kvs: compared all %d rows crossing 64K bit for bit across chunk sizes\n", T - first);
+    kvs_start = 0; kvs_keep = NULL; free(a); free(b);
+}
+
 /* COLI_VK_CHAIN_BENCH=1: decode-shaped GEMVs back to back in one frame (the chain's
  * situation: no host gap between matrices), per weight format, in GB/s of weights. */
 #include <time.h>
@@ -1807,6 +2354,7 @@ int main(int argc, char **argv) {
     test_norm(VKC_NORM_ADD1, 0); test_norm(VKC_NORM_ADD1, 1); test_norm(0, 0); test_norm(VKC_NORM_NOW, 1); test_norm(VKC_NORM_L2 | VKC_NORM_NOW, 0);
     printf("norm done\n");
     test_rope();
+    test_chunk_rows();
     test_attn(1, 0, 16, 0); test_attn(1, 140, 32, 0); test_attn(5, 200, 64, 0); test_attn(6, 9, 256, 1); test_attn(130, 3, 24, 0);
     /* MiMo: a prompt's rows through a window (from position 0, and past it), a decode row
      * over a ring as large as the window, prefill rows over a larger ring, full attention
@@ -1817,6 +2365,35 @@ int main(int argc, char **argv) {
     test_attn_win(3, 40, 4, 2, 48, 32, 8, 10, 0, 1); test_attn_win(4, 6, 4, 2, 64, 48, 0, 0, 1, 1);
     test_attn_win(2, 300, 4, 2, 16, 16, 150, 0, 1, 1); test_attn_win(130, 3, 4, 2, 24, 40, 16, 0, 0, 0);
     test_attn_win(1, 500, 8, 4, 192, 128, 128, 128, 1, 1);
+    /* prompt chunks through the blocked attention (chain_attnb.comp, from 16 rows): Qwen3.6's
+     * and Qwen3.8's head groups (8 and 12 a KV head), one head a KV head, lists, the window,
+     * the ring, position-major rows and the sink; then the same cases on chain_attn */
+    for (int pass = 0; pass < 2; pass++) {
+        setenv("COLI_VK_ATTN_BLOCK", pass ? "0" : "16", 1);
+        test_attn_hk(40, 7, 16, 2, 256, 0); test_attn_hk(33, 0, 24, 2, 64, 0); test_attn_hk(64, 100, 4, 4, 32, 0);
+        test_attn_hk(37, 5, 16, 2, 128, 1); test_attn_hk(16, 200, 24, 2, 24, 1);
+        test_attn_win(40, 0, 4, 2, 48, 32, 8, 0, 1, 1); test_attn_win(33, 20, 8, 2, 64, 48, 0, 0, 1, 0);
+        test_attn_win(50, 100, 4, 4, 48, 32, 16, 40, 0, 1); test_attn_win(20, 3, 8, 4, 192, 128, 128, 0, 1, 1);
+    }
+    unsetenv("COLI_VK_ATTN_BLOCK");
+    { VkcStats st; vkc_stats(&st); CHECK(st.attn_blocked >= 9, "attn: %llu calls took the blocked attention", st.attn_blocked);
+      printf("  blocked attention: %llu calls\n", st.attn_blocked); }
+    /* a long attention cut over several submissions (COLI_VK_ATTN_SLICE): the same cases,
+     * the blocked attention and chain_attn, slices of a few rows each */
+    {
+        VkcStats s0; vkc_stats(&s0);
+        setenv("COLI_VK_ATTN_SLICE", "60000", 1);
+        for (int pass = 0; pass < 2; pass++) {
+            setenv("COLI_VK_ATTN_BLOCK", pass ? "0" : "16", 1);
+            test_attn_hk(40, 7, 16, 2, 256, 0); test_attn_hk(37, 5, 16, 2, 128, 1); test_attn_hk(64, 100, 4, 4, 32, 0);
+            test_attn_win(50, 100, 4, 4, 48, 32, 16, 40, 0, 1); test_attn_win(33, 20, 8, 2, 64, 48, 0, 0, 1, 0);
+        }
+        unsetenv("COLI_VK_ATTN_BLOCK");
+        VkcStats s1; vkc_stats(&s1);
+        CHECK(s1.attn_slices > s0.attn_slices + 10, "attn: %llu slices", s1.attn_slices - s0.attn_slices);
+        printf("  attention in slices: %llu extra submissions\n", s1.attn_slices - s0.attn_slices);
+        unsetenv("COLI_VK_ATTN_SLICE");
+    }
     printf("attn done\n");
     test_dnconv(0); test_dnconv(1);
     test_dnrec(8, 8, 8, 4, 0); test_dnrec(4, 4, 4, 2, 1); test_dnrec(128, 128, 4, 2, 0); test_dnrec(32, 100, 6, 3, 1);
@@ -1843,6 +2420,17 @@ int main(int argc, char **argv) {
             {1, 16, 8, 16, 1024, 32, 64, 1, 20, 0, 1, 0, 0, 1, 10, 5, 10},     /* the largest latent, int3-g64 */
         };
         for (size_t k = 0; k < sizeof cases / sizeof *cases; k++) test_mla(cases[k]);
+        {   /* the core over a long chunk in slices of rows (COLI_VK_ATTN_SLICE) */
+            VkcStats s0; vkc_stats(&s0);
+            setenv("COLI_VK_ATTN_SLICE", "200000", 1);
+            test_mla(cases[1]); test_mla(cases[2]); test_mla(cases[4]); test_mla(cases[6]);
+            MlaCase big = {4, 24, 8, 32, 32, 64, 128, 40, 30, 0, 1, 0, 0, 0, 10, 10, 10};   /* 40 rows after 30 */
+            test_mla(big);
+            unsetenv("COLI_VK_ATTN_SLICE");
+            VkcStats s1; vkc_stats(&s1);
+            CHECK(s1.attn_slices > s0.attn_slices, "mla: no slice");
+            printf("  mla core in slices: %llu extra submissions\n", s1.attn_slices - s0.attn_slices);
+        }
         printf("mla done\n");
         test_dsa(1, 30, 2, 16, 8, 0, 0); test_dsa(4, 40, 4, 32, 16, 0, 0); test_dsa(3, 5, 2, 16, 64, 0, 0);
         test_dsa(3, 5, 2, 16, 64, 1, 0); test_dsa(2, 700, 3, 64, 100, 0, 0); test_dsa(1, 9, 64, 64, 4, 0, 0);
@@ -1869,7 +2457,17 @@ int main(int argc, char **argv) {
         test_situ(1.f, 1.f); test_situ(4.f, 25.f);
         printf("ares done\n");
     }
-    if (vkc_sconv_ready() && vkc_relattn_ready()) { test_inkling(); printf("inkling done\n"); }
+    if (vkc_sconv_ready() && vkc_relattn_ready()) {
+        test_inkling();
+        VkcStats s0; vkc_stats(&s0);
+        setenv("COLI_VK_ATTN_SLICE", "30000", 1);   /* the relative attention over slices of rows */
+        test_relattn(20, 30, 16, 16, 16, 4, 16); test_relattn(130, 3, 0, 200, 24, 4, 200); test_relattn(40, 10, 0, 64, 32, 16, 64);
+        unsetenv("COLI_VK_ATTN_SLICE");
+        VkcStats s1; vkc_stats(&s1);
+        CHECK(s1.attn_slices > s0.attn_slices, "relattn: no slice");
+        printf("  relative attention in slices: %llu extra submissions\n", s1.attn_slices - s0.attn_slices);
+        printf("inkling done\n");
+    }
     else CHECK(0, "inkling's ops: chain_sconv.spv or chain_relattn.spv did not load");
     if (!vkc_dsv4_ready()) { fails++; printf("FAIL: the DeepSeek V4 shader did not load\n"); }
     else {
@@ -1895,6 +2493,8 @@ int main(int argc, char **argv) {
         test_ds_swiglu(5000, 10.0f); test_ds_swiglu(3000, 0.0f);
         printf("dsv4 rounding done\n");
     }
+    if (!vkc_kvs_ready()) { fails++; printf("FAIL: the split KV shader did not load\n"); }
+    else { test_kvs(); printf("kvs done\n"); }
     VkcStats st; vkc_stats(&st);
     printf("chain: %llu frames, %llu ops, %llu matmuls (%llu GEMM), %llu barriers\n", st.frames, st.ops, st.matmuls, st.gemms, st.barriers);
     vkc_shutdown();

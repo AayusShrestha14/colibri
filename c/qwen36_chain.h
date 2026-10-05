@@ -34,6 +34,18 @@
  *     (reset_recurrent: a fill with zeros on the device, pin_restore: an upload).
  * Prompt-cache and prefix reuse need nothing more: a reused prefix is rows below the
  * watermark and a DeltaNet state that already sits where the next step expects it.
+ * A speculative verify (prompt lookup, q36_spec_step) runs here too: its matrices take
+ * the per-row GEMV (a decode step's bits), lm_head reads each of its rows, and the
+ * DeltaNet state and conv rings are copied on the device after each of its rows but the
+ * last, one slot per row (the recurrent ops split into one dispatch per copy, each
+ * ending on its row: the same bits), so a draft rejected after row r rolls back by
+ * swapping slot r's buffers in (q36c_rollback).
+ *
+ * Past the device's budget (vk_kvsplit.h) each attention layer keeps only a window of
+ * the newest positions on the device; the step's attention runs over that window on
+ * the device and over the older positions on the CPU (from the host's canonical cache)
+ * at once, the two merged through their softmax statistics. Below the budget the
+ * mirrors are whole, as above.
  *
  * The chain declines (the per-matrix path runs, state synced first) under the CUDA
  * expert tier, a qpack container, PILOT prefetch, or geometry outside its shaders
@@ -44,6 +56,7 @@
  * the ids do not describe (an image) cannot be rebuilt: that stops the engine.
  * COLI_VK_CHAIN_FAULT=n (vk_chain.c) fakes the loss at the n-th frame, for tests. */
 #include "vk_chain.h"
+#include "vk_kvsplit.h"
 
 #define Q36C_HOST 0
 #define Q36C_DEV  1
@@ -52,11 +65,15 @@
 typedef struct {
     int ok, failed;
     int rows;                                  /* scratch capacity in rows */
-    int cap;                                   /* device KV rows (the host's kv_cap) */
+    int cap;                                   /* the host's kv_cap the mirrors follow */
+    int dev_rows;                              /* device KV rows a layer: cap, or the split's */
+    VkcKvSplit ks;                             /* the split past the device's budget (ks.on) */
     VkcBuf *prm;                               /* every norm / conv / DeltaNet parameter */
     size_t *o_in, *o_post, *o_qn, *o_kn, *o_conv, *o_dn, o_final;
     ColiVkTensor **t_ab, **t_sg;               /* DeltaNet b|a rows, shared gate row (f32) */
     VkcBuf **rec, **ring, **kc, **vc;          /* per layer state */
+    VkcBuf **rec_snap[Q36_SPEC_SNAPS], **ring_snap[Q36_SPEC_SNAPS];   /* a verify's copies, slot r after row r */
+    int snap_slots, snap_valid;                /* allocated; written by the last verify */
     int *kv_valid, *attn_ord, n_attn;
     int dn_where, host_zero;
     VkcBuf *x, *nrm, *tmp, *q, *k, *v, *ctx, *qkv, *z, *ab, *cv, *dny, *h2, *lg, *gs, *us, *hs, *ds, *sgd, *fin;
@@ -67,11 +84,6 @@ typedef struct {
 } Q36Chain;
 
 static int g_vk_chain = 0;     /* COLI_VK_CHAIN decided on, and the chain's pipelines are up */
-static int q36c_chunk_rows(void) {
-    const char *e = getenv("COLI_VK_CHAIN_ROWS");
-    int v = e && *e ? atoi(e) : 512;
-    return v < 1 ? 1 : v > 65535 ? 65535 : v;
-}
 
 static void q36c_fatal(const char *what) {
     fprintf(stderr, "[VK] qwen36 chain: %s -- stopping (COLI_VK_CHAIN=0 keeps the state on the CPU)\n", what);
@@ -84,7 +96,7 @@ static void q36c_recover(Model *m, int upto) {
     Q36Chain *ch = (Q36Chain *)m->vkchain;
     Cfg *c = &m->c; int D = c->hidden;
     g_vk_chain = 0;
-    if (ch) { ch->failed = 1; ch->dn_where = Q36C_HOST; ch->host_zero = 0; }
+    if (ch) { ch->failed = 1; ch->dn_where = Q36C_HOST; ch->host_zero = 0; ch->snap_valid = 0; }
     for (int i = 0; i < c->n_layers; i++) {
         if (c->is_attn[i]) continue;
         memset(m->DN_rec[i], 0, (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim * sizeof(float));
@@ -100,7 +112,11 @@ static void q36c_recover(Model *m, int upto) {
     if (!ids) { fprintf(stderr, "OOM rebuilding the state\n"); exit(1); }
     memcpy(ids, m->kvp.fed, (size_t)upto * sizeof(int));
     for (int s = 0; s < upto; s++) memcpy(x + (int64_t)s * D, m->embed + (int64_t)ids[s] * D, D * sizeof(float));
+    /* a rebuild, not the verify being run: no copies, the batch's own matmuls */
+    int snap = m->snap_rows, rowwise = g_q36_rowwise;
+    m->snap_rows = 0; g_q36_rowwise = 0;
     layers_forward_range(m, x, upto, 0, 0, c->n_layers, 0, NULL);
+    m->snap_rows = snap; g_q36_rowwise = rowwise;
     free(ids); free(x);
 }
 
@@ -213,10 +229,27 @@ static Q36Chain *q36c_setup(Model *m) {
     return ch;
 }
 
-static int q36c_res(VkcBuf **b, size_t floats, int kind) { return vkc_reserve(b, (floats ? floats : 1) * sizeof(float), kind); }
+/* q36c_res counts instead of reserving while g_q36c_count >= 0 (the chunk's sizing) */
+static long long g_q36c_count = -1;
+static int q36c_res(VkcBuf **b, size_t floats, int kind) {
+    if (g_q36c_count >= 0) { g_q36c_count += (long long)(floats ? floats : 1) * (long long)sizeof(float); return 1; }
+    return vkc_reserve(b, (floats ? floats : 1) * sizeof(float), kind);
+}
+static int q36c_bufs(Q36Chain *ch, Model *m, int rows);
+/* Prompt rows per chunk (vkc_chunk_rows): the chain's scratch a row, counted from the
+ * reservations themselves, and the routed experts' outputs (the tier's rows, the
+ * CPU's contributions, and the host's sum) for it. */
+static int q36c_chunk_rows(Q36Chain *ch, Model *m) {
+    g_q36c_count = 0; q36c_bufs(ch, m, 1); long long b1 = g_q36c_count;
+    g_q36c_count = 0; q36c_bufs(ch, m, 2); long long b2 = g_q36c_count;
+    g_q36c_count = -1;
+    size_t row = (size_t)(b2 - b1) + (size_t)(m->c.n_experts > 0 ? 2 * m->c.topk + 1 : 0) * m->c.hidden * sizeof(float);
+    if (ch->ks.on) row += (long long)m->c.q_heads * (3 * (m->c.head_dim + 2) + m->c.q_head_dim) * sizeof(float);
+    return vkc_chunk_rows("qwen36", row);
+}
 
-/* scratch for `rows` rows, and the KV mirrors at the host's capacity */
-static int q36c_scratch(Q36Chain *ch, Model *m, int rows) {
+/* the scratch buffers for `rows` rows */
+static int q36c_bufs(Q36Chain *ch, Model *m, int rows) {
     Cfg *c = &m->c; int D = c->hidden, H = c->q_heads, KV = c->kv_heads, hd = c->head_dim;
     int qo = H * c->q_head_dim, kvo = KV * c->k_head_dim, vd = c->dn_vheads * c->dn_vdim;
     int E = c->n_experts > 0 ? c->n_experts : 1, SI = c->shared_inter > 0 ? c->shared_inter : 1;
@@ -233,23 +266,41 @@ static int q36c_scratch(Q36Chain *ch, Model *m, int rows) {
              q36c_res(&ch->kvd, (size_t)(ch->n_attn ? ch->n_attn : 1) * 2 * r * kvo, VKC_DOWN) &&
              q36c_res(&ch->outd, c->vocab, VKC_DOWN) && q36c_res(&ch->routed, r * D, VKC_UP) &&
              q36c_res(&ch->cs, r * (c->rotary_dim > 0 ? c->rotary_dim : 2), VKC_UP);
-    if (!ok) return 0;
+    return ok;
+}
+/* Plan and allocate the KV mirror before sizing a prompt chunk. */
+static int q36c_mirror(Q36Chain *ch, Model *m) {
+    Cfg *c = &m->c; int KV = c->kv_heads;
+    if (ch->cap != m->kv_cap) {        /* the host cache grew: mirror it again (whole, or split past the budget) */
+        size_t row = (size_t)KV * c->k_head_dim * 2 * sizeof(float);
+        int plan = ch->n_attn ? vkc_kv_plan(&ch->ks, "qwen36", ch->n_attn, row, m->kv_cap, 1, 0,
+                                            (size_t)ch->n_attn * ch->dev_rows * row) : 1;
+        if (!plan) { ch->cap = 0; return 0; }
+        ch->dev_rows = ch->ks.on ? ch->ks.rows : m->kv_cap;
+        for (int i = 0; i < c->n_layers; i++) {
+            if (!c->is_attn[i]) continue;
+            vkc_free(ch->kc[i]); vkc_free(ch->vc[i]); ch->kc[i] = ch->vc[i] = NULL;
+            ch->kv_valid[i] = 0;
+            ch->kc[i] = vkc_buf((size_t)KV * ch->dev_rows * c->k_head_dim * sizeof(float), VKC_DEV);
+            ch->vc[i] = vkc_buf((size_t)KV * ch->dev_rows * c->k_head_dim * sizeof(float), VKC_DEV);
+            if (!ch->kc[i] || !ch->vc[i]) { ch->cap = 0; return 0; }
+        }
+        ch->cap = m->kv_cap;
+    }
+    return 1;
+}
+
+/* scratch for `rows` rows, and the KV mirrors at the host's capacity */
+static int q36c_scratch(Q36Chain *ch, Model *m, int rows) {
+    Cfg *c = &m->c; int D = c->hidden;
+    size_t r = (size_t)rows;
+    if (!q36c_bufs(ch, m, rows)) return 0;
     if (ch->rows < rows) {
         float *hr = realloc(ch->host_routed, r * D * sizeof(float));
         if (!hr) return 0;
         ch->host_routed = hr; ch->rows = rows;
     }
-    if (ch->cap != m->kv_cap) {        /* the host cache grew: mirror it again */
-        for (int i = 0; i < c->n_layers; i++) {
-            if (!c->is_attn[i]) continue;
-            vkc_free(ch->kc[i]); vkc_free(ch->vc[i]); ch->kc[i] = ch->vc[i] = NULL;
-            ch->kv_valid[i] = 0;
-            ch->kc[i] = vkc_buf((size_t)KV * m->kv_cap * c->k_head_dim * sizeof(float), VKC_DEV);
-            ch->vc[i] = vkc_buf((size_t)KV * m->kv_cap * c->k_head_dim * sizeof(float), VKC_DEV);
-            if (!ch->kc[i] || !ch->vc[i]) { ch->cap = 0; return 0; }
-        }
-        ch->cap = m->kv_cap;
-    }
+    if (ch->ks.on && !vkc_kv_parts(&ch->ks, r * c->q_heads * (c->head_dim + 2))) return 0;
     return 1;
 }
 
@@ -271,18 +322,57 @@ static void q36c_sync_host(Model *m) {
 static void q36c_host_wrote(Model *m, int zero) {
     Q36Chain *ch = (Q36Chain *)m->vkchain;
     if (!ch || !ch->ok) return;
-    ch->dn_where = Q36C_HOST; ch->host_zero = zero;
+    ch->dn_where = Q36C_HOST; ch->host_zero = zero; ch->snap_valid = 0;
 }
 /* A CPU step from pos_base: the host state current before it, the device's stale after. */
 static void q36c_cpu_step(Model *m, int pos_base) {
     Q36Chain *ch = (Q36Chain *)m->vkchain;
     if (!ch || !ch->ok) return;
     q36c_sync_host(m);
-    ch->dn_where = Q36C_HOST; ch->host_zero = 0;
-    for (int i = 0; i < m->c.n_layers; i++) if (ch->kv_valid[i] > pos_base) ch->kv_valid[i] = pos_base;
+    ch->dn_where = Q36C_HOST; ch->host_zero = 0; ch->snap_valid = 0;
+    for (int i = 0; i < m->c.n_layers; i++) {
+        if (ch->kv_valid[i] > pos_base) ch->kv_valid[i] = pos_base;
+        if (m->c.is_attn[i]) vkc_kv_lower(&ch->ks, ch->attn_ord[i], pos_base);
+    }
+}
+/* A rejected draft: the state after the verify's row `slot` (its first slot+1 rows) is
+ * the device's copy in that slot; `len` positions stand, and the KV watermark comes
+ * down to them (the rows past them are the rejected drafts'). */
+static void q36c_rollback(Model *m, int slot, int len) {
+    Q36Chain *ch = (Q36Chain *)m->vkchain;
+    if (!ch || !ch->ok) return;
+    for (int i = 0; i < m->c.n_layers; i++) {
+        if (ch->kv_valid[i] > len) ch->kv_valid[i] = len;
+        if (m->c.is_attn[i]) vkc_kv_lower(&ch->ks, ch->attn_ord[i], len);
+    }
+    if (slot < 0 || slot >= ch->snap_valid || ch->dn_where != Q36C_DEV) { ch->snap_valid = 0; return; }
+    for (int i = 0; i < m->c.n_layers; i++) {
+        if (m->c.is_attn[i]) continue;
+        VkcBuf *t = ch->rec[i]; ch->rec[i] = ch->rec_snap[slot][i]; ch->rec_snap[slot][i] = t;
+        t = ch->ring[i]; ch->ring[i] = ch->ring_snap[slot][i]; ch->ring_snap[slot][i] = t;
+    }
+    ch->snap_valid = 0;
+}
+/* The device's copy slots for a verify that copies `rows` rows, allocated the first
+ * time a verify that deep runs. */
+static int q36c_spec_slots(Q36Chain *ch, Model *m, int rows) {
+    Cfg *c = &m->c; int L = c->n_layers;
+    if (rows > Q36_SPEC_SNAPS) rows = Q36_SPEC_SNAPS;
+    size_t nr = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
+    for (int sl = ch->snap_slots; sl < rows; sl++) {
+        if (!ch->rec_snap[sl] && !(ch->rec_snap[sl] = (VkcBuf **)calloc((size_t)L, sizeof(VkcBuf *)))) return 0;
+        if (!ch->ring_snap[sl] && !(ch->ring_snap[sl] = (VkcBuf **)calloc((size_t)L, sizeof(VkcBuf *)))) return 0;
+        for (int i = 0; i < L; i++) {
+            if (c->is_attn[i]) continue;
+            if (!ch->rec_snap[sl][i] && !(ch->rec_snap[sl][i] = vkc_buf(nr * sizeof(float), VKC_DEV))) return 0;
+            if (!ch->ring_snap[sl][i] && !(ch->ring_snap[sl][i] = vkc_buf(nc * sizeof(float), VKC_DEV))) return 0;
+        }
+        ch->snap_slots = sl + 1;
+    }
+    return 1;
 }
 /* Record the uploads that make the device state the host's, as the step at pos_base needs it. */
-static int q36c_push_state(Q36Chain *ch, Model *m, int pos_base) {
+static int q36c_push_state(Q36Chain *ch, Model *m, int pos_base, int n_rows) {
     Cfg *c = &m->c; int ok = 1;
     if (ch->dn_where == Q36C_HOST) {
         size_t nr = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
@@ -296,10 +386,18 @@ static int q36c_push_state(Q36Chain *ch, Model *m, int pos_base) {
     }
     int kvd = c->k_head_dim, KV = c->kv_heads;
     for (int i = 0; i < c->n_layers && ok; i++) {
+        if (c->is_attn[i] && ch->ks.on) {     /* the split: the window placed, its rows below pos_base uploaded */
+            VkcKvPart pt[2] = {{KV, kvd, m->K[i], (size_t)m->max_t * kvd, ch->kc[i], 0},
+                               {KV, kvd, m->V[i], (size_t)m->max_t * kvd, ch->vc[i], 0}};
+            vkc_kv_place(&ch->ks, ch->attn_ord[i], pos_base, n_rows);
+            ok = vkc_kv_push(&ch->ks, ch->attn_ord[i], pt, 2, pos_base);
+            ch->kv_valid[i] = pos_base;
+            continue;
+        }
         if (!c->is_attn[i] || ch->kv_valid[i] >= pos_base) continue;
         int t0 = ch->kv_valid[i], n = pos_base - t0;
         for (int h = 0; h < KV && ok; h++) {
-            size_t src = ((size_t)h * m->max_t + t0) * kvd, dst = ((size_t)h * ch->cap + t0) * kvd;
+            size_t src = ((size_t)h * m->max_t + t0) * kvd, dst = ((size_t)h * ch->dev_rows + t0) * kvd;
             ok = vkc_write(ch->kc[i], dst, m->K[i] + src, (size_t)n * kvd * sizeof(float)) &&
                  vkc_write(ch->vc[i], dst, m->V[i] + src, (size_t)n * kvd * sizeof(float));
         }
@@ -327,32 +425,53 @@ static int q36c_attention(Q36Chain *ch, Model *m, Layer *l, int i, int n, int pb
                        ok = vkc_norm(ch->k, ch->prm, ch->k, &p); }
     if (ok && half) { VkcRope p = {n * KV, KV, 0, kvo, kvd, half, 0, 2 * half}; ok = vkc_rope(ch->k, ch->cs, &p); }
     if (!ok) return 0;
+    size_t ko = (size_t)ch->attn_ord[i] * 2 * ch->rows * kvo;
+    if (ch->ks.on) {   /* the split: the rows into their window slots, the attention in two parts */
+        VkcKvPart pk = {KV, kvd, m->K[i], (size_t)m->max_t * kvd, ch->kc[i], 0}, pv = {KV, kvd, m->V[i], (size_t)m->max_t * kvd, ch->vc[i], 0};
+        VkcKvGqa a = {&ch->ks, ch->attn_ord[i], ch->q, ch->kc[i], ch->vc[i], ch->q, NULL, NULL, ch->ctx, n, H, KV, hd, kvd, pb, 0, 0, 0, 0,
+                      qo, qdim, gate_dim > 0, hd, qo, qdim, H * hd, 0, 0, 1.f / sqrtf((float)hd),
+                      m->K[i], m->V[i], (size_t)m->max_t * kvd, (size_t)kvd, (size_t)m->max_t * kvd, (size_t)kvd};
+        return vkc_kv_store(&ch->ks, ch->attn_ord[i], &pk, ch->k, 0, (size_t)kvo, (size_t)kvd, pb, n) &&
+               vkc_kv_store(&ch->ks, ch->attn_ord[i], &pv, ch->v, 0, (size_t)kvo, (size_t)kvd, pb, n) &&
+               vkc_copy(ch->kvd, ko, ch->k, 0, (size_t)n * kvo) && vkc_copy(ch->kvd, ko + (size_t)ch->rows * kvo, ch->v, 0, (size_t)n * kvo) &&
+               vkc_kv_gqa(&a) && vkc_matmul(vk_qw_tensor(&l->o), ch->ctx, 0, ch->tmp, 0, n);
+    }
     /* the new rows into the device cache, and to the host's */
     VkcRegion *rg = malloc(sizeof *rg * (size_t)n * KV);
     if (!rg) return 0;
     for (int s = 0; s < n; s++) for (int h = 0; h < KV; h++)
-        rg[s * KV + h] = (VkcRegion){((size_t)h * ch->cap + pb + s) * kvd, (size_t)s * kvo + (size_t)h * kvd, (size_t)kvd};
-    size_t ko = (size_t)ch->attn_ord[i] * 2 * ch->rows * kvo;
+        rg[s * KV + h] = (VkcRegion){((size_t)h * ch->dev_rows + pb + s) * kvd, (size_t)s * kvo + (size_t)h * kvd, (size_t)kvd};
     ok = vkc_copy_regions(ch->kc[i], ch->k, rg, n * KV) && vkc_copy_regions(ch->vc[i], ch->v, rg, n * KV) &&
          vkc_copy(ch->kvd, ko, ch->k, 0, (size_t)n * kvo) && vkc_copy(ch->kvd, ko + (size_t)ch->rows * kvo, ch->v, 0, (size_t)n * kvo);
     free(rg);
-    VkcAttn a = {n, H, KV, hd, pb, ch->cap, 0, qo, qdim, hd, qo, qdim, gate_dim > 0, 0, H * hd, 0, 0,
+    VkcAttn a = {n, H, KV, hd, pb, ch->dev_rows, 0, qo, qdim, hd, qo, qdim, gate_dim > 0, 0, H * hd, 0, 0,
                  1.f / sqrtf((float)hd), 0, 0};
     return ok && vkc_attn(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, NULL, &a) &&
            vkc_matmul(vk_qw_tensor(&l->o), ch->ctx, 0, ch->tmp, 0, n);
 }
-static int q36c_deltanet(Q36Chain *ch, Model *m, Layer *l, int i, int n) {
+/* ns: the chunk's rows a verify copies the state after (rows 0..ns-1, slots c0..). One
+ * copy rides on the one dispatch as the shaders pass its row; more split the
+ * convolution and the recurrence into one dispatch per copy, each ending on its row
+ * (the last takes the chunk's remaining rows): the state crosses between them through
+ * memory in f32, so every row gets the single dispatch's bits. */
+static int q36c_deltanet(Q36Chain *ch, Model *m, Layer *l, int i, int n, int c0, int ns) {
     Cfg *c = &m->c;
     int vh = c->dn_vheads, CD = c->dn_conv_dim, vd = vh * c->dn_vdim;
     int ok = vkc_matmul(vk_qw_tensor(&l->dn_qkv), ch->nrm, 0, ch->qkv, 0, n) &&
              vkc_matmul(vk_qw_tensor(&l->dn_z), ch->nrm, 0, ch->z, 0, n) &&
              vkc_matmul(ch->t_ab[i], ch->nrm, 0, ch->ab, 0, n);
-    VkcDnConv cp = {n, CD, c->dn_convk, 0, CD, 0, CD, -1, 0, (int)ch->o_conv[i], 0, 0};
-    VkcDnRec rp = {n, vh, c->dn_kheads, c->dn_vdim, c->dn_kheads * c->dn_kdim, 0, CD, 0, 2 * vh, vh, 2 * vh,
-                   0, vd, 0, vd, -1, 0, c->eps, 1.f / sqrtf((float)c->dn_kdim), 0, 0, (int)ch->o_dn[i]};
-    return ok && vkc_dnconv(ch->qkv, ch->prm, ch->ring[i], ch->cv, NULL, &cp) &&
-           vkc_dnrec(c->dn_kdim, ch->cv, ch->ab, ch->z, ch->rec[i], ch->prm, ch->dny, NULL, &rp) &&
-           vkc_matmul(vk_qw_tensor(&l->dn_out), ch->dny, 0, ch->tmp, 0, n);
+    int segs = ns > 1 ? ns : 1;
+    for (int r = 0; r < segs && ok; r++) {
+        int s0 = ns > 1 ? r : 0, len = ns > 1 && r < ns - 1 ? 1 : n - s0, snap_row = ns ? 0 : -1;
+        VkcBuf *rs = ns ? ch->rec_snap[c0 + r][i] : NULL, *cs = ns ? ch->ring_snap[c0 + r][i] : NULL;
+        VkcDnConv cp = {len, CD, c->dn_convk, s0 * CD, CD, s0 * CD, CD, snap_row, 0, (int)ch->o_conv[i], 0, 0};
+        VkcDnRec rp = {len, vh, c->dn_kheads, c->dn_vdim, c->dn_kheads * c->dn_kdim, s0 * CD, CD, s0 * 2 * vh, 2 * vh,
+                       vh + s0 * 2 * vh, 2 * vh, s0 * vd, vd, s0 * vd, vd, snap_row, 0, c->eps,
+                       1.f / sqrtf((float)c->dn_kdim), 0, 0, (int)ch->o_dn[i]};
+        ok = vkc_dnconv(ch->qkv, ch->prm, ch->ring[i], ch->cv, cs, &cp) &&
+             vkc_dnrec(c->dn_kdim, ch->cv, ch->ab, ch->z, ch->rec[i], ch->prm, ch->dny, rs, &rp);
+    }
+    return ok && vkc_matmul(vk_qw_tensor(&l->dn_out), ch->dny, 0, ch->tmp, 0, n);
 }
 static int q36c_shared(Q36Chain *ch, Model *m, Layer *l, int i, int n) {
     Cfg *c = &m->c; int ok = 1, SI = c->shared_inter;
@@ -376,25 +495,39 @@ static int q36c_combine(Q36Chain *ch, Model *m, int i, int n) {
 
 /* Every layer for S rows from host rows xh, the last row's logits into `logit`; xh gets
  * the final rows back when want_x. 0 = not taken (nothing on the device changed). */
-static int q36c_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int want_x, float *logit) {
+static int q36c_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int want_x, int nlogits, float *logit) {
     if (!g_vk_chain || qt_ready() || qq_active() || g_pilot) return 0;
-    if (g_vk_chain == COLI_VK_CHAIN_PREFILL && S <= 2) return 0;   /* prompts only: decode on the CPU */
+    /* prompts only: decode and verifies on the CPU */
+    if (g_vk_chain == COLI_VK_CHAIN_PREFILL && (S <= 2 || g_q36_rowwise)) return 0;
     Q36Chain *ch = q36c_setup(m);
     if (!ch || ch->failed) return 0;
     Cfg *c = &m->c; int D = c->hidden, L = c->n_layers, E = c->n_experts;
-    int CH = q36c_chunk_rows(), rows = S < CH ? S : CH;
+    int mirror_ok = q36c_mirror(ch, m);
+    int CH = mirror_ok ? q36c_chunk_rows(ch, m) : 1, rows = S < CH ? S : CH;
+    if (ch->ks.on && rows > ch->ks.chunk) rows = ch->ks.chunk;   /* a step's rows fit the split's window */
     int kvo = c->kv_heads * c->k_head_dim, half = c->rotary_dim / 2;
-    if (!q36c_scratch(ch, m, rows) || (lf && !q36c_res(&ch->lfd, (size_t)L * 3 * D, VKC_DOWN)) ||
-        (want_x && !q36c_res(&ch->xd, (size_t)rows * D, VKC_DOWN))) {
+    if (m->snap_rows > 0 && !q36c_spec_slots(ch, m, m->snap_rows)) {
+        fprintf(stderr, "[VK] qwen36 chain: device memory for a verify's %d copies refused; this verify on the CPU\n",
+                m->snap_rows);
+        return 0;
+    }
+    if (!mirror_ok || !q36c_scratch(ch, m, rows) || (lf && !q36c_res(&ch->lfd, (size_t)L * 3 * D, VKC_DOWN)) ||
+        (want_x && !q36c_res(&ch->xd, (size_t)rows * D, VKC_DOWN)) ||
+        (nlogits > 1 && (!q36c_res(&ch->fin, (size_t)nlogits * D, VKC_DEV) ||
+                         !q36c_res(&ch->outd, (size_t)nlogits * c->vocab, VKC_DOWN)))) {
         fprintf(stderr, "[VK] qwen36 chain: device memory for %d rows refused; per-matrix path\n", rows);
         ch->failed = 1;
         return 0;
     }
-    vkc_gemm_rows(-1);
+    vkc_gemm_rows(g_q36_rowwise ? 0 : -1);   /* a verify's rows get a decode step's bits */
+    int snapped = 0;
     for (int c0 = 0; c0 < S; c0 += rows) {
         int n = S - c0 < rows ? S - c0 : rows, pb = pos_base + c0;
+        int ns = m->snap_rows - c0 < n ? m->snap_rows - c0 : n;   /* the rows of this chunk a verify copies */
+        if (ns < 0) ns = 0;
+        if (ns) snapped = c0 + ns;
         if (!vkc_begin() || !vkc_write(ch->x, 0, xh + (size_t)c0 * D, (size_t)n * D * sizeof(float)) ||
-            !q36c_push_state(ch, m, pb)) goto lost;
+            !q36c_push_state(ch, m, pb, n)) goto lost;
         if (half) {   /* the CPU's own angles, cosines and sines (rope_head_partial / _mrope) */
             float *cs = (float *)vkc_ptr(ch->cs);
             for (int s = 0; s < n; s++) {
@@ -416,7 +549,7 @@ static int q36c_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int 
                 if (ok && lf) ok = vkc_copy(ch->lfd, ((size_t)(i - 1) * 3 + 2) * D, ch->x, (size_t)(n - 1) * D, D);
             }
             ok = ok && q36c_norm(ch->x, 0, ch->prm, ch->o_in[i], ch->nrm, 0, n, D, c->eps);
-            ok = ok && (c->is_attn[i] ? q36c_attention(ch, m, l, i, n, pb) : q36c_deltanet(ch, m, l, i, n));
+            ok = ok && (c->is_attn[i] ? q36c_attention(ch, m, l, i, n, pb) : q36c_deltanet(ch, m, l, i, n, c0, ns));
             if (ok && lf) ok = vkc_copy(ch->lfd, (size_t)i * 3 * D, ch->tmp, (size_t)(n - 1) * D, D);
             VkcEw add = {VKC_EW_ADD, n * D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
             ok = ok && vkc_ew(ch->x, ch->x, ch->tmp, NULL, NULL, &add);
@@ -426,7 +559,11 @@ static int q36c_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int 
                 ok = vkc_matmul(vk_qw_tensor(&l->gate), ch->h2, 0, ch->lg, 0, n) &&
                      vkc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E) && vkc_copy(ch->h2d, 0, ch->h2, 0, (size_t)n * D);
                 double t0 = tm_now();
-                ok = ok && vkc_submit(1);                      /* A1 */
+                /* A1; while it runs, the tier loads the experts this layer will likely
+                 * stream (a big prompt chunk only) */
+                ok = ok && vkc_submit(0);
+                if (ok) vkt_stream_prefetch(i, n);
+                ok = ok && vkc_finish();
                 ch->frames++; ch->wait_ms += tm_now() - t0;
                 if (!ok) break;
                 if (c->is_attn[i]) {                           /* the rows into the host's cache */
@@ -446,15 +583,27 @@ static int q36c_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int 
                 double t2 = tm_now();
                 tm_add(n, 2, t2 - t1); ch->host_ms += t2 - t1;
                 ok = ok && vkc_begin();
-            } else if (ok) ok = q36c_shared(ch, m, l, i, n);   /* a dense model: no host step */
+            } else if (ok) {
+                ok = q36c_shared(ch, m, l, i, n);
+                /* A dense backbone has no expert readback to end the frame.
+                 * Keep each layer in its own submission: a full 27B prompt in
+                 * one submission can exceed the driver's watchdog. The next
+                 * frame's barrier orders its residual add after this MLP. */
+                if (ok && i + 1 < L) ok = vkc_submit(0) && vkc_begin();
+            }
             pending = 1;
         }
         if (ok) ok = q36c_combine(ch, m, L - 1, n);
         if (ok && lf) ok = vkc_copy(ch->lfd, ((size_t)(L - 1) * 3 + 2) * D, ch->x, (size_t)(n - 1) * D, D);
         if (ok && want_x) ok = vkc_copy(ch->xd, 0, ch->x, 0, (size_t)n * D);
         int last = c0 + n == S;
-        if (ok && last) ok = q36c_norm(ch->x, (size_t)(n - 1) * D, ch->prm, ch->o_final, ch->fin, 0, 1, D, c->eps) &&
-                             vkc_matmul(vk_qw_tensor(&m->lm_head), ch->fin, 0, ch->outd, 0, 1);
+        /* the final norm and lm_head on this chunk's share of the last nlogits rows */
+        int lo0 = S - nlogits > c0 ? S - nlogits - c0 : 0, lo_n = n - lo0;
+        if (ok && lo_n > 0) {
+            int dst = c0 + lo0 - (S - nlogits);
+            ok = q36c_norm(ch->x, (size_t)lo0 * D, ch->prm, ch->o_final, ch->fin, (size_t)dst * D, lo_n, D, c->eps) &&
+                 vkc_matmul(vk_qw_tensor(&m->lm_head), ch->fin, (size_t)dst * D, ch->outd, (size_t)dst * c->vocab, lo_n);
+        }
         double t0 = tm_now();
         ok = ok && vkc_submit(1);
         ch->frames++; ch->wait_ms += tm_now() - t0;
@@ -469,14 +618,17 @@ static int q36c_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int 
             }
         }
         if (want_x) memcpy(xh + (size_t)c0 * D, vkc_ptr(ch->xd), (size_t)n * D * sizeof(float));
-        for (int i = 0; i < L; i++) if (c->is_attn[i]) ch->kv_valid[i] = pb + n;
+        for (int i = 0; i < L; i++) if (c->is_attn[i]) { ch->kv_valid[i] = pb + n; vkc_kv_done(&ch->ks, ch->attn_ord[i], pb + n); }
         ch->dn_where = Q36C_DEV; ch->host_zero = 0;
-        if (last) memcpy(logit, vkc_ptr(ch->outd), (size_t)c->vocab * sizeof(float));
+        if (last) memcpy(logit, vkc_ptr(ch->outd), (size_t)nlogits * c->vocab * sizeof(float));
     }
     if (lf) fwrite(vkc_ptr(ch->lfd), sizeof(float), (size_t)L * 3 * D, lf);
+    ch->snap_valid = snapped;
+    vkc_gemm_rows(-1);
     ch->forwards++;
     return 1;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
+    vkc_gemm_rows(-1);
     if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost(); }
     q36c_recover(m, pos_base);
     return 0;
@@ -489,5 +641,6 @@ static void q36c_report(Model *m) {
     fprintf(stderr, "[VK] qwen36 chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
                     "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %.1f MiB on the device\n",
             ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms, st.dev_bytes / 1048576.0);
+    vkc_kv_report(&ch->ks);
     vkc_prof_print();
 }

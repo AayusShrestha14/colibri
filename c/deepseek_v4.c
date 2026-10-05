@@ -602,6 +602,12 @@ int coli_st_prefetch_at_rep(const ColiSafetensorsIndex *index, int shard,
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 static int set_error(char *error, size_t size, const char *format, ...) {
     if (error && size) {
@@ -776,11 +782,69 @@ int coli_v4_layer_validate(const ColiDeepSeekV4LayerPlan *plan,
     return 0;
 }
 
+/* Dense weights on the Vulkan device only: a droppable tensor of a resident layer is
+ * read into an anonymous mapping of its own, so that its pages can go back to the system
+ * while its address stays reserved (the device copies are found by it, and no later
+ * allocation can take it), and come back at the same address if the CPU needs it. */
+static int g_v4_layer_map;   /* the reference loader maps droppable tensors (resident, device only) */
+static size_t v4_map_len(size_t bytes) {
+#ifdef _WIN32
+    SYSTEM_INFO si; GetSystemInfo(&si);
+    size_t page = si.dwAllocationGranularity ? si.dwAllocationGranularity : 65536;
+#else
+    long ps = sysconf(_SC_PAGESIZE);
+    size_t page = ps > 0 ? (size_t)ps : 4096;
+#endif
+    return (bytes + page - 1) / page * page;
+}
+static void *v4_map_alloc(size_t bytes) {
+    size_t len = v4_map_len(bytes ? bytes : 1);
+#ifdef _WIN32
+    return VirtualAlloc(NULL, len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void *p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return p == MAP_FAILED ? NULL : p;
+#endif
+}
+static int v4_map_drop(void *data, size_t bytes) {   /* pages back, the range reserved and unreadable */
+    size_t len = v4_map_len(bytes ? bytes : 1);
+#ifdef _WIN32
+    return VirtualFree(data, len, MEM_DECOMMIT) ? 0 : -1;
+#else
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
+#ifdef MAP_NORESERVE
+    flags |= MAP_NORESERVE;
+#endif
+    return mmap(data, len, PROT_NONE, flags, -1, 0) == MAP_FAILED ? -1 : 0;
+#endif
+}
+static int v4_map_restore(void *data, size_t bytes) {   /* zeroed, writable pages at the same address */
+    size_t len = v4_map_len(bytes ? bytes : 1);
+#ifdef _WIN32
+    return VirtualAlloc(data, len, MEM_COMMIT, PAGE_READWRITE) == data ? 0 : -1;
+#else
+    return mprotect(data, len, PROT_READ | PROT_WRITE);
+#endif
+}
+static void v4_map_free(void *data, size_t bytes) {
+    if (!data) return;
+#ifdef _WIN32
+    (void)bytes;
+    VirtualFree(data, 0, MEM_RELEASE);
+#else
+    munmap(data, v4_map_len(bytes ? bytes : 1));
+#endif
+}
+
 void coli_v4_layer_free(ColiV4Engine *engine,
                         ColiDeepSeekV4LayerWeights *weights) {
     (void)engine;
     if (!weights) return;
-    for (size_t i = 0; i < weights->plan.tensor_count; i++) free(weights->data[i]);
+    for (size_t i = 0; i < weights->plan.tensor_count; i++) {
+        if (weights->mapped[i])
+            v4_map_free(weights->data[i], (size_t)coli_v4_dense_tensor_bytes(&weights->plan.tensors[i]));
+        else free(weights->data[i]);
+    }
     memset(weights, 0, sizeof(*weights));
 }
 
@@ -858,8 +922,11 @@ int coli_v4_layer_load(ColiV4Engine *engine,
         const ColiSafetensorsTensor *tensor = coli_st_find(index, spec->name);
         size_t resident_bytes = tensor->dtype == COLI_ST_F8_E8M0
             ? (size_t)tensor->numel * sizeof(float) : (size_t)tensor->nbytes;
-        weights->data[i] = malloc(resident_bytes);
+        weights->mapped[i] = g_v4_layer_map && coli_v4_dense_device_only_tensor(spec) &&
+                             resident_bytes == coli_v4_dense_tensor_bytes(spec);
+        weights->data[i] = weights->mapped[i] ? v4_map_alloc(resident_bytes) : malloc(resident_bytes);
         if (!weights->data[i]) {
+            weights->mapped[i] = 0;
             coli_v4_layer_free(NULL, weights);
             return set_error(error, error_size, "out of memory loading: %s", spec->name);
         }
@@ -952,6 +1019,52 @@ static int resident_enabled_v2(ColiV4Engine *engine) {
     return engine && engine->runtime.dense_resident;
 }
 
+/* Dense weights on the Vulkan device only (deepseek_v4_internal.h): NULL in every link
+ * but the engine binary built with VK=1. */
+int (*coli_v4_dense_place)(ColiV4Engine *engine, int layer);
+int (*coli_v4_dense_device_lost)(void);
+void (*coli_v4_dense_reread)(uint64_t bytes);
+
+int coli_v4_layer_host_drop(ColiV4Engine *engine, int layer, size_t i) {
+    if (!engine || layer < 0 || layer >= COLI_V4_RESIDENT_MAX_LAYERS_V2 ||
+        !engine->dense_resident.ready[layer]) return -1;
+    ColiDeepSeekV4LayerWeights *w = &engine->dense_resident.layers[layer];
+    if (i >= w->plan.tensor_count || !w->mapped[i]) return -1;
+    if (w->host_gone[i]) return 0;
+    uint64_t bytes = coli_v4_dense_tensor_bytes(&w->plan.tensors[i]);
+    if (v4_map_drop(w->data[i], (size_t)bytes)) return -1;
+    w->host_gone[i] = 1;
+    engine->dense_resident.dropped_bytes += bytes;
+    return 0;
+}
+
+int coli_v4_layer_host_restore(ColiV4Engine *engine, const void *data, uint64_t *bytes_out) {
+    if (!engine || !data || !engine->dense_resident.device_only) return 0;
+    const ColiSafetensorsIndex *index = engine->dense_resident.index;
+    for (int layer = 0; layer < COLI_V4_RESIDENT_MAX_LAYERS_V2; layer++) {
+        if (!engine->dense_resident.ready[layer]) continue;
+        ColiDeepSeekV4LayerWeights *w = &engine->dense_resident.layers[layer];
+        for (size_t i = 0; i < w->plan.tensor_count; i++) {
+            if (!w->host_gone[i]) continue;
+            const ColiDeepSeekV4TensorSpec *spec = &w->plan.tensors[i];
+            uint64_t bytes = coli_v4_dense_tensor_bytes(spec);
+            uintptr_t p = (uintptr_t)data, b = (uintptr_t)w->data[i];
+            if (p < b || p - b >= bytes) continue;
+            /* back at the same address, read and laid out exactly as the first load did */
+            const ColiSafetensorsTensor *tensor = index ? coli_st_find(index, spec->name) : NULL;
+            if (!tensor || v4_map_restore(w->data[i], (size_t)bytes) ||
+                coli_st_read_tensor(index, tensor, w->data[i]) != 0) return -1;
+            if (spec->dtype == COLI_ST_F8_E4M3 && spec->packed_rows8 &&
+                v4_fp8_pack_rows8_inplace(w->data[i], spec->shape[0], spec->shape[1]) <= 0) return -1;
+            w->host_gone[i] = 0;
+            engine->dense_resident.dropped_bytes -= bytes;
+            if (bytes_out) *bytes_out = bytes;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int coli_v4_layer_load(ColiV4Engine *engine,
                        ColiDeepSeekV4LayerWeights *weights,
                        const ColiDeepSeekV4Config *config,
@@ -965,6 +1078,17 @@ int coli_v4_layer_load(ColiV4Engine *engine,
     if (!resident_enabled_v2(engine))
         return coli_v4_layer_resident_reference_load(
             NULL, weights, effective_config, index, layer, error, error_size);
+    if (engine->dense_resident.device_only && coli_v4_dense_device_lost &&
+        coli_v4_dense_device_lost()) {
+        /* the device that held the dense layers is gone: the CPU reads them per forward,
+         * as a low-memory plan does (its two-layer reserve is in the plan) */
+        if (coli_v4_layer_resident_reference_load(
+                NULL, weights, effective_config, index, layer, error, error_size)) return -1;
+        for (size_t i = 0; coli_v4_dense_reread && i < weights->plan.tensor_count; i++)
+            if (coli_v4_dense_device_only_tensor(&weights->plan.tensors[i]))
+                coli_v4_dense_reread(coli_v4_dense_tensor_bytes(&weights->plan.tensors[i]));
+        return 0;
+    }
     if (engine->dense_resident.index && engine->dense_resident.index != index) {
         if (error && error_size)
             snprintf(error, error_size,
@@ -973,9 +1097,12 @@ int coli_v4_layer_load(ColiV4Engine *engine,
     }
     engine->dense_resident.index = index;
     if (!engine->dense_resident.ready[layer]) {
-        if (coli_v4_layer_resident_reference_load(
+        g_v4_layer_map = engine->dense_resident.device_only;   /* droppable tensors in mappings of their own */
+        int failed = coli_v4_layer_resident_reference_load(
                 NULL, &engine->dense_resident.layers[layer], effective_config, index,
-                layer, error, error_size)) return -1;
+                layer, error, error_size);
+        g_v4_layer_map = 0;
+        if (failed) return -1;
 #ifdef COLI_V4_GPU_TIER
         if (coli_v4_gpu_layer_upload(engine, layer,
                                      &engine->dense_resident.layers[layer]) < 0)
@@ -985,6 +1112,10 @@ int coli_v4_layer_load(ColiV4Engine *engine,
         engine->dense_resident.ready[layer] = 1;
         engine->dense_resident.total_bytes +=
             engine->dense_resident.layers[layer].stats.total_bytes;
+        /* device only: the layer's matrices to the device and their host pages back,
+         * before the next layer is read (one layer in RAM at a time) */
+        if (engine->dense_resident.device_only && coli_v4_dense_place)
+            coli_v4_dense_place(engine, layer);
         if (layer == effective_config->num_hidden_layers - 1)
             fprintf(stderr, "v4_dense_resident layers=%d bytes=%.3fGiB\n",
                     effective_config->num_hidden_layers,
@@ -1410,6 +1541,23 @@ static int build_runtime_plan(ColiV4Engine *engine,
 }
 
 
+/* Dense weights on the Vulkan device only (deepseek_v4_internal.h): set by the engine
+ * binary built with VK=1, NULL in every other link. */
+ColiV4DenseDeviceDecide coli_v4_dense_device_decide;
+
+/* The bytes of the dense layers a device may hold alone (coli_v4_dense_device_only_tensor). */
+static uint64_t v4_dense_device_bytes(const ColiV4Engine *engine) {
+    uint64_t total = 0;
+    for (int layer = 0; layer < engine->config.num_hidden_layers; layer++) {
+        ColiDeepSeekV4LayerPlan plan;
+        if (coli_v4_layer_plan(&plan, &engine->config, layer, NULL, 0)) return 0;
+        for (size_t i = 0; i < plan.tensor_count; i++)
+            if (coli_v4_dense_device_only_tensor(&plan.tensors[i]))
+                total += coli_v4_dense_tensor_bytes(&plan.tensors[i]);
+    }
+    return total;
+}
+
 int coli_v4_expert_store_open_planned(
     ColiV4Engine *engine,
     const ColiDeepSeekV4Config *config,
@@ -1431,6 +1579,18 @@ int coli_v4_expert_store_open_planned(
     double open_plan_s = v4_open_now_s() - open_plan_t0;
 
     uint64_t fixed = plan.system_reserve_bytes + plan.runtime_reserve_bytes;
+    /* Dense weights on a Vulkan device only: its matrices count as not in RAM, only
+     * what stays on the host (norms, scales, the router...) does, and the RAM they
+     * would have taken goes to the experts' cache. */
+    uint64_t device_bytes = 0;
+    if (coli_v4_dense_device_decide && dense_bytes) {
+        uint64_t candidate = v4_dense_device_bytes(engine);
+        if (candidate && candidate < dense_bytes &&
+            coli_v4_dense_device_decide(engine, candidate, dense_bytes - candidate)) {
+            device_bytes = candidate;
+            dense_bytes -= candidate;
+        }
+    }
     ColiDeepSeekV4ResidentTierPlan tiers;
     ColiDeepSeekV4ResidentTierInputs tier_inputs = {
         plan.planner_available_bytes, fixed, dense_bytes,
@@ -1440,6 +1600,14 @@ int coli_v4_expert_store_open_planned(
                                    error, error_size)) return -1;
     dense_bytes = tiers.dense_bytes;
     runtime->dense_resident = tiers.dense_resident;
+    if (device_bytes && !tiers.dense_resident) {
+        fprintf(stderr, "ram_tiers: even the dense layers' host part (%.2f GiB) does not fit: "
+                        "they are read per forward and stay off the device\n",
+                tier_inputs.dense_bytes / (double)GIB);
+        device_bytes = 0;
+    }
+    engine->dense_resident.device_only = device_bytes != 0;
+    engine->dense_resident.device_bytes = device_bytes;
     if (dense_bytes > plan.planner_available_bytes - fixed) {
         snprintf(error, error_size, "resident V4 tiers exceed available RAM");
         return -1;
@@ -1469,6 +1637,17 @@ int coli_v4_expert_store_open_planned(
         plan.expert_cache_bytes + (resident_head ? head_bytes : 0);
     if (resident_head && coli_v4_head_cache_load(
             engine, engine->target_index, error, error_size)) return -1;
+    if (device_bytes)
+        fprintf(stderr,
+            "ram_tiers available=%.2fGiB dense=device(%.2fGiB on the device, %.2fGiB in RAM) "
+            "target_slots=%d target_cache=%.2fGiB head=%s projected=%.2fGiB\n",
+            plan.planner_available_bytes / (double)GIB,
+            device_bytes / (double)GIB, dense_bytes / (double)GIB,
+            slots,
+            plan.expert_cache_bytes / (double)GIB,
+            resident_head ? "resident-bf16" : "streamed-bf16",
+            plan.projected_bytes / (double)GIB);
+    else
     fprintf(stderr,
         "ram_tiers available=%.2fGiB dense=%s(%.2fGiB) "
         "target_slots=%d target_cache=%.2fGiB head=%s projected=%.2fGiB\n",
@@ -3364,6 +3543,8 @@ int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
         return compressor_pool_and_emit(state, output, produced, position,
                                         error, error_size);
     }
+    coli_v4_vk_host_ensure(wkv);     /* a device-only matrix comes back for the CPU */
+    coli_v4_vk_host_ensure(wgate);
 #endif
     #pragma omp parallel for
     for (int row = 0; row < projection; row++) {
@@ -6322,7 +6503,9 @@ int coli_v4_moe_routed(float *routed, const ColiDeepSeekV4LayerWeights *weights,
                        const ColiDeepSeekV4Config *config, ColiExpertStore *store,
                        const float *inputs, const int *tokens, int rows,
                        char *error, size_t error_size) {
-    if (!routed || !weights || !config || !store || !inputs || !tokens || rows < 1 || rows > 128)
+    /* a chunk of up to 128 rows as the CPU's prefill block takes, or with a chunk from the
+     * budget (vkc_chunk_auto) up to the chain's (the union path takes any batch) */
+    if (!routed || !weights || !config || !store || !inputs || !tokens || rows < 1 || rows > 65535)
         return set_error(error, error_size, "invalid chained MoE arguments");
     int d = config->hidden_size, result = 0;
     v4_moe_routed_only = 1;
@@ -6657,6 +6840,8 @@ int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
         return compressor_pool_and_emit(state, output, produced, position,
                                         error, error_size);
     }
+    coli_v4_vk_host_ensure(wkv);     /* a device-only matrix comes back for the CPU */
+    coli_v4_vk_host_ensure(wgate);
 #endif
     #pragma omp parallel for
     for (int row = 0; row < projection; row++) {
@@ -12465,6 +12650,7 @@ typedef struct {
     const void *data;
     int fmt, rows, columns, refused;
     ColiVkTensor *tensor;
+    int dho;            /* placed by v4_dho_place: the device holds the matrix alone */
 } V4VkEntry;
 static V4VkEntry *g_v4_vk_map;
 static size_t g_v4_vk_cap, g_v4_vk_used;
@@ -12501,7 +12687,7 @@ static V4VkEntry *v4_vk_insert(const void *data, int fmt, int rows, int columns)
     }
     size_t at = v4_vk_hash(data, g_v4_vk_cap);
     while (g_v4_vk_map[at].data) at = (at + 1) & (g_v4_vk_cap - 1);
-    g_v4_vk_map[at] = (V4VkEntry){data, fmt, rows, columns, 0, NULL};
+    g_v4_vk_map[at] = (V4VkEntry){data, fmt, rows, columns, 0, NULL, 0};
     g_v4_vk_used++;
     return &g_v4_vk_map[at];
 }
@@ -12552,12 +12738,16 @@ static int v4_vk_matmul_impl(int fmt, const void *data, const float *scales,
     if (fmt != 11 && fmt != 12) return -1;
     if (fmt == 12 && (!scales || columns % 128 || (rows8 && rows % 8))) return -1;
     V4VkEntry *e = v4_vk_find(data, fmt, rows, columns);
+    /* With the dense weights on the device only the hook is on whatever COLI_VK_DENSE
+     * says, for the matrices the device holds alone; the rest stay where it puts them. */
+    if (!coli_vk_dense() && !(e && e->dho)) return -1;
     if (e && e->refused) return -1;
     if (e && e->tensor)
         return coli_vk_matmul(&e->tensor, output, input, NULL, NULL, fmt, batch,
                               columns, rows, fmt == 12 ? 128 : 0) ? 0 : -1;
     size_t bytes = (size_t)rows * columns * (fmt == 11 ? 2 : 1);
     if (!v4_vk_resident(data, bytes)) return -1;
+    coli_v4_vk_host_ensure(data);   /* a view the placement did not make: its rows back first */
     if (!e && !(e = v4_vk_insert(data, fmt, rows, columns))) return -1;
     /* First use: the device copy is made from a row-major matrix and one f32
      * scale per 128 inputs of every row, the layout fmt 12 reads. */
@@ -12666,6 +12856,48 @@ static void v4_vkt_note(const ColiExpertView *view) {
     free(buffer);
 }
 
+/* The tier's streaming (a big prompt chunk's cold experts on the device): an expert as
+ * the store leases it (its RAM cache, else the disk), a pinned rows16 one unpacked to
+ * rows as v4_vkt_note does, held until the tier has copied it. */
+typedef struct { ColiExpertView view; unsigned char *buffer; } V4VkHold;
+static int v4_vkt_load(void *ctx, int layer, int expert, VktExpertSrc *src, void **h) {
+    ColiExpertStore *store = ctx;
+    if (!v4_vkt_thread()) return 0;
+    V4VkHold *hold = calloc(1, sizeof *hold);
+    if (!hold) return 0;
+    if (coli_expert_lookup(store, (ColiExpertKey){layer, expert}, &hold->view)) { free(hold); return 0; }
+    const ColiTensorView *m[3] = {&hold->view.gate, &hold->view.up, &hold->view.down};
+    if (m[0]->block_rows != 16 && m[1]->block_rows != 16 && m[2]->block_rows != 16) {
+        *src = (VktExpertSrc){m[0]->data, m[1]->data, m[2]->data, m[0]->scales, m[1]->scales, m[2]->scales};
+        *h = hold;
+        return 1;
+    }
+    size_t total = 0;
+    for (int k = 0; k < 3; k++) total += m[k]->data_bytes + m[k]->scale_bytes;
+    unsigned char *at = hold->buffer = malloc(total), *data[3], *scales[3];
+    if (!at) { coli_expert_release(store, &hold->view); free(hold); return 0; }
+    for (int k = 0; k < 3; k++) {
+        size_t rows = (size_t)m[k]->rows;
+        data[k] = at; at += m[k]->data_bytes;
+        scales[k] = at; at += m[k]->scale_bytes;
+        if (m[k]->block_rows == 16) {
+            v4_vkt_unpack16(data[k], m[k]->data, rows, m[k]->data_bytes / rows);
+            v4_vkt_unpack16(scales[k], m[k]->scales, rows, m[k]->scale_bytes / rows);
+        } else {
+            memcpy(data[k], m[k]->data, m[k]->data_bytes);
+            memcpy(scales[k], m[k]->scales, m[k]->scale_bytes);
+        }
+    }
+    *src = (VktExpertSrc){data[0], data[1], data[2], scales[0], scales[1], scales[2]};
+    *h = hold;
+    return 1;
+}
+static void v4_vkt_unhold(void *ctx, void *h) {
+    V4VkHold *hold = h;
+    if (!hold) return;
+    coli_expert_release((ColiExpertStore *)ctx, &hold->view);
+    free(hold->buffer); free(hold);
+}
 static void v4_vk_tier_start(const ColiV4Engine *engine) {
     const ColiDeepSeekV4Config *c = &engine->config;
     ColiExpertStore *store = engine->experts;
@@ -12686,9 +12918,12 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
                     .act_limit = c->swiglu_limit, .max_rows = 128 * c->num_experts_per_tok,
                     .ram_reserve = st.capacity_bytes > st.resident_bytes
                         ? (size_t)(st.capacity_bytes - st.resident_bytes) : 0,
+                    /* what the device has still to take: matrices placed already
+                     * (the dense weights on the device only) are in its usage */
                     .dense_bytes = coli_vk_dense()
-                        ? (size_t)(engine->dense_resident.total_bytes + engine->head_cache.bytes) : 0,
-                    .in_ram = v4_vkt_in_ram, .ram_ctx = store};
+                        ? (size_t)(engine->dense_resident.total_bytes - engine->dense_resident.dropped_bytes + engine->head_cache.bytes) : 0,
+                    .in_ram = v4_vkt_in_ram, .ram_ctx = store,
+                    .load = v4_vkt_load, .release = v4_vkt_unhold, .load_ctx = store};
     /* The device goes before the drivers unload, after the tier's teardown (atexit runs
      * last-registered first), and whether or not the tier starts: vkt_init makes the
      * expert batch's pipelines before it can refuse (no room). */
@@ -12741,23 +12976,161 @@ static void v4c_atexit(void);
 static void v4c_close(void);
 #endif
 
-static void v4_vk_open(const ColiV4Engine *engine) {
 #ifdef COLI_VULKAN
+/* ---- dense weights on the device only (COLI_VK_DENSE_HOST) ------------------------
+ * The RAM plan asks (coli_v4_dense_device_decide) before the engine exists as a whole,
+ * so the device opens there, early, with the chain's decision: COLI_VK_DENSE_HOST=0,
+ * or unset by coli_vk_dense_host_decide's rule (an integrated GPU; a discrete one with
+ * room for the matrices), with the dense part on the device (the chain, or
+ * COLI_VK_DENSE). Then the plan counts the matrices out of RAM and keeps the layers
+ * resident, every resident layer is uploaded as it is read and its fp8 matrices and
+ * compressor projections give their pages back (v4_dho_place), all of it before the
+ * expert tier sizes its budget. The CPU reads such a matrix again from disk at its own
+ * address (v4_dho_host), and a lost device turns the resident layers into per-forward
+ * reads, as a low-memory plan does (v4_dho_lost). */
+static int g_v4_vk_opened, g_v4_dho_asked;
+static pthread_mutex_t g_v4_dho_mx = PTHREAD_MUTEX_INITIALIZER;
+static int v4c_decide(const ColiV4Engine *engine);   /* deepseek_v4_chain.h */
+
+static void v4_vk_device_open(const ColiV4Engine *engine) {
+    if (g_v4_vk_opened) return;
+    g_v4_vk_opened = 1;
     g_v4_vk_thread = pthread_self();
     g_v4_vk_engine = engine;
     /* the device opens knowing whether the routed-expert tier will be tried, so the
-     * dense matrices get their default place (coli_vk_dense_decide) */
-    int tier = vkt_wanted() && engine->experts && !engine->experts->gpu &&
+     * dense matrices get their default place (coli_vk_dense_decide); asked by the RAM
+     * plan, the expert store is not open yet */
+    int tier = vkt_wanted() && !(engine->experts && engine->experts->gpu) &&
                engine->config.n_routed_experts > 0;
     g_v4_vk_ready = coli_vk_init_env_tier("deepseek_v4", tier);
+}
+static int v4_dho_decide(ColiV4Engine *engine, uint64_t device_bytes, uint64_t host_bytes) {
+    (void)host_bytes;
+    const char *on = getenv("COLI_VULKAN"), *keep = getenv("COLI_VK_DENSE_HOST");
+    if (!on || !atoi(on)) return 0;
+    if (keep && *keep && atoi(keep) != 0) return 0;   /* kept: said in v4_vk_open, the device opened there as before */
+#ifdef COLI_V4_GPU_TIER
+    const char *cuda = getenv("DSV4_CUDA");           /* the CUDA tier mirrors the host layers */
+    if (!(cuda && atoi(cuda) == 0)) return 0;
+#endif
+    v4_vk_device_open(engine);
+    if (!g_v4_vk_ready) return 0;
+    g_v4_dho_asked = 1;
+    int chain = v4c_decide(engine);
+    return coli_vk_dense_host_decide("deepseek_v4", chain != 0 || coli_vk_dense(), (size_t)device_bytes);
+}
+/* The CPU needs a matrix the device holds alone: read back from disk at its address. */
+static int v4_dho_host(const void *data) {
+    ColiV4Engine *engine = (ColiV4Engine *)g_v4_vk_engine;
+    if (!engine || !engine->dense_resident.device_only) return 0;
+    uint64_t bytes = 0;
+    pthread_mutex_lock(&g_v4_dho_mx);
+    int r = coli_v4_layer_host_restore(engine, data, &bytes);
+    pthread_mutex_unlock(&g_v4_dho_mx);
+    if (r < 0) {
+        fprintf(stderr, "[VK] deepseek_v4: a dense matrix the device held alone could not be read back from disk\n");
+        exit(1);
+    }
+    if (r > 0) coli_vk_dense_host_reloaded((size_t)bytes);
+    return 0;
+}
+static void v4_dho_reread(uint64_t bytes) { coli_vk_dense_host_reloaded((size_t)bytes); }
+static int v4_dho_lost(void) {
+    static int said;
+    if (coli_vk_available()) return 0;
+    if (!said) {
+        said = 1;
+        fprintf(stderr, "[VK] deepseek_v4: the device that held the dense layers is gone; the CPU reads them "
+                        "from disk per forward from here on, as a low-memory plan does\n");
+    }
+    return 1;
+}
+/* One resident layer just read: each droppable tensor up as every lookup will ask for it
+ * (fp8 as fmt 12 whole, wo_a per output group; the compressors' bf16 as fmt 11), then its
+ * pages back. A tensor the device refuses keeps its host copy. */
+static ColiVkTensor *v4c_tensor(int fmt, const void *data, const float *scales, int rows8, int rows, int columns);
+static int v4_dho_up(int fmt, const void *data, const float *scales, int rows8, int rows, int columns) {
+    if (!v4c_tensor(fmt, data, scales, rows8, rows, columns)) return 0;
+    V4VkEntry *e = v4_vk_find(data, fmt, rows, columns);
+    if (e) e->dho = 1;
+    return e != NULL;
+}
+static unsigned g_v4_dho_kept;
+static int v4_dho_place(ColiV4Engine *engine, int layer) {
+    ColiDeepSeekV4LayerWeights *w = &engine->dense_resident.layers[layer];
+    const ColiDeepSeekV4Config *c = &engine->config;
+    for (size_t i = 0; i < w->plan.tensor_count; i++) {
+        const ColiDeepSeekV4TensorSpec *spec = &w->plan.tensors[i];
+        if (!w->mapped[i] || w->host_gone[i]) continue;
+        int O = (int)spec->shape[0], I = (int)spec->shape[1], ok = 1;
+        if (spec->dtype == COLI_ST_F8_E4M3) {
+            char sname[COLI_V4_MAX_TENSOR_NAME];
+            size_t n = strlen(spec->name);
+            snprintf(sname, sizeof sname, "%.*s.scale", (int)(n > 7 ? n - 7 : 0), spec->name);   /* ".weight" -> ".scale" */
+            const float *scales = coli_v4_layer_data(w, sname, NULL);
+            const unsigned char *data = w->data[i];
+            size_t tail = strlen(".attn.wo_a.weight");
+            if (!scales) ok = 0;
+            else if (n > tail && !strcmp(spec->name + n - tail, ".attn.wo_a.weight") && c->o_groups > 1) {
+                int rows = c->o_lora_rank, sc = (I + 127) / 128, sr = (rows + 127) / 128;
+                for (int g = 0; ok && g < c->o_groups; g++)
+                    ok = v4_dho_up(12, data + (size_t)g * rows * I, scales + (size_t)g * sr * sc,
+                                   spec->packed_rows8, rows, I);
+            } else ok = v4_dho_up(12, data, scales, spec->packed_rows8, O, I);
+        } else ok = v4_dho_up(11, w->data[i], NULL, 0, O, I);
+        if (ok && !coli_v4_layer_host_drop(engine, layer, i))
+            coli_vk_dense_host_dropped((size_t)coli_v4_dense_tensor_bytes(spec));
+        else g_v4_dho_kept++;
+    }
+    return 0;
+}
+#endif
+
+static void v4_vk_open(const ColiV4Engine *engine) {
+#ifdef COLI_VULKAN
+    v4_vk_device_open(engine);      /* opened already when the RAM plan asked */
+    g_v4_vk_engine = engine;
+    ColiV4Engine *mut = (ColiV4Engine *)engine;
+    if (g_v4_vk_ready && !g_v4_dho_asked) {   /* COLI_VK_DENSE_HOST=1: said here, as every engine says it */
+        const char *keep = getenv("COLI_VK_DENSE_HOST");
+        if (keep && *keep && atoi(keep) != 0)
+            coli_vk_dense_host_decide("deepseek_v4", v4c_decide(engine) != 0 || coli_vk_dense(),
+                                      (size_t)engine->dense_resident.total_bytes);
+    }
+    int device_only = g_v4_vk_ready && engine->dense_resident.device_only;
+    if (device_only) coli_v4_vk_host = v4_dho_host;
     v4c_start(engine);              /* COLI_VK_CHAIN: the trunk on the device, before the tier sizes itself */
+    if (device_only) {              /* every layer up now (the chain has read them if it runs): before the tier */
+        char err[256] = {0};
+        for (int i = 0; i < engine->config.num_hidden_layers; i++) {
+            ColiDeepSeekV4LayerWeights w;
+            if (coli_v4_layer_load(mut, &w, &engine->config, engine->target_index, i, err, sizeof err)) {
+                fprintf(stderr, "[VK] deepseek_v4: layer %d did not load (%s)\n", i, err);
+                break;
+            }
+        }
+        coli_vk_dense_host_placed("deepseek_v4", g_v4_dho_kept
+            ? "norms, block scales, the router, weights_proj, the mHC mixes, the head; and matrices the device refused"
+            : "norms, block scales, the router, the indexer's weights_proj, the mHC mixes, the head");
+    }
     v4_vk_tier_start(engine);
     v4c_atexit();                   /* after the tier's: the chain goes before the device */
     if (g_v4_vk_ready && !vkt_ready() && !coli_vk_dense())
         coli_vk_dense_decide("deepseek_v4", 0, 1);   /* no tier after all: the trunk to the device */
-    if (g_v4_vk_ready && coli_vk_dense()) coli_v4_vk_matmul = v4_vk_matmul_impl;   /* COLI_VK_DENSE=0: no hook */
+    /* COLI_VK_DENSE=0: no hook, except for the matrices the device holds alone */
+    if (g_v4_vk_ready && (coli_vk_dense() || device_only)) coli_v4_vk_matmul = v4_vk_matmul_impl;
 #else
     (void)engine;
+#endif
+}
+
+/* Before the engine opens: the RAM plan may put the dense layers on the device only. */
+static void v4_vk_hooks(void) {
+#ifdef COLI_VULKAN
+    coli_v4_dense_device_decide = v4_dho_decide;
+    coli_v4_dense_place = v4_dho_place;
+    coli_v4_dense_device_lost = v4_dho_lost;
+    coli_v4_dense_reread = v4_dho_reread;
 #endif
 }
 
@@ -12782,6 +13155,7 @@ static void v4_vk_close(void) {
     fprintf(stderr, "[VK] deepseek_v4: %zu resident matrices on the device, %.1f MiB "
                     "(fp8 as fmt 12, bf16 as fmt 11)\n", tensors, bytes / 1048576.0);
     coli_v4_vk_matmul = NULL;
+    coli_v4_vk_host = NULL;
     for (size_t i = 0; i < g_v4_vk_cap; i++)
         coli_vk_tensor_free(g_v4_vk_map[i].tensor);
     free(g_v4_vk_map);
@@ -15595,6 +15969,7 @@ static int v4_serve_main(void) {
     if (ram && atof(ram) > 0.0)
         open_options.memory_limit_bytes =
             (uint64_t)(atof(ram) * 1073741824.0);
+    v4_vk_hooks();   /* the RAM plan may put the dense layers on the Vulkan device only */
     if (coli_v4_engine_open(&engine, &open_options, error, sizeof(error))) {
         fprintf(stderr, "%s\n", error);
         return 1;
@@ -15732,6 +16107,7 @@ int main(int argc, char **argv) {
         if (cli.memory_gib > 0.0)
             open_opts.memory_limit_bytes =
                 (uint64_t)(cli.memory_gib * 1073741824.0);
+        v4_vk_hooks();   /* the RAM plan may put the dense layers on the Vulkan device only */
         if (coli_v4_engine_open(&engine, &open_opts, error, sizeof(error))) {
             fprintf(stderr, "%s\n", error);
             goto cleanup;
@@ -16872,6 +17248,12 @@ fail:
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 static int set_error(char *error, size_t size, const char *format, ...) {
     if (error && size) {
@@ -17046,11 +17428,69 @@ int coli_v4_layer_validate(const ColiDeepSeekV4LayerPlan *plan,
     return 0;
 }
 
+/* Dense weights on the Vulkan device only: a droppable tensor of a resident layer is
+ * read into an anonymous mapping of its own, so that its pages can go back to the system
+ * while its address stays reserved (the device copies are found by it, and no later
+ * allocation can take it), and come back at the same address if the CPU needs it. */
+static int g_v4_layer_map;   /* the reference loader maps droppable tensors (resident, device only) */
+static size_t v4_map_len(size_t bytes) {
+#ifdef _WIN32
+    SYSTEM_INFO si; GetSystemInfo(&si);
+    size_t page = si.dwAllocationGranularity ? si.dwAllocationGranularity : 65536;
+#else
+    long ps = sysconf(_SC_PAGESIZE);
+    size_t page = ps > 0 ? (size_t)ps : 4096;
+#endif
+    return (bytes + page - 1) / page * page;
+}
+static void *v4_map_alloc(size_t bytes) {
+    size_t len = v4_map_len(bytes ? bytes : 1);
+#ifdef _WIN32
+    return VirtualAlloc(NULL, len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void *p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return p == MAP_FAILED ? NULL : p;
+#endif
+}
+static int v4_map_drop(void *data, size_t bytes) {   /* pages back, the range reserved and unreadable */
+    size_t len = v4_map_len(bytes ? bytes : 1);
+#ifdef _WIN32
+    return VirtualFree(data, len, MEM_DECOMMIT) ? 0 : -1;
+#else
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
+#ifdef MAP_NORESERVE
+    flags |= MAP_NORESERVE;
+#endif
+    return mmap(data, len, PROT_NONE, flags, -1, 0) == MAP_FAILED ? -1 : 0;
+#endif
+}
+static int v4_map_restore(void *data, size_t bytes) {   /* zeroed, writable pages at the same address */
+    size_t len = v4_map_len(bytes ? bytes : 1);
+#ifdef _WIN32
+    return VirtualAlloc(data, len, MEM_COMMIT, PAGE_READWRITE) == data ? 0 : -1;
+#else
+    return mprotect(data, len, PROT_READ | PROT_WRITE);
+#endif
+}
+static void v4_map_free(void *data, size_t bytes) {
+    if (!data) return;
+#ifdef _WIN32
+    (void)bytes;
+    VirtualFree(data, 0, MEM_RELEASE);
+#else
+    munmap(data, v4_map_len(bytes ? bytes : 1));
+#endif
+}
+
 void coli_v4_layer_free(ColiV4Engine *engine,
                         ColiDeepSeekV4LayerWeights *weights) {
     (void)engine;
     if (!weights) return;
-    for (size_t i = 0; i < weights->plan.tensor_count; i++) free(weights->data[i]);
+    for (size_t i = 0; i < weights->plan.tensor_count; i++) {
+        if (weights->mapped[i])
+            v4_map_free(weights->data[i], (size_t)coli_v4_dense_tensor_bytes(&weights->plan.tensors[i]));
+        else free(weights->data[i]);
+    }
     memset(weights, 0, sizeof(*weights));
 }
 
@@ -17071,8 +17511,11 @@ int coli_v4_layer_load(ColiV4Engine *engine,
         const ColiSafetensorsTensor *tensor = coli_st_find(index, spec->name);
         size_t resident_bytes = tensor->dtype == COLI_ST_F8_E8M0
             ? (size_t)tensor->numel * sizeof(float) : (size_t)tensor->nbytes;
-        weights->data[i] = malloc(resident_bytes);
+        weights->mapped[i] = g_v4_layer_map && coli_v4_dense_device_only_tensor(spec) &&
+                             resident_bytes == coli_v4_dense_tensor_bytes(spec);
+        weights->data[i] = weights->mapped[i] ? v4_map_alloc(resident_bytes) : malloc(resident_bytes);
         if (!weights->data[i]) {
+            weights->mapped[i] = 0;
             coli_v4_layer_free(NULL, weights);
             return set_error(error, error_size, "out of memory loading: %s", spec->name);
         }
@@ -18187,6 +18630,7 @@ static int fp8_matvec_compute(float *output, const ColiTensorView *weight,
  * rounded to E4M3 per 128, so the device multiplies exactly what the CPU kernel
  * would; only the order of the sums differs. */
 ColiV4VkMatmul coli_v4_vk_matmul;
+ColiV4VkHost coli_v4_vk_host;
 #endif
 
 int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
@@ -18213,6 +18657,7 @@ int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
     }
 #ifdef COLI_VULKAN
     if (coli_v4_vk_fp8(output, weight, activation, 1)) return 0;
+    coli_v4_vk_host_ensure(weight->data);
 #endif
     return fp8_matvec_compute(output, weight, activation);
 }
@@ -18235,6 +18680,7 @@ int coli_fp8_matvec_pre(float *output, const ColiTensorView *weight,
 #endif
 #ifdef COLI_VULKAN
     if (coli_v4_vk_fp8(output, weight, activation, 1)) return 0;
+    coli_v4_vk_host_ensure(weight->data);
 #endif
     return fp8_matvec_compute(output, weight, activation);
 }
@@ -18349,6 +18795,8 @@ int coli_fp8_dual_matvec_ref(float *output_a, float *output_b,
 #ifdef COLI_VULKAN
     if (coli_v4_vk_fp8(output_a, a, activation, 1) &&
         coli_v4_vk_fp8(output_b, b, activation, 1)) return 0;
+    coli_v4_vk_host_ensure(a->data);
+    coli_v4_vk_host_ensure(b->data);
 #endif
 #ifdef __AVX2__
     if (a->block_rows == 8) {
@@ -18472,6 +18920,7 @@ int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
         }
 #ifdef COLI_VULKAN
     if (coli_v4_vk_fp8(outputs, weight, activations, batch)) return 0;
+    coli_v4_vk_host_ensure(weight->data);
 #endif
     return fp8_batch_compute(outputs, weight, activations, batch);
 }
@@ -18494,6 +18943,7 @@ int coli_fp8_matmul_batch_pre(float *outputs, const ColiTensorView *weight,
 #endif
 #ifdef COLI_VULKAN
     if (coli_v4_vk_fp8(outputs, weight, activations, batch)) return 0;
+    coli_v4_vk_host_ensure(weight->data);
 #endif
     return fp8_batch_compute(outputs, weight, activations, batch);
 }

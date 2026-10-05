@@ -658,6 +658,11 @@ typedef struct {
     void *vk;                             /* ColiVkTensor*, caricata alla prima uso */
     int resident;                         /* eligible for persistent accelerator wrapping */
     void *metal;                          /* ColiMetalTensor*, created lazily */
+    /* the dense weights on the device only (COLI_VK_DENSE_HOST): the tensor it came from
+     * (kind 0 load_mat, 1 and 2 the halves absorb_kvb makes of kv_b_proj), to read it back
+     * (g53_dho_reload); vk_gone = 1 while the device holds it alone */
+    char *vk_name;
+    int vk_kind, vk_gone;
 } Mat;
 
 typedef struct {
@@ -888,6 +893,11 @@ static void absorb_kvb(GModel *m, GLayer *l, const char *name) {
     free(whole);
     l->kvb_kt = quantize_loaded(kt, H * L, QK);
     l->kvb_v = quantize_loaded(vv, H * V, L);
+#ifdef COLI_VULKAN
+    l->kvb_kt.vk_name = strdup(name); l->kvb_kt.vk_kind = 1;
+    l->kvb_v.vk_name = strdup(name); l->kvb_v.vk_kind = 2;
+    if (!l->kvb_kt.vk_name || !l->kvb_v.vk_name) { fprintf(stderr, "OOM on %s\n", name); exit(1); }
+#endif
 }
 
 /* rows x columns e' la forma con cui il forward usa la matrice, contata dalla
@@ -953,6 +963,9 @@ static Mat load_mat(GModel *m, int64_t rows, int64_t columns, const char *fmt, .
         st_read_raw(&m->S, name, packed, 1);
         st_read_f32_cap(&m->S, scales, step, qs->numel, 1);
         mat.fmt = 4; mat.q4 = packed; mat.s = step; mat.gs = 64; mat.resident = 1;
+#ifdef COLI_VULKAN
+        if (!(mat.vk_name = strdup(name))) { fprintf(stderr, "OOM on %s\n", name); exit(1); }
+#endif
         return mat;
     }
 
@@ -970,12 +983,72 @@ static Mat load_mat(GModel *m, int64_t rows, int64_t columns, const char *fmt, .
     mat.columns = (int)columns;
 
     mat = quantize_loaded(buffer, mat.rows, mat.columns);
+#ifdef COLI_VULKAN
+    if (!(mat.vk_name = strdup(name))) { fprintf(stderr, "OOM on %s\n", name); exit(1); }
+#endif
     return mat;
 }
+
+#ifdef COLI_VULKAN
+/* ---- the dense weights on the device only (COLI_VK_DENSE_HOST; docs/vulkan.md) -----
+ * With the dense part on the device (the chain, or the per-matrix path), every resident
+ * matrix is uploaded once the device is open and its host copy is given back, before the
+ * expert cache sizes itself from the free memory (expert_cache_init), so that RAM goes to
+ * the experts. mv and mm multiply a matrix the device holds alone by that copy (f32 as
+ * the backend's fmt 10, as the chain uploads it); anything else that reads it (mv_rows,
+ * mm_rows, a parallel region, a lost device) reads it back from the checkpoint first:
+ * load_mat, or absorb_kvb for kv_b's two halves, with the GLM53_BITS of the load, so the
+ * same bytes; the copy stays from there on. */
+static GModel *g_g53_dho_model;
+static pthread_mutex_t g_g53_dho_mx = PTHREAD_MUTEX_INITIALIZER;
+static int g53_vk_fmt(const Mat *w) { return w->fmt == 0 ? 10 : w->fmt; }
+static size_t g53_host_bytes(const Mat *w) {
+    const size_t r = (size_t)w->rows, cl = (size_t)w->columns;
+    if (w->fmt == 0) return r * cl * 4;
+    if (w->fmt == 1) return r * cl + r * 4;
+    return r * ((cl + 1) / 2) + r * ((cl + w->gs - 1) / w->gs) * 4;
+}
+static void g53_dho_reload(Mat *w) {
+    pthread_mutex_lock(&g_g53_dho_mx);
+    if (__atomic_load_n(&w->vk_gone, __ATOMIC_ACQUIRE)) {
+        GModel *m = g_g53_dho_model;
+        if (!m || !w->vk_name) { fprintf(stderr, "[VK] glm53: a dense matrix the device held alone cannot be read back\n"); exit(1); }
+        Mat n;
+        if (w->vk_kind == 0) n = load_mat(m, w->rows, w->columns, "%s", w->vk_name);
+        else {
+            GLayer tmp; memset(&tmp, 0, sizeof tmp);
+            absorb_kvb(m, &tmp, w->vk_name);
+            Mat *other = w->vk_kind == 1 ? &tmp.kvb_v : &tmp.kvb_kt;
+            n = w->vk_kind == 1 ? tmp.kvb_kt : tmp.kvb_v;
+            free((void *)other->f); free((void *)other->q8); free((void *)other->q4); free((void *)other->s);
+            free(other->vk_name);
+        }
+        if (n.fmt != w->fmt || n.rows != w->rows || n.columns != w->columns || n.gs != w->gs) {
+            fprintf(stderr, "[VK] glm53: %s came back from disk in another form (fmt %d, was %d)\n", w->vk_name, n.fmt, w->fmt);
+            exit(1);
+        }
+        w->f = n.f; w->q8 = n.q8; w->q4 = n.q4; w->s = n.s;
+        free(n.vk_name);
+        __atomic_store_n(&w->vk_gone, 0, __ATOMIC_RELEASE);
+        coli_vk_dense_host_reloaded(g53_host_bytes(w));
+    }
+    pthread_mutex_unlock(&g_g53_dho_mx);
+}
+static int g53_dho_gone(const Mat *w) { return __atomic_load_n(&w->vk_gone, __ATOMIC_ACQUIRE); }
+/* The device's copy of a matrix it holds alone: 0 = the CPU computes (after a read-back). */
+static int g53_dho_matmul(const Mat *w, float *out, const float *x, int S) {
+    if (omp_in_parallel() || !w->vk) return 0;
+    return coli_vk_matmul((ColiVkTensor **)&((Mat *)w)->vk, out, x, NULL, NULL, g53_vk_fmt(w), S, w->columns,
+                          w->rows, w->fmt == 4 ? w->gs : 0);
+}
+#endif
 
 /* Come mv ma su un blocco di righe contigue: serve alle matrici che tengono
  * una testa dopo l'altra in un unico tensore. */
 static void mv_rows(float *out, const Mat *w, const float *x, int row0, int rows) {
+#ifdef COLI_VULKAN
+    if (g53_dho_gone(w)) g53_dho_reload((Mat *)w);
+#endif
     switch (w->fmt) {
     case 4: {
         const int packed = (w->columns + 1) / 2, groups = w->columns / w->gs;
@@ -1014,6 +1087,10 @@ static void mv(float *out, const Mat *w, const float *x) {
     }
 #endif
 #ifdef COLI_VULKAN
+    if (g53_dho_gone(w)) {
+        if (g53_dho_matmul(w, out, x, 1)) return;
+        g53_dho_reload((Mat *)w);
+    }
     if (g_vk_dense && w->resident && (w->fmt == 1 || w->fmt == 4)) {
         Mat *mutable_w = (Mat *)w;
         if (coli_vk_matmul((ColiVkTensor **)&mutable_w->vk, out, x,
@@ -1042,6 +1119,11 @@ static void mm(float *out, const Mat *w, const float *x, int S) {
     gpu |= g_metal_ready && w->resident && (w->fmt == 1 || w->fmt == 4);
 #endif
 #ifdef COLI_VULKAN
+    if (S > 1 && g53_dho_gone(w)) {   /* the device holds it alone: S rows there, else row by row (mv reads it back) */
+        if (g53_dho_matmul(w, out, x, S)) return;
+        for (int t = 0; t < S; t++) mv(out + (size_t)t * w->rows, w, x + (size_t)t * w->columns);
+        return;
+    }
     if (S > 1 && g_vk_dense && w->resident && (w->fmt == 1 || w->fmt == 4)) {
         Mat *mutable_w = (Mat *)w;
         if (coli_vk_matmul((ColiVkTensor **)&mutable_w->vk, out, x,
@@ -1066,6 +1148,9 @@ static void mm(float *out, const Mat *w, const float *x, int S) {
 /* mv_rows for S rows: out[S, rows] from x[S, columns] and W's rows
  * [row0, row0 + rows). */
 static void mm_rows(float *out, const Mat *w, const float *x, int S, int row0, int rows) {
+#ifdef COLI_VULKAN
+    if (g53_dho_gone(w)) g53_dho_reload((Mat *)w);
+#endif
     switch (w->fmt) {
     case 4: {
         const int packed = (w->columns + 1) / 2, groups = w->columns / w->gs;
@@ -1897,11 +1982,11 @@ static void expert_mats(const GModel *m, const Slot *slot, Mat *gate, Mat *up, M
     const int hidden = m->c.hidden, inter = m->c.moe_inter;
     const Mat shape[3] = {
         { 4, NULL, NULL, slot->piece[0], (const float *)slot->piece[1],
-          inter, hidden, 64, NULL, 0, NULL },
+          inter, hidden, 64, NULL, 0, NULL, NULL, 0, 0 },
         { 4, NULL, NULL, slot->piece[2], (const float *)slot->piece[3],
-          inter, hidden, 64, NULL, 0, NULL },
+          inter, hidden, 64, NULL, 0, NULL, NULL, 0, 0 },
         { 4, NULL, NULL, slot->piece[4], (const float *)slot->piece[5],
-          hidden, inter, 64, NULL, 0, NULL },
+          hidden, inter, 64, NULL, 0, NULL, NULL, 0, 0 },
     };
     *gate = shape[0]; *up = shape[1]; *down = shape[2];
 }
@@ -1962,6 +2047,27 @@ static VktExpertSrc glm53_slot_src(const Slot *slot) {
     return (VktExpertSrc){slot->piece[0], slot->piece[2], slot->piece[4],
                           slot->piece[1], slot->piece[3], slot->piece[5]};
 }
+/* The tier's streaming (a big prompt chunk's cold experts on the device): a group of
+ * experts read as ffn_vk_cpu reads them (expert_block_read: the layer cache, the misses
+ * in parallel), up to the cache's capacity, each valid until the next read. */
+static int glm53_vk_load_batch(void *ctx, int index, const int *e, int n, VktExpertSrc *srcs, void **h) {
+    GModel *m = ctx;
+    LCache *cache = &m->ecache[index];
+    if (n > cache->cap) n = cache->cap;
+    if (n < 1 || n > 64) return 0;
+    int slot_of[64], to_read[64];
+    expert_block_read(m, index, e, n, slot_of, to_read);
+    for (int u = 0; u < n; u++) {
+        Slot *slot = &cache->s[slot_of[u]];
+        slot->used = ++m->clock;
+        srcs[u] = glm53_slot_src(slot); h[u] = slot;
+    }
+    return n;
+}
+static int glm53_vk_load(void *ctx, int index, int e, VktExpertSrc *src, void **h) {
+    return glm53_vk_load_batch(ctx, index, &e, 1, src, h) == 1;
+}
+static void glm53_vk_unhold(void *ctx, void *h) { (void)ctx; (void)h; }
 /* Pairs i of one block that want[i] marks, on the CPU: their experts in first-seen
  * order, in blocks of the layer's cache slots as ffn_layer reads them, each computed
  * once for all its rows into ctb[i]. note: offer each to the tier. */
@@ -2006,7 +2112,7 @@ static void ffn_vk_cpu(GModel *m, int index, const float *x, int rows, int K, co
 static void ffn_layer_vk(GModel *m, int index, const float *x, int tokens, const int *chosen,
                          const float *weight, float *out, float *sg, float *su, float *tmp, float *xg) {
     const Cfg *c = &m->c;
-    const int D = c->hidden, K = c->topk, B = tokens < GLM53_VK_ROWS ? tokens : GLM53_VK_ROWS, nmax = B * K;
+    const int D = c->hidden, K = c->topk, B = vkt_step_rows(tokens, GLM53_VK_ROWS), nmax = B * K;   /* a whole prompt chunk when the tier streams */
     uint8_t *taken = calloc((size_t)nmax, 1), *want = calloc((size_t)nmax, 1);
     const float **dev = malloc((size_t)nmax * sizeof(*dev));
     float *ctb = malloc((size_t)nmax * D * sizeof(float));
@@ -2287,6 +2393,62 @@ static void expert_geometry(GModel *m);
 static void expert_table_init(GModel *m);
 static void expert_cache_init(GModel *m);
 
+#ifdef COLI_VULKAN
+/* Upload one matrix as glm53_chain.h's g53c_tensor would (the same format and geometry,
+ * so the chain and mv/mm find this copy) and give its host copy back. */
+static int g53_dho_drop(Mat *w, int keep, int drop, size_t *bytes) {
+    if (keep || !w->resident || !w->vk_name || w->vk_gone || w->rows < 1 || w->columns < 1) return 0;
+    const void *p = w->fmt == 0 ? (const void *)w->f : w->fmt == 1 ? (const void *)w->q8 : (const void *)w->q4;
+    if (!p || (w->fmt != 0 && w->fmt != 1 && w->fmt != 4) || (w->fmt == 4 && (w->gs < 8 || w->gs % 8))) return 0;
+    if (!drop) { *bytes += g53_host_bytes(w); return 1; }
+    if (!coli_vk_tensor_ensure((ColiVkTensor **)&w->vk, p, w->fmt ? w->s : NULL, g53_vk_fmt(w), w->columns, w->rows,
+                               w->fmt == 4 ? w->gs : 0)) return 0;
+    const size_t b = g53_host_bytes(w);
+    free((void *)w->f); free((void *)w->q8); free((void *)w->q4); free((void *)w->s);
+    w->f = NULL; w->q8 = NULL; w->q4 = NULL; w->s = NULL;
+    __atomic_store_n(&w->vk_gone, 1, __ATOMIC_RELEASE);
+    coli_vk_dense_host_dropped(b);
+    *bytes += b;
+    return 1;
+}
+/* Every resident matrix but the routed experts: the head (unless tied to the embedding),
+ * each layer's attention (KDA or MLA with its indexer), dense MLP and shared expert. The
+ * absorbed kv_b halves stay when the chain will not run every forward: outside it the
+ * CPU's attention reads them by row (mm_rows, mv_rows). */
+static int g53_dho_pass(GModel *m, int keep_kvb, int drop, size_t *bytes) {
+    int n = g53_dho_drop(&m->head, 0, drop, bytes);
+    for (int i = m->layer_begin; i < m->layer_end; i++) {
+        GLayer *l = &m->layer[i];
+        Mat *all[] = {&l->kq, &l->kk, &l->kv, &l->ko, &l->kga, &l->kgb, &l->kfa, &l->kfb, &l->kb,
+                      &l->qa, &l->qb, &l->kva, &l->o, &l->iwq, &l->iwk, &l->iwp, &l->ikpg,
+                      &l->dg, &l->du, &l->dd, &l->rg, &l->ru, &l->rd};
+        for (size_t k = 0; k < sizeof(all) / sizeof(all[0]); k++) n += g53_dho_drop(all[k], 0, drop, bytes);
+        n += g53_dho_drop(&l->kvb_kt, keep_kvb, drop, bytes);
+        n += g53_dho_drop(&l->kvb_v, keep_kvb, drop, bytes);
+    }
+    return n;
+}
+/* Once the device is open, before expert_cache_init reads the free memory: the decision
+ * (the chain's own, made silently here and printed by g53c_start), the uploads and the
+ * RAM given back. */
+static void g53_dho_start(GModel *m, int tier) {
+    if (!g_vk_ready || !m->has_io || m->layer_begin != 0 || m->layer_end != m->c.n_layers) return;
+    const int chain = coli_vk_chain_decide(NULL, tier, COLI_VK_CHAIN_UNMEASURED);
+    const int keep_kvb = chain != COLI_VK_CHAIN_ON;
+    size_t bytes = 0;
+    g53_dho_pass(m, keep_kvb, 0, &bytes);
+    if (!coli_vk_dense_host_decide("glm53", chain != COLI_VK_CHAIN_OFF || g_vk_dense, bytes)) return;
+    g_g53_dho_model = m;
+    g_vk_dense = 1;   /* the steps the chain does not run take the device too: the CPU has no copy */
+    bytes = 0;
+    g53_dho_pass(m, keep_kvb, 1, &bytes);
+    coli_vk_dense_host_placed("glm53", keep_kvb
+        ? "the embedding (and a head tied to it), the routers, the mHC mixes and norms, the vision tower, "
+          "the absorbed kv_b (the chain will not run every forward: the CPU's attention reads it)"
+        : "the embedding (and a head tied to it), the routers, the mHC mixes and norms, the vision tower");
+}
+#endif
+
 static void model_load_range(GModel *m, const char *dir, int layer_begin,
                              int layer_end, int load_io) {
     load_cfg(&m->c, dir);
@@ -2468,6 +2630,7 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
         if (g_vk_ready) coli_vk_set_swiglu_limit(m->c.swiglu_limit);
         if (!g_vk_ready) fprintf(stderr, "Vulkan: no usable device, falling back to CPU\n");
         else if (g_vk_dense) fprintf(stderr, "Vulkan: active for resident matrices\n");
+        g53_dho_start(m, tier);   /* COLI_VK_DENSE_HOST: the trunk on the device only, before the expert cache sizes itself */
     }
 #endif
     /* La cache si dimensiona qui, non prima: quanto si puo' spendere dipende
@@ -2716,6 +2879,7 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
  * una perdita per richiesta. Ogni allocazione fatta dal caricamento ha qui il
  * suo rilascio, l'indice dei tensori compreso. */
 static void mat_release(Mat *mat) {
+    free(mat->vk_name);
 #ifdef COLI_METAL
     if (mat->metal) coli_metal_tensor_free((ColiMetalTensor *)mat->metal);
 #endif
@@ -2955,6 +3119,11 @@ static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
     const Cfg *c = &m->c;
     const char *setting = getenv("GLM53_PREFILL_CHUNK");
     int chunk = setting ? atoi(setting) : 128;
+#ifdef COLI_VULKAN
+    /* the dense chain with a chunk from the budget: blocks of its chunk, so a long
+     * prompt's MoE steps are big ones the tier can stream */
+    if (!setting && !(g_echo_k > 0 && g_echo_id)) { int r = g53c_prefill_rows(m, s, n); if (r > 0) chunk = r; }
+#endif
     if (chunk < 1) chunk = 1;
     if (chunk > n) chunk = n;
 
@@ -4095,8 +4264,10 @@ static void glm53_vk_tier_start(GModel *m) {
                         .act = VKT_ACT_SWIGLU, .act_limit = c->swiglu_limit,
                         .max_rows = GLM53_VK_ROWS * c->topk,
                         .ram_reserve = (size_t)cap * (size_t)sparse * (size_t)m->e_slot,
-                        .dense_bytes = g_vk_dense ? glm53_dense_dev_bytes(m) : 0,
-                        .in_ram = glm53_in_ram, .ram_ctx = m};
+                        .dense_bytes = g_vk_dense && !coli_vk_dense_device_only() ? glm53_dense_dev_bytes(m) : 0,
+                        .in_ram = glm53_in_ram, .ram_ctx = m,
+                        .load = glm53_vk_load, .release = glm53_vk_unhold, .load_ctx = m,
+                        .load_batch = glm53_vk_load_batch};
         atexit(coli_vk_shutdown);   /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
         if (vkt_init(&vc, rt_counts_all())) {
             atexit(vkt_shutdown);

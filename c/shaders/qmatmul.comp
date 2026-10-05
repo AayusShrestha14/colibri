@@ -26,7 +26,7 @@ layout(std430, binding = 2) readonly buffer Sc { float scale[]; };
 layout(std430, binding = 3) writeonly buffer Y { float y[]; };
 
 layout(push_constant) uniform P {
-    int fmt;        // 1=int8, 2=int4, 4=grouped int4, 5=int3-g64, 7=MXFP4, 10=f32, 11=bf16, 12=fp8-e4m3 grouped, 13=int8 grouped
+    int fmt;        // 1=int8, 2=int4, 4=grouped int4, 5=int3-g64, 7=MXFP4, 10=f32, 11=bf16, 12=fp8-e4m3 grouped, 13=int8 grouped, 14=f16
     int S, I, O;
     int rowWords;   // uint32 words per weight row
     int gs;         // fmt=4 group size (multiple of 8; host gates otherwise)
@@ -107,6 +107,13 @@ void main() {
                 if (i0 + 1 < p.I)
                     sum += (staged ? xsh[i0 + 1] : x[xoff + i0 + 1]) * uintBitsToFloat(pk & 0xffff0000u);
             }
+        } else if (p.fmt == 14) { // f16 weights, two per word, LOW half = even column
+            int words = (p.I + 1) / 2;
+            for (int wi = lane; wi < words; wi += sgsize) {
+                vec2 h = unpackHalf2x16(w[rowBase + uint(wi)]); int i0 = wi * 2;
+                sum += (staged ? xsh[i0] : x[xoff + i0]) * h.x;
+                if (i0 + 1 < p.I) sum += (staged ? xsh[i0 + 1] : x[xoff + i0 + 1]) * h.y;
+            }
         } else if (p.fmt == 12 || p.fmt == 13) { // fp8 e4m3 / int8, 4 per word, one f32
             // scale per gs inputs. gs % 4 == 0 (host-gated): a word never straddles a group.
             int words = (p.I + 3) / 4, ng = (p.I + p.gs - 1) / p.gs;
@@ -173,7 +180,7 @@ void main() {
             }
         }
         float tot = subgroupAdd(sum);
-        if (lane == 0) y[s * p.O + o] = (p.fmt == 5 || p.fmt == 4 || p.fmt == 7 || p.fmt == 10 || p.fmt == 11 || p.fmt == 12 || p.fmt == 13)
+        if (lane == 0) y[s * p.O + o] = (p.fmt == 5 || p.fmt == 4 || p.fmt == 7 || p.fmt == 10 || p.fmt == 11 || p.fmt == 12 || p.fmt == 13 || p.fmt == 14)
                                         ? tot : tot * scale[o];
     }
 }

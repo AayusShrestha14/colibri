@@ -75,7 +75,7 @@ class _CgroupMount:
 # sidecar and self-invalidate on any change. Best-effort: any read/write failure falls
 # straight back to a full recompute (see analyze_model). Sits alongside .coli_usage/.coli_ssd.
 _ANALYSIS_CACHE_NAME = ".coli_analysis.json"
-_ANALYSIS_CACHE_VERSION = 8
+_ANALYSIS_CACHE_VERSION = 11
 
 
 def _dense_in_ram(descriptor, on_disk_bytes):
@@ -84,6 +84,11 @@ def _dense_in_ram(descriptor, on_disk_bytes):
     Coincidono per chi li carica come stanno; una famiglia che li riquantizza
     al caricamento lo dichiara nel registro. Un errore qui non e' cosmetico:
     e' la differenza fra dire a qualcuno che il modello ci sta e dirgli di no."""
+    # GLM53's quantization is per matrix, with F32 vectors/vision and an int8
+    # fallback for narrow rows. A whole-checkpoint ratio cannot represent it;
+    # _glm53_dense_tensors prices its source inventory below, outside the cache.
+    if descriptor.id == "glm53":
+        return on_disk_bytes
     ratio = getattr(descriptor, "dense_load_ratio", None)
     if ratio is None:
         return on_disk_bytes
@@ -91,6 +96,270 @@ def _dense_in_ram(descriptor, on_disk_bytes):
         return max(0, int(ratio(on_disk_bytes)))
     except Exception:
         return on_disk_bytes
+
+
+# A token embedding table: "embed_tokens", DeepSeek's "embed", "tok_embeddings",
+# "wte"; not a vision tower's patch or position embedding.
+_EMBED_TABLE = re.compile(r"(^|\.)(embed_tokens|embed|tok_embeddings|wte|word_embeddings)\.weight$")
+
+
+def _vk_flag(env, name):
+    value = (env.get(name) or "").strip()
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return 1
+
+
+# The families whose dense chain is on by default on an integrated GPU with the
+# expert tier (coli_vk_chain_decide's measured `igpu`, docs/vulkan.md).
+_VK_IGPU_CHAIN_ON = ("qwen36", "olmoe")
+_VK_DENSE_HOST_FAMILIES = frozenset((
+    "qwen36", "qwen38", "glm", "glm53", "inkling", "kimi", "mimo",
+    "olmoe", "deepseek_v4", "deepseek_v41",
+))
+
+
+def _vk_device(env, vulkan):
+    if vulkan is not None or not _vk_flag(env, "COLI_VULKAN"):
+        return vulkan
+    try:
+        from setup_hw import best_vulkan_device, detect_vulkan
+        return best_vulkan_device(detect_vulkan().get("devices", []))
+    except Exception:
+        return None
+
+
+def _vk_dense_active(family_id, env, vulkan):
+    if (family_id not in _VK_DENSE_HOST_FAMILIES or
+            not _vk_flag(env, "COLI_VULKAN") or _vk_flag(env, "COLI_CUDA")):
+        return False
+    kind = (vulkan or {}).get("type")
+    if kind not in ("discrete", "integrated", "cpu", "virtual", "other"):
+        return False
+    tier = _vk_flag(env, "COLI_VK_TIER") != 0
+    chain, dense = _vk_flag(env, "COLI_VK_CHAIN"), _vk_flag(env, "COLI_VK_DENSE")
+    if chain is None:
+        chain = (kind not in ("integrated", "cpu") or
+                 kind == "integrated" and tier and family_id in _VK_IGPU_CHAIN_ON)
+    if dense is None:
+        # colibri.c passes default=0 to coli_vk_dense_decide; its chain is
+        # independent, but disabling that chain does not enable per-matrix GEMVs.
+        dense = family_id != "glm" and (kind not in ("integrated", "cpu") or not tier)
+    return bool(chain or dense)
+
+
+def _text_weight_name(name):
+    return name.removeprefix("language_model.").replace("model.language_model.", "model.", 1)
+
+
+_Q38_TRUNK_COMPONENTS = {
+    "self_attn.q_proj": "attnq", "self_attn.k_proj": "attnk",
+    "self_attn.v_proj": "attnv", "self_attn.o_proj": "attno",
+    "self_attn.indexer.index_qk_proj": "qsaidx",
+    "linear_attn.in_proj_qkv": "dnqkv", "linear_attn.in_proj_z": "dnz",
+    "linear_attn.out_proj": "dnout", "mlp.gate": "router",
+    "mlp.shared_expert.gate_proj": "shg", "mlp.shared_expert.up_proj": "shu",
+    "mlp.shared_expert.down_proj": "shd",
+}
+for _block, _tag in (("attn", "hca"), ("mlp", "hcm")):
+    for _part, _suffix in (("input_mix_weight_down", "d"),
+                           ("input_mix_weight_up", "u"), ("block_inject_weight", "i")):
+        _Q38_TRUNK_COMPONENTS[f"{_block}_hyper_connection.{_part}"] = _tag + _suffix
+
+
+def _layer_component(name):
+    match = re.fullmatch(r"model\.layers\.\d+\.(.+)\.weight", _text_weight_name(name))
+    return match[1] if match else None
+
+
+def _matrix_shape(tensor):
+    shape = tensor.get("shape")
+    element = {"BF16": 2, "F16": 2, "F32": 4, "F8_E4M3": 1}.get(tensor["dtype"])
+    if (not element or not isinstance(shape, list) or len(shape) != 2 or
+            any(type(n) is not int or n <= 0 for n in shape) or
+            shape[0] * shape[1] * element != tensor["size"]):
+        return None
+    return shape
+
+
+def _q38_cpu_dense_tensors(info, env):
+    """Price q38_trunk_offer_all's CPU rows, independently of CUDA placement.
+
+    The scan cache is environment independent. Selection happens here on each
+    plan: the threshold includes a float scale per output row, the skip list is
+    component based, and F16 checkpoints are loaded as F32 before quantization.
+    """
+    tensors = info.get("dense_tensors", [])
+    if info["resolved_family"].descriptor.id != "qwen38" or env.get("Q38_TRUNK_CPU_INT8") == "0":
+        return info
+    threshold = re.match(r"\s*([+-]?\d+)", env.get("Q38_TRUNK_MIN_KB", "1024"))
+    min_kb = int(threshold[1]) if threshold else 0   # C atol; negative casts to size_t
+    skipped = set(env.get("Q38_TRUNK_SKIP", "").split(","))
+    adjusted, delta = [], 0
+    for tensor in tensors:
+        shape = _matrix_shape(tensor)
+        name = _text_weight_name(tensor["name"])
+        tag = "lmhead" if name == "lm_head.weight" else _Q38_TRUNK_COMPONENTS.get(_layer_component(name))
+        if shape and tag and tag not in skipped and min_kb >= 0:
+            rows, columns = shape
+            quantized = rows * columns + 4 * rows
+            if quantized >= min_kb * 1024:
+                delta += quantized - tensor["resident"]
+                tensor = dict(tensor, resident=quantized)
+        adjusted.append(tensor)
+    return dict(info, dense_bytes=info["dense_bytes"] + delta, dense_tensors=adjusted)
+
+
+_ATTENTION_PROJECTIONS = frozenset("self_attn." + p + "_proj" for p in ("q", "k", "v", "o"))
+_MLP_PROJECTIONS = frozenset("mlp." + p + "_proj" for p in ("gate", "up", "down"))
+_SHARED_PROJECTIONS = frozenset("mlp.shared_experts." + p + "_proj" for p in ("gate", "up", "down"))
+_G53_MATRICES = (_ATTENTION_PROJECTIONS | _MLP_PROJECTIONS | _SHARED_PROJECTIONS |
+                 frozenset("self_attn." + p + "_proj" for p in ("q_a", "q_b", "g_a", "g_b", "f_a", "f_b", "b")) |
+                 {"self_attn.kv_a_proj_with_mqa", "self_attn.indexer.wq_b",
+                  "self_attn.indexer.wk", "self_attn.indexer.weights_proj"})
+
+
+def _glm53_dense_tensors(info, env):
+    """Mirror glm53.c's quantize_loaded for known matrices, reserve F32 otherwise.
+
+    Cached scans contain source geometry. Never cache GLM53_BITS or multiply
+    vectors, embeddings and the vision tower by a quantized-matrix ratio. kv_b's
+    absorbed halves and unrecognized components retain a conservative F32 budget.
+    """
+    if info["resolved_family"].descriptor.id != "glm53":
+        return info
+    setting = re.match(r"\s*([+-]?\d+)", env.get("GLM53_BITS", "4"))
+    bits = int(setting[1]) if setting else 0
+    if bits not in (4, 8, 32):
+        raise ValueError("GLM53_BITS must be 4, 8 or 32")
+    adjusted, total, embedding = [], 0, 0
+    for tensor in info.get("dense_tensors", []):
+        name = _text_weight_name(tensor["name"])
+        size, dtype = tensor["size"], tensor["dtype"]
+        element = {"BF16": 2, "F16": 2, "F32": 4}.get(dtype)
+        resident = (size // element * 4) if element and size % element == 0 else size
+        shape = _matrix_shape(tensor)
+        known = (name == "lm_head.weight" or _layer_component(name) in _G53_MATRICES or
+                 re.fullmatch(r"model\.layers\.\d+\.self_attn\.indexer\.index_kpool_compress_gate", name))
+        if element and shape and known and bits != 32:
+            rows, columns = shape
+            if bits == 4 and columns % 64 == 0:
+                resident = rows * (columns // 2) + rows * (columns // 64) * 4
+            else:
+                resident = rows * columns + rows * 4
+        adjusted.append(dict(tensor, resident=resident))
+        total += resident
+        if _EMBED_TABLE.search(name):
+            embedding += resident
+    return dict(info, dense_bytes=total, embed_bytes=embedding, dense_tensors=adjusted)
+
+
+def _vk_released_tensor_bytes(tensor, family, env):
+    """A lower bound on the host allocation an engine's dho pass can free.
+
+    Only audited matrix names and source formats get credit. Keep norms, vision,
+    routers used by the CPU, unknown packed layouts and hardware-dependent BF16
+    kernels in RAM. Upload refusal can still retain a copy at runtime.
+    """
+    shape = _matrix_shape(tensor)
+    if not shape:
+        return 0
+    name, dtype = _text_weight_name(tensor["name"]), tensor["dtype"]
+    part = _layer_component(name)
+    rows, columns = shape
+    count, resident = rows * columns, tensor["resident"]
+    head = name == "lm_head.weight"
+    floating = dtype in ("BF16", "F16", "F32")
+    if family == "qwen38":
+        known = (head or part in _Q38_TRUNK_COMPONENTS or
+                 part in ("linear_attn.in_proj_a", "linear_attn.in_proj_b", "ple.key_proj", "ple.value_proj") or
+                 name in ("model.hyper_connection_mixer.input_mix_weight_down.weight",
+                          "model.hyper_connection_mixer.input_mix_weight_up.weight"))
+        return resident if known and floating else 0
+    if family == "qwen36":
+        known = (head or part in _ATTENTION_PROJECTIONS or part in _MLP_PROJECTIONS or
+                 part in ("mlp.gate", "linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.out_proj") or
+                 part in {p.replace("shared_experts", "shared_expert") for p in _SHARED_PROJECTIONS})
+        setting = re.match(r"\s*([+-]?\d+)", env.get("COLI_DENSE_BITS", "8"))
+        bits = int(setting[1]) if setting else 8
+        if not known or not floating or bits == 16:
+            return 0
+        # The checkpoint can be F32 while the engine holds int4/int8. Crediting
+        # the checkpoint bytes would also erase RAM that was never duplicated.
+        lower = count // 2 if bits == 4 else count
+        return min(resident, lower)
+    if family == "olmoe":
+        return min(resident, count * 4) if floating and (head or part in _ATTENTION_PROJECTIONS or part == "mlp.gate") else 0
+    if family == "glm53":
+        # kv_b's absorbed halves and a tied head can remain CPU-readable.
+        # Conservatively reserve those; every matrix listed here is in g53_dho_pass.
+        if not floating or part not in _G53_MATRICES:
+            return 0
+        bits = env.get("GLM53_BITS", "4")
+        lower = count * 4 if bits == "32" else count if bits == "8" else count // 2
+        return min(resident, lower)
+    if family == "kimi":
+        if env.get("K3_MMAP") not in (None, "", "0") or not floating:
+            return 0
+        known = (head or part in _ATTENTION_PROJECTIONS or part in _MLP_PROJECTIONS or
+                 part in ("self_attn.g_proj", "self_attn.q_a_proj", "self_attn.q_b_proj", "self_attn.kv_a_proj_with_mqa", "self_attn.kv_b_proj") or
+                 part in ("block_sparse_moe.routed_expert_down_proj", "block_sparse_moe.routed_expert_up_proj") or
+                 part in {p.replace("mlp.", "block_sparse_moe.", 1) for p in _SHARED_PROJECTIONS})
+        return min(resident, count // 2) if known else 0
+    if family == "inkling":
+        known = head or part in _ATTENTION_PROJECTIONS or part == "self_attn.r_proj" or part in _MLP_PROJECTIONS or part in _SHARED_PROJECTIONS
+        # BF16 may use AVX512-BF16 on the CPU and be ineligible for Vulkan;
+        # packed 2/3-bit or unknown group layouts may be ineligible as well.
+        return resident if known and dtype == "F32" else 0
+    if family == "mimo":
+        known = head or part in ("self_attn.qkv_proj", "self_attn.o_proj") or part in _MLP_PROJECTIONS
+        return min(resident, count) if known else 0
+    if family == "deepseek_v4":
+        # coli_v4_dense_device_only_tensor: layer FP8 matrices and the two
+        # BF16 compressor projections. Head, mHC, routers and scales stay.
+        known = re.fullmatch(r"layers\.\d+\.(?:attn|ffn)\..+\.weight", name)
+        droppable = dtype == "F8_E4M3" or (dtype == "BF16" and name.endswith(("compressor.wkv.weight", "compressor.wgate.weight")))
+        return resident if known and droppable else 0
+    if family == "deepseek_v41":
+        # v41_dho_bytes names the mapped trunk. Sidecar block scales stay.
+        known = re.fullmatch(r"layers\.\d+\.(?:attn\.(?:wq_a|wq_b|wkv|wo_a|wo_b|compressor\.(?:wkv|wgate)|indexer\.(?:wk|wq_b|weights_proj))|ffn\.shared_experts\.w[123]|engram\.wkv)\.weight", name)
+        return resident if known and dtype in ("BF16", "F8_E4M3") else 0
+    # GLM's CLI-selected QT format (including unsupported planar/IQ/E8/2-bit
+    # forms) is not described by this scan. Do not guess a releasable allocation.
+    return 0
+
+
+def vk_dense_device_only(dense_bytes, family_id=None, env=None, vulkan=None):
+    """(device_only, why): whether a Vulkan engine keeps its dense weights on the
+    device only, with no host copy (docs/vulkan.md, "Dense weights on the device
+    only"), as the engine's coli_vk_dense_host_decide() decides it: COLI_VULKAN=1,
+    the dense part on the device (the chain or the per-matrix path), and
+    COLI_VK_DENSE_HOST=0, or unset with an integrated GPU or a discrete one whose
+    free memory, less 1 GiB, holds them. `vulkan` is the device setup_hw would
+    report (probed when None and needed)."""
+    env = os.environ if env is None else env
+    host = _vk_flag(env, "COLI_VK_DENSE_HOST")
+    if host is not None and host != 0:
+        return False, None
+    vulkan = _vk_device(env, vulkan)
+    kind = (vulkan or {}).get("type")
+    if not _vk_dense_active(family_id, env, vulkan):
+        return False, None
+    if host == 0:
+        return True, "COLI_VK_DENSE_HOST=0"
+    if kind == "integrated":
+        return True, "an integrated GPU: its memory is the same RAM"
+    if kind == "discrete":
+        used = sum(heap.get("usage", 0) for heap in vulkan.get("heaps", [])
+                   if heap.get("device_local"))
+        free = ((vulkan.get("budget_bytes") or vulkan.get("device_local_bytes") or 0)
+                - used - (1 << 30))
+        if dense_bytes <= free:
+            return True, "a discrete GPU with room for the dense weights"
+    return False, None
 
 
 def _analysis_signature(shards, config_path):
@@ -103,7 +372,7 @@ def _analysis_signature(shards, config_path):
     return "|".join(parts)
 
 
-def _tensor_sizes(path):
+def _tensor_sizes(path, with_shape=False):
     file_size = path.stat().st_size
     with path.open("rb") as stream:
         raw = stream.read(8)
@@ -122,7 +391,8 @@ def _tensor_sizes(path):
         dtype = meta.get("dtype")
         if not isinstance(dtype, str):
             raise ValueError(f"invalid tensor dtype for {name}: {path}")
-        yield name, end - start, dtype
+        item = (name, end - start, dtype)
+        yield (*item, meta.get("shape")) if with_shape else item
 
 
 def analyze_model(model):
@@ -165,6 +435,10 @@ def analyze_model(model):
         pass  # missing/corrupt/unreadable cache -> recompute
 
     dense_bytes = 0
+    # The embedding tables among them: the engines gather their rows on the CPU, so
+    # they keep a host copy when the rest of the dense weights live on a Vulkan
+    # device only (vk_dense_device_only below).
+    embed_bytes = 0
     # Model-owned allocations that are retained once, independently of the
     # number of per-layer cache slots. Qwen3.8's native FP8 path uses this for
     # its normalized scale bank; fallback accounting remains conservative.
@@ -172,11 +446,14 @@ def analyze_model(model):
     # What the engine's GPU trunk offload would put in VRAM (int8), for the
     # families that have one; taken out of the VRAM budget before experts.
     trunk_int8_bytes = 0
+    # Keep the source geometry, dtype and resident contribution for placement
+    # decisions. These facts can be cached; environment-dependent credits cannot.
+    dense_tensors = []
     expert_groups = {}
     tensor_names = set()
     for shard in shards:
         try:
-            sizes = list(_tensor_sizes(shard))
+            sizes = list(_tensor_sizes(shard, with_shape=True))
         except OSError as error:
             # Name the file. An OSError raised by read() on an already-open
             # stream carries no filename, so `coli doctor` reported bare
@@ -187,7 +464,7 @@ def analyze_model(model):
             # storage, all of them is the mount.
             raise OSError(error.errno,
                           f"{error.strerror or error}: {shard}") from error
-        for name, size, dtype in sizes:
+        for name, size, dtype, shape in sizes:
             tensor_names.add(name)
             contributions = expert_contributions(resolved, name, size, dtype)
             if contributions:
@@ -200,8 +477,14 @@ def analyze_model(model):
                 if fixed_bytes:
                     expert_fixed_bytes += fixed_bytes
                 else:
-                    dense_bytes += resident_contribution(
-                        resolved, name, size, dtype)
+                    resident = resident_contribution(resolved, name, size, dtype)
+                    dense_bytes += resident
+                    if resident:
+                        dense_tensors.append({"name": name, "size": size, "dtype": dtype,
+                                              "shape": shape,
+                                              "resident": _dense_in_ram(resolved.descriptor, resident)})
+                    if _EMBED_TABLE.search(name):
+                        embed_bytes += resident
                     trunk_int8_bytes += trunk_contribution(
                         resolved, name, size, dtype)
 
@@ -245,8 +528,10 @@ def analyze_model(model):
         # serve a rispondere "ci sta?", non "quanto pesa il file".
         "dense_bytes": _dense_in_ram(resolved.descriptor, dense_bytes),
         "dense_disk_bytes": dense_bytes,
+        "embed_bytes": _dense_in_ram(resolved.descriptor, embed_bytes),
         "expert_fixed_bytes": expert_fixed_bytes,
         "trunk_int8_bytes": trunk_int8_bytes,
+        "dense_tensors": dense_tensors,
         "expert_bytes": sum(expert_groups.values()),
         "expert_count": len(expert_groups),
         "expert_layers": len(per_layer),
@@ -257,6 +542,9 @@ def analyze_model(model):
         "config": config,
         "resolved_family": resolved,
     }
+    # analyze_model has one stable, default-format answer regardless of the
+    # caller's process environment. build_plan reapplies its requested settings.
+    result = _glm53_dense_tensors(result, {})
     try:  # best-effort write; a read-only model dir must never break planning.
         # Atomic write (tmp file + os.replace): a concurrent `coli plan` on the
         # same model dir must never observe a half-written cache -- write_text()
@@ -1528,10 +1816,33 @@ def _family_expert_cache_knob(family_id, cache_bytes):
 def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                available_memory=None, available_disk=None, gpus=None,
                policy="quality", physical_cpus=None, cpu_sockets=None,
-               kv_slots=1):
+               kv_slots=1, env=None, vulkan=None):
     if policy not in POLICIES:
         raise ValueError(f"unknown policy: {policy}")
     info = qwen38_int4_sidecar(analyze_model(model))
+    env_now = os.environ if env is None else env
+    info = _q38_cpu_dense_tensors(info, env_now)
+    info = _glm53_dense_tensors(info, env_now)
+    # Only the matrices a family's dho pass can release earn RAM credit. The
+    # embedding, norms, CPU-only components and unrecognized formats stay reserved.
+    vulkan = _vk_device(env_now, vulkan)
+    family_id = info["resolved_family"].descriptor.id
+    kept = min(info["dense_bytes"], info.get("embed_bytes", 0))
+    device_dense_bytes = max(0, info["dense_bytes"] - kept)
+    vk_dense, vk_dense_why = vk_dense_device_only(
+        device_dense_bytes, family_id, env_now, vulkan)
+    dense_on_device = 0
+    if vk_dense:
+        dense_on_device = min(device_dense_bytes, sum(
+            _vk_released_tensor_bytes(tensor, family_id, env_now)
+            for tensor in info.get("dense_tensors", [])))
+        info = dict(info, dense_bytes=info["dense_bytes"] - dense_on_device)
+    # On an integrated/software device the remaining device copy still consumes
+    # physical RAM. Keeping host copies costs two copies; dropping them saves one,
+    # not both. Price the device copy even when COLI_VK_DENSE_HOST=1.
+    shared_dense_bytes = (device_dense_bytes
+                          if (vulkan or {}).get("type") in ("integrated", "cpu")
+                          and _vk_dense_active(family_id, env_now, vulkan) else 0)
     physical_cpus = physical_cpu_count() if physical_cpus is None else physical_cpus
     cpu_sockets = cpu_socket_count() if cpu_sockets is None else cpu_sockets
     resolved = info["resolved_family"]
@@ -1591,7 +1902,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
 
     placement_unified = any(gpu.get("unified_memory", False)
                             for gpu in planning_gpus)
-    unified = placement_unified or _host_unified_memory()
+    unified = placement_unified or _host_unified_memory() or bool(shared_dense_bytes)
     typical = info["typical_expert_bytes"]
     max_expert = info["max_expert_bytes"] or typical
     kv_bytes = (geometry.context_state_bytes + geometry.fixed_state_bytes) * kv_slots
@@ -1601,7 +1912,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     # every cache slot. Include it in the resident runtime reservation so the
     # selected capacity cannot overrun the model's actual allocation.
     runtime_bytes = int(1.2 * GB + 2.5 * GB + 64 * max_expert +
-                        info["expert_fixed_bytes"] + kv_bytes + kv_buffer)
+                        info["expert_fixed_bytes"] + kv_bytes + kv_buffer + shared_dense_bytes)
     per_cap = info["per_cap_bytes"]
     configured_experts = geometry.configured_experts
 
@@ -1765,6 +2076,9 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                      "available_bytes": available_disk, "cold_expert_bytes": cold_bytes},
             "ram": {"role": "resident+warm-experts", "available_bytes": available_memory,
                     "budget_bytes": ram_budget, "dense_bytes": info["dense_bytes"],
+                    "dense_on_device_bytes": dense_on_device,
+                    "dense_on_device_reason": vk_dense_why if vk_dense else None,
+                    "shared_device_dense_bytes": shared_dense_bytes,
                     "runtime_bytes": runtime_bytes,
                     "expert_fixed_bytes": info["expert_fixed_bytes"],
                     "sequence_state_bytes": geometry.context_state_bytes,
@@ -1884,7 +2198,9 @@ def format_plan(plan):
              f"disk   {format_bytes(tiers['disk']['cold_expert_bytes'])} cold experts · "
              f"{format_bytes(tiers['disk']['available_bytes'])} free",
              f"RAM    {format_bytes(tiers['ram']['budget_bytes'])} budget · "
-             f"{format_bytes(tiers['ram']['dense_bytes'])} dense · "
+             f"{format_bytes(tiers['ram']['dense_bytes'])} dense"
+             + (f" (+{format_bytes(tiers['ram']['dense_on_device_bytes'])} on the Vulkan device only)"
+                if tiers['ram'].get('dense_on_device_bytes') else "") + " · "
              f"{format_bytes(tiers['ram']['runtime_bytes'])} runtime · "
              f"{format_bytes(tiers['ram']['warm_expert_bytes'])} warm experts · "
              f"cap {tiers['ram']['cache_slots_per_layer']}/layer"]

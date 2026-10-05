@@ -4,7 +4,7 @@
 // layout) for the formats a dense trunk uses, read 16 bytes per lane per step:
 //   1  int8 rows, one scale per row (16 weights per step)
 //   4  int4 in groups of 64, nibble - 8, low nibble = even column (32 per step)
-//   10 f32 (4 per step), 11 bf16, low half = even column (8 per step)
+//   10 f32 (4 per step), 11 bf16 and 14 f16, low half = even column (8 per step)
 // qmatmul.comp reads one 32-bit word per lane per step and checks every element
 // against I; on an integrated GPU at its floor clock that leaves the GEMV short of
 // loads in flight and long on instructions (measured on a Radeon 780M: int8 at 22 to
@@ -44,7 +44,7 @@ void main() {
     int s = int(gl_WorkGroupID.y);
     int tid = int(gl_LocalInvocationID.x);
     int nq = p.rowWords / 4;                            // uvec4 steps per row
-    int per = p.fmt == 1 ? 16 : p.fmt == 4 ? 32 : p.fmt == 11 ? 8 : 4;   // values per step
+    int per = p.fmt == 1 ? 16 : p.fmt == 4 ? 32 : p.fmt == 11 || p.fmt == 14 ? 8 : 4;   // values per step
     int nx4 = nq * per / 4, i4 = p.I / 4;              // padded x length in vec4s
     for (int k = tid; k < nx4; k += 256) xs[k] = k < i4 ? x4[s * i4 + k] : vec4(0.0);
     barrier();
@@ -82,11 +82,13 @@ void main() {
                 }
                 a0 += (t0 + t1 + t2 + t3) * sc;
             }
-        } else if (p.fmt == 11) {
+        } else if (p.fmt == 11 || p.fmt == 14) {
             for (int q = lane; q < nql; q += lpr) {
                 uvec4 w = w4[rb + q]; int xb = q * 2;
                 vec4 x0 = xs[xb], x1 = xs[xb + 1];
-                vec2 b0 = bf(w.x), b1 = bf(w.y), b2 = bf(w.z), b3 = bf(w.w);
+                vec2 b0, b1, b2, b3;
+                if (p.fmt == 11) { b0 = bf(w.x); b1 = bf(w.y); b2 = bf(w.z); b3 = bf(w.w); }
+                else { b0 = unpackHalf2x16(w.x); b1 = unpackHalf2x16(w.y); b2 = unpackHalf2x16(w.z); b3 = unpackHalf2x16(w.w); }
                 a0 += x0.x * b0.x + x0.y * b0.y;
                 a1 += x0.z * b1.x + x0.w * b1.y;
                 a2 += x1.x * b2.x + x1.y * b2.y;

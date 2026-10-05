@@ -58,6 +58,18 @@
  * fakes it): the forward runs again on the CPU from its input, which the chain leaves
  * untouched until every chunk is through, and the CPU runs from there.
  *
+ * Past the device's budget (vk_kvsplit.h) each compressed layer keeps only some blocks of
+ * its compressed rows on the device: a window over the newest rows and the blocks its
+ * list reads most; the rest stay in the host's compressed rows, which hold every row. The
+ * sparse attention stages only selected missing rows in bounded device scratch and
+ * reads them alongside resident rows in the original list order (vkc_kv_ds). This
+ * preserves one global score maximum and V4's bf16 weights and output exactly. A
+ * chunk's new compressed rows go through a scratch into their slots and come back into
+ * the host's rows (reserved for the forward at its start) as soon as their layer's frame
+ * is through, so the host part of a later chunk finds every row it reads; the count is
+ * set at the end as before. The window ring and the indexer's keys stay whole on the
+ * device. Below the budget the mirrors are whole, as above.
+ *
  * The chain declines (the CPU runs, the watermarks follow) when the dense layers are not
  * resident (a low-memory plan reloads them per forward; the --oracle path's own copies
  * too), under the CUDA tier, for prompts only when COLI_VK_CHAIN=2 and the forward has
@@ -67,6 +79,7 @@
  * (the Hadamard transform) or above 4096 floats, a top-k above 4096, more than 8
  * streams. */
 #include "vk_chain.h"
+#include "vk_kvsplit.h"
 
 typedef struct {
     int ratio, idx, kind;                       /* compress ratio (0 none), an indexer, its list */
@@ -97,26 +110,37 @@ typedef struct {
     float *host_routed;
     unsigned long long forwards;
     double host_ms;
+    VkcKvSplit ks;                              /* the compressed rows split past the device's budget (ks.on) */
+    int *sli, nsl, rmin, planned;               /* per layer its table (-1 none), tables, the least ratio */
+    VkcBuf *cnew, *cdn;                         /* a chunk's new compressed rows, and their copy for the host */
 } V4Chain;
 
 static V4Chain *g_v4c;
 static int g_v4c_mode = 0;                      /* COLI_VK_CHAIN as decided */
 static int g_v4c_inited = 0;
 
-/* Rows per chunk: the CPU's prefill chunk (V4_PREFILL_CHUNK, 128 at most), so the host's
- * MoE sees the batches the CPU block would; COLI_VK_CHAIN_ROWS lowers it. */
+/* Rows per chunk with COLI_VK_CHAIN_ROWS set (or V4_PREFILL_CHUNK): the CPU's prefill
+ * chunk (V4_PREFILL_CHUNK, 128 at most), so the host's MoE sees the batches the CPU block
+ * would; COLI_VK_CHAIN_ROWS lowers it. Unset (the chunk from the budget, vkc_chunk_auto):
+ * up to 8192 rows (v4c_chunk_rows), the MoE step taking the whole chunk; this is then the
+ * window rings' first size, grown by the forward that needs more (v4c_grow_win). */
 static int v4c_rows(void) {
     static int rows;
     if (!rows) {
         const char *c = getenv("V4_PREFILL_CHUNK"), *e = getenv("COLI_VK_CHAIN_ROWS");
         int cw = c ? atoi(c) : 128;
         if (cw < 1 || cw > 128) cw = 128;
-        int v = e && *e ? atoi(e) : cw;
+        int v = e && *e && strcmp(e, "auto") ? atoi(e) : cw;
         rows = v < 1 ? 1 : v > cw ? cw : v;
     }
     return rows;
 }
-static int v4c_res(VkcBuf **b, size_t floats, int kind) { return vkc_reserve(b, (floats ? floats : 1) * sizeof(float), kind); }
+/* v4c_res counts instead of reserving while g_v4c_count >= 0 (the chunk's sizing) */
+static long long g_v4c_count = -1;
+static int v4c_res(VkcBuf **b, size_t floats, int kind) {
+    if (g_v4c_count >= 0) { g_v4c_count += (long long)(floats ? floats : 1) * (long long)sizeof(float); return 1; }
+    return vkc_reserve(b, (floats ? floats : 1) * sizeof(float), kind);
+}
 static const void *v4c_val(const ColiDeepSeekV4LayerWeights *w, const char *suffix) {
     char name[COLI_V4_MAX_TENSOR_NAME];
     snprintf(name, sizeof name, "layers.%d.%s", w->plan.layer, suffix);
@@ -135,6 +159,7 @@ static ColiVkTensor *v4c_tensor(int fmt, const void *data, const float *scales, 
     if (e && e->refused) return NULL;
     size_t bytes = (size_t)rows * columns * (fmt == 10 ? 4 : fmt == 11 ? 2 : 1);
     if (!v4_vk_resident(data, bytes)) return NULL;
+    coli_v4_vk_host_ensure(data);   /* a view the placement did not make (device only): its rows back first */
     if (!e && !(e = v4_vk_insert(data, fmt, rows, columns))) return NULL;
     const unsigned char *weights = data;
     unsigned char *unpacked = NULL;
@@ -194,6 +219,7 @@ static void v4c_lower(int pos) {
     for (int i = 0; i < ch->L; i++) {
         V4cLayer *ly = &ch->ly[i];
         if (ly->ratio > 0 && ly->kv_valid > pos / ly->ratio) ly->kv_valid = pos / ly->ratio;
+        if (ly->ratio > 0 && ch->sli[i] >= 0) vkc_kv_lower(&ch->ks, ch->sli[i], pos / ly->ratio);
         if (ly->idx && ly->ik_valid > pos / 4) ly->ik_valid = pos / 4;
         ly->ring_ok = ly->iring_ok = 0;
     }
@@ -238,7 +264,10 @@ static int v4c_setup(ColiV4Engine *engine) {
         }
     }
     V4Chain *ch = calloc(1, sizeof *ch);
-    if (!ch || !(ch->ly = calloc((size_t)L, sizeof *ch->ly))) { free(ch); return 0; }
+    if (!ch || !(ch->ly = calloc((size_t)L, sizeof *ch->ly)) || !(ch->sli = malloc((size_t)L * sizeof(int)))) {
+        if (ch) free(ch->ly);
+        free(ch); return 0;
+    }
     g_v4c = ch;
     ch->engine = engine; ch->L = L; ch->D = c->hidden_size; ch->H = c->hc_mult; ch->HD = ch->H * ch->D;
     ch->nm = (2 + ch->H) * ch->H; ch->hr = 2 * ch->H + ch->H * ch->H;
@@ -255,6 +284,8 @@ static int v4c_setup(ColiV4Engine *engine) {
         ly->ratio = c->compress_ratios[i]; ly->idx = ly->ratio == 4;
         if (ly->ratio > ch->rmax) ch->rmax = ly->ratio;
         ly->crows = ly->ratio == 4 ? 8 : ly->ratio; ly->cproj = (ly->ratio == 4 ? 2 : 1) * ch->hd;
+        ch->sli[i] = ly->ratio > 0 ? ch->nsl++ : -1;    /* the split's tables: one per compressed layer */
+        if (ly->ratio > 0 && (ch->rmin == 0 || ly->ratio < ch->rmin)) ch->rmin = ly->ratio;
         if (ly->ratio > 0 && !ly->idx) {
             int k = 1;
             while (k < ch->nkind && ch->kratio[k] != ly->ratio) k++;
@@ -342,7 +373,7 @@ static int v4c_setup(ColiV4Engine *engine) {
 
 /* room on the device for `rows` compressed rows (and keys) of layer i; growing drops them */
 static int v4c_cache(V4Chain *ch, V4cLayer *ly, int rows) {
-    if (ly->ratio > 0 && ly->ccap < rows) {
+    if (ly->ratio > 0 && ly->ccap < rows && !ch->ks.on) {   /* under the split the rows keep their ks.rows */
         int cap = 64; while (cap < rows) cap *= 2;
         vkc_free(ly->ckv);
         ly->ckv = vkc_buf((size_t)cap * ch->hd * sizeof(float), VKC_DEV);
@@ -355,6 +386,69 @@ static int v4c_cache(V4Chain *ch, V4cLayer *ly, int rows) {
         ly->ikey = vkc_buf((size_t)cap * ch->ID * sizeof(float), VKC_DEV);
         ly->ik_valid = 0; ly->icap = ly->ikey ? cap : 0;
         if (!ly->ikey) return 0;
+    }
+    return 1;
+}
+
+static int v4c_scratch(V4Chain *ch, int rows, int E, int LR);
+/* Prompt rows per chunk (vkc_chunk_rows, decided at the first forward, after the tier
+ * filled; V4_PREFILL_CHUNK or COLI_VK_CHAIN_ROWS set: v4c_rows): the chain's scratch a
+ * row at the forward's context, the window rings' row and the routed experts' outputs. */
+static int v4c_chunk_rows(V4Chain *ch, int E, int LR) {
+    if (!vkc_chunk_auto() || getenv("V4_PREFILL_CHUNK")) return v4c_rows();
+    size_t wcap = ch->wcap;
+    g_v4c_count = 0; v4c_scratch(ch, 1, E, LR); long long b1 = g_v4c_count;
+    g_v4c_count = 0; v4c_scratch(ch, 2, E, LR); long long b2 = g_v4c_count;
+    g_v4c_count = -1; ch->wcap = wcap;
+    const ColiDeepSeekV4Config *c = &ch->engine->config;
+    size_t row = (size_t)(b2 - b1) + (size_t)ch->L * ch->hd * sizeof(float) +
+                 (size_t)(2 * c->num_experts_per_tok + 1) * ch->D * sizeof(float);
+    if (ch->ks.on) row += (size_t)LR * sizeof(int);
+    return vkc_chunk_rows("deepseek_v4", row);
+}
+/* The window rings for chunks of `rows`: W + rows rows each; rings that grow are
+ * mirrored again (every slot stale). */
+static int v4c_grow_win(V4Chain *ch, int rows) {
+    if (ch->W + rows <= ch->Wd) return 1;
+    int Wd = ch->W + rows;
+    int *sp = realloc(ch->slot_pos, (size_t)Wd * sizeof(int));
+    if (!sp) return 0;
+    ch->slot_pos = sp;
+    for (int k = 0; k < Wd; k++) sp[k] = -1;
+    for (int i = 0; i < ch->L; i++) {
+        vkc_free(ch->ly[i].win);
+        if (!(ch->ly[i].win = vkc_buf((size_t)Wd * ch->hd * sizeof(float), VKC_DEV))) return 0;
+    }
+    ch->Wd = Wd; ch->win_valid = 0;
+    return 1;
+}
+/* The compressed rows, whole or split: planned when the whole mirrors would grow (and at
+ * the first forward); once split, the split stays. E: the positions the forward reaches.
+ * 0 = the device refused the split's rows. */
+static int v4c_plan(V4Chain *ch, int E) {
+    if (!ch->nsl || ch->ks.on) return 1;
+    int grow = !ch->planned, tcap = 1, hd = ch->hd;
+    size_t need = 0, held = 0;
+    for (int i = 0; i < ch->L; i++) {
+        V4cLayer *ly = &ch->ly[i];
+        if (ly->ratio <= 0) continue;
+        int want = E / ly->ratio + 1, cap = ly->ccap, host = ch->engine->config.max_position_embeddings / ly->ratio + 1;
+        if (host < want) host = want;
+        if (host > tcap) tcap = host;
+        if (cap < want) { cap = 64; while (cap < want) cap *= 2; grow = 1; }
+        need += (size_t)cap * hd * sizeof(float); held += (size_t)ly->ccap * hd * sizeof(float);
+    }
+    if (!grow) return 1;
+    ch->planned = 1;
+    /* a window over recent slots, with optional read-based pins; the forward's
+     * chunks shrink to what the window takes (v4c_forward) */
+    if (vkc_kv_plan_need(&ch->ks, "deepseek_v4", ch->nsl, (size_t)hd * sizeof(float), tcap, 1, 1, held, need) != 2) return 1;
+    for (int i = 0; i < ch->L; i++) {
+        V4cLayer *ly = &ch->ly[i];
+        if (ly->ratio <= 0) continue;
+        vkc_free(ly->ckv);
+        ly->ccap = 0; ly->kv_valid = 0;
+        if (!(ly->ckv = vkc_buf((size_t)ch->ks.rows * hd * sizeof(float), VKC_DEV))) return 0;
     }
     return 1;
 }
@@ -380,7 +474,13 @@ static int v4c_scratch(V4Chain *ch, int rows, int E, int LR) {
              v4c_res(&ch->hs, r * ch->I, VKC_DEV) && v4c_res(&ch->ds, r * ch->D, VKC_DEV) &&
              v4c_res(&ch->h2d, r * ch->D, VKC_DOWN) && v4c_res(&ch->routed, r * ch->D, VKC_UP) &&
              v4c_res(&ch->xd, r * ch->HD, VKC_DOWN) && v4c_res(&ch->taps, (size_t)taps * r * ch->HD, VKC_DOWN);
-    if (!ok) return 0;
+    if (ok && ch->ks.on) {     /* the split: a chunk's new compressed rows and their canonical host copy */
+        size_t nc = r / (size_t)ch->rmin + 2;
+        if (g_v4c_count >= 0)
+            g_v4c_count += (long long)((2 * r * ch->hd * sizeof(float) + ch->rmin - 1) / ch->rmin);
+        else ok = v4c_res(&ch->cnew, nc * ch->hd, VKC_DEV) && v4c_res(&ch->cdn, nc * ch->hd, VKC_DOWN);
+    }
+    if (!ok || g_v4c_count >= 0) return ok;   /* counting: the buffers only */
     if (ch->rows < rows) {
         float *hr = realloc(ch->host_routed, r * ch->D * sizeof(float));
         if (!hr) return 0;
@@ -440,14 +540,16 @@ typedef struct { int start, n, pb, nr, csW, csC, LR, s_ident; } V4cFwd;
 /* the compressor's ring for nr rows into out (rows of D floats), then the produced rows'
  * pooled-latent pipeline: bf16, norm, bf16, RoPE at the group's first position, and the
  * attention's E4M3 per 64 on the no-position part (or the indexer's Hadamard and E2M1) */
+/* out's row 0 is compressed row obase (0: out holds every row; the split's scratch: the
+ * chunk's first new row) */
 static int v4c_compress(V4Chain *ch, const V4cFwd *f, ColiVkTensor *wkv, ColiVkTensor *wg, VkcBuf *kvb, VkcBuf *scb,
-                        VkcBuf *ring, size_t ape, VkcBuf *out, int r, int D, size_t norm, int fp4) {
+                        VkcBuf *ring, size_t ape, VkcBuf *out, int obase, int r, int D, size_t norm, int fp4) {
     int nr = f->nr, pb = f->pb, P = r == 4 ? 2 * D : D, g0 = pb / r, np = (pb + nr) / r - g0, rd = ch->rd;
-    VkcDsComp cp = {nr, pb, r, P, D, r == 4, 0, P, 0, P, (int)ape, 0, D, 0};
+    VkcDsComp cp = {nr, pb, r, P, D, r == 4, 0, P, 0, P, (int)ape, -obase * D, D, 0};
     if (!vkc_matmul(wkv, ch->nrm, 0, kvb, 0, nr) || !vkc_matmul(wg, ch->nrm, 0, scb, 0, nr) ||
         !vkc_dsv4_compress(kvb, scb, ring, ch->prm, out, &cp)) return 0;
     if (np <= 0) return 1;
-    int o = g0 * D, cs = f->csC + (g0 * r - (pb - ch->rmax + 1)) * rd;
+    int o = (g0 - obase) * D, cs = f->csC + (g0 * r - (pb - ch->rmax + 1)) * rd;
     if (!v4c_bf16(out, np, D, o, D) || !v4c_norm(ch, out, o, D, norm, out, o, D, np, D, 0) || !v4c_bf16(out, np, D, o, D) ||
         !v4c_rope(ch, out, np, 1, o + D - rd, D, 0, cs, r * rd, 0)) return 0;
     if (!fp4) return v4c_round(out, out, VKC_DS_E4M3, np, 1, D - rd, 64, 1, o, D, 0, o, D, 0);
@@ -465,11 +567,20 @@ static int v4c_attention(V4Chain *ch, int i, const V4cFwd *f) {
              vkc_matmul(ly->wq_a, ch->nq, 0, ch->qa, 0, nr) && v4c_bf16(ch->qa, nr, QL, 0, QL) &&
              v4c_norm(ch, ch->qa, 0, QL, ly->o_qn, ch->qr, 0, QL, nr, QL, 0) && v4c_bf16(ch->qr, nr, QL, 0, QL) &&
              v4c_e4m3(ch->qr, ch->qrq, nr, QL);
-    if (ok && ly->ratio > 0)
-        ok = v4c_compress(ch, f, ly->cwkv, ly->cwg, ch->craw, ch->cscr, ly->ring, ly->o_ape, ly->ckv, ly->ratio, hd, ly->o_cn, 0);
+    int sp = ch->ks.on && ly->ratio > 0, li = ch->sli[i];
+    if (ok && ly->ratio > 0) {
+        int r = ly->ratio, g0 = pb / r, np = (pb + nr) / r - g0;
+        ok = v4c_compress(ch, f, ly->cwkv, ly->cwg, ch->craw, ch->cscr, ly->ring, ly->o_ape, sp ? ch->cnew : ly->ckv,
+                          sp ? g0 : 0, r, hd, ly->o_cn, 0);
+        if (ok && sp && np > 0) {   /* the split: into their slots, and down for the host's rows once the frame is through */
+            VkcKvPart pt = {1, hd, NULL, 0, ly->ckv, 0};
+            ok = vkc_kv_store(&ch->ks, li, &pt, ch->cnew, 0, (size_t)hd, 0, g0, np) && vkc_copy(ch->cdn, 0, ch->cnew, 0, (size_t)np * hd);
+            vkc_kv_done(&ch->ks, li, g0 + np);
+        }
+    }
     if (ok && ly->idx) {                                                /* the indexer: keys, queries, scores, top-k */
         int IH = ch->IH, ID = ch->ID, width = (pb + nr) / 4, K = c->index_topk;
-        ok = v4c_compress(ch, f, ly->iwkv, ly->iwg, ch->icraw, ch->icscr, ly->iring, ly->o_iape, ly->ikey, 4, ID, ly->o_icn, 1) &&
+        ok = v4c_compress(ch, f, ly->iwkv, ly->iwg, ch->icraw, ch->icscr, ly->iring, ly->o_iape, ly->ikey, 0, 4, ID, ly->o_icn, 1) &&
              vkc_matmul(ly->iwq, ch->qrq, 0, ch->iq, 0, nr) && v4c_bf16(ch->iq, nr, IH * ID, 0, IH * ID) &&
              v4c_rope(ch, ch->iq, nr * IH, IH, ID - rd, IH * ID, ID, tcs, rd, 0) &&
              v4c_round(ch->iq, ch->iq, VKC_DS_HADAMARD, nr * IH, IH, ID, 0, 0, 0, IH * ID, ID, 0, IH * ID, ID) &&
@@ -508,8 +619,14 @@ static int v4c_attention(V4Chain *ch, int i, const V4cFwd *f) {
     int kind = ly->ratio > 0 && !ly->idx ? ly->kind : 0;
     VkcDsAttn a = {nr, nh, hd, cnt, kind * nr * f->LR, f->LR, ch->Wd, 0, 0, 0, qrow, 0, qrow, (int)ly->o_sink, 1,
                    1.0f / sqrtf((float)hd)};
-    ok = ok && vkc_dsv4_attn(ch->q, ly->win, ly->ratio > 0 ? ly->ckv : NULL, ch->list, ch->prm, ch->heads, &a) &&
-         v4c_rope(ch, ch->heads, nr * nh, nh, hd - rd, qrow, hd, tcs, rd, 1) &&
+    if (ok && sp) {   /* stage selected cold rows, preserving V4's complete softmax and bf16 rounding */
+        ColiV4AttentionView v;
+        ok = !coli_v4_attention_view(ch->attn[i], &v);
+        VkcKvDs d = {&ch->ks, li, ch->q, ly->win, ly->ckv, ch->prm, ch->list, ch->heads, nr, nh, hd, cnt, a.l_off, a.l_row,
+                     ch->Wd, 0, 0, qrow, (int)ly->o_sink, 1, 0, qrow, (pb + nr) / ly->ratio, a.scale, ok ? v.compressed : NULL};
+        ok = ok && vkc_kv_ds(&d);
+    } else ok = ok && vkc_dsv4_attn(ch->q, ly->win, ly->ratio > 0 ? ly->ckv : NULL, ch->list, ch->prm, ch->heads, &a);
+    ok = ok && v4c_rope(ch, ch->heads, nr * nh, nh, hd - rd, qrow, hd, tcs, rd, 1) &&
          v4c_round(ch->heads, ch->heads, VKC_DS_E4M3, nr, 1, qrow, 128, 0, 0, qrow, 0, 0, qrow, 0);
     int og = ch->og, ol = ch->ol, gw = ch->gw;
     if (ok && og == 1) ok = vkc_matmul(ly->wo_a[0], ch->heads, 0, ch->grp, 0, nr);
@@ -590,7 +707,24 @@ static int v4c_forward(ColiV4Engine *engine, float **state_ptr, float **next_ptr
             return 0;
         }
     }
-    int rows = n < v4c_rows() ? n : v4c_rows(), LR = W + (K > 0 ? K : 1);
+    if (!v4c_plan(ch, E)) {
+        fprintf(stderr, "[VK] deepseek_v4 chain: device memory for the split's compressed rows refused; the CPU runs the layers\n");
+        ch->failed = 1; g_v4c_mode = 0;
+        return 0;
+    }
+    for (int i = 0; ch->ks.on && i < L; i++)            /* the split: the host's rows take this forward's new ones as it goes */
+        if (ch->ly[i].ratio > 0 && coli_v4_attention_reserve(attention[i], E / ch->ly[i].ratio)) return 0;
+    int LR = W + (K > 0 ? K : 1), CH = v4c_chunk_rows(ch, E, LR);
+    if (ch->ks.on) {   /* a chunk's new compressed rows fit the split's window */
+        int mx = ch->rmin == 1 ? ch->ks.chunk : (ch->ks.chunk - 1) * ch->rmin;
+        if (CH > mx) CH = mx < 1 ? 1 : mx;
+    }
+    int rows = n < CH ? n : CH;
+    if (!v4c_grow_win(ch, rows)) {
+        fprintf(stderr, "[VK] deepseek_v4 chain: device memory for window rings of %d rows refused; the CPU runs the layers\n", rows);
+        ch->failed = 1; g_v4c_mode = 0;
+        return 0;
+    }
     int ok = v4c_scratch(ch, rows, E, LR);
     for (int i = 0; ok && i < L; i++) ok = v4c_cache(ch, &ch->ly[i], E / (ch->ly[i].ratio > 0 ? ch->ly[i].ratio : 1) + 1);
     /* what comes back at the end: the window rows, each layer's new compressed rows and
@@ -602,7 +736,7 @@ static int v4c_forward(ColiV4Engine *engine, float **state_ptr, float **next_ptr
         ly->pw = pn; pn += (size_t)nq * hd;
         if (ly->ratio <= 0) continue;
         int r = ly->ratio;
-        ly->pc = pn; pn += (size_t)(E / r - start / r) * hd;
+        ly->pc = pn; pn += ch->ks.on ? 0 : (size_t)(E / r - start / r) * hd;   /* split: back per chunk */
         ly->q1 = E - r > start ? E - r : start;     /* without the overlap only the slots written change */
         ly->ns = r == 4 ? ly->crows : E - ly->q1;
         ly->pr = pn; pn += (size_t)2 * ly->ns * ly->cproj;
@@ -674,7 +808,7 @@ static int v4c_forward(ColiV4Engine *engine, float **state_ptr, float **next_ptr
                         ok = vkc_write(ly->win, (size_t)(q % ch->Wd) * hd, v.kv + (size_t)(q % W) * hd, (size_t)hd * sizeof(float));
                 if (ly->ratio <= 0) continue;
                 int t0 = ly->kv_valid, t1 = start / ly->ratio;
-                if (ok && t1 > t0) ok = vkc_write(ly->ckv, (size_t)t0 * hd, v.compressed + (size_t)t0 * hd, (size_t)(t1 - t0) * hd * sizeof(float));
+                if (ok && t1 > t0 && !ch->ks.on) ok = vkc_write(ly->ckv, (size_t)t0 * hd, v.compressed + (size_t)t0 * hd, (size_t)(t1 - t0) * hd * sizeof(float));
                 ColiV4CompressorView cv;
                 size_t rf = (size_t)ly->crows * ly->cproj;
                 if (ok && !ly->ring_ok)
@@ -693,6 +827,17 @@ static int v4c_forward(ColiV4Engine *engine, float **state_ptr, float **next_ptr
             if (!ok) goto lost;
             for (int q = q_lo; q < start; q++) ch->slot_pos[q % ch->Wd] = q;
         }
+        for (int i = 0; ch->ks.on && ok && i < L; i++) {   /* the split: each table's window over this chunk's new rows */
+            V4cLayer *ly = &ch->ly[i];
+            if (ly->ratio <= 0) continue;
+            ColiV4AttentionView v;
+            if (coli_v4_attention_view(attention[i], &v)) goto lost;
+            int r = ly->ratio, g0 = pb / r;
+            VkcKvPart pt = {1, hd, v.compressed, 0, ly->ckv, 0};
+            vkc_kv_place(&ch->ks, ch->sli[i], g0, (pb + nr) / r - g0);
+            ok = vkc_kv_push(&ch->ks, ch->sli[i], &pt, 1, g0);
+        }
+        if (!ok) goto lost;
         for (int s = 0; s < nr; s++) ch->slot_pos[(pb + s) % ch->Wd] = pb + s;   /* this chunk's rows go in below */
         int pending = 0;
         for (int i = 0; i < L && ok; i++) {
@@ -704,8 +849,18 @@ static int v4c_forward(ColiV4Engine *engine, float **state_ptr, float **next_ptr
             }
             ok = ok && v4c_pre(ch, ly->fna, ly->o_hca, ch->hpa, ly->o_an, nr) && v4c_attention(ch, i, &f) &&
                  v4c_post(ch, ch->hpa, nr) && v4c_pre(ch, ly->fnf, ly->o_hcf, ch->hpf, ly->o_fn, nr) &&
-                 vkc_copy(ch->h2d, 0, ch->nrm, 0, (size_t)nr * D) && vkc_submit(1);    /* A1 */
+                 vkc_copy(ch->h2d, 0, ch->nrm, 0, (size_t)nr * D) && vkc_submit(0);    /* A1 */
+            /* while it runs, the tier loads the experts this layer will likely stream (a
+             * big prompt chunk only) */
+            if (ok) vkt_stream_prefetch(i, nr);
+            ok = ok && vkc_finish();
             if (!ok) break;
+            if (ch->ks.on && ly->ratio > 0) {               /* this chunk's new compressed rows into the host's */
+                int r = ly->ratio, g0 = pb / r, np = (pb + nr) / r - g0;
+                ColiV4AttentionView v;
+                if (np > 0 && !coli_v4_attention_view(attention[i], &v))
+                    memcpy(v.compressed + (size_t)g0 * hd, vkc_ptr(ch->cdn), (size_t)np * hd * sizeof(float));
+            }
             /* A2: the shared expert, while the host computes the routed experts */
             ok = vkc_begin() && v4c_shared(ch, ly, nr) && vkc_submit(0);
             if (!ok) break;
@@ -741,7 +896,7 @@ static int v4c_forward(ColiV4Engine *engine, float **state_ptr, float **next_ptr
                 if (!ok || ly->ratio <= 0) continue;
                 int r = ly->ratio, g0 = start / r, np = E / r - g0;
                 size_t rf = (size_t)ly->crows * ly->cproj, cp = (size_t)ly->cproj;
-                ok = vkc_copy(ch->pull, ly->pc, ly->ckv, (size_t)g0 * hd, (size_t)np * hd);
+                ok = ch->ks.on || vkc_copy(ch->pull, ly->pc, ly->ckv, (size_t)g0 * hd, (size_t)np * hd);
                 if (ok && r == 4) ok = vkc_copy(ch->pull, ly->pr, ly->ring, 0, 2 * rf);
                 else if (ok) {
                     VkcRegion *rr = malloc((size_t)2 * ly->ns * sizeof *rr);
@@ -783,7 +938,7 @@ static int v4c_forward(ColiV4Engine *engine, float **state_ptr, float **next_ptr
             int r = ly->ratio, g0 = start / r, np = E / r - g0;
             if (coli_v4_attention_reserve(attention[i], E / r)) goto host_oom;
             coli_v4_attention_view(attention[i], &v);
-            memcpy(v.compressed + (size_t)g0 * hd, pl + ly->pc, (size_t)np * hd * sizeof(float));
+            if (!ch->ks.on) memcpy(v.compressed + (size_t)g0 * hd, pl + ly->pc, (size_t)np * hd * sizeof(float));
             coli_v4_attention_set_count(attention[i], E / r);
             ColiV4CompressorView cv;
             coli_v4_compressor_view(v.compressor, &cv);
@@ -842,16 +997,25 @@ static void v4c_report(void) {
     fprintf(stderr, "[VK] deepseek_v4 chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
                     "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %.1f MiB on the device\n",
             ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms, st.dev_bytes / 1048576.0);
+    vkc_kv_report(&ch->ks);
     vkc_prof_print();
 }
 
 /* COLI_VK_CHAIN at startup, before the tier sizes itself (the trunk's device copies count
  * as used): the decision, the pipelines, the resident layers and their tensors. */
+/* The decision, made once: by the RAM plan when it asks whether the dense layers may live
+ * on the device only (the expert store is not open then), else at v4c_start. */
+static int g_v4c_decision = -1;
+static int v4c_decide(const ColiV4Engine *engine) {
+    if (g_v4c_decision >= 0) return g_v4c_decision;
+    if (!g_v4_vk_ready || !engine) return 0;
+    int tier_on = vkt_wanted() && !(engine->experts && engine->experts->gpu) && engine->config.n_routed_experts > 0;
+    return g_v4c_decision = coli_vk_chain_decide("deepseek_v4", tier_on, COLI_VK_CHAIN_UNMEASURED);
+}
 static void v4c_start(const ColiV4Engine *cengine) {
     ColiV4Engine *engine = (ColiV4Engine *)cengine;
     if (!g_v4_vk_ready || !engine) return;
-    int tier_on = vkt_wanted() && engine->experts && !engine->experts->gpu && engine->config.n_routed_experts > 0;
-    int on = coli_vk_chain_decide("deepseek_v4", tier_on, COLI_VK_CHAIN_UNMEASURED);
+    int on = v4c_decide(engine);
     const char *no = NULL;
     if (on && !(g_v4c_inited = vkc_init())) no = "the chain's pipelines did not come up";
     if (on && !no && !(vkc_mla_ready() && vkc_mhc_ready() && vkc_dsv4_ready()))
