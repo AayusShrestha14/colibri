@@ -102,6 +102,7 @@ static float *down(VkcBuf *b, size_t off, size_t n) {
 /* ---- matmul ----------------------------------------------------------------------- */
 static uint16_t f2bf(float f) { uint32_t u; memcpy(&u, &f, 4); return (uint16_t)((u + 0x7fff + ((u >> 16) & 1)) >> 16); }
 static float bf2f(uint16_t h) { uint32_t u = (uint32_t)h << 16; float f; memcpy(&f, &u, 4); return f; }
+static double g_mm_tol = 2e-4;   /* chain_gemm.comp's cases: x rounded to f16 */
 static void test_matmul(int fmt, int S, int I, int O, size_t xo, size_t yo) {
     float *x = fvec((size_t)S * I, 1.f), *W = malloc((size_t)O * I * sizeof(float));
     void *codes = NULL; float *sc = NULL; int gs = 0;
@@ -140,7 +141,7 @@ static void test_matmul(int fmt, int S, int I, int O, size_t xo, size_t yo) {
     vkc_submit(1);
     float *y = (float *)vkc_ptr(yb) + yo;
     double e = relerr(y, ref, (size_t)S * O, 1e-3);
-    CHECK(ok && e < 2e-4 && !bad(y, (size_t)S * O), "matmul fmt %d S %d I %d O %d xo %zu yo %zu: ok %d err %.2e", fmt, S, I, O, xo, yo, ok, e);
+    CHECK(ok && e < g_mm_tol && !bad(y, (size_t)S * O), "matmul fmt %d S %d I %d O %d xo %zu yo %zu: ok %d err %.2e", fmt, S, I, O, xo, yo, ok, e);
     vkc_free(xb); vkc_free(yb); coli_vk_tensor_free(t);
     free(x); free(W); free(codes); free(sc); free(ref);
 }
@@ -2349,6 +2350,21 @@ int main(int argc, char **argv) {
         test_matmul(fmts[k], 2, 64, 33, 3, 5);           /* offsets the device cannot bind */
         test_matmul(fmts[k], 1, 100, 33, 0, 0);          /* rows that are not whole 16-byte steps */
         test_matmul(fmts[k], 2, 3072, 40, 0, 0);         /* a long row (chain_gemv's staging) */
+    }
+    /* int8 and int4 prompt GEMMs whose shapes chain_gemm.comp takes (I % 64, O % 128), on
+     * a device with cooperative matrices at subgroup size 64: full and partial row tiles,
+     * bindable offsets; its x is rounded to f16, hence the bound */
+    {
+        VkcStats s0; vkc_stats(&s0);
+        g_mm_tol = 2e-3;
+        for (int k = 0; k < 2; k++) {
+            test_matmul(fmts[k], 64, 256, 256, 0, 0);
+            test_matmul(fmts[k], 70, 512, 384, 64, 128);
+            test_matmul(fmts[k], 130, 192, 128, 0, 0);
+        }
+        g_mm_tol = 2e-4;
+        VkcStats s1; vkc_stats(&s1);
+        printf("  prompt GEMMs on chain_gemm: %llu\n", s1.tile_gemms - s0.tile_gemms);
     }
     printf("matmul done\n");
     test_norm(VKC_NORM_ADD1, 0); test_norm(VKC_NORM_ADD1, 1); test_norm(0, 0); test_norm(VKC_NORM_NOW, 1); test_norm(VKC_NORM_L2 | VKC_NORM_NOW, 0);

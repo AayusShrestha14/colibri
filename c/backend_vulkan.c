@@ -4463,6 +4463,7 @@ int coli_vk_core(ColiVkCore *o) {
     }
     o->gemm_min_s = G.gemm_min_s; o->gemm_min_so = G.gemm_min_so;
     o->integrated = coli_vk_device_integrated(); o->shares_ram = coli_vk_device_shares_ram();
+    o->coop_sg = G.has_coop ? G.coop_sg : 0;
     return 1;
 }
 int coli_vk_tensor_info(const ColiVkTensor *t, ColiVkTensorInfo *o) {

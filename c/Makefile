@@ -730,6 +730,8 @@ VK_SPV   += shaders/chain_ares.spv
 VK_SPV   += shaders/chain_sconv.spv shaders/chain_relattn.spv
 # blocked attention for prompt chunks (made on first use; vk_chain.c, chain_attnb.comp)
 VK_SPV   += shaders/chain_attnb.spv
+# the int8/int4 prompt GEMM on the matrix units (optional at run time)
+VK_SPV   += shaders/chain_gemm.spv
 # the KV cache split between the device and the host past the device's budget
 # (vk_chain.h: vkc_kvs_*; vk_kvsplit.h)
 VK_SPV   += shaders/chain_kvs.spv
@@ -880,6 +882,12 @@ shaders/%.spv: shaders/%.comp
 # (shaderc 2023.6+). An older one keeps the committed .spv instead of failing the build;
 # at run time the shader is optional anyway (the fp32 GEMM takes over without it).
 shaders/qmatmul_coop.spv: shaders/qmatmul_coop.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
+# chain_gemm.comp needs the same glslc as qmatmul_coop.comp above, with the same
+# fallback; without its .spv the chain keeps its other GEMMs.
+shaders/chain_gemm.spv: shaders/chain_gemm.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@ || { [ -f $@ ] && touch $@ && \
 	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
