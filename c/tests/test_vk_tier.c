@@ -756,32 +756,32 @@ static void grouped(void) {
         {{VKT_SRC_I4U_PLANAR64, 64}, {VKT_SRC_I4U_PLANAR64, 64}, 0, "planar int4-g64"},
     };
     int h0 = H; H = 256;
-    int any_grouped = 0, any_summed = 0;
+    int any_grouped = 0, any_summed = 0, any_gemv = 0;
     for (size_t c = 0; c < sizeof cs / sizeof *cs; c++) {
-        for (int mode = 0; mode < 3; mode++) {   /* single, whole, mixed */
+        for (int mode = 0; mode < 4; mode++) {   /* single, whole, mixed, decode */
             model_make(cs[c].gu, cs[c].dn);
             g_act = VKT_ACT_SWIGLU; g_limit = cs[c].limit;
             set_budget(mode == 2 ? 4 : L * E, cs[c].gu, cs[c].dn);
-            setenv("COLI_VK_TIER_RATE", mode ? "0" : "64", 1);
+            setenv("COLI_VK_TIER_RATE", mode == 1 || mode == 2 ? "0" : "64", 1);
             setenv("COLI_VK_TIER_SYNC", "1", 1);
-            if (mode) { setenv("COLI_VK_TIER_STREAM_SLOTS", "4", 1); setenv("COLI_VK_TIER_STREAM_ROWS", "6", 1);
+            if (mode == 1 || mode == 2) { setenv("COLI_VK_TIER_STREAM_SLOTS", "4", 1); setenv("COLI_VK_TIER_STREAM_ROWS", "6", 1);
                         setenv("COLI_VK_TIER_STREAM_HALF", "70", 1); }
             VktConfig vc = cfg_of(cs[c].gu, cs[c].dn, VKT_ACT_SWIGLU, cs[c].limit);
-            if (mode) { vc.load = load_cb; vc.release = release_cb; }
+            if (mode == 1 || mode == 2) { vc.load = load_cb; vc.release = release_cb; }
             uint32_t hist[L][E], *hr[L];
             for (int l = 0; l < L; l++) { hr[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = 100 - e; }
-            int on = vkt_init(&vc, mode ? hr : NULL);
+            int on = vkt_init(&vc, mode == 1 || mode == 2 || mode == 3 ? hr : NULL);
             unsetenv("COLI_VK_TIER_SYNC"); unsetenv("COLI_VK_TIER_STREAM_HALF");
             CHECK(on, "grouped %s: the tier did not start", cs[c].name);
             if (!on) { model_free(); continue; }
-            if (mode) {   /* the warm start: whole = every expert, mixed = the four hottest */
+            if (mode) {   /* the warm start: whole and decode = every expert, mixed = the four hottest */
                 int pl[L * E], pe[L * E], np = vkt_plan(pl, pe, L * E);
                 for (int i = 0; i < np; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
                 vkt_put_done();
             }
             ColiVkXbStats a, b; coli_vk_xb_stats(&a);
             Books bk = {0, 0}; double worst = 0; int summed = 0;
-            static const int Ss[3][4] = {{32, 32, 32, 32}, {40, 64, 40, 64}, {40, 64, 40, 64}};
+            static const int Ss[4][4] = {{32, 32, 32, 32}, {40, 64, 40, 64}, {40, 64, 40, 64}, {1, 2, 1, 3}};
             for (int t = 0; t < 4; t++)
                 for (int l = 0; l < L; l++) {
                     int S = Ss[mode][t], idx[64 * K]; float w[64 * K];
@@ -791,12 +791,13 @@ static void grouped(void) {
                     if (r > worst) worst = r;
                 }
             coli_vk_xb_stats(&b);
-            unsigned long long gb = b.grouped_batches - a.grouped_batches;
-            static const char *mn[3] = {"single", "whole", "mixed"};
-            printf("  %-30s %-6s device %3llu of %3llu, %3llu grouped batches, %d summed on the device, worst %.2e\n",
-                   cs[c].name, mn[mode], bk.dev, bk.routed, gb, summed, worst);
+            unsigned long long gb = b.grouped_batches - a.grouped_batches, gv = b.gemv_batches - a.gemv_batches;
+            static const char *mn[4] = {"single", "whole", "mixed", "decode"};
+            printf("  %-30s %-6s device %3llu of %3llu, %3llu grouped GEMM / %3llu GEMV batches, %d summed on the device, worst %.2e\n",
+                   cs[c].name, mn[mode], bk.dev, bk.routed, gb, gv, summed, worst);
             CHECK(bk.dev > 0, "grouped %s %s: nothing ran on the device", cs[c].name, mn[mode]);
             CHECK(worst < (gb ? 1e-2 : 2e-3), "grouped %s %s: off the reference (%.3g)", cs[c].name, mn[mode], worst);
+            any_gemv |= gv > 0;
             any_grouped |= gb > 0; any_summed |= summed > 0;
             vkt_shutdown(); model_free();
             unsetenv("COLI_VK_TIER_STREAM_SLOTS"); unsetenv("COLI_VK_TIER_STREAM_ROWS");
@@ -805,6 +806,8 @@ static void grouped(void) {
     printf("  grouped route %s, device sums %s\n", any_grouped ? "taken" : "not on this device",
            any_summed ? "taken" : "not on this device");
     CHECK(!any_grouped || any_summed, "grouped: the device took the grouped route but never summed a whole step");
+    const char *gve = getenv("COLI_VK_XB_GEMV");
+    CHECK(!any_grouped || any_gemv || (gve && *gve == '0'), "grouped: the device took the grouped GEMM but never the grouped GEMV");
     H = h0;
 }
 

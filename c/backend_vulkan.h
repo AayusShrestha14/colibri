@@ -256,6 +256,7 @@ int  coli_vk_xb_join(const float **yrows, double *device_ms);
 typedef struct {
     unsigned long long batches, experts, rows, gemm_experts;
     unsigned long long grouped_batches;   /* batches that took the grouped GEMM (qmatmul_grp.comp) */
+    unsigned long long gemv_batches;      /* batches that took the grouped GEMV (qmatmul_grp_gemv.comp) */
     double device_ms;                 /* summed batch device time (timestamps) */
     int timestamps, queue_shared, gemm_rows;
     size_t scratch_bytes;

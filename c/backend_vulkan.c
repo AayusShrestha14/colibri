@@ -3426,9 +3426,10 @@ typedef struct XbCtx {
      * batch, [1 + h] sub-batch half h. */
     VkShaderModule sh_grp[2]; VkDescriptorSetLayout dsl_grp; VkPipelineLayout pl_grp;
     VkPipeline p_grp[2]; VkDescriptorPool grp_pool; VkDescriptorSet grp_set[3][2];
+    VkShaderModule sh_gv[2]; VkPipeline p_gv[2];   /* qmatmul_grp_gemv.comp: the same batches below grp_rows */
     XbBuf grp_it[3][2], grp_et[3][2], grp_map[3];
     int grp_rows;
-    unsigned long long grp_batches;
+    unsigned long long grp_batches, gv_batches;
     /* a big step's whole-step buffers (coli_vk_xb_step_*): its token rows once (xt), every
      * assignment's output row in place (ys, s*K + k), the routed sum (out) and its inputs */
     struct {
@@ -3442,7 +3443,8 @@ typedef struct XbCtx {
 static XbCtx g_xb[2];
 static int xb_dev_ready(const XbCtx *X) { return X->d ? G2.ready : G.ready; }
 struct PCV4 { int rows, n; };
-struct PCGRP { int I, O; float limit; int ibase; int kgat; };   /* qmatmul_grp.comp */
+struct PCGRP { int I, O; float limit; int ibase; int kgat; int rpw; };   /* qmatmul_grp.comp, qmatmul_grp_gemv.comp (rpw) */
+#define XB_GV_RPW 64   /* outputs per grouped-GEMV workgroup */
 #define XB_GRP_TT 4   /* 16-row tiles of an expert per workgroup: 64 rows (2, 4 or 8) */
 
 static size_t xb_up(size_t v, size_t a) { return (v + a - 1) / a * a; }
@@ -3711,6 +3713,23 @@ static void xb_grp_init(XbCtx *X) {
             X->p_grp[v] = VK_NULL_HANDLE; return;
         }
     }
+    /* the grouped GEMV for the small batches (COLI_VK_XB_GEMV=0: per-expert GEMVs) */
+    const char *ge = getenv("COLI_VK_XB_GEMV");
+    const char *gnm[2] = {"qmatmul_grp_gemv.spv", "qmatmul_grp_gemv_gate_up.spv"};
+    for (int v = 0; v < 2 && !(ge && *ge == '0'); v++) {
+        char path[1100];
+        derive_dir_file(X->spv, gnm[v], path, sizeof path);
+        if (!(X->sh_gv[v] = load_spv(X->dev, path))) { X->p_gv[0] = VK_NULL_HANDLE; break; }
+        VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = &rss,
+                      .flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT,
+                      .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = X->sh_gv[v], .pName = "main",
+                      .pSpecializationInfo = &si}, .layout = X->pl_grp};
+        if (vkCreateComputePipelines(X->dev, VK_NULL_HANDLE, 1, &ci, NULL, &X->p_gv[v]) != VK_SUCCESS) {
+            X->p_gv[v] = VK_NULL_HANDLE; X->p_gv[0] = VK_NULL_HANDLE; break;
+        }
+    }
+    if (!X->p_gv[0] || !X->p_gv[1]) X->p_gv[0] = X->p_gv[1] = VK_NULL_HANDLE;
     VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 30};
     VkDescriptorPoolCreateInfo dp = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .maxSets = 6, .poolSizeCount = 1, .pPoolSizes = &ps};
@@ -3912,24 +3931,29 @@ static uint64_t vk_addr(VkBuffer b) {
  * which the sets bind as their offsets. `slot`: whose tables and sets (0 the single
  * batch, 1 + h a sub-batch half). 0 = not taken, nothing recorded. */
 /* Whether the grouped route takes this batch (and its row total). */
+/* Whether the grouped route takes this batch (and its row total): 1 the grouped GEMM
+ * (grp_rows rows or more), 2 the grouped GEMV (fewer), 0 neither. */
 static int xb_grp_ok(const XbCtx *X, ColiVkExpert *const *ex, const int *rows, int count, int *total_out) {
     const int D = X->D, I = X->I;
     const size_t dr = (size_t)D * 4, ir = (size_t)I * 4;
     int total = 0;
     for (int c = 0; c < count; c++) total += rows[c];
     if (total_out) *total_out = total;
-    if (!X->grp_rows || total < X->grp_rows || X->act != COLI_VK_ACT_SWIGLU) return 0;
-    if (D % 128 || I % 128 || dr % X->align || ir % X->align) return 0;
+    if (!X->grp_rows || X->act != COLI_VK_ACT_SWIGLU || dr % X->align || ir % X->align) return 0;
+    int mode = total >= X->grp_rows ? 1 : X->p_gv[0] ? 2 : 0;
+    if (mode == 1 && (D % 128 || I % 128)) return 0;
+    if (mode == 2 && (D % 32 || I % 32 || D > 8192 || I > 8192)) return 0;
+    if (!mode) return 0;
     for (int c = 0; c < count; c++) {
         const ColiVkTensor *t[3] = {ex[c]->g, ex[c]->u, ex[c]->d};
         for (int k = 0; k < 3; k++) {
             int f = t[k]->fmt;
             if (t[k]->dev || !t[k]->pool || !(f == 1 || f == 2 || f == 4) || t[k]->rowWords % 4 ||
-                (f == 4 && (t[k]->gs < 8 || t[k]->gs % 8))) return 0;
+                (f == 4 && (t[k]->gs < 8 || t[k]->gs % (mode == 2 ? 32 : 8)))) return 0;
         }
         if (ex[c]->u->fmt != ex[c]->g->fmt || ex[c]->u->gs != ex[c]->g->gs) return 0;
     }
-    return 1;
+    return mode;
 }
 /* amap (a big step's sub-batch, X->st.on): packed row j is assignment amap[j]; x comes from
  * the step's token rows and y goes to the step's output rows (the scratch's x and y unused). */
@@ -3937,8 +3961,8 @@ static int xb_grp_record(XbCtx *X, VkCommandBuffer cmd, int slot, ColiVkExpert *
                          int count, const size_t *off, size_t x0, size_t i0, size_t y0, const int *amap) {
     const int D = X->D, I = X->I;
     const size_t dr = (size_t)D * 4, ir = (size_t)I * 4;
-    int total = 0;
-    if (!xb_grp_ok(X, ex, rows, count, &total)) return 0;
+    int total = 0, mode = xb_grp_ok(X, ex, rows, count, &total);
+    if (!mode || (mode == 2 && amap)) return 0;
     if (amap) {
         XbBuf *mb = &X->grp_map[slot];
         size_t nb = (size_t)total * 4;
@@ -3947,11 +3971,12 @@ static int xb_grp_record(XbCtx *X, VkCommandBuffer cmd, int slot, ColiVkExpert *
     }
     /* items: (expert, first row, 128-row output block), 64 rows a workgroup; the tiles
      * of one (expert, block) adjacent, so workgroups in flight share weights */
-    const int tm = 16 * XB_GRP_TT;
+    /* the GEMV's items: (expert, row, XB_GV_RPW outputs) */
+    const int tm = mode == 1 ? 16 * XB_GRP_TT : 1, bo = mode == 1 ? 128 : XB_GV_RPW;
     int nit[2] = {0, 0};
     for (int c = 0; c < count; c++) {
         int nt = (rows[c] + tm - 1) / tm;
-        nit[0] += nt * (D / 128); nit[1] += nt * (I / 128);
+        nit[0] += nt * ((D + bo - 1) / bo); nit[1] += nt * ((I + bo - 1) / bo);
     }
     for (int v = 0; v < 2; v++) {
         XbBuf *ib = &X->grp_it[slot][v], *eb = &X->grp_et[slot][v];
@@ -3973,9 +3998,10 @@ static int xb_grp_record(XbCtx *X, VkCommandBuffer cmd, int slot, ColiVkExpert *
             et[8] = (uint32_t)rows[c]; et[9] = (uint32_t)((off[3 * c] - x0) / dr);
             et[10] = (uint32_t)a->fmt; et[11] = (uint32_t)a->rowWords; et[12] = (uint32_t)a->gs;
             memcpy((uint8_t *)X->grp_et[slot][v].ptr + (size_t)c * 64, et, sizeof et);   /* written, never read back */
-            for (int ob = 0; ob < O / 128; ob++)
+            for (int ob = 0; ob < (O + bo - 1) / bo; ob++)
                 for (int t0 = 0; t0 < rows[c]; t0 += tm) {
-                    uint32_t q[4] = {(uint32_t)c, (uint32_t)t0, (uint32_t)ob, 0};
+                    /* the GEMM takes a block index, the GEMV its first output */
+                    uint32_t q[4] = {(uint32_t)c, (uint32_t)t0, (uint32_t)(mode == 1 ? ob : ob * bo), 1};
                     memcpy(it + (size_t)n * 4, q, sizeof q); n++;
                 }
         }
@@ -4000,16 +4026,16 @@ static int xb_grp_record(XbCtx *X, VkCommandBuffer cmd, int slot, ColiVkExpert *
                 .dstBinding = (uint32_t)b, .descriptorCount = 1,
                 .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[b]};
         vkUpdateDescriptorSets(X->dev, 5, w, 0, NULL);
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, X->p_grp[v]);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, mode == 1 ? X->p_grp[v] : X->p_gv[v]);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, X->pl_grp, 0, 1, &X->grp_set[slot][v], 0, NULL);
         for (int i0n = 0; i0n < nit[v]; i0n += 65535) {   /* the grid's x limit every device has */
-            struct PCGRP pc = {v ? D : I, v ? I : D, X->limit, i0n, amap ? X->st.K : 0};
+            struct PCGRP pc = {v ? D : I, v ? I : D, X->limit, i0n, amap ? X->st.K : 0, XB_GV_RPW};
             vkCmdPushConstants(cmd, X->pl_grp, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
             vkCmdDispatch(cmd, (uint32_t)(nit[v] - i0n < 65535 ? nit[v] - i0n : 65535), 1, 1);
         }
         if (!step) xb_barrier(cmd);
     }
-    X->grp_batches++;
+    if (mode == 1) X->grp_batches++; else X->gv_batches++;
     return 1;
 }
 /* Record one batch laid out at off[] (its x rows already written) into cmd, with its
@@ -4230,7 +4256,7 @@ static void xb_stats(const XbCtx *X, ColiVkXbStats *st) {
     st->scratch_bytes = 2 * (X->x.region + 3 * X->g.region + X->y.region);
     st->sub_batches = X->sub_batches; st->sub_experts = X->sub_experts; st->sub_rows = X->sub_rows;
     st->sub_gemm = X->sub_gemm; st->sub_ms = X->sub_ms;
-    st->cooperative_matmuls = X->cooperative_matmuls; st->grouped_batches = X->grp_batches;
+    st->cooperative_matmuls = X->cooperative_matmuls; st->grouped_batches = X->grp_batches; st->gemv_batches = X->gv_batches;
 }
 void coli_vk_xb_stats(ColiVkXbStats *st) { xb_stats(&g_xb[0], st); }
 void coli_vk_xb_stats_dev(int dev, ColiVkXbStats *st) {
@@ -4436,7 +4462,7 @@ int coli_vk_xb_sub_issue_step(int h, ColiVkExpert *const *ex, const int *rows, i
     if (!X->st.on || h < 0 || h > 1 || count < 1) return 0;
     for (int c = 0; c < count; c++) if (!ex[c] || ex[c]->X != X) return 0;
     int total = 0;
-    if (!xb_grp_ok(X, ex, rows, count, &total)) {   /* packed as before, copied into ys at the join */
+    if (xb_grp_ok(X, ex, rows, count, &total) != 1) {   /* packed as before, copied into ys at the join */
         const float **xr = malloc((size_t)total * sizeof(*xr));
         if (!xr) return 0;
         for (int j = 0; j < total; j++) xr[j] = X->st.xh + (size_t)(assign[j] / X->st.K) * X->D;
@@ -4537,6 +4563,10 @@ static void xb_shutdown(XbCtx *X) {
     if (X->st.pool) vkDestroyDescriptorPool(X->dev, X->st.pool, NULL);
     if (X->st.pl) vkDestroyPipelineLayout(X->dev, X->st.pl, NULL);
     if (X->st.dsl) vkDestroyDescriptorSetLayout(X->dev, X->st.dsl, NULL);
+    for (int v = 0; v < 2; v++) {
+        if (X->p_gv[v]) vkDestroyPipeline(X->dev, X->p_gv[v], NULL);
+        if (X->sh_gv[v]) vkDestroyShaderModule(X->dev, X->sh_gv[v], NULL);
+    }
     if (X->pl_grp) vkDestroyPipelineLayout(X->dev, X->pl_grp, NULL);
     if (X->dsl_grp) vkDestroyDescriptorSetLayout(X->dev, X->dsl_grp, NULL);
     for (int k = 0; k < X->ndpools; k++) vkDestroyDescriptorPool(X->dev, X->dpools[k], NULL);
