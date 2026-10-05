@@ -90,6 +90,10 @@ static uint64_t g_metal_moe_rows = 0;
 static int g_vk_ready = 0;  /* COLI_VULKAN=1 and the device opened */
 static int g_vk_dense = 0;  /* the resident matrices run there (coli_vk_dense_decide) */
 #endif
+#ifndef COLI_VULKAN   /* exclusive RAM/VRAM (vk_tier.h) is the Vulkan build's: no device holds an expert */
+static inline int  vkt_ram_first(int layer, int eid) { (void)layer; (void)eid; return 0; }
+static inline void vkt_ram_gave(void) {}
+#endif
 #include "compat.h"
 #include "serve_poll.h"          /* CANCEL a meta' turno (#1332) */
 #include "route_trace.h"
@@ -2006,10 +2010,14 @@ static void expert_block_read(GModel *m, int index, const int *ids, int here,
         if (hit) { slot_of[i] = (int)(hit - cache->s); continue; }
         Slot *victim;
         if (cache->n < cache->cap) victim = &cache->s[cache->n++];
-        else {
-            int lru = 0;
+        else {   /* il meno usato; prima ancora uno che il tier Vulkan tiene gia' (vkt_ram_first) */
+            int lru = 0, dev = -1;
             for (int j = 1; j < cache->n; j++)
                 if (cache->s[j].used < cache->s[lru].used) lru = j;
+            for (int j = 0; j < cache->n; j++)
+                if (cache->s[j].eid >= 0 && vkt_ram_first(index, cache->s[j].eid) &&
+                    (dev < 0 || cache->s[j].used < cache->s[dev].used)) dev = j;
+            if (dev >= 0) { lru = dev; vkt_ram_gave(); }
             victim = &cache->s[lru];
         }
         /* prenotato subito: cosi' la scelta successiva non lo ripesca */

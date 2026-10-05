@@ -84,6 +84,10 @@
 /* 1 once COLI_VULKAN=1 opened a device, after the weights load (a VK=1 build). */
 static int g_vk_ready = 0;
 #endif
+#ifndef COLI_VULKAN   /* exclusive RAM/VRAM (vk_tier.h) is the Vulkan build's: no device holds an expert */
+static inline int  vkt_ram_first(int layer, int eid) { (void)layer; (void)eid; return 0; }
+static inline void vkt_ram_gave(void) {}
+#endif
 
 #define V41_MAX_LAYERS 64
 #define V41_MAX_ENGRAM 4
@@ -1610,6 +1614,19 @@ static void ehit_mark(Model *m, int layer, int eid) {
  * DSpark stage: same slot shapes, same LRU, a different set of experts. Only the
  * backbone's routing reaches the dashboard's grid -- the draft head has its own,
  * smaller expert set, and a row of it would not line up with anything. */
+/* The slot a full cache gives up: the least recently used, and before it (the
+ * backbone's layers: the DSpark stages keep their experts on the CPU) the least
+ * recently used of those whose expert the Vulkan tier holds (vkt_ram_first). */
+static int v41_victim(const LCache *cache, const char *kind, int layer) {
+    int oldest = 0, dev = -1, backbone = !strcmp(kind, "layers");
+    for (int i = 1; i < cache->n; i++)
+        if (cache->slot[i].used < cache->slot[oldest].used) oldest = i;
+    for (int i = 0; backbone && i < cache->n; i++)
+        if (cache->slot[i].eid >= 0 && vkt_ram_first(layer, cache->slot[i].eid) &&
+            (dev < 0 || cache->slot[i].used < cache->slot[dev].used)) dev = i;
+    if (dev >= 0) { vkt_ram_gave(); return dev; }
+    return oldest;
+}
 static Slot *expert_slot_at(Model *m, LCache *cache, const char *kind, int layer, int eid) {
     if (!strcmp(kind, "layers")) ehit_mark(m, layer, eid);
     for (int i = 0; i < cache->n; i++)
@@ -1623,10 +1640,7 @@ static Slot *expert_slot_at(Model *m, LCache *cache, const char *kind, int layer
     if (cache->n < cache->cap) {
         victim = &cache->slot[cache->n++];
     } else {
-        int oldest = 0;
-        for (int i = 1; i < cache->n; i++)
-            if (cache->slot[i].used < cache->slot[oldest].used) oldest = i;
-        victim = &cache->slot[oldest];
+        victim = &cache->slot[v41_victim(cache, kind, layer)];
     }
     victim->used = ++m->clock;
     expert_fetch(m, kind, layer, &victim, &eid, 1);
@@ -1665,10 +1679,7 @@ static void expert_slots_at(Model *m, LCache *cache, const char *kind, int layer
         if (cache->n < cache->cap) {
             victim = &cache->slot[cache->n++];
         } else {
-            int oldest = 0;
-            for (int i = 1; i < cache->n; i++)
-                if (cache->slot[i].used < cache->slot[oldest].used) oldest = i;
-            victim = &cache->slot[oldest];
+            victim = &cache->slot[v41_victim(cache, kind, layer)];
         }
         victim->used = ++m->clock;
         victim->eid = -1;                  /* not this expert yet: the read is still pending */
