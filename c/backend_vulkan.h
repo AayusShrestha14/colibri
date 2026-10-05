@@ -193,6 +193,12 @@ void coli_vk_pool_stats(int pool, ColiVkPoolStats *st);
 /* The expert tier's budget: its pool never holds more block bytes than this. */
 void coli_vk_tier_pool_limit(size_t bytes);
 void coli_vk_tier_pool_limit_dev(int dev, size_t bytes);   /* dev 1: COLI_VK_DEV2's pool (3) */
+/* The tier's extra layers (an MTP head's experts, another size than the main ones'):
+ * a pool of their own on the primary device (pool 4), its budget, and a tensor in it
+ * (as coli_vk_tier_tensor). */
+void coli_vk_tier_extra_pool_limit(size_t bytes);
+int  coli_vk_tier_tensor_extra(ColiVkTensor **t, int fmt, int I, int O, int gs,
+                               uint8_t **rows, size_t *stride, float **scales);
 /* A tensor in the tier's pool, to fill in place: O rows of coli_vk_tensor_row_bytes
  * at *stride apart (padding zeroed) and coli_vk_tensor_scale_count floats of scales
  * (fmt 10/11: one, set it to 1), then coli_vk_tensor_commit. Thread-safe. Returns 0

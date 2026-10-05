@@ -1258,11 +1258,14 @@ static VkWPool g_wpool  = {.p = {.block_bytes = VK_WBLOCK}, .mx = PTHREAD_MUTEX_
 static VkWPool g_tpool  = {.p = {.block_bytes = VK_WBLOCK}, .mx = PTHREAD_MUTEX_INITIALIZER, .dev = 0, .prio = 0.4f};
 static VkWPool g_wpool2 = {.p = {.block_bytes = VK_WBLOCK}, .mx = PTHREAD_MUTEX_INITIALIZER, .dev = 1, .prio = -1.f};
 static VkWPool g_tpool2 = {.p = {.block_bytes = VK_WBLOCK}, .mx = PTHREAD_MUTEX_INITIALIZER, .dev = 1, .prio = -1.f};   /* the tier's experts on COLI_VK_DEV2 */
+/* the tier's extra layers (an MTP head's), whose experts have another size than the
+ * main ones': a pool of their own, so neither leaves holes the other cannot use */
+static VkWPool g_xpool  = {.p = {.block_bytes = VK_WBLOCK}, .mx = PTHREAD_MUTEX_INITIALIZER, .dev = 0, .prio = 0.4f};
 /* Device k's pools take VK_WBLOCK blocks, smaller ones under COLI_VK_DEVICE_CAP_MB. */
 static void vk_pool_blocks(int k) {
     size_t bb = VK_WBLOCK;
     if (g_mem.cap[k]) { bb = (size_t)64 << 10; while ((uint64_t)bb < g_mem.cap[k] / 4096 && bb < VK_WBLOCK) bb <<= 1; }
-    if (k == 0) { g_wpool.p.block_bytes = bb; g_tpool.p.block_bytes = bb; }
+    if (k == 0) { g_wpool.p.block_bytes = bb; g_tpool.p.block_bytes = bb; g_xpool.p.block_bytes = bb; }
     else { g_wpool2.p.block_bytes = bb; g_tpool2.p.block_bytes = bb; }
 }
 static VkDevice pool_device(const VkWPool *P);
@@ -3261,7 +3264,9 @@ void coli_vk_tensor_free(ColiVkTensor *t) {
     tensor_release(t);
 }
 
-static VkWPool *pool_of(int which) { return which == 1 ? &g_tpool : which == 2 ? &g_wpool2 : which == 3 ? &g_tpool2 : &g_wpool; }
+static VkWPool *pool_of(int which) {
+    return which == 1 ? &g_tpool : which == 2 ? &g_wpool2 : which == 3 ? &g_tpool2 : which == 4 ? &g_xpool : &g_wpool;
+}
 void coli_vk_pool_stats(int which, ColiVkPoolStats *st) {
     VkWPool *P = pool_of(which);
     VkaStats v;
@@ -3289,6 +3294,7 @@ static void tier_pool_limit(VkWPool *P, size_t bytes) {
 }
 void coli_vk_tier_pool_limit(size_t bytes) { tier_pool_limit(&g_tpool, bytes); }
 void coli_vk_tier_pool_limit_dev(int dev, size_t bytes) { tier_pool_limit(dev == 1 ? &g_tpool2 : &g_tpool, bytes); }
+void coli_vk_tier_extra_pool_limit(size_t bytes) { tier_pool_limit(&g_xpool, bytes); }
 
 size_t coli_vk_tensor_bytes(const ColiVkTensor *t) { return t ? t->wbytes : 0; }
 
@@ -4250,6 +4256,15 @@ int coli_vk_tier_tensor(ColiVkTensor **t, int fmt, int I, int O, int gs,
                         uint8_t **rows, size_t *stride, float **scales) {
     return coli_vk_tier_tensor_dev(0, t, fmt, I, O, gs, rows, stride, scales);
 }
+int coli_vk_tier_tensor_extra(ColiVkTensor **t, int fmt, int I, int O, int gs,
+                              uint8_t **rows, size_t *stride, float **scales) {
+    if (!G.ready || !fmt_uploadable(fmt, gs)) return 0;
+    void *w, *s;
+    ColiVkTensor *n = tensor_alloc(&g_xpool, fmt, I, O, gs, &w, &s);
+    if (!n) return 0;
+    *t = n; *rows = w; *stride = (size_t)n->rowWords * 4; *scales = s;
+    return 1;
+}
 /* Staged uploads: the host images of tensors filled in place (coli_vk_tier_tensor) go
  * to their device-local ranges, all of them before this returns, and are freed. Mapped
  * memory: nothing to do. Any thread; the tensors of one call on one device. */
@@ -4310,8 +4325,9 @@ static void place_report(void) {
     if (!u->on) return;
     VkPhysicalDeviceMemoryProperties mp;
     vkGetPhysicalDeviceMemoryProperties(G.phys, &mp);
-    ColiVkPoolStats w, t;
-    coli_vk_pool_stats(0, &w); coli_vk_pool_stats(1, &t);
+    ColiVkPoolStats w, t, x;
+    coli_vk_pool_stats(0, &w); coli_vk_pool_stats(1, &t); coli_vk_pool_stats(4, &x);
+    t.peak_used += x.peak_used;   /* the expert tier: its extra layers' pool too */
     size_t kv = 0, ln = 0;
     for (int l = 0; l < VK_KV_LAYERS; l++) {
         if (G.kv[l].bl) kv += (size_t)G.kv[l].rows * (G.kv[l].K + G.kv[l].R) * 4;
@@ -4426,6 +4442,7 @@ void coli_vk_shutdown(void) {
     pthread_mutex_unlock(&g_imports_mx);
     pool_destroy(&g_wpool);    /* weight blocks: unmapped/freed with the device */
     pool_destroy(&g_tpool);
+    pool_destroy(&g_xpool);
     if (PW.buf) { vkDestroyBuffer(G.dev, PW.buf, NULL); vkFreeMemory(G.dev, PW.mem, NULL); }
     free(PW.cp);
     memset(&PW, 0, sizeof PW);
