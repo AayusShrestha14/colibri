@@ -490,7 +490,8 @@ static Q38Chain *q38c_setup_dev(Model *m, int d) {
         q38c_shrink(ch, m, i, vkc_lost() ? "the device was lost" : "the device refused an upload or an allocation");
         break;
     }
-    if (ch->nl && !q38c_arena(ch, m)) q38c_shrink(ch, m, ch->lo, "the device refused the chain's parameter buffer");
+    if (ch->nl && !q38c_arena(ch, m))
+        q38c_shrink(ch, m, ch->lo, vkc_lost() ? "the device was lost" : "the device refused the chain's parameter buffer");
     if (fit && !ch->placed_said) { vkc_fit_placed(nm, fit); ch->placed_said = 1; }
     if (ch->nl && ch->head) {
         Q38Weight *w[Q38C_TAIL]; int n = q38c_tail_mats(m, w, 1), ok = 1;
