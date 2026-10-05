@@ -389,7 +389,14 @@ static InkChain *inkc_setup(Model *m) {
     int nl = inkc_layers(m);
     if (fit && !g_inkc_placed) { vkc_fit_placed("inkling", &g_inkc_fit); g_inkc_placed = 1; }   /* placed here, lm_head next */
     if (fit && vkc_fit_partial(&g_inkc_fit)) inkc_refuse_from(m, nl);
-    if (!what && nl == L && (!fit || g_inkc_fit.tail) && !(ch->t_lm = inkc_tensor(m->lm_head, D, c->unpad_vocab))) what = "lm_head";
+    if (!what && nl == L && (!fit || g_inkc_fit.tail) && !(ch->t_lm = inkc_tensor(m->lm_head, D, c->unpad_vocab))) {
+        if (!fit) what = "lm_head";
+        else {   /* the fit's tail did not go up: every layer here, the head on the CPU */
+            g_inkc_fit.tail = 0;
+            inkc_refuse_from(m, L);
+            fprintf(stderr, "[VK] inkling chain: lm_head did not reach the device; it runs on the CPU, the layers here\n");
+        }
+    }
     if (what || !nl) {
         if (what) {
             int bf16 = m->L[0].q.h && !m->L[0].q.q4 && !ink_vk_fmt(&m->L[0].q);

@@ -150,6 +150,10 @@ static MimoChain *mc_setup(Model *m) {
              (c->moe[i] || (mc_ctensor(&l->gate) && mc_ctensor(&l->up) && mc_ctensor(&l->down)));
     }
     int full = nl == L && (!g_mc_fit.L || g_mc_fit.tail);
+    if (ok && full && g_mc_fit.L && !mc_ctensor(&m->head)) {   /* the fit's tail did not go up: the head on the CPU */
+        full = 0; g_mc_fit.tail = 0;
+        fprintf(stderr, "[VK] mimo chain: the head did not reach the device; it runs on the CPU, the layers here\n");
+    }
     ok = ok && (!full || mc_ctensor(&m->head));
     if (!ok) { fprintf(stderr, "[VK] mimo chain: a dense matrix did not reach the device; per-matrix path\n"); return NULL; }
     size_t n = 0;

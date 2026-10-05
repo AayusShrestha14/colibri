@@ -94,16 +94,29 @@ ptl_cap() {
   ptl_check_placed "$eng" vk.log "$tag"
   echo "   $tag: COLI_VK_DEVICE_CAP_MB=$cap: $(grep -a "^\[VK\] $eng chain: [0-9]* of [0-9]* layers on the device" vk.log | tail -1 | sed "s/^\[VK\] $eng chain: //")"
 }
+# ptl_head_fault <engine> <probe log>: the COLI_VK_STAGED_FAULT=submit:n n of the head's
+# upload, the first time the point is reached after the last layer's setup (the probe's
+# placed line, as for ptl_calc fault; one weight block holds the fixture, so no zero fill)
+ptl_head_fault() {
+  sed -n "s/^\[VK\] $1 chain: [0-9]* of [0-9]* layers placed:.*reached \([0-9,]*\) times.*/\1/p" "$2" | tail -1 |
+    awk -F, '{ print $NF + 1 }'
+}
 # The reserve the capped runs keep for a chunk's scratch and the frames' staging (the tier
 # takes the rest of the device): 0.04 GiB.
 PTL_RESERVE=0.04
 # ptl_plan <engine> <tag> <fixture> <log> <env...>: coli plan's prediction (resource_plan.py,
 # vk_chain_fit) for the same device and settings, from the checkpoint's header and config
-# alone: the engine's free bytes, per-layer bytes, fixed bytes, tail and N. The tiny
-# inkling's config says model_type inkling_text, which the family registry does not
-# take: the plan reads a copy that says inkling (the real checkpoint's), the tensors linked.
+# alone: the engine's free bytes, per-layer bytes, fixed bytes and N. The tiny inkling's
+# config says model_type inkling_text, which the family registry does not take: the plan
+# reads a copy that says inkling (the real checkpoint's), the tensors linked. The plan
+# counts a buffer's alignment as 256 bytes, Lavapipe's: a driver that aligns them wider
+# (Dozen: 64 KiB) gives a tiny fixture's layers other bytes, so only Lavapipe compares.
 ptl_plan() {
   local eng=$1 tag=$2 fx=$3 log=$4; shift 4
+  case "${VK_ICD_FILENAMES:-}" in
+    *lvp_icd*) ;;
+    *) echo "   coli plan: not compared on this driver (its buffers' alignment is not the plan's 256 bytes)"; return 0 ;;
+  esac
   $PY - "$eng" "$fx" "$log" "$@" <<'PY' || fail "$tag: coli plan predicts otherwise"
 import json, os, re, shutil, sys, tempfile
 sys.path.insert(0, ".")
@@ -200,6 +213,17 @@ ptl_inkling() {
     env COLI_VK_DENSE_HOST=$h COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:1000000 COLI_VK_CHAIN_LAYERS=8 COLI_USAGE=chain.usage \
       COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 SNAP=tiny_inkling ./inkling 8 0 $R > ptl-fprobe.log 2>&1 || true
     for k in 0 3 7; do ink_fault "partial inkling upload failing in layer $k (COLI_VK_DENSE_HOST=$h)" $k ptl-fprobe.log COLI_VK_DENSE_HOST=$h; done
+    if [ $h = 1 ]; then   # lm_head's upload failing: every layer on the device, the head on the CPU
+      f=$(ptl_head_fault inkling ptl-fprobe.log)
+      rm -f chain.usage
+      env COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:$f COLI_VK_CHAIN_LAYERS=8 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 \
+        COLI_VULKAN=1 COLI_VK_CHAIN=1 SNAP=tiny_inkling ./inkling 8 0 $R > vk.log 2>&1 || true
+      grep -qa "lm_head did not reach the device; it runs on the CPU" vk.log || { cat vk.log; fail "partial inkling head fault: not the head's"; }
+      same_tokens cpu.log vk.log "partial inkling head fault"
+      ptl_check_n inkling vk.log 8 "partial inkling head fault"
+      ptl_check_placed inkling vk.log "partial inkling head fault"
+      echo "OK partial inkling lm_head's upload failing (submit #$f): tokens = CPU, every layer on the device, the head on the CPU"
+    fi
     if [ $h = 0 ]; then   # the dropped host copies are the 7 layers' only, none read back
       [ "$(dho_dropped vk.log)" = 56 ] || { grep -a '^\[VK\]' vk.log; fail "partial inkling fault, device only: $(dho_dropped vk.log) matrices dropped, not the 7 layers' 56"; }
       [ "$(dho_reloaded vk.log)" = 0 ] || { grep -a '^\[VK\]' vk.log; fail "partial inkling fault, device only: a matrix read back"; }
@@ -340,6 +364,16 @@ ptl_mimo_all() {
     env COLI_VK_DENSE_HOST=$h COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:1000000 COLI_VK_CHAIN_LAYERS=6 COLI_TEMP=0 COLI_VULKAN=1 \
       COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 MIMO_DENSE_BITS=32 ./mimo mimo_tiny --ids "$P" --ngen 6 > /dev/null 2> ptl-fprobe.log
     for k in 0 2 5; do mimo_fault "partial mimo upload failing in layer $k (COLI_VK_DENSE_HOST=$h)" $k ptl-fprobe.log COLI_VK_DENSE_HOST=$h; done
+    if [ $h = 1 ]; then   # the head's upload failing: every layer on the device, the head on the CPU
+      f=$(ptl_head_fault mimo ptl-fprobe.log)
+      env COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:$f COLI_VK_CHAIN_LAYERS=6 COLI_TEMP=0 COLI_VULKAN=1 COLI_VK_CHAIN=1 \
+        COLI_VK_TIER_SYNC=1 MIMO_DENSE_BITS=32 ./mimo mimo_tiny --ids "$P" --ngen 6 > mimo-vk.txt 2> vk.log
+      grep -qa "the head did not reach the device; it runs on the CPU" vk.log || { cat vk.log; fail "partial mimo head fault: not the head's"; }
+      [ -s mimo-cpu.txt ] && cmp -s mimo-cpu.txt mimo-vk.txt || { cat mimo-cpu.txt mimo-vk.txt vk.log; fail "partial mimo head fault: tokens differ from the CPU"; }
+      ptl_check_n mimo vk.log 6 "partial mimo head fault"
+      ptl_check_placed mimo vk.log "partial mimo head fault"
+      echo "OK partial mimo the head's upload failing (submit #$f): tokens = CPU, every layer on the device, the head on the CPU"
+    fi
     if [ $h = 0 ]; then   # the dropped host copies are the 5 layers' only (layer 0's five, two a layer after it)
       [ "$(dho_dropped vk.log)" = 13 ] || { grep -a '^\[VK\]' vk.log; fail "partial mimo fault, device only: $(dho_dropped vk.log) matrices dropped, not the 5 layers' 13"; }
       [ "$(dho_reloaded vk.log)" = 0 ] || { grep -a '^\[VK\]' vk.log; fail "partial mimo fault, device only: a matrix read back"; }
