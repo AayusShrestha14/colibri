@@ -2263,6 +2263,13 @@ the device's budget and the checkpoint's header). The dense-host lines say it:
 [VK] deepseek_v4: dense weights at exit: 31 matrices on the device only (0.4 MiB of host copies dropped, the 3 of 6 layers on the device), 0 read back from disk for the CPU (0.0 MiB); RSS 0.14 GiB
 ```
 
+`coli plan` counts every buffer at the backend's least alignment, 256 bytes. A device that
+aligns storage buffers more coarsely makes the engine count more: Mesa's Dozen (the Iris Xe
+through D3D12) aligns them to 64 KiB, and its fit counted 1,379,048 bytes for the six-layer
+fixture's first layer, which Lavapipe and the plan count at 159,720. On a real model, whose
+matrices are megabytes each, that is a few 64 KiB per matrix; on such a device the plan can
+predict a layer more than the engine places.
+
 **The tier** sizes itself after the chain's uploads, as before, and takes what is left.
 
 | Engine | What the handoff moves | On the partial chain |
