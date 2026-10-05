@@ -144,14 +144,50 @@ ld2_olmoe() {
     $PY tests/vulkan_chain_serve.py ./olmoe olmoe_tiny_c PILOT=1 WIDE=2 COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=1 COLI_VK_CHAIN_LAYERS2=2
 }
 
+# mimo: its own gate (mimo_chain_gate: the vendor fixture's cases, tokens and logits), with
+# the split forced; the second device's chain must have run in the logits run
+ld2_mimo_gate() {   # <tag> <case> <n0> <n1> <env...>
+  local tag=$1 c=$2 n0=$3 n1=$4; shift 4
+  mimo_chain_gate "$tag" "$c" COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=$n0 COLI_VK_CHAIN_LAYERS2=$n1 COLI_VK_TIER_BALANCE=0 "$@"
+  local f; f=$(ld2_forwards mimo mimo-vk.err)
+  [ "$f" -gt 0 ] || { cat mimo-vk.err; fail "$tag $c: the second device's chain never ran"; }
+  echo "   $tag $c: the second device's chain ran $f forwards"
+}
+ld2_mimo() {
+  $PY tools/make_mimo_tiny.py --output ./mimo_tiny --force --vision
+  MGRID=$($PY -c "import json;i=json.load(open('mimo_tiny/ref.json'))['image'];print(i['grid_h'],i['grid_w'])")
+  local c
+  for c in $($PY -c "import json;print(' '.join(json.load(open('mimo_tiny/ref.json'))['cases']))"); do
+    ld2_mimo_gate "ld2 mimo 3 + 3, the head on the second device" $c 3 3 MIMO_DENSE_BITS=32
+    ld2_mimo_gate "ld2 mimo 1 + 2, the CPU the rest and the head" $c 1 2 MIMO_DENSE_BITS=32
+  done
+  ld2_mimo_gate "ld2 mimo 2 + 4, blocks of 3" image 2 4 MIMO_DENSE_BITS=32 MIMO_CHUNK=3
+  ld2_mimo_gate "ld2 mimo 1 + 5, the release's FP8 and BF16" image 1 5 MIMO_DENSE_BITS=0
+  ld2_mimo_gate "ld2 mimo experts on both devices too" image 3 3 MIMO_DENSE_BITS=32 MIMO_VK_EXPERTS=2 COLI_VK_TIER_GB=0.00002
+  ld2_mimo_gate "ld2 mimo KV split on both" image 3 3 MIMO_DENSE_BITS=32 COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=2
+  CHAINMODE=2 ld2_mimo_gate "ld2 mimo prompts only" image 3 3 MIMO_DENSE_BITS=32
+  # the second device lost at its third frame: the host's caches hold whole steps, the CPU
+  # runs the rest from where they end
+  local x=(--image mimo_tiny/patches.f32 --grid $MGRID) ids
+  ids=$(mimo_ids image prompt_ids)
+  COLI_TEMP=0 MIMO_DENSE_BITS=32 ./mimo mimo_tiny --ids "$ids" --ngen 6 "${x[@]}" > mimo-cpu.txt 2>/dev/null
+  COLI_TEMP=0 MIMO_DENSE_BITS=32 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=3 \
+    COLI_VK_CHAIN_LAYERS2=3 COLI_VK_CHAIN_FAULT2=3 ./mimo mimo_tiny --ids "$ids" --ngen 6 "${x[@]}" > mimo-vk.txt 2> mimo-vk.err
+  cmp -s mimo-cpu.txt mimo-vk.txt || { cat mimo-cpu.txt mimo-vk.txt mimo-vk.err; fail "ld2 mimo second device lost: tokens differ from the CPU"; }
+  grep -q "COLI_VK_CHAIN_FAULT2" mimo-vk.err && grep -q "the device was lost at position" mimo-vk.err ||
+    { cat mimo-vk.err; fail "ld2 mimo second device lost: the loss was not taken over"; }
+  echo "OK ld2 mimo second device lost: tokens = CPU, $(grep -o 'the device was lost at position [0-9]*' mimo-vk.err)"
+}
+
 family_layers_dev2() {
   export OMP_NUM_THREADS=2
-  make qwen36 qwen38 olmoe tests/test_vk_chain VK=1
+  make qwen36 qwen38 olmoe mimo tests/test_vk_chain VK=1
   COLI_VK_DEV2=0 ./tests/test_vk_chain shaders/qmatmul.spv | tee vk_chain.log
   tail -1 vk_chain.log | grep -qx PASS || fail "the chain's ops on two devices"
   ld2_qwen36
   ld2_qwen38
   ld2_olmoe
+  ld2_mimo
   unset OMP_NUM_THREADS
 }
 family_layers_dev2_sanitize() {
