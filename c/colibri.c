@@ -1875,6 +1875,11 @@ static void load_cfg(Cfg *c, const char *snap){
     if(c->topk>c->n_experts){
         fprintf(stderr,"config: num_experts_per_tok=%d exceeds n_routed_experts=%d\n",
                 c->topk,c->n_experts); exit(1); }
+    /* the DSA indexer ropes the first qk_rope_head_dim floats of each of its rows, which
+     * are index_head_dim long (GLM-5.2: 64 of 128) */
+    if(c->index_hd>0 && c->index_hd<c->qk_rope){
+        fprintf(stderr,"config: index_head_dim=%d is shorter than qk_rope_head_dim=%d, which the "
+                "indexer ropes in each of its rows\n",c->index_hd,c->qk_rope); exit(1); }
     #undef CKR
     free(ar);
 }
