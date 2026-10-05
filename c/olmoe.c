@@ -1762,6 +1762,9 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         if (!chain_n) {
             free(chain_logit); chain_logit = NULL;
             olc_cpu_step(m, pos_base);
+            /* the primary's layers may have run before the second device's were lost: their
+             * residual is in x, and the CPU redoes the whole step from the embedding */
+            for (int s = 0; s < S; s++) memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
         } else if (rows_only) { free(chain_logit); chain_logit = NULL; }
     }
     if (!chain_logit) layers_forward_range(m, x, S, pos_base, chain_n, c->n_layers, 1);

@@ -81,6 +81,7 @@ typedef struct {
     VkcBuf *x, *nrm, *tmp, *qkv, *kn, *vn, *wk, *wv, *ctx, *g, *u, *fin;
     VkcBuf *h2d, *kvd, *outd, *routed, *cs;
     float *host_out;
+    float *host_in;                            /* a chunk's rows before the primary's layers (the second device's chain) */
     unsigned long long forwards, frames;
     double wait_ms, host_ms;
 } MimoChain;
@@ -591,13 +592,21 @@ static int mc_forward(Model *m, float *h, int S, int pos_base, float *logits, in
         int ro = !full ? 0 : logits && all_rows ? n : logits && last ? 1 : 0;
         float *hr = h + (size_t)c0 * H, *lc = all_rows ? logits + (size_t)c0 * V : logits;
         at = ch;
+        /* the chunk's rows as they came in: the primary's residual replaces them, and if the
+         * second device is lost the CPU runs the chunk from these */
+        if (ch2) {
+            float *keep = (float *)realloc(ch2->host_in, (size_t)rows * H * sizeof(float));
+            if (!keep) goto lost;
+            ch2->host_in = keep;
+            memcpy(keep, hr, (size_t)n * H * sizeof(float));
+        }
         if (!mc_chunk(ch, m, hr, n, pb, ch2 ? 0 : ro, lc)) goto lost;
         if (ch2) {
             at = ch2;
             vkc_device(1);
             int ok = mc_chunk(ch2, m, hr, n, pb, ro, lc);
             vkc_device(0);
-            if (!ok) goto lost;
+            if (!ok) { memcpy(hr, ch2->host_in, (size_t)n * H * sizeof(float)); goto lost; }
         }
         if (!full) {   /* the CPU's layers and the head on the chunk's rows */
             double t1 = now_s();
