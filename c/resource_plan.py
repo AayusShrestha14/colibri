@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Hardware and model placement planning for colibri's disk/RAM/VRAM tiers."""
 
+import collections
 import json
 import os
 import platform
@@ -132,13 +133,16 @@ def _vk_device(env, vulkan):
         return None
 
 
-def _vk_dense_active(family_id, env, vulkan):
+def _vk_chain_dense(family_id, env, vulkan):
+    """(chain, dense): whether the engine runs its dense chain, and its per-matrix
+    path, on the Vulkan device (coli_vk_chain_decide, coli_vk_dense_decide); both
+    False when it does not open one."""
     if (family_id not in _VK_DENSE_HOST_FAMILIES or
             not _vk_flag(env, "COLI_VULKAN") or _vk_flag(env, "COLI_CUDA")):
-        return False
+        return False, False
     kind = (vulkan or {}).get("type")
     if kind not in ("discrete", "integrated", "cpu", "virtual", "other"):
-        return False
+        return False, False
     tier = _vk_flag(env, "COLI_VK_TIER") != 0
     chain, dense = _vk_flag(env, "COLI_VK_CHAIN"), _vk_flag(env, "COLI_VK_DENSE")
     if chain is None:
@@ -148,7 +152,11 @@ def _vk_dense_active(family_id, env, vulkan):
         # colibri.c passes default=0 to coli_vk_dense_decide; its chain is
         # independent, but disabling that chain does not enable per-matrix GEMVs.
         dense = family_id != "glm" and (kind not in ("integrated", "cpu") or not tier)
-    return bool(chain or dense)
+    return bool(chain), bool(dense)
+
+
+def _vk_dense_active(family_id, env, vulkan):
+    return any(_vk_chain_dense(family_id, env, vulkan))
 
 
 def _text_weight_name(name):
@@ -360,6 +368,386 @@ def vk_dense_device_only(dense_bytes, family_id=None, env=None, vulkan=None):
         if dense_bytes <= free:
             return True, "a discrete GPU with room for the dense weights"
     return False, None
+
+
+# ---- the partial chain (docs/vulkan.md, "A partial chain") ------------------------------
+# When the dense layers do not all fit the device, the chain takes the first N of them and
+# the CPU the rest and the head; only the N layers' host copies can then be dropped. The
+# engine decides N with vkc_fit (vk_chain.c) from what the device has free; this mirrors
+# it, per family, from the scanned tensors and the config:
+#   _VK_CHAIN_LAYOUT[family_id](info, env) -> VkChainLayout(layers, fixed, tail) or None
+#     layers  each layer's device bytes as the engine's fit counts them (its matrices,
+#             each range aligned, its state at its first size, its share of the
+#             parameters), fixed  the engine's fixed bytes (the scratch of one prompt
+#             chunk, without the pools' granularity), tail  what goes up only with every
+#             layer (the head, matrices the per-matrix path uploads as it meets them).
+# Families without an entry keep N = L (the plan as before).
+VkChainLayout = collections.namedtuple("VkChainLayout", "layers fixed tail")
+_VK_CHAIN_LAYOUT = {}
+_VK_ALIGN = 256   # coli_vk_buffer_alignment: a storage buffer's alignment, at least 256
+
+
+def _vk_up(value, align=_VK_ALIGN):
+    return (value + align - 1) // align * align
+
+
+def vk_tensor_bytes(fmt, columns, rows, group=0):
+    """vkc_fit_tensor: a resident tensor's rows at their padded stride and its scales,
+    each range aligned (fmt as the backend numbers them: 10 f32, 11 bf16, 12 fp8 in
+    groups, 1 int8 rows, 2 int4 rows, 4 int4 in groups, 7 MXFP4, 13 int8 in groups)."""
+    row = {10: 4 * columns, 11: 2 * columns, 14: 2 * columns, 12: columns, 13: columns, 1: columns,
+           2: (columns + 1) // 2, 4: (columns + 1) // 2, 7: (columns + 1) // 2}[fmt]
+    data = (row + 3) // 4 * 4 * rows
+    if fmt in (10, 11, 14):
+        scales = 1
+    elif fmt in (4, 7, 12, 13):
+        scales = rows * -(-columns // group)
+    else:
+        scales = rows
+    return _vk_up(data or 4) + _vk_up(4 * scales)
+
+
+def vk_buf_bytes(value):
+    """vkc_fit_buf: a chain buffer (vkc_buf) of `value` bytes."""
+    return _vk_up((max(value, 4) + 3) // 4 * 4)
+
+
+def _vk_layer_index(name):
+    match = re.match(r"(?:model\.)?layers\.(\d+)\.", _text_weight_name(name))
+    return int(match[1]) if match else None
+
+
+def _vk_cap_bytes(env):
+    value = (env.get("COLI_VK_DEVICE_CAP_MB") or "").strip()
+    try:
+        return max(0, int(float(value) * 1048576)) if value else 0
+    except ValueError:
+        return 0
+
+
+def _vk_block(cap, default):
+    """coli_vk_block_bytes: a pool's block, smaller under COLI_VK_DEVICE_CAP_MB."""
+    if not cap:
+        return default
+    block = 64 << 10
+    while block < cap // 4096:
+        block <<= 1
+    return min(block, default)
+
+
+def vk_fit_pools(cap=0):
+    """vkc_fit_pools: a weight block, a block of each chain pool, the frames' staging."""
+    return _vk_block(cap, 256 << 20) + 3 * _vk_block(cap, 64 << 20) + 4 * (4 << 20)
+
+
+def _vk_free_bytes(env, vulkan):
+    """coli_vk_free_bytes as a plan sees it: the cap (the process holds nothing yet),
+    else the device's budget (or its device-local heap) less its heaps' usage."""
+    cap = _vk_cap_bytes(env)
+    if cap:
+        return cap
+    vulkan = vulkan or {}
+    used = sum(heap.get("usage", 0) for heap in vulkan.get("heaps", []) if heap.get("device_local"))
+    return max(0, (vulkan.get("budget_bytes") or vulkan.get("device_local_bytes") or 0) - used)
+
+
+def vk_chain_fit(info, family_id, env=None, vulkan=None):
+    """The engine's vkc_fit for this model and device: {"n", "L", "tail", "forced",
+    "free", "reserve", "fixed", "layers"}, or None when the chain does not run or the
+    family has no layout (N = L then, as before)."""
+    env = os.environ if env is None else env
+    vulkan = _vk_device(env, vulkan)
+    chain, _ = _vk_chain_dense(family_id, env, vulkan)
+    layout_of = _VK_CHAIN_LAYOUT.get(family_id)
+    layout = layout_of(info, env, vulkan) if chain and layout_of else None
+    if layout is None:
+        return None
+    layers = list(layout.layers)
+    count = len(layers)
+    free = _vk_free_bytes(env, vulkan)
+    try:
+        reserve = max(0, int(float(env.get("COLI_VK_TIER_RESERVE_GB") or 1.0) * (1 << 30)))
+    except ValueError:
+        reserve = 1 << 30
+    fixed = layout.fixed + vk_fit_pools(_vk_cap_bytes(env))
+    room = max(0, free - reserve)
+    forced = (env.get("COLI_VK_CHAIN_LAYERS") or "").strip()
+    if forced and forced != "auto":
+        match = re.match(r"\s*([+-]?\d+)", forced)
+        n = min(max(int(match[1]) if match else 0, 0), count)
+        tail = n == count and count > 0
+    elif fixed + sum(layers) <= room:
+        n, tail = count, fixed + sum(layers) + layout.tail <= room
+    else:
+        n, used = 0, fixed
+        while n < count and used + layers[n] <= room:
+            used += layers[n]
+            n += 1
+        tail = False
+    return {"n": n, "L": count, "tail": tail, "forced": bool(forced and forced != "auto"),
+            "free": free, "reserve": reserve, "fixed": fixed, "layers": layers}
+
+
+def _v4_chain_rows(env):
+    """deepseek_v4_chain.h v4c_rows: the CPU's prefill block, COLI_VK_CHAIN_ROWS below it."""
+    def number(name, default):
+        match = re.match(r"\s*([+-]?\d+)", env.get(name) or "")
+        return int(match[1]) if match else default
+    block = number("V4_PREFILL_CHUNK", 128)
+    if block < 1 or block > 128:
+        block = 128
+    value = env.get("COLI_VK_CHAIN_ROWS") or ""
+    rows = number("COLI_VK_CHAIN_ROWS", block) if value.strip() and value.strip() != "auto" else block
+    return min(max(rows, 1), block)
+
+
+def _v4_chain_layout(info, env, vulkan):
+    """deepseek_v4_chain.h: v4c_layer_bytes, v4c_fixed_bytes, v4c_tail_bytes."""
+    c = info.get("config") or {}
+    try:
+        L = int(c["num_hidden_layers"])
+        ratios = [int(r) for r in c["compress_ratios"][:L]]
+        D, H, nh, hd = c["hidden_size"], c.get("hc_mult", 1), c["num_attention_heads"], c["head_dim"]
+        rd, QL, og, ol = c["qk_rope_head_dim"], c["q_lora_rank"], c.get("o_groups", 1), c["o_lora_rank"]
+        W, inter = c["sliding_window"], c["moe_intermediate_size"]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if len(ratios) < L or L < 1:
+        return None
+    IH = c.get("index_n_heads") or 0
+    IH = IH if IH > 0 else 1
+    ID = c.get("index_head_dim") or 0
+    ID = ID if ID > 0 else 2
+    topk = c.get("index_topk") or 0
+    HD, nm, hr = H * D, (2 + H) * H, 2 * H + H * H
+    rows = _v4_chain_rows(env)
+    layers = [0] * L
+    for tensor in info.get("dense_tensors", []):
+        layer, shape = _vk_layer_index(tensor["name"]), tensor.get("shape")
+        if layer is None or layer >= L or not isinstance(shape, list) or len(shape) != 2:
+            continue
+        suffix = re.sub(r"^(?:model\.)?layers\.\d+\.", "", _text_weight_name(tensor["name"]))
+        out, columns, parts, fmt = shape[0], shape[1], 1, 0
+        if tensor["dtype"] == "F8_E4M3":
+            fmt = 12
+            if suffix == "attn.wo_a.weight":
+                parts, out = og, ol
+        elif tensor["dtype"] == "BF16" and (suffix.endswith(("compressor.wkv.weight", "compressor.wgate.weight"))
+                                            or suffix == "attn.indexer.weights_proj.weight"):
+            fmt = 11
+        elif tensor["dtype"] == "F32" and suffix in ("hc_attn_fn", "hc_ffn_fn"):
+            fmt = 10
+        if fmt:
+            layers[layer] += parts * vk_tensor_bytes(fmt, columns, out, 128 if fmt == 12 else 0)
+    for i, r in enumerate(ratios):
+        crows, cproj = (8 if r == 4 else r), (2 if r == 4 else 1) * hd
+        state = vk_buf_bytes((W + rows) * hd * 4)
+        if r > 0:
+            state += vk_buf_bytes(2 * crows * cproj * 4) + vk_buf_bytes(64 * hd * 4)
+        if r == 4:
+            state += vk_buf_bytes(2 * 8 * 2 * ID * 4) + vk_buf_bytes(64 * ID * 4)
+        floats = 2 * D + QL + hd + nh + 2 * (3 + nm)
+        if r > 0:
+            floats += hd + r * cproj
+        if r == 4:
+            floats += ID + 8 * ID
+        floats += min(rows, W) * hd
+        if r > 0:
+            floats += (rows // r) * hd + 2 * (crows if r == 4 else min(rows, r)) * cproj
+        if r == 4:
+            floats += (rows // 4) * ID + 2 * 8 * 2 * ID
+        layers[i] += state + 4 * floats
+    # v4c_scratch's counting pass at `rows` rows, the context of the window and them
+    E = W + rows
+    K = max([topk if r == 4 else E // r if r > 0 else 0 for r in ratios] + [0])
+    LR = W + (K if K > 0 else 1)
+    kinds = 1 + len({r for r in ratios if r > 0 and r != 4})
+    rmax = max([1] + ratios)
+    taps = 3 if int(c.get("num_nextn_predict_layers") or 0) >= 3 else 1
+    r_ = rows
+    counts = [r_ * HD, r_ * HD, r_ * nm, r_ * hr, r_ * hr, r_ * D, r_ * D, r_ * D, r_ * QL, r_ * QL, r_ * QL,
+              r_ * nh * hd, r_ * hd, r_ * nh * hd, r_ * og * ol, r_ * D, r_ * 2 * hd, r_ * 2 * hd,
+              r_ * 2 * ID, r_ * 2 * ID, r_ * IH * ID, r_ * IH, r_ * max(E // 4, 1), kinds * r_ * LR,
+              (2 * r_ + rmax) * rd, r_ * D, r_ * inter, r_ * inter, r_ * inter, r_ * D, r_ * D, r_ * D,
+              r_ * HD, taps * r_ * HD]
+    fixed = sum(4 * (n if n else 1) for n in counts)
+    _, dense = _vk_chain_dense("deepseek_v4", env, vulkan)
+    tail = 0
+    if dense:
+        tail = (vk_tensor_bytes(11, D, int(c.get("vocab_size") or 0)) +
+                L * vk_tensor_bytes(11, D, int(c.get("n_routed_experts") or 0)))
+    return VkChainLayout(layers, fixed, tail)
+
+
+_VK_CHAIN_LAYOUT["deepseek_v4"] = _v4_chain_layout
+
+
+# ---- qwen36 (Qwen3.6, Qwen3-Coder, Qwen3.8-27B, Clef's backbone) and olmoe ------------
+def _vk_chain_rows(env, default=256):
+    """vkc_fit_rows: COLI_VK_CHAIN_ROWS when it is a number, else the engine's block."""
+    value = (env.get("COLI_VK_CHAIN_ROWS") or "").strip()
+    match = re.match(r"\s*([+-]?\d+)", value)
+    if not value or value == "auto" or not match:
+        return default
+    return min(max(int(match[1]), 1), 65535)
+
+
+def _vk_kv_block(env):
+    match = re.match(r"\s*([+-]?\d+)", env.get("COLI_VK_KV_BLOCK") or "")
+    return max(int(match[1]) if match else 64, 1)
+
+
+def _q36_dense_fmt(env, tag, columns):
+    """The format qwen36.c puts a dense matrix on the device in (load_tq, vk_qw_fmt): f32
+    with COLI_DENSE_I8=0, f16 with COLI_DENSE_BITS=16, int4 in groups of 64 with
+    COLI_DENSE_BITS=4 where COLI_DENSE_INT4 (unset: every tag) names its tag and the
+    columns divide by 64, else int8 rows."""
+    if (env.get("COLI_DENSE_I8") or "").strip() == "0":
+        return 10
+    match = re.match(r"\s*([+-]?\d+)", env.get("COLI_DENSE_BITS") or "")
+    bits = int(match[1]) if match else 8
+    if bits == 16:
+        return 14
+    if bits == 4 and columns % 64 == 0:
+        tags = (env.get("COLI_DENSE_INT4") or "").strip()
+        if not tags or tag in re.split(r"[ ,]+", tags):
+            return 4
+    return 1
+
+
+# the matrices qwen36's chain multiplies by, and load_tq's tag for each (a dense model's
+# MLP loads as the shared expert)
+_Q36_CHAIN_TAGS = {"self_attn.q_proj": "attn", "self_attn.k_proj": "attn", "self_attn.v_proj": "attn",
+                   "self_attn.o_proj": "attn", "linear_attn.in_proj_qkv": "dnproj",
+                   "linear_attn.in_proj_z": "dnproj", "linear_attn.out_proj": "dnout", "mlp.gate": "router",
+                   "mlp.shared_expert.gate_proj": "shexp", "mlp.shared_expert.up_proj": "shexp",
+                   "mlp.shared_expert.down_proj": "shexp", "mlp.gate_proj": "shexp", "mlp.up_proj": "shexp",
+                   "mlp.down_proj": "shexp"}
+
+
+def _q36_chain_layout(info, env, vulkan):
+    """qwen36_chain.h: q36c_fit_layer, q36c_start's fixed bytes and lm_head as the tail,
+    from the scanned matrices' shapes and the scalars of qwen36_meta.json (what the engine
+    reads; config.json's when the checkpoint has none)."""
+    try:
+        meta = json.loads((Path(info["path"]) / "qwen36_meta.json").read_text(encoding="utf-8"))
+    except (KeyError, OSError, ValueError):
+        meta = {}
+    c = info.get("config") or {}
+    c = c.get("text_config", c)
+    try:
+        L = int(meta.get("n_layers") or c["num_hidden_layers"])
+        D = int(meta.get("hidden") or c["hidden_size"])
+        hd = int(meta.get("head_dim") or c["head_dim"])
+        kdim = int(meta.get("dn_kdim") or c.get("linear_key_head_dim") or 0)
+        convk = int(meta.get("dn_convk") or c.get("linear_conv_kernel_dim") or 0)
+    except (KeyError, TypeError, ValueError):
+        return None
+    types = meta.get("layer_types") or c.get("layer_types")
+    if not isinstance(types, list):
+        interval = int(c.get("full_attention_interval") or 4)
+        types = ["full_attention" if i % interval == interval - 1 else "linear_attention" for i in range(L)]
+    if L < 1 or len(types) < L:
+        return None
+    attn = [t == "full_attention" for t in types[:L]]
+    rot = int(meta.get("rotary_dim") or 0)
+    if rot <= 0:
+        factor = float(meta.get("partial_rotary_factor") or c.get("partial_rotary_factor") or 0)
+        rot = int(hd * factor + 0.5) if factor > 0 else hd
+        rot = min(max(rot + rot % 2, 2), hd)
+    # the shapes the engine loads, from the checkpoint
+    rows_of, layers, norms = {}, [0] * L, [0] * L
+    matrices = []
+    for tensor in info.get("dense_tensors", []):
+        name, shape = _text_weight_name(tensor["name"]), tensor.get("shape")
+        layer, part = _vk_layer_index(name), _layer_component(name)
+        if layer is not None and layer < L and part in ("self_attn.q_norm", "self_attn.k_norm"):
+            norms[layer] += hd
+            continue
+        if not isinstance(shape, list) or len(shape) != 2:
+            continue
+        if name == "lm_head.weight" or (layer is not None and layer < L and (part in _Q36_CHAIN_TAGS or part in (
+                "linear_attn.in_proj_b", "mlp.shared_expert_gate"))):
+            rows_of.setdefault(name if layer is None else part, shape)
+            matrices.append((layer, part if layer is not None else name, shape))
+    def rows(part, default=0):
+        return rows_of[part][0] if part in rows_of else default
+    E = rows("mlp.gate")
+    SI = rows("mlp.shared_expert.gate_proj") or rows("mlp.gate_proj")
+    vh = rows("linear_attn.in_proj_b")
+    conv, vd = rows("linear_attn.in_proj_qkv"), rows("linear_attn.in_proj_z")
+    qo, kvo = rows("self_attn.q_proj"), rows("self_attn.k_proj")
+    o_in = rows_of["self_attn.o_proj"][1] if "self_attn.o_proj" in rows_of else 0
+    vocab = rows("lm_head.weight", int(c.get("vocab_size") or 0))
+    vdim = vd // vh if vh else 0
+    # COLI_VK_IMPORT (qwen36.c main, vk_qw_tensor): int8 and f16 rows read in place, only
+    # their scales on the device; by default for a model without routed experts on a device
+    # sharing the CPU's RAM, never while host copies are dropped off a non-integrated one
+    kind = (vulkan or {}).get("type")
+    flag = _vk_flag(env, "COLI_VK_IMPORT")
+    imports = flag != 0 if flag is not None else E == 0 and kind in ("integrated", "cpu")
+    if imports and kind != "integrated" and _vk_flag(env, "COLI_VK_DENSE_HOST") == 0:
+        imports = False
+
+    def placed(tag, shape):
+        out, columns = shape
+        fmt = _q36_dense_fmt(env, tag, columns)
+        if imports and fmt in (1, 14):
+            return _vk_up(4 * (out if fmt == 1 else 1))
+        return vk_tensor_bytes(fmt, columns, out, 64 if fmt == 4 else 0)
+    head = 0
+    for layer, part, shape in matrices:
+        if layer is None:
+            head = placed("lmhead", shape)
+        elif part in _Q36_CHAIN_TAGS:
+            layers[layer] += placed(_Q36_CHAIN_TAGS[part], shape)
+        elif part == "mlp.shared_expert_gate" and E and SI:
+            layers[layer] += vk_tensor_bytes(10, D, 1)                 # the gate row, f32
+    for i in range(L):
+        floats = 2 * D
+        if attn[i]:
+            floats += norms[i]
+            layers[i] += 2 * vk_buf_bytes(kvo * 3 * _vk_kv_block(env) * 4)   # the K/V mirror at the split's floor
+        else:
+            floats += conv * convk + 2 * vh + vdim
+            layers[i] += vk_tensor_bytes(10, D, 2 * vh)                # the b|a rows, f32
+            layers[i] += vk_buf_bytes(vh * kdim * vdim * 4) + vk_buf_bytes(conv * (convk - 1) * 4)
+        layers[i] += 4 * floats                                        # its share of the parameters
+    # q36c_bufs for the fit's rows, their read-back, the arena's final norm
+    r, n_attn = _vk_chain_rows(env), sum(attn)
+    counts = [r * D, r * D, r * D, r * qo, r * kvo, r * kvo, r * o_in, r * conv, r * vd, r * 2 * vh, r * conv,
+              r * vd, r * D, r * max(E, 1), r * max(SI, 1), r * max(SI, 1), r * max(SI, 1), r * D, r, D, r * D,
+              r * max(E, 1), max(n_attn, 1) * 2 * r * kvo, vocab, r * D, r * max(rot, 2), r * D]
+    fixed = sum(vk_buf_bytes(4 * max(n, 1)) for n in counts) + vk_buf_bytes(4 * D) + vk_buf_bytes(4)
+    return VkChainLayout(layers, fixed, head)
+
+
+_VK_CHAIN_LAYOUT["qwen36"] = _q36_chain_layout
+
+
+def _olmoe_chain_layout(info, env, vulkan):
+    """olmoe_chain.h olc_fit_start: q, k, v, o and the router as f32 tensors, the K/V
+    mirror at the split's floor, the parameters; one chunk's scratch; lm_head the tail."""
+    c = info.get("config") or {}
+    try:
+        L, D, H = int(c["num_hidden_layers"]), int(c["hidden_size"]), int(c["num_attention_heads"])
+        E, vocab = int(c["num_experts"]), int(c["vocab_size"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if L < 1 or H < 1 or D % H:
+        return None
+    hd = D // H
+    layer = (4 * vk_tensor_bytes(10, D, D) + vk_tensor_bytes(10, D, E) +
+             2 * vk_buf_bytes(H * 3 * _vk_kv_block(env) * hd * 4) + 4 * 4 * D)
+    r = _vk_chain_rows(env)
+    counts = [r * D] * 8 + [r * E, D, r * D, r * E, 2 * r * D, vocab, r * D, r * hd, r * D]
+    if (env.get("PILOT") or "").strip() not in ("", "0"):
+        counts.append(r * D)   # PILOT's rows after attention
+    fixed = sum(vk_buf_bytes(4 * max(n, 1)) for n in counts) + vk_buf_bytes(4 * D) + vk_buf_bytes(4)
+    return VkChainLayout([layer] * L, fixed, vk_tensor_bytes(10, D, vocab))
+
+
+_VK_CHAIN_LAYOUT["olmoe"] = _olmoe_chain_layout
 
 
 def _analysis_signature(shards, config_path):
@@ -1829,18 +2217,36 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     family_id = info["resolved_family"].descriptor.id
     kept = min(info["dense_bytes"], info.get("embed_bytes", 0))
     device_dense_bytes = max(0, info["dense_bytes"] - kept)
-    vk_dense, vk_dense_why = vk_dense_device_only(
-        device_dense_bytes, family_id, env_now, vulkan)
+    # A partial chain (vk_chain_fit): only the first N layers' tensors go to the device;
+    # the CPU's layers and the head keep their host copies.
+    chain_fit = vk_chain_fit(info, family_id, env_now, vulkan)
+    partial = chain_fit is not None and (chain_fit["n"] < chain_fit["L"] or not chain_fit["tail"])
+
+    def on_device(tensor):
+        if not partial:
+            return True
+        layer = _vk_layer_index(tensor["name"])
+        return layer is not None and layer < chain_fit["n"]
+    tensors_on_device = [tensor for tensor in info.get("dense_tensors", []) if on_device(tensor)]
+    if partial:
+        released = sum(_vk_released_tensor_bytes(tensor, family_id, env_now) for tensor in tensors_on_device)
+        vk_dense, vk_dense_why = ((False, None) if chain_fit["n"] == 0 else
+                                  vk_dense_device_only(released, family_id, env_now, vulkan))
+    else:
+        vk_dense, vk_dense_why = vk_dense_device_only(
+            device_dense_bytes, family_id, env_now, vulkan)
     dense_on_device = 0
     if vk_dense:
         dense_on_device = min(device_dense_bytes, sum(
             _vk_released_tensor_bytes(tensor, family_id, env_now)
-            for tensor in info.get("dense_tensors", [])))
+            for tensor in tensors_on_device))
         info = dict(info, dense_bytes=info["dense_bytes"] - dense_on_device)
     # On an integrated/software device the remaining device copy still consumes
     # physical RAM. Keeping host copies costs two copies; dropping them saves one,
     # not both. Price the device copy even when COLI_VK_DENSE_HOST=1.
-    shared_dense_bytes = (device_dense_bytes
+    device_copy = (min(device_dense_bytes, sum(tensor["resident"] for tensor in tensors_on_device))
+                   if partial else device_dense_bytes)
+    shared_dense_bytes = (device_copy
                           if (vulkan or {}).get("type") in ("integrated", "cpu")
                           and _vk_dense_active(family_id, env_now, vulkan) else 0)
     physical_cpus = physical_cpu_count() if physical_cpus is None else physical_cpus
@@ -2078,6 +2484,9 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                     "budget_bytes": ram_budget, "dense_bytes": info["dense_bytes"],
                     "dense_on_device_bytes": dense_on_device,
                     "dense_on_device_reason": vk_dense_why if vk_dense else None,
+                    "vk_chain_layers": ({"on_device": chain_fit["n"], "layers": chain_fit["L"],
+                                         "tail": chain_fit["tail"], "forced": chain_fit["forced"]}
+                                        if chain_fit is not None else None),
                     "shared_device_dense_bytes": shared_dense_bytes,
                     "runtime_bytes": runtime_bytes,
                     "expert_fixed_bytes": info["expert_fixed_bytes"],
@@ -2199,7 +2608,11 @@ def format_plan(plan):
              f"{format_bytes(tiers['disk']['available_bytes'])} free",
              f"RAM    {format_bytes(tiers['ram']['budget_bytes'])} budget · "
              f"{format_bytes(tiers['ram']['dense_bytes'])} dense"
-             + (f" (+{format_bytes(tiers['ram']['dense_on_device_bytes'])} on the Vulkan device only)"
+             + (f" (+{format_bytes(tiers['ram']['dense_on_device_bytes'])} on the Vulkan device only"
+                + (f", the first {tiers['ram']['vk_chain_layers']['on_device']} of "
+                   f"{tiers['ram']['vk_chain_layers']['layers']} layers"
+                   if (tiers['ram'].get('vk_chain_layers') or {}).get('on_device', 0)
+                   < (tiers['ram'].get('vk_chain_layers') or {}).get('layers', 0) else "") + ")"
                 if tiers['ram'].get('dense_on_device_bytes') else "") + " · "
              f"{format_bytes(tiers['ram']['runtime_bytes'])} runtime · "
              f"{format_bytes(tiers['ram']['warm_expert_bytes'])} warm experts · "
