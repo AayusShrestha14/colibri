@@ -736,6 +736,8 @@ VK_SPV   += shaders/chain_kvs.spv
 # the decision engines' encoders (laya, gliner_decide): bidirectional attention over row
 # ranges with DeBERTa's relative terms, LayerNorm, GeGLU, RoPE (made on first use)
 VK_SPV   += shaders/chain_enc.spv
+# the attention core on the matrix units for prompt chunks (optional at run time)
+VK_SPV   += shaders/chain_attn_flash.spv
 endif
 
 # Optional AMD XDNA2 (Ryzen AI NPU) lane, Windows. Same opt-in shape as VK=1:
@@ -876,6 +878,12 @@ vk_chain.o: vk_chain.c .build-config
 shaders/%.spv: shaders/%.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@
+# chain_attn_flash.comp needs the same glslc as qmatmul_coop.comp below, with the same
+# fallback; without its .spv the chain keeps chain_attn.comp.
+shaders/chain_attn_flash.spv: shaders/chain_attn_flash.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
 # The cooperative-matrix GEMM needs a glslc that knows GL_KHR_cooperative_matrix
 # (shaderc 2023.6+). An older one keeps the committed .spv instead of failing the build;
 # at run time the shader is optional anyway (the fp32 GEMM takes over without it).
