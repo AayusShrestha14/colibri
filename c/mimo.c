@@ -1191,6 +1191,32 @@ static void embed_rows(Model *m, const int *ids, int n, float *h) {
  * image-pad position of the WHOLE prompt (the first at `first_pad`). */
 typedef struct { const float *rows; int n_rows; } ImageRows;
 
+/* Layers [l0, L) on the CPU for the nc rows hc at position pc (in place; xn and tmp hold
+ * nc rows each). trace: MIMO_TRACE's file, the residual after every block. */
+static void layers_cpu(Model *m, float *hc, int nc, int pc, int l0, float *xn, float *tmp, FILE *trace) {
+    Cfg *c = &m->c;
+    int H = c->hidden;
+    for (int li = l0; li < c->n_layers && nc > 0; li++) {
+        Layer *l = &m->L[li];
+        for (int t = 0; t < nc; t++) rmsnorm(xn + (size_t)t * H, hc + (size_t)t * H, l->ln1, H, c->eps);
+        attention(m, li, xn, nc, pc, tmp);
+        for (size_t i = 0; i < (size_t)nc * H; i++) hc[i] += tmp[i];
+        if (trace) fwrite(hc, sizeof(float), (size_t)nc * H, trace);
+        for (int t = 0; t < nc; t++) rmsnorm(xn + (size_t)t * H, hc + (size_t)t * H, l->ln2, H, c->eps);
+        if (c->moe[li]) moe(m, li, xn, nc, tmp);
+        else dense_mlp(m, l, xn, nc, tmp);
+        for (size_t i = 0; i < (size_t)nc * H; i++) hc[i] += tmp[i];
+        if (trace) fwrite(hc, sizeof(float), (size_t)nc * H, trace);
+    }
+}
+/* The final norm and lm_head on the CPU: every row of hc into lc (all_rows), or its last. */
+static void head_cpu(Model *m, const float *hc, int nc, float *lc, int all_rows, float *xn) {
+    Cfg *c = &m->c;
+    int H = c->hidden, from = all_rows ? 0 : nc - 1, rows = nc - from;
+    for (int t = from; t < nc; t++) rmsnorm(xn + (size_t)(t - from) * H, hc + (size_t)t * H, m->norm, H, c->eps);
+    dw_matmul(lc, xn, rows, &m->head);
+}
+
 #ifdef COLI_VULKAN
 #include "mimo_chain.h"   /* COLI_VK_CHAIN: every layer's dense chain on the device */
 #endif
@@ -1224,31 +1250,16 @@ static void forward(Model *m, const int *ids, int n, float *logits, int all_rows
     int done = 0;
 #ifdef COLI_VULKAN
     if (g_vk_chain && !trace) {
-        done = mc_forward(m, h, n, m->pos, logits, all_rows);
+        done = mc_forward(m, h, n, m->pos, logits, all_rows, xn, tmp);
         if (done < n) mc_cpu_step(m, m->pos + done);
     }
 #endif
     float *hc = h + (size_t)done * H, *lc = logits && all_rows ? logits + (size_t)done * c->vocab : logits;
     int nc = n - done, pc = m->pos + done;
-    for (int li = 0; li < c->n_layers && nc > 0; li++) {
-        Layer *l = &m->L[li];
-        for (int t = 0; t < nc; t++) rmsnorm(xn + (size_t)t * H, hc + (size_t)t * H, l->ln1, H, c->eps);
-        attention(m, li, xn, nc, pc, tmp);
-        for (size_t i = 0; i < (size_t)nc * H; i++) hc[i] += tmp[i];
-        if (trace) fwrite(hc, sizeof(float), (size_t)nc * H, trace);
-        for (int t = 0; t < nc; t++) rmsnorm(xn + (size_t)t * H, hc + (size_t)t * H, l->ln2, H, c->eps);
-        if (c->moe[li]) moe(m, li, xn, nc, tmp);
-        else dense_mlp(m, l, xn, nc, tmp);
-        for (size_t i = 0; i < (size_t)nc * H; i++) hc[i] += tmp[i];
-        if (trace) fwrite(hc, sizeof(float), (size_t)nc * H, trace);
-    }
+    layers_cpu(m, hc, nc, pc, 0, xn, tmp, trace);
     if (trace) { fclose(trace); trace = NULL; }
     traced = 1;
-    if (lc && nc > 0) {
-        int from = all_rows ? 0 : nc - 1, rows = nc - from;
-        for (int t = from; t < nc; t++) rmsnorm(xn + (size_t)(t - from) * H, hc + (size_t)t * H, m->norm, H, c->eps);
-        dw_matmul(lc, xn, rows, &m->head);
-    }
+    if (lc && nc > 0) head_cpu(m, hc, nc, lc, all_rows, xn);
     kv_prefix_record(&m->kvp, ids, m->pos, n);
     m->pos += n;
     m->forwards++;
@@ -1342,8 +1353,10 @@ static Vision *g_vision;
  * the experts take only what they leave; one that does not fit stays on the
  * CPU. Returns how many went up. The dense chain alone (the per-matrix path off)
  * takes the trunk and leaves the tower on the CPU (vision 0). */
+static void mc_place(Model *m, int *dropped);   /* below: a fit's layers, layer by layer */
 static int vk_dense_upload(Model *m, int vision) {
     int n = 0;
+    if (g_mc_fit.L && !g_mc_placed) mc_place(m, NULL);   /* the chain's fit: its layers, each whole or none */
     for (int li = 0; li < m->c.n_layers; li++) {
         Layer *l = &m->L[li];
         n += dw_upload(&l->qkv) + dw_upload(&l->o);
@@ -1389,6 +1402,104 @@ static size_t vk_dense_bytes(const Model *m, int vision) {
     return b;
 }
 
+/* ---- a partial chain (vk_chain.h, vkc_fit): the first n layers on the device --------
+ * mc_fit_start decides n at start-up, before any upload and before the tier sizes its
+ * budget. A layer's bytes: its matrices in their dense form (MIMO_DENSE_BITS: the fused
+ * qkv and o_proj, the dense layer's MLP too), its K/V mirror at the size the chain
+ * allocates (a sliding layer's ring; a full layer's context, or COLI_VK_KV_DEVICE_ROWS
+ * when that asks for fewer: the split covers the rest) and its norms and sink logits.
+ * Fixed: the final norm and the scratch of one block of vkc_fit_rows(MIMO_CHUNK) rows
+ * (the residual's handoff reuses the normed rows' read-back). Tail: the head, and the
+ * vision tower when the per-matrix path takes it (COLI_VK_DENSE). The CPU's layers, the
+ * head and the tower of a partial chain stay on the CPU with their host copies (vk_off:
+ * the per-matrix path leaves them there). */
+static void mc_fit_start(Model *m) {
+    Cfg *c = &m->c; int L = c->n_layers, H = c->hidden;
+    for (int k = 0; k < 2; k++) if (c->head_dim[k] > 256 || c->v_dim[k] > 256) return;   /* the chain declines */
+    size_t *per = calloc((size_t)L, sizeof *per), *mat = calloc((size_t)L, sizeof *mat);
+    int ok = per && mat;
+    long forced = vkc_kv_env("COLI_VK_KV_DEVICE_ROWS", 0);
+#define MC_FITW(d) do { const DW *d_ = (d); int g_; const float *s_; int f_ = d_->w ? dw_vk_fmt(d_, &g_, &s_) : -1; \
+        if (f_ < 0) ok = 0; else { per[i] += vkc_fit_tensor(f_, d_->I, d_->O, g_); mat[i] += coli_vk_tensor_payload(f_, d_->I, d_->O, g_); } } while (0)
+    for (int i = 0; i < L && ok; i++) {
+        const Layer *l = &m->L[i];
+        MC_FITW(&l->qkv); MC_FITW(&l->o);
+        if (!c->moe[i]) { MC_FITW(&l->gate); MC_FITW(&l->up); MC_FITW(&l->down); }
+        McGeo g = mc_geo(m, i);
+        size_t rows = !g.swa && forced > 0 && forced < g.rows ? (size_t)forced : (size_t)g.rows;
+        per[i] += vkc_fit_buf(rows * g.kd * sizeof(float)) + vkc_fit_buf(rows * g.vdd * sizeof(float)) +
+                  ((size_t)2 * H + (l->sink ? (size_t)c->heads[c->swa[i]] : 0)) * sizeof(float);
+    }
+#undef MC_FITW
+    int hg; const float *hs;
+    int hf = m->head.w ? dw_vk_fmt(&m->head, &hg, &hs) : -1;
+    if (!ok || hf < 0) { free(per); free(mat); return; }   /* a matrix the device does not take: the chain declines as before */
+    size_t tail = vkc_fit_tensor(hf, m->head.I, m->head.O, hg);
+    if (g_vision && coli_vk_dense()) {   /* the tower the per-matrix path puts on the device */
+        Vision *v = g_vision;
+        const DW *t[3] = {&v->embed, &v->fc1, &v->fc2};
+        for (int k = 0; k < 3; k++) if (t[k]->w && dw_vk_fmt(t[k], &hg, &hs) >= 0) tail += vkc_fit_tensor(dw_vk_fmt(t[k], &hg, &hs), t[k]->I, t[k]->O, hg);
+        for (int b = 0; b < v->depth; b++) {
+            const DW *d[5] = {&v->b[b].qkv, &v->b[b].proj, &v->b[b].gate, &v->b[b].up, &v->b[b].down};
+            for (int k = 0; k < 5; k++) if (d[k]->w && dw_vk_fmt(d[k], &hg, &hs) >= 0) tail += vkc_fit_tensor(dw_vk_fmt(d[k], &hg, &hs), d[k]->I, d[k]->O, hg);
+        }
+    }
+    MimoChain g; memset(&g, 0, sizeof g);
+    g.o_kvd = calloc((size_t)L, sizeof(size_t));
+    const char *mc = getenv("MIMO_CHUNK");
+    int R = vkc_fit_rows(mc && *mc && atoi(mc) > 0 ? atoi(mc) : 64);
+    g_mc_count = 0; g_mc_fitcount = 1;
+    mc_scratch(&g, m, R, 1);
+    size_t fixed = (size_t)g_mc_count + vkc_fit_buf((size_t)H * sizeof(float));
+    g_mc_count = -1; g_mc_fitcount = 0;
+    free(g.o_kvd);
+    vkc_fit("mimo", L, per, mat, fixed, tail, &g_mc_fit);
+    free(per); free(mat);
+}
+/* Layers from..L-1, the head and the tower refused to the device: what of them is there
+ * is freed, and the per-matrix path leaves them on the CPU. */
+static void mc_refuse(DW *d) {
+    if (d->vk && !d->vk_gone) { coli_vk_tensor_free((ColiVkTensor *)d->vk); d->vk = NULL; }
+    if (!d->vk_gone) d->vk_off = 1;
+}
+static void mc_refuse_from(Model *m, int from) {
+    if (vkc_ready()) vkc_finish();
+    for (int li = from; li < m->c.n_layers; li++) {
+        Layer *l = &m->L[li];
+        mc_refuse(&l->qkv); mc_refuse(&l->o); mc_refuse(&l->gate); mc_refuse(&l->up); mc_refuse(&l->down);
+    }
+    mc_refuse(&m->head);
+    if (g_vision) {
+        Vision *v = g_vision;
+        mc_refuse(&v->embed); mc_refuse(&v->fc1); mc_refuse(&v->fc2);
+        for (int b = 0; b < v->depth; b++) {
+            mc_refuse(&v->b[b].qkv); mc_refuse(&v->b[b].proj); mc_refuse(&v->b[b].gate); mc_refuse(&v->b[b].up); mc_refuse(&v->b[b].down);
+        }
+    }
+}
+static void dw_drop(DW *d, int *n);   /* below */
+/* The fit's layers up, layer by layer: each whole or not at all (a layer that fails is
+ * freed, it and the rest refused, vkc_fit_shrink); dropped: with COLI_VK_DENSE_HOST, each
+ * layer's host copies given back once all of it is on the device (counted there). */
+static void mc_place(Model *m, int *dropped) {
+    for (int i = 0; i < g_mc_fit.n; i++) {
+        Layer *l = &m->L[i];
+        DW *d[5] = {&l->qkv, &l->o, &l->gate, &l->up, &l->down};
+        int nd = m->c.moe[i] ? 2 : 5, ok = 1;
+        for (int k = 0; k < nd && ok; k++) ok = dw_upload(d[k]);
+        if (!ok) {
+            mc_refuse_from(m, i);
+            vkc_fit_shrink("mimo", &g_mc_fit, i, "a dense matrix did not go up");
+            break;
+        }
+        if (dropped) for (int k = 0; k < nd; k++) dw_drop(d[k], dropped);
+        vkc_fit_mark(&g_mc_fit, i);
+    }
+    if (vkc_fit_partial(&g_mc_fit)) mc_refuse_from(m, g_mc_fit.n);   /* the CPU's layers, the head, the tower */
+    vkc_fit_placed("mimo", &g_mc_fit);
+    g_mc_placed = 1;
+}
+
 /* ---- the dense matrices on the device only (COLI_VK_DENSE_HOST) ----------------
  * With the trunk on the device (the chain, or COLI_VK_DENSE), every trunk matrix goes
  * up now, before the expert tier sizes its budget, and its host copy is dropped; the
@@ -1409,17 +1520,35 @@ static void dw_drop(DW *d, int *n) {
 static void mimo_dho_start(Model *m) {
     if (!g_vk_ready) return;
     int vision = coli_vk_dense();
-    if (!coli_vk_dense_host_decide("mimo", coli_vk_dense() || g_vk_chain, vk_dense_bytes(m, vision))) return;
+    /* a partial chain's fit: the first n layers' bytes only (the head and the tower with
+     * the tail); n = 0 leaves the dense part on the CPU */
+    size_t bytes = vk_dense_bytes(m, vision);
+    int fit = g_mc_fit.L > 0, tail = !fit || (g_mc_fit.n == g_mc_fit.L && g_mc_fit.tail);
+    if (fit) {
+        bytes = 0;
+        for (int li = 0; li < g_mc_fit.n; li++) {
+            const Layer *l = &m->L[li];
+            bytes += dw_bytes(&l->qkv) + dw_bytes(&l->o);
+            if (!m->c.moe[li]) bytes += dw_bytes(&l->gate) + dw_bytes(&l->up) + dw_bytes(&l->down);
+        }
+        if (tail) bytes += vk_dense_bytes(m, vision) - vk_dense_bytes(m, 0) + dw_bytes(&m->head);
+    }
+    if (!coli_vk_dense_host_decide("mimo", (coli_vk_dense() || g_vk_chain) && !(fit && !g_mc_fit.n), bytes)) return;
     g_mimo_dho = 1;
     g_dw_dho_S = &m->S; g_dw_dho_c = &m->c;
     int n = 0;
-    for (int li = 0; li < m->c.n_layers; li++) {
-        Layer *l = &m->L[li];
-        dw_drop(&l->qkv, &n); dw_drop(&l->o, &n);
-        if (!m->c.moe[li]) { dw_drop(&l->gate, &n); dw_drop(&l->up, &n); dw_drop(&l->down, &n); }
-    }
-    dw_drop(&m->head, &n);
-    if (g_vision) {
+    if (fit) {
+        coli_vk_dense_host_layers(g_mc_fit.n, g_mc_fit.L);
+        mc_place(m, &n);   /* each layer whole, then its host copies */
+        tail = g_mc_fit.n == g_mc_fit.L && g_mc_fit.tail;
+    } else
+        for (int li = 0; li < m->c.n_layers; li++) {
+            Layer *l = &m->L[li];
+            dw_drop(&l->qkv, &n); dw_drop(&l->o, &n);
+            if (!m->c.moe[li]) { dw_drop(&l->gate, &n); dw_drop(&l->up, &n); dw_drop(&l->down, &n); }
+        }
+    if (tail) dw_drop(&m->head, &n);
+    if (g_vision && tail) {
         Vision *v = g_vision;
         DW *t[3] = {&v->embed, &v->fc1, &v->fc2};
         for (int k = 0; k < 3; k++) { if (vision) dw_drop(t[k], &n); else t[k]->vk_off = 1; }
@@ -1465,7 +1594,8 @@ static void vk_tier_start(Model *m) {
                     .gate_up = f, .down = f, .act = VKT_ACT_SWIGLU,
                     .max_rows = MIMO_VK_ROWS * c->topk,
                     .ram_reserve = (size_t)(m->e_bytes + 8192) * (size_t)cap * (size_t)nmoe,
-                    .dense_bytes = (coli_vk_dense_device_only() ? 0 :   /* placed already (mimo_dho_start) */
+                    .dense_bytes = g_mc_fit.L && vkc_fit_partial(&g_mc_fit) ? mc_kv_bytes_n(m, g_mc_fit.n) :   /* a partial chain: placed already, its caches to come */
+                                   (coli_vk_dense_device_only() ? 0 :   /* placed already (mimo_dho_start) */
                                     coli_vk_dense() ? vk_dense_bytes(m, 1) : g_vk_chain ? vk_dense_bytes(m, 0) : 0) +
                                    (g_vk_chain ? mc_kv_bytes(m) : 0),   /* the chain's KV caches */
                     .in_ram = vk_in_ram, .ram_ctx = m,
@@ -1984,9 +2114,19 @@ int main(int argc, char **argv) {
          * MiMo checkpoint: an integrated GPU keeps it opt-in (docs/vulkan.md). */
         if (g_vk_ready) {
             g_vk_chain = coli_vk_chain_decide("mimo", tier, COLI_VK_CHAIN_UNMEASURED);
+            /* the chain's fit before any upload: its first n layers on the device, the
+             * others, the head and the tower on the CPU when they do not all fit */
+            if (g_vk_chain) mc_fit_start(m);
+            if (g_mc_fit.L && !g_mc_fit.n) {   /* its line said the chain stays off: nothing goes up */
+                g_vk_chain = 0;
+                mc_refuse_from(m, 0);
+                vkc_fit_placed("mimo", &g_mc_fit);
+                g_mc_placed = 1;
+            }
             if (g_vk_chain && !vkc_init()) g_vk_chain = 0;
         }
         mimo_dho_start(m);   /* COLI_VK_DENSE_HOST: the dense matrices on the device only, before the tier sizes its budget */
+        if (g_vk_chain && vkc_fit_partial(&g_mc_fit) && !g_mc_placed) mc_place(m, NULL);   /* before the tier, too */
         if (g_vk_ready && tier) vk_tier_start(m);
         if (g_vk_ready && !vkt_ready() && !coli_vk_dense()) coli_vk_dense_decide("mimo", 0, 1);   /* no tier after all */
         if (g_vk_chain) {   /* the chain's teardown before the device's (the tier registered the device's) */
@@ -1994,7 +2134,7 @@ int main(int argc, char **argv) {
             atexit(vkc_shutdown);
         }
     }
-    if (g_vk_ready && (coli_vk_dense() || g_vk_chain)) {   /* COLI_VK_DENSE=0: the trunk stays on the CPU */
+    if (g_vk_ready && (coli_vk_dense() || g_vk_chain) && !(g_mc_fit.L && !g_mc_fit.n)) {   /* COLI_VK_DENSE=0: the trunk stays on the CPU */
         int up = vk_dense_upload(m, coli_vk_dense());
         size_t used = 0, count = 0;
         coli_vk_mem_info(&used, &count);
