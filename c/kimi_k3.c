@@ -409,7 +409,17 @@ static int dsa_score_single(int *sel, int maxsel, const float *qi, const float *
  * before the shared one; k3_vk_aliases() reads them into the shared names. */
 #ifdef COLI_VULKAN
 #include "backend_vulkan.h"
+#include "vk_chain.h"                     /* vkc_fit: how many layers the dense chain places (a partial chain) */
 static int g_k3_vk=0;                     /* the device is open */
+/* The partial chain (kimi_k3_chain.h, k3c_fit_now): the first g_k3_fit.n layers on the
+ * device, decided once before anything goes up and before the expert cache is sized.
+ * g_k3_partial: something the full chain would place stays on the CPU (layers, the head),
+ * so nothing more goes to the device for the per-matrix path. g_k3_dho_layers and
+ * g_k3_dho_head: what COLI_VK_DENSE_HOST takes off the host (the chain's layers, and the
+ * head only with every layer and the tail on the device). */
+static VkcFit g_k3_fit;
+static int g_k3_fit_done, g_k3_partial;
+static int g_k3_dho_layers=1<<30, g_k3_dho_head=1;
 /* COLI_VK_DENSE_HOST: the dense matrices on the device only (k3_dho_*): every W the
  * chain does not run goes to the device through w_matmul, prompts included */
 static int g_k3_dho=0;
@@ -791,22 +801,23 @@ static int k3_f32_dev(void *t, float *y, const float *x, int S, int I, int O){
            coli_vk_matmul((ColiVkTensor**)&t,y,x,NULL,NULL,10,S,I,O,0);
 }
 #define K3_F32_DEV(t,y,x,S,I,O) k3_f32_dev(t,y,x,S,I,O)
-/* Every W of the model, in a fixed order. */
+/* Every W of the model, in a fixed order (with a partial chain, its layers' and the head
+ * only when it goes to the device as well). */
 static void k3_dho_each(Model *m, void (*f)(W *, size_t *, int *), size_t *b, int *n){
-    for(int i=0;i<m->c.n_layers;i++){
+    for(int i=0;i<m->c.n_layers&&i<g_k3_dho_layers;i++){
         Layer *l=&m->L[i];
         if(l->kda){ Kda *a=&l->a; W *ws[]={&a->q,&a->k,&a->v,&a->g,&a->o}; for(size_t k=0;k<5;k++) f(ws[k],b,n); }
         else { Mla *a=&l->m; W *ws[]={&a->qa,&a->qb,&a->kva,&a->kvb,&a->o,&a->g,&a->wk,&a->wq,&a->wp}; for(size_t k=0;k<9;k++) f(ws[k],b,n); }
         if(l->sparse){ Moe *o=&l->moe; W *ws[]={&o->lat_down,&o->lat_up,&o->sh_gate,&o->sh_up,&o->sh_down}; for(size_t k=0;k<5;k++) f(ws[k],b,n); }
         else { W *ws[]={&l->d_gate,&l->d_up,&l->d_down}; for(size_t k=0;k<3;k++) f(ws[k],b,n); }
     }
-    if(m->has_head) f(&m->lm_head,b,n);
+    if(m->has_head&&g_k3_dho_head) f(&m->lm_head,b,n);
 }
 static void k3_dho_count(W *w, size_t *b, int *n){ size_t x=k3_w_host_bytes(w); if(x&&!w->mapped&&k3_vk_fmt(w)>0){ *b+=x; (*n)++; } }
 /* The f32 matrices the chain multiplies on the device: the routers, the KDA decay pair and beta. */
 static size_t k3_dho_f32_bytes(const Model *m){
     const Cfg *c=&m->c; size_t b=0;
-    for(int i=0;i<c->n_layers;i++){
+    for(int i=0;i<c->n_layers&&i<g_k3_dho_layers;i++){
         const Layer *l=&m->L[i];
         if(l->sparse&&l->moe.router) b+=(size_t)c->n_experts*c->hidden*4;
         if(l->kda&&l->a.fa) b+=((size_t)c->kda_hd*c->hidden+(size_t)c->kda_proj*c->kda_hd+(size_t)c->kda_heads*c->hidden)*4;
@@ -817,12 +828,20 @@ static size_t k3_dho_f32_bytes(const Model *m){
  * chain's own decision asked silently (k3c_start prints it later). The cache counts the
  * W matrices out of RAM; the f32 ones only leave once the chain has them, so it does not
  * count on those. */
+static int k3c_fit_now(Model *m, int tier_on, int cuda_on);   /* kimi_k3_chain.h */
 static void k3_dho_decide(Model *m, int tier_on, int cuda_on){
     if(!g_k3_vk) return;
     int chain=!cuda_on&&!k3_dsa_indexer_on()&&coli_vk_chain_decide(NULL,tier_on,COLI_VK_CHAIN_UNMEASURED)!=COLI_VK_CHAIN_OFF;
+    int dense_on=coli_vk_dense()||chain;
+    if(k3c_fit_now(m,tier_on,cuda_on)){   /* a partial chain: its layers, and the head with the tail */
+        g_k3_dho_layers=g_k3_fit.n; g_k3_dho_head=g_k3_fit.n==m->c.n_layers&&g_k3_fit.tail;
+        chain=g_k3_fit.n>0; dense_on=chain||(coli_vk_dense()&&!g_k3_partial);
+    }
     size_t b=0; int n=0;
     k3_dho_each(m,k3_dho_count,&b,&n);
-    if(!coli_vk_dense_host_decide("kimi_k3",coli_vk_dense()||chain,b+(chain?k3_dho_f32_bytes(m):0))) return;
+    int on=coli_vk_dense_host_decide("kimi_k3",dense_on,b+(chain?k3_dho_f32_bytes(m):0));
+    if(g_k3_fit.L>0) coli_vk_dense_host_layers(g_k3_fit.n,m->c.n_layers);
+    if(!on) return;
     g_k3_dho=1; g_k3_dho_model=m; g_k3_dho_bytes=b;
 }
 #else
@@ -1981,11 +2000,13 @@ static void experts_apply_union(Model *m, int li, int nu, const int *uids,
                 /* LRU over the UNPINNED slots. pin_seed caps pinned at cap/2, so a
                  * victim always exists; the -1 fallback is a belt-and-braces guard
                  * against a future caller pinning everything and deadlocking here. */
-                int lru=-1;
+                int lru=-1, dev=-1;   /* an expert the Vulkan tier holds goes first (vkt_ram_first) */
                 for(int i=0;i<lc->n;i++){
                     if(lc->s[i].pinned) continue;
+                    if(lc->s[i].eid>=0 && vkt_ram_first(li,lc->s[i].eid)){ if(dev<0 || lc->s[i].used<lc->s[dev].used) dev=i; continue; }
                     if(lru<0 || lc->s[i].used<lc->s[lru].used) lru=i;
                 }
+                if(dev>=0){ lru=dev; vkt_ram_gave(); }
                 if(lru<0) break;                    /* every slot pinned: keep the read */
                 dst=&lc->s[lru];
             }
@@ -2136,7 +2157,7 @@ static void k3_dho_place(Model *m){
     k3_dho_each(m,k3_dho_drop,&b,&n);
     if(g_k3c_on){
         const Cfg *c=&m->c; char nm[200];
-        for(int i=0;i<c->n_layers;i++){
+        for(int i=0;i<c->n_layers&&i<g_k3_dho_layers;i++){   /* the chain's layers: it holds their f32 matrices */
             Layer *l=&m->L[i];
             if(l->sparse){
                 snprintf(nm,sizeof nm,"model.layers.%d.block_sparse_moe.gate.weight",i);
@@ -2166,8 +2187,11 @@ static void k3_vk_tier_start(Model *m){
 #ifdef COLI_CUDA
     cuda_on=g_k3_cuda;
 #endif
-    if(g_k3_dho){ size_t b=0; int n=0; k3_dho_each(m,k3_dho_upload,&b,&n); }   /* COLI_VK_DENSE_HOST: every W into its own vk first */
+    /* COLI_VK_DENSE_HOST: every W into its own vk first (with the chain's fit, its setup
+     * puts each of its layers' there, layer by layer) */
+    if(g_k3_dho&&g_k3_fit.L<1){ size_t b=0; int n=0; k3_dho_each(m,k3_dho_upload,&b,&n); }
     k3c_start(m,nmoe&&vkt_wanted()&&!cuda_on);   /* COLI_VK_CHAIN: the trunk on the device, before the tier sizes itself */
+    if(g_k3_dho&&g_k3_fit.L>0&&!g_k3c_on){ size_t b=0; int n=0; k3_dho_each(m,k3_dho_upload,&b,&n); }   /* no chain after all: the per-matrix path's */
     if(g_k3_dho) k3_dho_place(m);                /* then the host copies go, before the tier sizes its budget */
     if(cuda_on) fprintf(stderr,"[VK] tier kimi_k3: the CUDA expert tier is on and wins; the Vulkan tier stays off\n");
     else if(nmoe&&vkt_wanted()){
@@ -2177,7 +2201,7 @@ static void k3_vk_tier_start(Model *m){
                       .act=VKT_ACT_SITU,.act_a=c->situ_b1,.act_b=c->situ_b2,
                       .max_rows=K3_VK_ROWS*c->topk,
                       .ram_reserve=(size_t)(m->e_slot+8192)*(size_t)cap*(size_t)nmoe,
-                      .dense_bytes=coli_vk_dense()&&!g_k3c_on&&!g_k3_dho?k3_vk_dense_bytes(m):0,   /* the chain's are there already */
+                      .dense_bytes=coli_vk_dense()&&!g_k3c_on&&!g_k3_dho&&!g_k3_partial?k3_vk_dense_bytes(m):0,   /* the chain's are there already; a partial chain: nothing more goes up */
                       .in_ram=k3_vk_in_ram,.ram_ctx=m,
                       .load=k3_vk_load,.release=k3_vk_unhold,.load_ctx=m,.load_batch=k3_vk_load_batch};
         atexit(coli_vk_shutdown);   /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
@@ -2211,7 +2235,9 @@ static void k3_vk_tier_start(Model *m){
         for(int i=0;i<c->n_layers;i++){
             if(!m->L[i].sparse) continue;
             Moe *o=&m->L[i].moe;
-            nsh+=w_vk_upload(&o->sh_gate)+w_vk_upload(&o->sh_up)+w_vk_upload(&o->sh_down);
+            if(g_k3_partial)   /* a partial chain: nothing new goes up, the CPU's layers keep theirs */
+                nsh+=(o->sh_gate.vk!=NULL)+(o->sh_up.vk!=NULL)+(o->sh_down.vk!=NULL);
+            else nsh+=w_vk_upload(&o->sh_gate)+w_vk_upload(&o->sh_up)+w_vk_upload(&o->sh_down);
         }
         size_t used=0, count=0; coli_vk_mem_info(&used,&count);
         fprintf(stderr,"[VK] kimi_k3: %d shared-expert matrices on the device (%.2f MiB)\n",nsh,used/1048576.0);
@@ -2221,6 +2247,8 @@ static void k3_vk_tier_start(Model *m){
 static void k3_vk_report(const Model *m, const char *scope){
     if(!g_k3_vk) return;
     fprintf(stderr,"[VK] kimi_k3: %llu matmuls on the GPU\n",coli_vk_matmul_calls());
+    { size_t bytes=0, tensors=0; coli_vk_mem_info(&bytes,&tensors);
+      fprintf(stderr,"[VK] kimi_k3: %zu resident matrices on the device, %.1f MiB\n",tensors,bytes/1048576.0); }
     vkt_report(scope,m->hits,m->miss);
     k3c_report();              /* the dense chain's line, when it ran */
 }
@@ -2682,20 +2710,24 @@ static float *step_chunk_ex(Model *m, const int *ids, int pos0, int C,
     k3_embed(m,ids,pos0,C,hidden);
     if(pos0==0&&C<=1) fprintf(stderr,"[DBG] step_chunk pos=%d C=%d metal=%d\n", pos0, C, g_k3_metal);
     int echo_on = g_echo_k>0 && g_echo_id;
+    int from=0;   /* the first layer the CPU runs */
 #ifdef COLI_VULKAN
-    /* every layer on the device (kimi_k3_chain.h): the final rows (fin, when the head
-     * reads more than the last one) and the last row's logits (dev_last) come back;
-     * 0: the CPU below, its state current first */
+    /* the layers on the device (kimi_k3_chain.h). Every layer: the final rows (fin, when
+     * the head reads more than the last one) and the last row's logits (dev_last) come
+     * back. A partial chain's first N: the rows' AttnRes state after layer N - 1 comes
+     * back in hidden, bres and nb, and the CPU runs the rest from there. 0: the CPU runs
+     * every layer below, its state current first */
     float *fin=NULL, *dev_last=NULL; int chain=0;
     if(g_k3c_on){
-        chain=k3c_forward(m,hidden,pos0,C,g_lfp||g_k3_val_lfp||echo_on,&fin,&dev_last,
+        chain=k3c_forward(m,hidden,bres,&nb,pos0,C,g_lfp||g_k3_val_lfp||echo_on,&fin,&dev_last,
                           poll_cancel,cancel_context,cancelled);
         if(!chain) k3c_cpu_step(m,pos0);
     }
-    if(!chain)
+    from=chain;
 #endif
-    k3_layers_forward_range(m,hidden,bres,&nb,pos0,C,0,c->n_layers,
-                            poll_cancel,cancel_context,cancelled);
+    if(from<c->n_layers&&!(cancelled&&*cancelled))
+        k3_layers_forward_range(m,hidden,bres,&nb,pos0,C,from,c->n_layers,
+                                poll_cancel,cancel_context,cancelled);
     float *logits=NULL;
     if((!cancelled||!*cancelled)&&m->has_head){
         double t0=now_s();
@@ -2707,7 +2739,7 @@ static float *step_chunk_ex(Model *m, const int *ids, int pos0, int C,
             if(!g_lfp && !g_k3_val_lfp && !echo_on && t<C-1) continue;
             float *lo=falloc(c->vocab);
 #ifdef COLI_VULKAN
-            if(chain){   /* the chain's final rows, normalized; the last row's logits from the device */
+            if(chain==c->n_layers){   /* the chain's final rows, normalized; the last row's logits from the device */
                 if(t==C-1&&dev_last) memcpy(lo,dev_last,(size_t)c->vocab*sizeof(float));
                 else w_matmul(lo,fin+(int64_t)t*D,&m->lm_head,1);
             } else

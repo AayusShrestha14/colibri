@@ -376,8 +376,12 @@ ptl_family_glm() {
   CHAIN_SERVE_EXPECT='glm53: [0-9]+ dense matrices on the device only.*the 3 of 6 layers on the device' COLI_VK_DENSE_HOST=0 \
     CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_l6_serve GLM53_BITS=32 COLI_VK_CHAIN_LAYERS=3
   unset CHAIN_SERVE_EXPECT
-  # a pin restored over rows another branch rewrote, 2 of 4 layers on the device
-  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_CHAIN_LAYERS=2 COLI_USAGE=$PWD/chain.usage COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 $PY tests/glm53_pin_branch_harness.py --binary ./glm53 --fixture glm53_mm_tiny
+  # a pin restored over rows another branch rewrote, 2 of 4 layers on the device. The
+  # harness compares two engine processes, so the tier is off (which experts a device
+  # computes depends on each process's history), and the scores within 1e-5: the cold
+  # engine's prompt takes the blocked attention, the warm one's short tail the per-row
+  # one, which agree to rounding (CI's runners differed at one position by 1e-6).
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_CHAIN_LAYERS=2 COLI_USAGE=$PWD/chain.usage COLI_VK_TIER=0 $PY tests/glm53_pin_branch_harness.py --binary ./glm53 --fixture glm53_mm_tiny --tol 1e-5
   rm -rf glm_tiny_shx glm53_l6 glm53_l6s-i4 glm53_l6_serve chain.usage
   rm -f ptl-probe.err ptl-ram*.log same-*.log same-*.tok same-*.f32
   unset OMP_NUM_THREADS CAP_RAISE

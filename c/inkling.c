@@ -77,10 +77,18 @@ static int g_metal = 0;
  * keeps its own bf16 residents, and with CUDA (or Metal) on the tier stays off. */
 #include "backend_vulkan.h"
 #include "vk_tier.h"
+#include "vk_chain.h"
 static int g_vk_ready = 0;
 static int g_vk_tier_try = 0;   /* the device opened with the expert tier to be tried */
 static int g_vk_chain = 0;      /* COLI_VK_CHAIN decided on, and the chain's pipelines are up (inkling_chain.h) */
 static int g_ink_dho = 0;       /* COLI_VK_DENSE_HOST: the dense matrices on the device only (ink_dho_place) */
+/* The partial chain's fit (inkc_fit_start, inkling_chain.h): the first n of L layers on the
+ * device; L = 0 while there is none (the chain off, or one that declines as before). */
+static VkcFit g_inkc_fit;
+#endif
+#ifndef COLI_VULKAN   /* exclusive RAM/VRAM (vk_tier.h) is the Vulkan build's: no device holds an expert */
+static inline int  vkt_ram_first(int layer, int eid) { (void)layer; (void)eid; return 0; }
+static inline void vkt_ram_gave(void) {}
 #endif
 #if defined(__APPLE__)
 #include <mach/mach.h>
@@ -1050,9 +1058,10 @@ static void ink_vk_mark(Wt *w, int views, int *by, int *cpu) {
     int fmt = ink_vk_attach(w, views);
     if (fmt) by[fmt]++; else (*cpu)++;
 }
-static void ink_vk_mark_dense(Model *m, int layer_begin, int layer_end) {
+/* head 0: lm_head stays on the CPU (a partial chain's, inkc_fit_start) */
+static void ink_vk_mark_dense(Model *m, int layer_begin, int layer_end, int head) {
     int by[13] = {0}, cpu = 0;
-    ink_vk_mark(&m->lm_head, 1, by, &cpu);
+    if (head) ink_vk_mark(&m->lm_head, 1, by, &cpu);
     for (int i = layer_begin; i < layer_end; i++) {
         Layer *l = &m->L[i];
         Wt *one[] = { &l->q, &l->k, &l->v, &l->r, &l->o, &l->dg, &l->du, &l->dd };
@@ -1136,9 +1145,9 @@ static int ink_dho_drop(Wt *w, int views, int64_t stride, int I, int O, int *n) 
     return 1;
 }
 static size_t ink_dho_count(const Wt *w, int64_t n, int I) { return ink_vk_fmt(w) ? ink_wt_bytes(w, n, I) : 0; }
-static size_t ink_dho_bytes(const Model *m, int layer_begin, int layer_end) {
+static size_t ink_dho_bytes(const Model *m, int layer_begin, int layer_end, int head) {
     const Cfg *c = &m->c; int64_t D = c->hidden;
-    size_t b = ink_dho_count(&m->lm_head, (int64_t)c->unpad_vocab * D, (int)D);
+    size_t b = head ? ink_dho_count(&m->lm_head, (int64_t)c->unpad_vocab * D, (int)D) : 0;
     for (int i = layer_begin; i < layer_end; i++) {
         const Layer *l = &m->L[i];
         int64_t q = (int64_t)L_HEADS(c, i) * L_HD(c, i), kv = (int64_t)L_KV(c, i) * L_HD(c, i), I = c->moe_inter;
@@ -1151,21 +1160,34 @@ static size_t ink_dho_bytes(const Model *m, int layer_begin, int layer_end) {
     }
     return b;
 }
+/* Layer i's matrices up (each view of a fused tensor its own) and their host copies given back. */
+static void ink_dho_drop_layer(Model *m, int i, int *n) {
+    const Cfg *c = &m->c; int D = c->hidden;
+    Layer *l = &m->L[i];
+    int q = L_HEADS(c, i) * L_HD(c, i), kv = L_KV(c, i) * L_HD(c, i), I = c->moe_inter, ns = c->n_shared;
+    ink_dho_drop(&l->q, 1, 0, D, q, n); ink_dho_drop(&l->k, 1, 0, D, kv, n); ink_dho_drop(&l->v, 1, 0, D, kv, n);
+    ink_dho_drop(&l->r, 1, 0, D, L_HEADS(c, i) * c->d_rel, n); ink_dho_drop(&l->o, 1, 0, q, D, n);
+    if (!c->sparse[i]) {
+        ink_dho_drop(&l->dg, 1, 0, D, c->dense_inter, n); ink_dho_drop(&l->du, 1, 0, D, c->dense_inter, n);
+        ink_dho_drop(&l->dd, 1, 0, c->dense_inter, D, n);
+    } else if (ns > 0) {
+        ink_dho_drop(&l->sh_g, ns, (int64_t)I * D, D, I, n); ink_dho_drop(&l->sh_u, ns, (int64_t)I * D, D, I, n);
+        ink_dho_drop(&l->sh_d, ns, (int64_t)D * I, I, D, n);
+    }
+}
+/* inkling_chain.h: the partial chain's fit, and its layers placed at start-up */
+static void inkc_fit_start(Model *m);
+static void inkc_place_init(Model *m, int *dropped);
 static void ink_dho_place(Model *m, int layer_begin, int layer_end) {
     const Cfg *c = &m->c; int D = c->hidden, n = 0;
-    ink_dho_drop(&m->lm_head, 1, 0, D, c->unpad_vocab, &n);
-    for (int i = layer_begin; i < layer_end; i++) {
-        Layer *l = &m->L[i];
-        int q = L_HEADS(c, i) * L_HD(c, i), kv = L_KV(c, i) * L_HD(c, i), I = c->moe_inter, ns = c->n_shared;
-        ink_dho_drop(&l->q, 1, 0, D, q, &n); ink_dho_drop(&l->k, 1, 0, D, kv, &n); ink_dho_drop(&l->v, 1, 0, D, kv, &n);
-        ink_dho_drop(&l->r, 1, 0, D, L_HEADS(c, i) * c->d_rel, &n); ink_dho_drop(&l->o, 1, 0, q, D, &n);
-        if (!c->sparse[i]) {
-            ink_dho_drop(&l->dg, 1, 0, D, c->dense_inter, &n); ink_dho_drop(&l->du, 1, 0, D, c->dense_inter, &n);
-            ink_dho_drop(&l->dd, 1, 0, c->dense_inter, D, &n);
-        } else if (ns > 0) {
-            ink_dho_drop(&l->sh_g, ns, (int64_t)I * D, D, I, &n); ink_dho_drop(&l->sh_u, ns, (int64_t)I * D, D, I, &n);
-            ink_dho_drop(&l->sh_d, ns, (int64_t)D * I, I, D, &n);
-        }
+    if (g_inkc_fit.L) {
+        /* the chain's fit: its layers whole, each one's host copies given back once all of
+         * it is on the device (inkc_place_init), then lm_head when the tail went up too */
+        inkc_place_init(m, &n);
+        if (g_inkc_fit.n == g_inkc_fit.L && g_inkc_fit.tail) ink_dho_drop(&m->lm_head, 1, 0, D, c->unpad_vocab, &n);
+    } else {
+        ink_dho_drop(&m->lm_head, 1, 0, D, c->unpad_vocab, &n);
+        for (int i = layer_begin; i < layer_end; i++) ink_dho_drop_layer(m, i, &n);
     }
     coli_vk_dense_host_placed("inkling", "the embedding and audio tables (row lookups), the routers, norms, convolution taps, bias banks"
 #ifdef HAVE_BF16_DOT
@@ -1192,14 +1214,28 @@ static void ink_vk_init_model(Model *m, int layer_begin, int layer_end) {
      * shaders read is marked and goes up now, its host copy given back */
     int chain = !other_gpu && layer_begin == 0 && layer_end == m->c.n_layers &&
                 coli_vk_chain_decide(NULL, g_vk_tier_try, INKLING_CHAIN_IGPU) != COLI_VK_CHAIN_OFF;
-    if (coli_vk_dense_host_decide("inkling", (coli_vk_dense() || chain) && !other_gpu, ink_dho_bytes(m, layer_begin, layer_end))) {
+    /* the chain's fit before any upload and before the expert cache is sized: the first n
+     * layers on the device, the others (and lm_head, unless the tail went up) on the CPU
+     * with their host copies, the per-matrix path leaving them there */
+    if (chain) inkc_fit_start(m);
+    int end = g_inkc_fit.L ? g_inkc_fit.n : layer_end, head = g_inkc_fit.L ? g_inkc_fit.tail : 1;
+    int on_device = (coli_vk_dense() || chain) && !other_gpu && !(g_inkc_fit.L && !g_inkc_fit.n);
+    if (coli_vk_dense_host_decide("inkling", on_device, ink_dho_bytes(m, layer_begin, end, head))) {
         g_ink_dho = 1; g_ink_dho_model = m;
-        ink_vk_mark_dense(m, layer_begin, layer_end);
-        ink_dho_place(m, layer_begin, layer_end);
+        if (g_inkc_fit.L) coli_vk_dense_host_layers(g_inkc_fit.n, g_inkc_fit.L);
+        ink_vk_mark_dense(m, layer_begin, end, head);
+        ink_dho_place(m, layer_begin, end);
+        return;
+    }
+    if (g_inkc_fit.L && vkc_fit_partial(&g_inkc_fit)) {
+        /* a partial chain: its layers up now, before the expert cache and the tier size
+         * themselves; the per-matrix path shares their copies where it runs */
+        if (coli_vk_dense()) ink_vk_mark_dense(m, 0, end, 0);
+        inkc_place_init(m, NULL);
         return;
     }
     if (!coli_vk_dense()) return;   /* nothing marked: the CPU computes the dense matrices */
-    ink_vk_mark_dense(m, layer_begin, layer_end);
+    ink_vk_mark_dense(m, layer_begin, layer_end, 1);
 }
 #endif
 
@@ -1511,9 +1547,16 @@ static Slot *slot_acquire(Model *m, int layer, int eid) {
                                   if (!s->q13 || !s->q2) { fprintf(stderr,"OOM expert slot\n"); exit(1); } }
         else                    { s->f13 = falloc(n13); s->f2 = falloc(n2); }
     } else {
-        int lru = -1;
-        for (int i = 0; i < lc->n; i++)
-            if (!lc->slots[i].pinned && (lru < 0 || lc->slots[i].used < lc->slots[lru].used)) lru = i;
+        int lru = -1, dev = -1;   /* an expert the Vulkan tier holds goes first (vkt_ram_first) */
+        for (int i = 0; i < lc->n; i++) {
+            if (lc->slots[i].pinned) continue;
+            if (lc->slots[i].eid >= 0 && vkt_ram_first(layer, lc->slots[i].eid)) {
+                if (dev < 0 || lc->slots[i].used < lc->slots[dev].used) dev = i;
+                continue;
+            }
+            if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
+        }
+        if (dev >= 0) { lru = dev; vkt_ram_gave(); }
         if (lru < 0) { fprintf(stderr, "layer %d: cache cap %d entirely pinned\n", layer, lc->cap); exit(1); }
         s = &lc->slots[lru];
     }
@@ -1859,9 +1902,12 @@ static int ink_vk_in_ram(void *ctx, int layer, int e) {
 }
 /* Bytes the dense matrices marked for the device will take there (the budget leaves
  * them room), from the geometry: int8 1 byte, int4-g64 0.5625, f32 4, bf16 2. */
+static size_t inkc_fit_later(const Model *m);   /* inkling_chain.h */
 static size_t ink_vk_dense_bytes(const Model *m) {
     const Cfg *c = &m->c;
     double b = 0;
+    if (g_inkc_fit.L && vkc_fit_partial(&g_inkc_fit))   /* a partial chain: its layers placed already */
+        return inkc_fit_later(m);
     if (g_ink_dho) return 0;   /* placed already (ink_dho_place): the free memory the tier reads counts them */
     #define INK_VKB(w, n) do { const Wt *w_ = (w); int f_ = w_->vk ? ink_vk_fmt(w_) : 0; \
         b += (double)(n) * (f_ == 1 ? 1.0 : f_ == 4 ? 0.5625 : f_ == 10 ? 4.0 : f_ == 11 ? 2.0 : 0.0); } while (0)
@@ -1959,7 +2005,8 @@ static void ink_vk_tier_start(Model *m) {
     }
     if (!vkt_ready() && !coli_vk_dense() && coli_vk_dense_decide("inkling", 0, 1)) {   /* no tier after all */
         g_vk_tier_try = 0;
-        ink_vk_mark_dense(m, 0, c->n_layers);
+        /* a partial chain's layers are up already (the chain's copies): the rest stays on the CPU */
+        if (!vkc_fit_partial(&g_inkc_fit)) ink_vk_mark_dense(m, 0, c->n_layers, 1);
     }
     g_vk_tier_try = vkt_ready();
 }
@@ -2594,16 +2641,19 @@ static float *step_mm(Model *m, const int *ids, int S, int pos0, int *tf_out,
     /* COLI_VK_CHAIN: the layers, the final norm and lm_head on the device; x comes
      * back only when the per-position heads below read every row */
     float *chain_logit = NULL;
+    int layer0 = 0;   /* the first layer the CPU runs */
     if (g_vk_chain) {
         chain_logit = falloc(c->unpad_vocab);
-        if (!inkc_forward(m, x, S, pos0, (g_echo_k > 0 && g_echo_id && S > 1) || tf_out != NULL, chain_logit)) {
-            free(chain_logit); chain_logit = NULL;
-            inkc_cpu_step(m, pos0, S);
-        }
+        int took = inkc_forward(m, x, S, pos0, (g_echo_k > 0 && g_echo_id && S > 1) || tf_out != NULL, chain_logit);
+        if (took != 1) { free(chain_logit); chain_logit = NULL; }
+        if (!took) inkc_cpu_step(m, pos0, S);
+        else if (took == 2) layer0 = inkc_layers(m);   /* a partial chain: x is the residual after its last layer */
     }
     if (!chain_logit)
-#endif
+        inkling_layers_forward_range(m, x, S, pos0, layer0, c->n_layers);
+#else
     inkling_layers_forward_range(m, x, S, pos0, 0, c->n_layers);
+#endif
     m->kv_len = pos0 + S;
     /* record what was just fed, at the positions it went to (kv_prefix.h).
      * Audio taints the record: every frame carries the same token id while the

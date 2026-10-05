@@ -334,6 +334,24 @@ jobs:
           - family: dev2-sanitize
             req: c/tools/requirements-deepseek-v4-tiny.txt
             extra: sympy pillow
+          # DeepSeek V4.1 Flash and Kimi K3 (the V4.1 fixture's requirements; Kimi K3's
+          # fixture needs numpy alone)
+          - family: partial-dsk
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          - family: partial-dsk-sanitize
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          # inkling's and MiMo's partial chain (the first N layers on the device, the
+          # rest and the head on the CPU): N forced, from a device cap and from an upload
+          # failing inside a layer, the chain's forward paths with N < L, and the same
+          # under ASan and UBSan
+          - family: partial-inkling-mimo
+            req: c/tools/requirements-kimi-k3-tiny.txt
+            extra: -r c/tools/oracle-requirements.txt pillow
+          - family: partial-inkling-mimo-sanitize
+            req: c/tools/requirements-kimi-k3-tiny.txt
+            extra: -r c/tools/oracle-requirements.txt pillow
           # big prompt chunks and expert streaming (docs/vulkan.md): every chain engine on a
           # prompt past its usual block, the chunk from the budget, a forced small chunk and
           # streaming threshold, staged, the feature off, and the forced runs under ASan

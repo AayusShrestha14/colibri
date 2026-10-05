@@ -532,6 +532,38 @@ The dashboard's expert map (`EMAP`) shows a device-resident expert as tier 2 (VR
 the experts a device step served still light up in `HITS`, and qwen36's
 `CACHE_ROUTE` ranks them like CUDA-resident ones.
 
+### RAM and VRAM without the same experts (`COLI_VK_TIER_EXCLUSIVE`)
+
+With RAM short of the working set, the engine's RAM expert cache and the tier would
+otherwise hold many of the same experts: the CPU reads an expert, computes it, the tier
+promotes it, and its RAM copy stays until the LRU reaches it. Exclusive caching (on unless
+`COLI_VK_TIER_EXCLUSIVE=0`) gives that copy up first:
+
+- **When the RAM cache must evict**, it first takes, among the slots it may evict, the
+  least recently used one whose expert the tier holds on a device (`vkt_ram_first`), and
+  only then its usual LRU choice. With RAM to spare nothing is evicted and nothing
+  changes; with little RAM the two caches hold different experts, so together they hold
+  more of them. An expert routed in its layer's current step is never offered, even on a
+  device: the CPU may be computing it from that slot (the balance handed it back, or the
+  batch had no room for its rows).
+- **The prefetchers that read experts into RAM** (the PILOT workers of qwen36, olmoe and
+  colibri) skip what the device holds. qwen38's only advises the page cache, and only of
+  the experts the CPU will compute.
+- Every MoE engine does it in its own cache: qwen36, qwen38, olmoe, inkling, mimo,
+  kimi_k3, deepseek_v41, deepseek_v4's expert store, colibri and glm53. Pinned slots and
+  slots being read or computed are never taken, as before.
+- The run's line says how many RAM copies were given up for it:
+  `| exclusive: N RAM copies of device experts given up first`.
+
+The cost: an expert the device holds is no longer in RAM to hand back to the CPU when the
+device is the slower side of a step (`COLI_VK_TIER_BALANCE`), so on an integrated GPU at its
+floor clock the balance has fewer experts to move. `COLI_VK_TIER_EXCLUSIVE=0` keeps the
+copies.
+
+The `dev2` families' `excl` and `noexcl` cases run every engine with a RAM cache of a slot
+or two against its CPU run. On DeepSeek V4's 16-expert fixture with 6 slots a layer, the
+run with it gave up 21 RAM copies and read 46 experts from disk, against 51 without it.
+
 ### A second device (`COLI_VK_DEV2`)
 
 A machine with two GPUs (a V100 beside a GTX 1070, an RX 9070 beside an RX 580) can
@@ -1141,6 +1173,35 @@ the picture) are the previous build's; with `COLI_VULKAN=1` and `COLI_VK_CHAIN=0
 unset, those of 54 (the tier balanced deterministically, `COLI_VK_TIER_BALANCE=0`, since
 its balance moves bits from run to run on either build).
 
+**A partial chain.** MiMo-V2.6's dense part (about 24 GB on Flash, 32 GB on Pro in its
+native FP8/BF16 form) does not fit most cards, so the chain takes the first N layers
+that do (`vkc_fit`, decided at start-up before anything goes up; `COLI_VK_CHAIN_LAYERS`
+forces N) and the CPU runs the others and the head. A layer's bytes are its matrices in
+their `MIMO_DENSE_BITS` form (the fused qkv, o_proj, and the dense layer 0's MLP), its
+K/V mirror at the size the chain allocates (a sliding layer's ring; a full layer's
+context, or `COLI_VK_KV_DEVICE_ROWS` when that asks for fewer: the split covers the
+rest) and its norms and sink logits; the head is the tail, with the vision tower when
+the per-matrix path would take it (`COLI_VK_DENSE`). A partial chain places its layers
+before the tier sizes itself; with everything fitting, the layers go up after the tier
+as before. Each prompt chunk crosses the N device layers, its residual rows come down
+with the frame that ends it (the buffer the normed rows use), and the CPU runs layers
+N.. and the head on those rows before the next chunk; a chunk counts as computed once
+both sides ran it, so a device lost in a later chunk loses nothing either side holds,
+and the CPU runs on from where the host's caches end. The device's layers keep their
+mirrors behind the watermarks above; the CPU's layers keep their caches on the host
+only, and nothing of them, of the head or of the tower goes up through the per-matrix
+path. A layer that does not fully reach the device is freed and the chain keeps the
+layers before it. With `COLI_VK_DENSE_HOST=0` only the N layers drop their host copies,
+and `coli plan` (`resource_plan.py`, MiMo's layout) predicts the same N from the
+checkpoint's header and config and credits those layers alone.
+`tests/vulkan_engines.sh partial-inkling-mimo` gates it on the fixture (every N from 0
+to 6, text and picture, the three dense forms, N from a device cap and from an upload
+failing inside a layer, chunks of 3 rows, one token at a time, prompts only, the KV
+split, a lost device, device-only weights, serve sessions and the prefix-reuse tests)
+on the CPU's tokens and logits within 1e-4 of the largest, and `coli plan`'s numbers on
+the engine's (free, per-layer and fixed bytes, N) under each cap. Lavapipe only: no
+discrete GPU was available, so the fit's choice on a real card is not measured.
+
 **The default.** The chain's speed on a real MiMo model is not measured: no MiMo
 checkpoint is on the test box (the smallest, Flash, has 309B parameters). The chain is
 on for a discrete GPU (the common rule), off on an integrated GPU (`COLI_VK_CHAIN=1`
@@ -1275,6 +1336,36 @@ What the numbers say:
 **Not measured**: a discrete GPU; OLMoE in serve sessions, past a 537-token context, with
 `PILOT` (its experts fit in RAM here) or with the dense trunk on the device beside the
 chain (`COLI_VK_DENSE=1`).
+
+**Inkling's partial chain.** Inkling's dense part is 49 GB in bf16 (about 15 GB in the
+dense-int4g64 container), so on any consumer card its chain is partial: `vkc_fit` decides
+at start-up, before anything goes up and before the expert cache is sized, how many
+layers from the first fit (`COLI_VK_CHAIN_LAYERS` forces N), and the CPU runs the others
+and lm_head. A layer's bytes are its matrices in the form each goes up in (q, k, v, r,
+o_proj; the dense MLP's three, or the router's f32 copy and each shared expert's three),
+its share of the parameter arena, its four convolution rings and its K/V mirror at the
+window's rows (a global layer's grows with the context: the KV split covers that). No fit
+is made when the chain would decline anyway: bf16 matrices on a CPU whose bf16 dot
+rounds the activations go to the device in no form (the `[VK] inkling: 0 resident
+matrices go to the GPU` case), and the chain declines as before. A partial chain places
+its layers at start-up, before the tier sizes itself (so does every fit with
+`COLI_VK_DENSE_HOST` dropping the host copies, which drops each layer's only once all of
+it is on the device); with everything fitting and the host copies kept, the layers go up
+at the first forward as before. Every chunk of a forward crosses the N layers, the
+residual rows come down once a chunk, and the CPU runs layers N.. over all the rows
+layer by layer, as its own forward does, then the head and the per-position heads. The
+device's layers keep their mirrors, rings and convolution states as above; the CPU's
+layers keep theirs on the host, so a CPU step lowers and a lost device rebuilds the
+device's layers alone (`rebuilding the state of P positions ... (the device's layers;
+the CPU's have theirs)`). `coli plan` (`resource_plan.py`, inkling's layout, which reads
+the dense-int4g64 container's forms when it is there) predicts the same N.
+`tests/vulkan_engines.sh partial-inkling-mimo` gates it on the tiny fixtures (every N
+from 0 to 8, the dense-int4g64 container, the expert containers, bf16, D = 6144 with N
+from 0 to 2, N from a device cap and from an upload failing inside a layer, chunks of 3,
+prompts only, the KV split, a lost device, device-only weights, serve sessions and the
+prefix-reuse and dashboard tests) on the CPU's tokens and every forward's logits within
+1e-4 of the largest, and `coli plan`'s numbers on the engine's under each cap, on
+Lavapipe; no discrete GPU was available.
 
 **Inkling: not measured.** No Inkling checkpoint runs on the box (the model is 975B),
 so its integrated-GPU default is off (`COLI_VK_CHAIN_UNMEASURED`: the `[VK]` line says
@@ -1440,6 +1531,30 @@ same arithmetic in another order. On the fixtures every configuration gives the 
 tokens, and every logits row is within 1e-6 of the largest logit: 9.3e-7 at worst on
 Lavapipe, 1.1e-6 on a Radeon 780M (RADV) and 1.0e-6 on an Intel Iris Xe (Mesa's Dozen,
 four configurations).
+
+**A partial chain** ([below](#a-partial-chain)): when the dense layers do not all fit the
+device, deepseek_v41 chains the first N and `forward_full`'s CPU loop runs the rest from
+layer N (`v41c_forward` returns the layers it ran). The handoff gives back every row's
+`hc_mult` streams and the last FFN site's mix, and the host state the CPU's layers read
+from a chain layer within the same forward: the candidate mask (`m->candidates`, when the
+candidate source is a chain layer and an index source after N reads it) and the index
+list the last chain index source published (`m->shared_topk`, which a compressed layer
+after N reads before the next index source runs). A chain layer that reads a CPU layer's
+index keys (the published-key rule: the layer that published last, or an earlier row's
+layer in a verify) reads the host's rows as the CPU's layer order has them at that point,
+from a mirror of those keys lowered after every forward. The chain's layers write their
+rings, compressed rows, keys and groups back at the end of the forward as before; the
+CPU's layers keep theirs on the host. The fit counts each layer's matrices (fp8 as fmt 12
+with a scale per 32 inputs, the compressor's and the indexer's bf16, the mHC mixes in
+f32, an engram layer's `eng_wkv`; for prompts only with the dense weights on the device
+only, wo_a per output group too), its window ring, its compressor's group and 64
+compressed rows and keys, its share of the parameters and of a forward's pull buffer; the
+fixed part is the scratch of one 512-row chunk, the tail (with `COLI_VK_DENSE`) the head
+and the routers. With the dense weights on the device only the fit runs before the
+layers are read and each chained layer goes up whole as it is read (its matrices, an
+engram layer's projection, its state) before its host pages are given back, so a layer
+that does not reach the device reads nothing back from disk. DSpark's stages take the
+means of their target layers from whichever side ran them.
 
 **The default**: `COLI_VK_CHAIN_UNMEASURED`, so the chain is off on an integrated GPU
 (`COLI_VK_CHAIN=1` turns it on, `2` for prompts only) and on a discrete GPU follows the
@@ -1624,6 +1739,26 @@ and 6.1e-3; the 780M: 2.3e-4, 9.9e-4 and 3.3e-3). The tests hold every logits ro
 configuration. With the CPU's int8 expert activations (`K3_IDOT=1`, tier off) a flipped
 int8 step moved the logits by 8.3e-3 on Lavapipe (no step flipped on the 780M), the
 tokens unchanged; that configuration is gated on its tokens.
+
+**A partial chain** ([below](#a-partial-chain)): kimi_k3 chains the first N layers and
+`step_chunk_ex` runs the rest with `k3_layers_forward_range` from layer N. The handoff
+moves each row's AttnRes state after layer N-1: the prefix, the block snapshots so far
+and their count, written to the caller's buffers once every chunk is through (a lost
+device reruns the forward from its untouched input). The chain's layers keep their KDA
+state, convolution windows and MLA mirrors on the device as before (the "who holds the
+newest" flag, its syncs and pushes and the watermarks cover them alone); the CPU's layers
+keep theirs on the host, so after a lost device only the chain layers' KDA state is
+rebuilt from the prefix record (layers 0..N-1 replayed). The fit runs once the device is
+open and before the expert cache is sized: each layer's matrices in the form the loader
+made of them (int4-g64, int8 rows or f32; the router and the KDA decay and beta
+projections in f32), the KDA state and windows, an MLA layer's mirror and down rows at one
+256-row chunk's positions, its share of the parameters; the fixed part is the scratch of
+one chunk and the output mix, the tail the head. With every layer on the device and not
+the head, the chain hands the CPU its final normalized rows and the CPU multiplies the
+head. With the dense weights on the device only, only the chain's layers' matrices (and
+the head with the tail) give back their host copies, after the setup, so a layer that
+does not reach the device has nothing to read back; the expert cache's RAM plan counts
+only those.
 
 **The default**: kimi_k3 passes `COLI_VK_CHAIN_UNMEASURED`: off on an integrated GPU
 (`COLI_VK_CHAIN=1` turns it on, `2` for prompts only), on a discrete GPU the rule above.
@@ -2169,6 +2304,22 @@ first matrix. RADV places them in system RAM instead, where every access crosses
 **Staged uploads** put resident data in a DEVICE_LOCAL memory type the host does not map
 and copy it there from a host staging buffer with `vkCmdCopyBuffer`.
 
+**Straight from host memory.** Where the device has `VK_EXT_external_memory_host`, a
+staged upload skips the staging buffer: the source pages are imported as a transfer
+source and the device copies from them directly, so the CPU does not copy the bytes a
+second time. It applies to:
+- the tier's experts (and the streaming slots' refills), from the host image they are
+  converted in, which is allocated aligned to the device's import alignment;
+- the trunk's rows from the weights themselves, when they need no padding.
+
+An import lives until its command buffer's fence. Pages the driver will not import (some
+file-backed mappings, a refusal) are staged as before. The second device (`COLI_VK_DEV2`)
+does the same. `COLI_VK_UP_IMPORT=0` stages every copy; a `[VK] staged uploads: copied
+straight from host memory` line says imports are on, and the exit report counts the
+imported bytes and copies and the refused ones. On Lavapipe the results are the same bits
+either way. On a discrete card it removes a host copy of every uploaded byte, which matters
+most for the tier's warm start and the trunk's placement; its speed there was not measured.
+
 **The rule** (`place_decide` in `backend_vulkan.c`). `COLI_VK_STAGED=1` stages,
 `COLI_VK_STAGED=0` keeps the mapped path. Unset: staged when the host-visible
 device-local heap holds less than a quarter of the largest device-local heap, or there is
@@ -2469,6 +2620,8 @@ predict a layer more than the engine places.
 | qwen38 | the four hyper-connection streams of every row; the MTP head reads the final streams from whichever side ran the last layer, and the PLE ring and n-gram history stay with the PLE layer's side | yes |
 | colibri (GLM-5.2) | the residual rows; when layer N is a shared DSA indexer layer, the selection the device's last full layer made (1 + `index_topk` ints a row) | yes ([GLM](#glm-52-and-glm-53-flash-on-the-chain)) |
 | glm53 (GLM-5.3 Flash) | the hc_mult streams | yes ([GLM](#glm-52-and-glm-53-flash-on-the-chain)) |
+| deepseek_v41 | the hc_mult streams and the last site's mix; the candidate mask and the published index list a chain layer made for the CPU's layers; DSpark's target means from whichever side ran them | yes |
+| kimi_k3 | the AttnRes prefix, the block snapshots and their count; with every layer but not the head, the final rows for the CPU's head | yes |
 
 **`COLI_VK_DEVICE_CAP_MB=n`** (tests) makes the device hold at most n MiB of device-local
 memory (a fraction is taken): every allocation of the backend and the chain (tensors, the
@@ -2491,6 +2644,19 @@ and the prefix-reuse tests, and the chain against itself (chunks, prefill blocks
 with N < L; the dense weights on the device only with N < L. A discrete GPU has not been
 measured: none is available here, so the fit's behaviour on one (the budget a real driver
 reports, its allocation granularity) is not verified.
+
+`partial-dsk` does the same for DeepSeek V4.1 Flash and Kimi K3 on Lavapipe:
+`COLI_VK_CHAIN_LAYERS` at every k of their six-layer fixtures (V4.1's cuts at 2 and 4 hand
+the CPU's layers the index list and the candidate mask; Kimi K3's at 1, 3 and 5 cut inside
+an AttnRes block of two layers); `COLI_VK_DEVICE_CAP_MB` aimed at 0, 1, 3 and 5 layers and
+at every layer but the head (the line's N and `coli plan`'s, with the same free, per-layer
+and fixed bytes); an upload failing inside layers 0, 2 and 4, and with the dense weights on
+the device only inside layer 3, where nothing is read back from disk; prompt chunks, expert
+streaming, DSpark drafts (V4.1), prompts only, the tier off, the per-matrix path beside,
+the KV split, a lost device (V4.1: the forward again on the CPU; Kimi K3: the chain layers'
+KDA state rebuilt from the prefix record), serve sessions with prefix reuse, Kimi K3's
+recurrent-state photos and V4.1's images with N < L; the dense weights on the device only
+with N < L.
 
 ## Correctness
 
