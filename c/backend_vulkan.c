@@ -9,7 +9,7 @@
 // submit/wait per call; async queues and zero-copy import come in M4.
 #include "backend_vulkan.h"
 #include "vk_alloc.h"
-#include <vulkan/vulkan.h>
+#include "vk_load.h"
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,7 +19,83 @@
 #ifdef __linux__
 #include <unistd.h>
 #endif
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+#ifdef __APPLE__
+#include <mach-o/dyld.h>   /* _NSGetExecutablePath */
+#endif
 static double vk_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1000.0 + t.tv_nsec/1e6; }
+
+/* ---- the loader (vk_load.h) ------------------------------------------------------
+ * Opened the first time a device is asked for: COLI_VK_LOADER when set (a path, or a
+ * name the system's search finds), else the system's loader, vulkan-1.dll (which every
+ * GPU driver installs on Windows), libvulkan.so.1, or on macOS the Vulkan SDK's
+ * libvulkan.1.dylib or MoltenVK. Every function vk_load.h lists must be there: the loader
+ * exports all of Vulkan 1.2's, so one that lacks any predates it. */
+#define COLI_VK_DEFINE(f) PFN_##f coli_##f;
+COLI_VK_FUNCS(COLI_VK_DEFINE)
+#undef COLI_VK_DEFINE
+
+static void (*vk_sym(void *lib, const char *name))(void) {
+#ifdef _WIN32
+    return (void (*)(void))GetProcAddress((HMODULE)lib, name);
+#else
+    void *p = dlsym(lib, name);
+    void (*fn)(void);
+    memcpy(&fn, &p, sizeof fn);
+    return fn;
+#endif
+}
+int coli_vk_load(void) {
+    static int state;   /* 0 not tried, 1 loaded, -1 not available */
+    if (state) return state > 0;
+    state = -1;
+    const char *env = getenv("COLI_VK_LOADER"), *name;
+    void *lib = NULL;
+#ifdef _WIN32
+#ifndef LOAD_LIBRARY_SEARCH_DEFAULT_DIRS
+#define LOAD_LIBRARY_SEARCH_DEFAULT_DIRS 0x00001000
+#endif
+    if (env && *env) lib = (void *)LoadLibraryA(name = env);
+    else {   /* the program's directory and System32, never the current one */
+        lib = (void *)LoadLibraryExA(name = "vulkan-1.dll", NULL, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+        if (!lib) lib = (void *)LoadLibraryA(name);
+    }
+#else
+#ifdef __APPLE__
+    static const char *const names[] = {"libvulkan.1.dylib", "libvulkan.dylib", "libMoltenVK.dylib"};
+#else
+    static const char *const names[] = {"libvulkan.so.1", "libvulkan.so"};
+#endif
+    if (env && *env) lib = dlopen(name = env, RTLD_NOW | RTLD_LOCAL);
+    else for (size_t i = 0; !lib && i < sizeof names / sizeof *names; i++)
+        lib = dlopen(name = names[i], RTLD_NOW | RTLD_LOCAL);
+#endif
+    if (!lib) {
+        fprintf(stderr, "[VK] no Vulkan loader (%s): the GPU's driver installs it%s\n", name,
+                env && *env ? "" : "; COLI_VK_LOADER=<file> names another");
+        return 0;
+    }
+    const char *missing = NULL;
+#define COLI_VK_TAKE(f) if (!(coli_##f = (PFN_##f)vk_sym(lib, #f)) && !missing) missing = #f;
+    COLI_VK_FUNCS(COLI_VK_TAKE)
+#undef COLI_VK_TAKE
+    if (missing) {
+        fprintf(stderr, "[VK] the Vulkan loader %s has no %s: it predates Vulkan 1.2\n", name, missing);
+#ifdef _WIN32
+        FreeLibrary((HMODULE)lib);
+#else
+        dlclose(lib);
+#endif
+        return 0;
+    }
+    state = 1;
+    return 1;
+}
 
 #define VKCHECK(x, what) do { VkResult _r = (x); if (_r != VK_SUCCESS) { \
     fprintf(stderr, "[VK] %s failed: %d\n", what, _r); return 0; } } while (0)
@@ -98,6 +174,8 @@ static void vk_mem_free(VkDevice d, VkDeviceMemory m, const VkAllocationCallback
     }
     vkFreeMemory(d, m, cb);
 }
+#undef vkAllocateMemory   /* vk_load.h's, which the two above call */
+#undef vkFreeMemory
 #define vkAllocateMemory vk_mem_alloc
 #define vkFreeMemory vk_mem_free
 /* A device just created: which of its memory types count, and the cap. */
@@ -720,6 +798,10 @@ static void derive_sibling(const char *spv, const char *suffix, char *out, size_
 /* "…/qmatmul.spv" -> "…/attention_absorb.spv" (same directory). */
 static void derive_dir_file(const char *spv, const char *fname, char *out, size_t n) {
     const char *sl = strrchr(spv, '/');
+#ifdef _WIN32
+    const char *bs = strrchr(spv, '\\');   /* COLI_VK_SHADERS=C:\...\qmatmul.spv */
+    if (bs && (!sl || bs > sl)) sl = bs;
+#endif
     size_t pre = sl ? (size_t)(sl - spv) + 1 : 0;
     if (pre + strlen(fname) + 1 < n) { memcpy(out, spv, pre); strcpy(out + pre, fname); }
     else snprintf(out, n, "%s", fname);
@@ -813,6 +895,7 @@ static int g_vk_prof;
 
 int coli_vk_init(const char *spv_path) {
     if (G.ready) return 1;
+    if (!coli_vk_load()) return 0;
     up_fault_init();
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .apiVersion = VK_API_VERSION_1_2};
@@ -2026,17 +2109,30 @@ const char *coli_vk_shader_path(char *buf, size_t n) {
         if (!stat(env, &st) && S_ISDIR(st.st_mode)) { snprintf(buf, n, "%s/qmatmul.spv", env); return buf; }
         return env;
     }
-#ifdef __linux__
-    ssize_t k = readlink("/proc/self/exe", buf, n - 1);
+    /* shaders/ next to the binary, wherever it was started from: an unpacked release
+     * archive started by its full path found them only from its own directory before */
+    long k = -1;
+#if defined(__linux__)
+    k = readlink("/proc/self/exe", buf, n - 1);
+#elif defined(_WIN32)
+    k = (long)GetModuleFileNameA(NULL, buf, (DWORD)n);
+    if (k >= (long)n - 1) k = -1;   /* truncated */
+#elif defined(__APPLE__)
+    uint32_t sz = (uint32_t)n;
+    if (_NSGetExecutablePath(buf, &sz) == 0) k = (long)strlen(buf);
+#endif
     if (k > 0) {
         buf[k] = 0;
         char *sl = strrchr(buf, '/');
+#ifdef _WIN32
+        char *bs = strrchr(buf, '\\');
+        if (bs && (!sl || bs > sl)) sl = bs;
+#endif
         if (sl && (size_t)(sl + 1 - buf) + sizeof("shaders/qmatmul.spv") <= n) {
             strcpy(sl + 1, "shaders/qmatmul.spv");
             if (!stat(buf, &st)) return buf;
         }
     }
-#endif
     return "shaders/qmatmul.spv";
 }
 

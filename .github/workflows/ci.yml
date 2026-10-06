@@ -122,7 +122,10 @@ jobs:
           # while backend_vulkan.c compiles perfectly. Assert all four exist.
           ls -l shaders/qmatmul.spv shaders/qmatmul_gate_up.spv \
                 shaders/attention_absorb.spv shaders/rmsnorm.spv
-          ldd colibri | grep -q libvulkan || { echo "FAIL: built without linking libvulkan"; exit 1; }
+          # Nothing links the loader (vk_load.h): a VK=1 binary starts without one, as
+          # the release archives' must. The Vulkan build is the string it opens.
+          if ldd colibri | grep -q libvulkan; then echo "FAIL: colibri links libvulkan"; ldd colibri; exit 1; fi
+          grep -q libvulkan.so.1 colibri || { echo "FAIL: built without the Vulkan backend"; exit 1; }
       - name: Initialise the backend against Lavapipe
         run: |
           cd c
@@ -143,6 +146,12 @@ jobs:
           grep -q "expert tier active" vk.log || {
             echo "FAIL: Vulkan initialised but the expert tier did not activate"; exit 1; }
           echo "OK: shaders compiled, device negotiated, expert tier active"
+          # and with no loader, a line saying so instead of a binary that cannot start
+          COLI_VK_LOADER=/nonexistent/libvulkan.so.1 COLI_NO_OMP_TUNE=1 COLI_VULKAN=1 SNAP=/tmp/vkprobe \
+            timeout 120 ./colibri > vk0.log 2>&1 || true
+          cat vk0.log
+          grep -q "\[VK\] no Vulkan loader (/nonexistent/libvulkan.so.1)" vk0.log || {
+            echo "FAIL: no line for a missing Vulkan loader"; exit 1; }
       - name: Every qmatmul weight format against a CPU reference
         run: |
           cd c

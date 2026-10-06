@@ -10,7 +10,8 @@ Download the repository (**Code**, then **Download ZIP**, or `git clone`), unzip
 it and double-click **`START-HERE.bat`**. It checks for Python (and offers to
 install it with winget), finds your hardware, recommends a model that fits,
 gets the engine (built with MSYS2 when it is installed, with Vulkan when your
-GPU can use it; otherwise the prebuilt CPU engine from the release), downloads
+GPU can use it; otherwise the prebuilt one from the release, which runs on the
+CPU or with Vulkan), downloads
 the model with resume and opens the dashboard. Running it again starts colibri
 directly. The same from a terminal: `py -3 c\coli setup`. See
 [quickstart.md](quickstart.md#the-one-step-way).
@@ -33,6 +34,20 @@ their own they have no model to load, print how to launch and exit, which from
 Explorer looks like a window that flashes and disappears (#1241). The launcher
 needs Python 3 from https://www.python.org/downloads/ with "Add python.exe to
 PATH" ticked; the engines themselves need nothing.
+
+The engines are built with Vulkan, their shaders in `shaders\`: `coli.cmd
+setup` runs them on a GPU with a Vulkan driver (NVIDIA's, AMD's and Intel's
+drivers all install one) and on the CPU everywhere else, with nothing to build.
+
+**NVIDIA, CUDA.** For an RTX 30, 40 or 50 series card (compute capability 8.0
+and newer: A100, H100 and later too) the release also has
+**`colibri-<version>-windows-x86_64-cuda.zip`**. Unpack it into the same folder:
+it replaces `colibri.exe`, `qwen36.exe` and `kimi_k3.exe` with the same engines
+plus CUDA, and adds `coli_cuda.dll` and NVIDIA's CUDA runtime
+(`cudart64_12.dll`), so no CUDA toolkit is needed, only an NVIDIA driver for
+CUDA 12. `coli.cmd setup` then picks CUDA for the models those three engines
+run; an older card keeps Vulkan. To build the DLL yourself, for a card the
+package does not cover, see below.
 
 The rest of this page is for building from source.
 

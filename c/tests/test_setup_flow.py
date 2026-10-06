@@ -137,8 +137,11 @@ class HomeTestCase(unittest.TestCase):
 
 
 class BackendChoice(unittest.TestCase):
-    def choose(self, hw, family="qwen36", tc=None, requested="auto", platform="linux"):
-        with modeled(platform):
+    def choose(self, hw, family="qwen36", tc=None, requested="auto", platform="linux", here=None):
+        """choose_backend with `here` as the engines' directory (default: an empty one,
+        so an engine built in this checkout does not decide the answer)."""
+        with modeled(platform), tempfile.TemporaryDirectory() as empty, \
+                mock.patch.object(setup_flow, "HERE", here or empty):
             return setup_flow.choose_backend(hw, family_by_id(family), tc or TC_ALL, requested)
 
     def test_no_gpu_is_cpu(self):
@@ -203,16 +206,90 @@ class BackendChoice(unittest.TestCase):
         self.assertEqual(self.choose(hw_report(vulkan=IGPU, nvidia=[RTX]), requested="cpu")["backend"],
                          "cpu")
 
-    def test_windows_without_msys2_points_at_it(self):
+    def test_windows_release_archive_with_a_cpu_engine_points_at_msys2(self):
+        # an archive from before 2.0: its engine has no Vulkan and cannot be rebuilt
         tc = dict(TC_ALL, source_checkout=False, make=None, cc=None, can_build=False,
                   can_build_vulkan=False, can_build_cuda=False)
-        decision = self.choose(hw_report(vulkan=IGPU), tc=tc, platform="win32")
+        with tempfile.TemporaryDirectory() as here:
+            Path(here, "qwen36.exe").write_bytes(b"MZ plain")
+            decision = self.choose(hw_report(vulkan=IGPU), tc=tc, platform="win32", here=here)
         self.assertEqual(decision["backend"], "cpu")
         hint = decision["missing"][0][1]
         self.assertIn("msys2.org", hint)
         self.assertIn("mingw-w64-ucrt-x86_64-gcc", hint)
         self.assertIn("mingw-w64-ucrt-x86_64-shaderc", hint)
         self.assertIn("source checkout", hint)      # a release archive cannot rebuild itself
+
+    def test_a_vulkan_engine_here_needs_no_vulkan_toolchain(self):
+        # a release archive since 2.0: Vulkan engines and their shaders, no compiler
+        tc = dict(TC_ALL, source_checkout=False, make=None, cc=None, can_build=False,
+                  can_build_vulkan=False, can_build_cuda=False)
+        for os_name, content in (("linux", b"\x7fELF libvulkan.so.1"), ("win32", b"MZ vulkan-1.dll")):
+            with self.subTest(os=os_name), tempfile.TemporaryDirectory() as here:
+                Path(here, engine_name(os_name)).write_bytes(content)
+                decision = self.choose(hw_report(vulkan=IGPU), tc=tc, platform=os_name, here=here)
+                self.assertEqual(decision["backend"], "cpu")        # no shaders beside it
+                os.makedirs(os.path.join(here, "shaders"))
+                Path(here, "shaders", "qmatmul.spv").write_bytes(b"\x03\x02\x23\x07")
+                decision = self.choose(hw_report(vulkan=IGPU), tc=tc, platform=os_name, here=here)
+                self.assertEqual(decision["backend"], "vulkan")
+                self.assertEqual(decision["missing"], [])
+
+    def windows_cuda_here(self, here, dll=True):
+        """The release's windows-x86_64-cuda.zip unpacked: CUDA and Vulkan engines,
+        their shaders and coli_cuda.dll."""
+        Path(here, "qwen36.exe").write_bytes(b"MZ coli_cuda.dll vulkan-1.dll")
+        os.makedirs(os.path.join(here, "shaders"), exist_ok=True)
+        Path(here, "shaders", "qmatmul.spv").write_bytes(b"\x03\x02\x23\x07")
+        if dll:
+            Path(here, "coli_cuda.dll").write_bytes(b"MZ")
+
+    def test_windows_cuda_package_takes_cuda_on_an_ampere_card(self):
+        tc = dict(TC_ALL, source_checkout=False, make=None, cc=None, can_build=False,
+                  can_build_vulkan=False, can_build_cuda=False)
+        rtx_vk = {"name": RTX["name"], "type": "discrete", "api_version": "1.3.289",
+                  "api_version_raw": (1 << 22) | (3 << 12) | 289}
+        with tempfile.TemporaryDirectory() as here:
+            self.windows_cuda_here(here)
+            card = dict(RTX, compute_cap="8.9")
+            decision = self.choose(hw_report(vulkan=rtx_vk, nvidia=[card]), tc=tc, platform="win32", here=here)
+            self.assertEqual(decision["backend"], "cuda")
+            self.assertIn("coli_cuda.dll beside the engine", decision["reason"])
+            # a card older than the DLL's sm_80: Vulkan, saying why
+            old = dict(RTX, name="NVIDIA GeForce RTX 2070", compute_cap="7.5")
+            decision = self.choose(hw_report(vulkan=rtx_vk, nvidia=[old]), tc=tc, platform="win32", here=here)
+            self.assertEqual(decision["backend"], "vulkan")
+            self.assertIn("compute 8.0 and newer, and the NVIDIA GeForce RTX 2070 is compute 7.5",
+                          decision["reason"])
+            # unless CUDA is asked for by name
+            decision = self.choose(hw_report(vulkan=rtx_vk, nvidia=[old]), tc=tc, platform="win32",
+                                   here=here, requested="cuda")
+            self.assertEqual(decision["backend"], "cuda")
+            # an engine without a CUDA path in that archive: Vulkan
+            decision = self.choose(hw_report(vulkan=rtx_vk, nvidia=[card]), family="mimo", tc=tc,
+                                   platform="win32", here=here)
+            self.assertNotEqual(decision["backend"], "cuda")
+        with tempfile.TemporaryDirectory() as here:   # the engines without the DLL
+            self.windows_cuda_here(here, dll=False)
+            decision = self.choose(hw_report(vulkan=rtx_vk, nvidia=[dict(RTX, compute_cap="8.9")]),
+                                   tc=tc, platform="win32", here=here)
+            self.assertEqual(decision["backend"], "vulkan")
+            self.assertEqual(decision["missing"][0][0], "cuda")
+            self.assertIn("windows-x86_64-cuda.zip", decision["missing"][0][1])
+
+    def test_no_compiler_counts_on_the_release_vulkan_engine(self):
+        # nothing here builds and no engine is here: resolve_engine downloads the
+        # release's, which are Vulkan builds on Linux and Windows x86_64
+        tc = dict(TC_ALL, make=None, cc=None, can_build=False, can_build_vulkan=False,
+                  can_build_cuda=False)
+        for os_name in ("linux", "win32"):
+            with self.subTest(os=os_name):
+                self.assertEqual(self.choose(hw_report(vulkan=DGPU), tc=tc, platform=os_name)["backend"],
+                                 "vulkan")
+        with modeled("linux", "aarch64"), tempfile.TemporaryDirectory() as empty, \
+                mock.patch.object(setup_flow, "HERE", empty):   # no release for it
+            decision = setup_flow.choose_backend(hw_report(vulkan=DGPU), family_by_id("qwen36"), tc)
+        self.assertEqual(decision["backend"], "cpu")
 
 
 #: What NVIDIA's own nvcc prints, measured: 11.x and 12.x from the
@@ -576,10 +653,22 @@ class RunConfiguration(HomeTestCase):
 class EngineResolution(HomeTestCase):
     def test_binary_backend(self):
         for content, expected in ((b"\0libvulkan.so.1\0", "vulkan"), (b"VULKAN-1.DLL", "vulkan"),
-                                  (b"libcudart.so.12", "cuda"), (b"plain", "cpu")):
+                                  (b"libcudart.so.12", "cuda"), (b"plain", "cpu"),
+                                  (b"coli_cuda.dll vulkan-1.dll", "cuda")):
             path = Path(self.tmp.name, "engine")
             path.write_bytes(b"\x7fELF" + content)
             self.assertEqual(setup_flow.binary_backend(str(path)), expected)
+        self.assertEqual(setup_flow.binary_backends(str(path)), {"cuda", "vulkan"})
+
+    def test_an_engine_with_both_backends_is_used_for_vulkan(self):
+        # a Windows release engine built with CUDA_DLL=1 and VK=1, no compiler here
+        no_build = dict(TC_ALL, source_checkout=False, can_build=False, can_build_vulkan=False,
+                        can_build_cuda=False)
+        info, build, said = self.resolve_present("win32", lambda path, *a, **k: str(path), tc=no_build,
+                                                 content=b"MZ coli_cuda.dll vulkan-1.dll")
+        build.assert_not_called()
+        self.assertEqual(info["backend"], "vulkan")
+        self.assertEqual(info["source"], "present")
 
     def resolve_present(self, os_name, make, tc=TC_ALL, content=b"libvulkan.so.1"):
         """resolve_engine with an engine already here and `make` standing in for
@@ -755,10 +844,15 @@ class Releases(HomeTestCase):
     LAYOUTS = {"linux": ("linux-x86_64.tar.gz", ("coli", "qwen36")),
                "win32": ("windows-x86_64.zip", ("coli", "coli.cmd", "qwen36.exe"))}
 
-    def make_archive(self, os_name):
+    def make_archive(self, os_name, vulkan=False):
+        """A release archive; `vulkan`, one since 2.0: Vulkan engines and their shaders."""
         suffix, binaries = self.LAYOUTS[os_name]
-        members = [(name, b"engine" if name.startswith("qwen36") else b"# launcher") for name in binaries]
+        engine = (b"engine vulkan-1.dll" if os_name == "win32" else b"engine libvulkan.so.1") \
+            if vulkan else b"engine"
+        members = [(name, engine if name.startswith("qwen36") else b"# launcher") for name in binaries]
         members += [("web/dist/index.html", b"<html></html>"), ("tools/k3_tokenizer.py", b"")]
+        if vulkan:
+            members.append(("shaders/qmatmul.spv", b"\x03\x02\x23\x07"))
         buffer = io.BytesIO()
         if suffix.endswith(".zip"):
             with zipfile.ZipFile(buffer, "w") as zf:
@@ -777,25 +871,32 @@ class Releases(HomeTestCase):
             with self.subTest(os=os_name):
                 self.check_prebuilt(os_name)
 
-    def check_prebuilt(self, os_name):
+    def test_prebuilt_vulkan_engine_when_there_is_no_compiler(self):
+        for os_name in ("linux", "win32"):
+            with self.subTest(os=os_name):
+                self.check_prebuilt(os_name, vulkan=True)
+
+    def check_prebuilt(self, os_name, vulkan=False):
         tag = "v1.12.1"
         name = f"colibri-{tag}-{self.LAYOUTS[os_name][0]}"
-        archive = self.make_archive(os_name)
+        archive = self.make_archive(os_name, vulkan)
         sums = f"{hashlib.sha256(archive).hexdigest()}  {name}\n".encode()
         urls = self.serve_release({name: archive, "SHA256SUMS.txt": sums}, folder=os_name)
         getter = lambda url: {"tag_name": tag, "assets": [{"name": n, "browser_download_url": u}
                                                           for n, u in urls.items()]}
         tc = dict(TC_ALL, source_checkout=False, can_build=False, can_build_vulkan=False)
-        empty = os.path.join(self.tmp.name, f"nothing-here-{os_name}")
+        empty = os.path.join(self.tmp.name, f"nothing-here-{os_name}-{vulkan}")
         os.makedirs(empty)
-        home = os.path.join(self.tmp.name, f"home-{os_name}")
+        home = os.path.join(self.tmp.name, f"home-{os_name}-{vulkan}")
         with modeled(os_name), mock.patch.object(setup_flow, "HERE", empty), \
              mock.patch.dict(os.environ, {"COLI_SETUP_HOME": home}), \
              mock.patch.object(setup_flow, "_api_get", side_effect=getter):
             out = []
             info = setup_flow.resolve_engine(family_by_id("qwen36"), setup_catalog.by_id("qwen36-35b"),
                                              {"backend": "vulkan", "missing": []}, tc, out=out.append)
-            self.assertEqual(info["backend"], "cpu")               # prebuilt engines are CPU builds
+            # an archive from before 2.0 has CPU engines; one since, Vulkan engines
+            self.assertEqual(info["backend"], "vulkan" if vulkan else "cpu")
+            self.assertEqual("no vulkan build" in "\n".join(out), not vulkan)
             self.assertTrue(info["source"].startswith("release v1.12.1"))
             self.assertTrue(os.path.isfile(info["engine"]))
             self.assertEqual(os.path.basename(info["engine"]), engine_name(os_name))

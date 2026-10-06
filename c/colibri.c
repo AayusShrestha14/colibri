@@ -684,28 +684,11 @@ static int g_vk_budget2;      /* COLI_VK_EXPERTS2: dev2 expert-tier cap (with CO
 static int g_vk_reg_n2;       /* experts resident on the dev2 tier */
 /* Resolve the main shader path (#523): COLI_VK_SHADERS may be the qmatmul.spv file itself
  * OR a directory containing it; unset, look alongside the binary (<exedir>/shaders/, the
- * build layout) before the historical CWD-relative fallback, so launching from outside c/
- * works. The other shaders load as siblings of the returned path (backend derive_*). */
-static const char *vk_resolve_spv(char *buf, size_t n){
-    const char *env = getenv("COLI_VK_SHADERS");
-    struct stat st;
-    if(env && *env){
-        if(!stat(env,&st) && S_ISDIR(st.st_mode)){ snprintf(buf,n,"%s/qmatmul.spv",env); return buf; }
-        return env;
-    }
-#ifdef __linux__
-    ssize_t k = readlink("/proc/self/exe", buf, n-1);
-    if(k > 0){
-        buf[k] = 0;
-        char *sl = strrchr(buf, '/');
-        if(sl && (size_t)(sl+1-buf) + sizeof("shaders/qmatmul.spv") <= n){
-            strcpy(sl+1, "shaders/qmatmul.spv");
-            if(!stat(buf,&st)) return buf;
-        }
-    }
-#endif
-    return "shaders/qmatmul.spv";
-}
+ * build layout and the release archives') before the historical CWD-relative fallback, so
+ * launching from outside c/ works. The other shaders load as siblings of the returned path
+ * (backend derive_*). The backend's coli_vk_shader_path, which every other engine uses:
+ * this copy of it looked beside the binary on Linux only. */
+static const char *vk_resolve_spv(char *buf, size_t n){ return coli_vk_shader_path(buf, n); }
 /* PROF anatomy of the VK expert block (master-thread accumulated in moe(), printed by
  * profile_print): where a decode block's wall goes besides t_ecpu/t_ewait/t_egpu. */
 static double g_vkb_cls, g_vkb_issue, g_vkb_acc, g_vkb_wrk, g_vkb_join;

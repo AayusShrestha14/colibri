@@ -37,7 +37,8 @@ Both run `coli setup`, which does the rest:
    in your RAM, and the download fits on your disk.
 3. **Gets the engine**: it builds it for your machine when a compiler is
    there, with Vulkan or CUDA when your GPU can use it, or downloads the
-   prebuilt one (CPU) when there is no compiler. If a package is missing for
+   prebuilt one when there is no compiler (CPU, and on Linux and Windows
+   Vulkan too). If a package is missing for
    your GPU it prints the exact command to install it and carries on with the
    CPU; nothing is installed system-wide without you. Run the setup again once
    you have installed it, and it rebuilds the engine for the GPU. CUDA is used
@@ -177,6 +178,8 @@ Inside you'll find:
 | File | What it is |
 |---|---|
 | `colibri.exe` | **the engine** — the C program that actually runs the model |
+| `qwen36.exe`, `kimi_k3.exe`, … | the engines of the other model families, chosen from the model's `config.json` |
+| `shaders\` | the Vulkan shaders: the engines run on a Vulkan GPU too, with nothing to build |
 | `coli` | the command-line launcher (`chat`, `serve`, `convert`, `doctor`, …) |
 | `openai_server.py`, `resource_plan.py`, `doctor.py`, `autotune.py` | Python support for the API server, placement planner, diagnostics, and measured tuning |
 
@@ -184,6 +187,9 @@ One setup step: **install Python 3** from
 [python.org](https://www.python.org/downloads/) — the `coli` launcher and the
 API gateway are Python scripts (the engine itself is pure C and needs nothing).
 No renaming, no configuration: the launcher finds `colibri.exe` next to itself.
+With an NVIDIA RTX 30, 40 or 50 series card, also unpack
+`colibri-<version>-windows-x86_64-cuda.zip` into the same folder for CUDA
+([windows.md](windows.md#if-you-downloaded-a-release-archive-start-here)).
 
 For better understanding, from powershell prompt, a complete invocation line 
 (relying on py launcher, to be launched from the folder where colibri.exe is) is:

@@ -685,25 +685,21 @@ endif
 # support (Polaris/RX 580); the VRAM-resident int4 expert-group PRIMITIVE measured ~35%
 # faster than the ROCm/HIP one on an RX 9070 (per-call incl. readback — end-to-end tok/s
 # depends on what else bounds the box; see docs/vulkan.md, benchmarking notes included).
-# Needs libvulkan + glslc (shaderc). Default build unchanged (all colibri.c hooks under
-# #ifdef COLI_VULKAN). The .comp shaders compile to .spv, loaded at runtime from
-# COLI_VK_SHADERS (default: alongside the binary / ./shaders).
+# Needs the Vulkan headers + glslc (shaderc) to build. Default build unchanged (all
+# colibri.c hooks under #ifdef COLI_VULKAN). The .comp shaders compile to .spv, loaded at
+# runtime from COLI_VK_SHADERS (default: alongside the binary / ./shaders).
 VK        ?= 0
 VK_OBJ     =
 VK_SPV     =
 GLSLC     ?= glslc
 ifeq ($(VK),1)
 CFLAGS   += -DCOLI_VULKAN
-ifneq ($(IS_WIN),)
-# Windows has no libvulkan: the loader is vulkan-1.dll, installed by the GPU
-# driver, and MSYS2's vulkan-loader package ships only its import library,
-# libvulkan-1.dll.a. The -static in the Windows LDFLAGS makes ld skip every
-# .dll.a, so neither -lvulkan nor -lvulkan-1 resolved and VK=1 failed at link
-# time. Search dynamically for this one library, then switch back: libgomp,
-# winpthreads and libgcc stay static, and the only new import is vulkan-1.dll.
-LDFLAGS  += -Wl,-Bdynamic -lvulkan-1 -Wl,-Bstatic
-else
-LDFLAGS  += -lvulkan
+# Nothing links the Vulkan loader: backend_vulkan.c opens it at run time (vk_load.h),
+# so a VK=1 binary starts where there is no libvulkan.so.1 or vulkan-1.dll and runs on
+# the CPU there. The release archives are built this way. dlopen needs -ldl before
+# glibc 2.34; Windows' LoadLibrary is in kernel32.
+ifeq ($(IS_WIN),)
+LDFLAGS  += -ldl
 endif
 # vk_tier.o: the routed-expert tier the MoE engines share (vk_tier.h); an engine
 # that does not call it links nothing from it.

@@ -8,18 +8,28 @@ an RX 580 runs here via RADV) and, measured on an RX 9070 (RDNA4), it is
 
 ```bash
 cd c
-make glm VK=1                # needs libvulkan + glslc (shaderc) for the shaders
+make glm VK=1                # needs the Vulkan headers + glslc (shaderc) for the shaders
 COLI_VULKAN=1 COLI_VK_DENSE=1 COLI_VK_ATTN=1 \
 PIN=<model>/.coli_usage PIN_GB=0 COLI_NO_OMP_TUNE=1 \
 ./coli run "Hello" --topp 0.7
 ```
 
-Requirements: `libvulkan` and a Vulkan **1.2** ICD with
+Requirements: a Vulkan **1.2** driver with
 `GL_KHR_shader_subgroup_arithmetic` (any Mesa RADV, AMDVLK, NVIDIA or Intel
-ANV driver from the last several years), plus `glslc` at build time. The
+ANV driver from the last several years), plus the Vulkan headers and `glslc`
+at build time. The
 backend picks the most capable physical device (discrete > integrated) and
 degrades to the CPU path on any failure — a wedged GPU can slow a run, never
 corrupt it.
+
+Nothing links the Vulkan loader: the backend opens it (`libvulkan.so.1`,
+`vulkan-1.dll`, on macOS `libvulkan.1.dylib` or MoltenVK; `COLI_VK_LOADER`
+names another) when `COLI_VULKAN=1` asks for a device. A `VK=1` binary therefore
+starts on a machine with no Vulkan at all and runs on the CPU there, and with
+`COLI_VULKAN=1` says `[VK] no Vulkan loader (...)`. The release archives for
+Linux and Windows are built this way, with the shaders in `shaders/` next to the
+engines: unpacked, they run on a Vulkan GPU with nothing to build, and
+`coli setup` turns the GPU on when it finds one.
 
 Set `COLI_NO_OMP_TUNE=1` on multi-core boxes: the engine's OMP self-tune
 (active spin-wait) is skipped under `COLI_CUDA`/`COLI_METAL` but not under
@@ -37,24 +47,27 @@ Unified-memory APUs and cards with Resizable BAR keep the mapped path.
 
 The compiled shaders are found via `COLI_VK_SHADERS` (either the
 `qmatmul.spv` file or the directory holding the `.spv` set); unset, the
-engine looks in `shaders/` next to the binary, then relative to the CWD.
+engine looks in `shaders/` next to the binary (Linux, Windows and macOS),
+then relative to the CWD.
 
 ### Windows (MSYS2)
 
-In the MSYS2 **UCRT64** shell ([quickstart.md](quickstart.md)), add the Vulkan
-headers, the loader's import library and `glslc`, then build:
+The release's `windows-x86_64.zip` has the engines built this way. To build
+them, in the MSYS2 **UCRT64** shell ([quickstart.md](quickstart.md)) add the
+Vulkan headers and `glslc`:
 
 ```bash
-pacman -S --needed mingw-w64-ucrt-x86_64-vulkan-headers \
-  mingw-w64-ucrt-x86_64-vulkan-loader mingw-w64-ucrt-x86_64-shaderc
+pacman -S --needed mingw-w64-ucrt-x86_64-vulkan-headers mingw-w64-ucrt-x86_64-shaderc
 cd c
 make colibri.exe VK=1
 ```
 
-The binary is statically linked like the default Windows build, plus one
-import: `vulkan-1.dll`, the loader the GPU driver installs in `System32`, so it
-runs outside MSYS2 with nothing added to `PATH`. The next-to-the-binary shader
-lookup above is Linux-only: on Windows run from `c\` or set `COLI_VK_SHADERS`.
+The binary is statically linked like the default Windows build and imports
+nothing for Vulkan: it opens `vulkan-1.dll`, the loader every GPU driver
+installs in `System32`, from the program's directory or `System32` (never the
+current one), so it runs outside MSYS2 with nothing added to `PATH`, and on a
+machine without a Vulkan driver it runs on the CPU. It finds `shaders\` next to
+itself wherever it is started from.
 To check the driver before downloading a model, point `SNAP` at a folder
 holding only a `config.json`, as the CI's Lavapipe job does; the backend
 initialises before any weight is read:

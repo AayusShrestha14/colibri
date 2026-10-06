@@ -1037,8 +1037,11 @@ def env_for(a):
         # engine's "CPU" rows were GPU-assisted). --gpu none remains the
         # canonical hard off-switch (works on every platform, also clears the
         # CUDA_* sizing vars).
+        # COLI_VULKAN=1 is a backend choice too (coli setup's, on a card the CUDA
+        # DLL does not run on): CUDA does not stack on it unasked.
         if (sys.platform == "win32" and a.gpu is None and not a.vram
-                and e.get("COLI_CUDA") != "0"):
+                and e.get("COLI_CUDA") != "0"
+                and str(e.get("COLI_VULKAN","")).strip() in ("","0")):
             if cuda_binary():
                 from resource_plan import (discover_gpus, plans_placement, build_plan,
                                            environment_for_plan, format_bytes)
