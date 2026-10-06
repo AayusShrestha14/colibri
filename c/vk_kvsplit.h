@@ -51,6 +51,9 @@
 #include "vk_chain.h"
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef _WIN32
+#include <malloc.h>   /* _aligned_malloc */
+#endif
 #include <string.h>
 #include <math.h>
 #include <time.h>
@@ -109,11 +112,28 @@ typedef struct {
 
 static double vkc_kv_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
 
+/* The shadows' pages, aligned for the host-memory import. On Windows they come from
+ * _aligned_malloc, which only _aligned_free may release (free() corrupts the heap). */
+static void *vkc_kv_pages(size_t al, size_t bytes) {
+#ifdef _WIN32
+    return _aligned_malloc(bytes, al);
+#else
+    void *p = NULL;
+    return posix_memalign(&p, al, bytes) ? NULL : p;
+#endif
+}
+static void vkc_kv_pages_free(void *p) {
+#ifdef _WIN32
+    _aligned_free(p);
+#else
+    free(p);
+#endif
+}
 static void vkc_kv_shadow_free(VkcKvSplit *ks) {
     if (ks->sh) for (int i = 0; i < ks->nl; i++)
         for (int k = 0; k < 2; k++) {
             vkc_free(ks->sh[i].b[k]);   /* after the frames that read it, before its pages go */
-            free(ks->sh[i].p[k]);
+            vkc_kv_pages_free(ks->sh[i].p[k]);
         }
     free(ks->sh); ks->sh = NULL; ks->shadow_bytes = 0;
     vkc_free(ks->cscr); ks->cscr = NULL;
@@ -728,14 +748,13 @@ static VkcKvShadow *vkc_kv_shadow(VkcKvSplit *ks, int li, int nparts, const floa
         size_t al = coli_vk_import_alignment();
         for (int k = 0; k < nparts; k++) {
             size_t n = (size_t)nseg[k] * ks->cap * seglen[k], bytes = (n * sizeof(float) + al - 1) / al * al;
-            void *p = NULL;
-            if (!al || posix_memalign(&p, al, bytes)) p = NULL;
+            void *p = al ? vkc_kv_pages(al, bytes) : NULL;
             sh->p[k] = (float *)p;
             if (p) { memset(p, 0, bytes); sh->b[k] = vkc_host(p, bytes, &sh->off[k]); }
             if (!p || !sh->b[k]) {
                 fprintf(stderr, "[VK] %s chain: no shadow for layer %d's host rows (%.1f MiB), the CPU computes its part\n",
                         ks->engine, li, bytes / 1048576.0);
-                for (int j = 0; j <= k; j++) { vkc_free(sh->b[j]); free(sh->p[j]); sh->b[j] = NULL; sh->p[j] = NULL; }
+                for (int j = 0; j <= k; j++) { vkc_free(sh->b[j]); vkc_kv_pages_free(sh->p[j]); sh->b[j] = NULL; sh->p[j] = NULL; }
                 sh->cap = -1;
                 return NULL;
             }
