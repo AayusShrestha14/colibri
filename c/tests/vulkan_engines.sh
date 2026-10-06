@@ -433,6 +433,7 @@ family_qwen() {
     tier_gate qwen36 "qwen36 tier mixed int4/int8 cap=$cap" $D COLI_DENSE_I8=0 SNAP=qwen36_tiny64_d8 -- $cap 4 qwen36_tiny64/ref_full.json
   done
   tier_gate qwen36 "qwen36 tier alone (COLI_VK_DENSE=0)" COLI_VK_DENSE=0 COLI_DENSE_I8=0 SNAP=qwen36_tiny64_c -- 8 4 qwen36_tiny64/ref_full.json
+  grep -q 'dense chain off (COLI_VK_DENSE=0' vk.log || { cat vk.log; fail "qwen36 tier alone: COLI_VK_DENSE=0 did not keep the chain off"; }
   EVICT=1 tier_gate qwen36 "qwen36 tier, a budget of two experts" COLI_VK_TIER_GB=0.00002 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
   # COLI_VK_TIER=0: the dense trunk alone, as before the tier; with no tier the default
   # puts the trunk on the device, Lavapipe included

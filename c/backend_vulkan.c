@@ -2189,6 +2189,9 @@ unsigned long long coli_vk_dense_host_dropped_bytes(void) { return __atomic_load
  * _ON (every forward) or _PREFILL (forwards of more than two rows: prompts, not decode
  * steps or an MTP verify).
  *   COLI_VK_CHAIN set and non-empty: 0 off, 2 prefill only, any other number on.
+ *   Unset, COLI_VK_DENSE=0: off (the trunk stays on the CPU, as that variable says; the
+ *   chain's device copy of it would also take the expert tier's budget: on an 8 GB card
+ *   with qwen38 the tier got 1.87 GiB instead of 6 and decode lost 24%, #1900).
  *   Unset, a discrete GPU: on.
  *   Unset, an integrated GPU: `igpu` when the engine runs the expert tier (tier_on),
  *   else off; an engine never timed on one passes COLI_VK_CHAIN_UNMEASURED, which is
@@ -2204,13 +2207,16 @@ unsigned long long coli_vk_dense_host_dropped_bytes(void) { return __atomic_load
  *   Unset, a CPU device (Lavapipe): off.
  * Printed as a [VK] line with an engine name (NULL: silent). */
 int coli_vk_chain_decide(const char *engine, int tier_on, int igpu) {
-    const char *e = getenv("COLI_VK_CHAIN");
+    const char *e = getenv("COLI_VK_CHAIN"), *dn = getenv("COLI_VK_DENSE");
     char why[192];
     int on;
     if (e && *e) {
         int v = atoi(e);
         on = v == 0 ? COLI_VK_CHAIN_OFF : v == 2 ? COLI_VK_CHAIN_PREFILL : COLI_VK_CHAIN_ON;
         snprintf(why, sizeof why, "COLI_VK_CHAIN=%s", e);
+    } else if (dn && *dn == '0') {
+        on = COLI_VK_CHAIN_OFF;
+        snprintf(why, sizeof why, "COLI_VK_DENSE=0: the trunk on the CPU; COLI_VK_CHAIN=1 turns the chain on");
     } else if (coli_vk_device_integrated()) {
         int measured = igpu != COLI_VK_CHAIN_UNMEASURED;
         on = tier_on && measured ? igpu : COLI_VK_CHAIN_OFF;
