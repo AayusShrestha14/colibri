@@ -1252,6 +1252,24 @@ static void q38_pending_image_clear(void){
     memset(&g_pending_image,0,sizeof g_pending_image);
 }
 
+/* IMAGE: the patches wait for the SUBMIT they belong to. */
+static int q38_serve_take_image(FILE *out,ColiServeCommand *command){
+    if(!g_serve_model||!g_serve_model->vis_ready){
+        coli_serve_write_error(out,command->id,
+            "this engine has no vision tower; images are not supported");
+        coli_serve_command_dispose(command);return 0;
+    }
+    if(g_pending_image.present)
+        fprintf(stderr,"[qwen38] a second image arrived before its SUBMIT; dropping the first\n");
+    q38_pending_image_clear();
+    g_pending_image.patches=coli_serve_command_take_payload(command);
+    g_pending_image.bytes=command->payload_bytes;
+    g_pending_image.grid_h=command->grid_h;
+    g_pending_image.grid_w=command->grid_w;
+    g_pending_image.present=1;
+    coli_serve_command_dispose(command);return 0;
+}
+
 static int serve_read_req(FILE *in,FILE *out,ServeReq *q,const char *active_id){
     ColiServeCommand command;
     ColiServeReadResult result=coli_serve_read_command(in,&q38_wire,&command);
@@ -1268,22 +1286,7 @@ static int serve_read_req(FILE *in,FILE *out,ServeReq *q,const char *active_id){
         int control=active?(command.kind==COLI_SERVE_COMMAND_STOP?1:3):0;
         coli_serve_command_dispose(&command);return control;
     }
-    if(command.kind==COLI_SERVE_COMMAND_IMAGE){
-        if(!g_serve_model||!g_serve_model->vis_ready){
-            coli_serve_write_error(out,command.id,
-                "this engine has no vision tower; images are not supported");
-            coli_serve_command_dispose(&command);return 0;
-        }
-        if(g_pending_image.present)
-            fprintf(stderr,"[qwen38] a second image arrived before its SUBMIT; dropping the first\n");
-        q38_pending_image_clear();
-        g_pending_image.patches=coli_serve_command_take_payload(&command);
-        g_pending_image.bytes=command.payload_bytes;
-        g_pending_image.grid_h=command.grid_h;
-        g_pending_image.grid_w=command.grid_w;
-        g_pending_image.present=1;
-        coli_serve_command_dispose(&command);return 0;
-    }
+    if(command.kind==COLI_SERVE_COMMAND_IMAGE)return q38_serve_take_image(out,&command);
     if(command.kind!=COLI_SERVE_COMMAND_SUBMIT){coli_serve_command_dispose(&command);return 0;}
     if(active_id){
         coli_serve_write_error(out,command.id,"engine busy");
@@ -1757,7 +1760,16 @@ static int q38_serve_budget(int np, int max_tok, int max_ctx, int read_only){
     return max_tok > room ? room : max_tok;
 }
 
-static int serve_one(Model *m, ServeReq *q){
+/* When a request was accepted, and the counters then: the DONE and PROF frames
+ * report the request's share from them. */
+typedef struct { double started; uint64_t hits, misses; Q38Timers timers; } Q38ReqClock;
+
+/* A request's prompt into the conversation the Model holds: its tokens and image,
+ * the budget, ACCEPT, the pins and the prefix cache, the prefill and its read-out.
+ * 1 with the prompt's ids and the logits after it; 0 when the request ended here,
+ * its ERROR frame written. serve_one and serve_mux start every request here. */
+static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, float **lo_out,
+                           Q38ReqClock *clk){
     int *ids=NULL, np=0;
     encode_text_n(q->payload,(size_t)q->plen,&ids,&np); /* byte-counted prompt; qwen38 adds no BOS */
     if(g_pending_image.present){
@@ -1792,9 +1804,7 @@ static int serve_one(Model *m, ServeReq *q){
         q->max_tok = budget;
     }
     printf("ACCEPT %s %d\n",q->id,np); fflush(stdout);
-    double request_started=now_s();
-    uint64_t hits_before=m->hits, misses_before=m->miss;
-    Q38Timers timers_before=m->timers;
+    clk->started=now_s(); clk->hits=m->hits; clk->misses=m->miss; clk->timers=m->timers;
     /* Prima gli scatti CHIESTI, e il piu profondo: sono punti di ritorno che
      * il client ha dichiarato, e battono la cache automatica, che insegue solo
      * l'ultimo prompt. Se nessuno serve, si ricade su quella. */
@@ -1866,6 +1876,16 @@ static int serve_one(Model *m, ServeReq *q){
         fprintf(stderr,"[qwen38 prefix] cache disabled for request %s (state snapshot unavailable)\n",q->id);
     if(getenv("Q38_PREFIX_LOG"))
         fprintf(stderr,"[qwen38 prefix] request=%s reused=%d/%d\n",q->id,reuse,np);
+    *ids_out=ids; *np_out=np; *lo_out=lo;
+    return 1;
+}
+
+static int serve_one(Model *m, ServeReq *q){
+    int *ids=NULL, np=0; float *lo=NULL; Q38ReqClock clk;
+    if(!q38_serve_start(m,q,&ids,&np,&lo,&clk)) return 0;
+    double request_started=clk.started;
+    uint64_t hits_before=clk.hits, misses_before=clk.misses;
+    Q38Timers timers_before=clk.timers;
     int gen=0, limited=1, cancelled=0, stopped=0, input_eof=0;
     int eos_ids[4];int n_eos=serve_eos_ids(eos_ids,4,m->c.eos_id,m->c.vocab);
     /* Q38_MTP=1: the head drafts and a verify forward checks it; every token
@@ -1951,6 +1971,207 @@ static int serve_one(Model *m, ServeReq *q){
     return input_eof?-1:0;
 }
 
+/* ---- several conversations at once (KV_SLOTS>1) -----------------------------
+ * The gateway's cache slots, each a conversation with a state of its own (Q38Seq,
+ * qwen38_core.h). A SUBMIT on a free slot starts its request at once: the prompt goes
+ * in through the same q38_serve_start as a lone request's, on that slot's state, with
+ * its pins and its own prefix cache. Then every step picks the next token of each
+ * active request from its logits and runs one forward over a row of each
+ * (q38_forward_rows): the matrices and the experts are read once for all of them. A
+ * request's frames are a lone request's; they interleave by id. Nothing drafts
+ * (speculation follows one conversation), and the slot keeps its state between turns,
+ * so a conversation's next turn reuses its prompt as a lone serve's does. */
+static int g_q38_mux_slots = 1;
+static Q38Seq *g_q38_mux_seq;              /* [slots]: the conversations the Model does not hold */
+static Q38PrefixCache *g_q38_mux_prefix;   /* [slots]: their prefix caches */
+static int g_q38_mux_cur;                  /* the slot the Model holds, -1 when every one is parked */
+
+typedef struct {
+    ServeReq q;
+    int active, stop, cancel, limited;
+    int *ids, np, gen;
+    float *lo;                      /* the logits the next pick reads */
+    Q38ReqClock clk;
+    double first_token_at, last_token_at;
+    unsigned char sbuf[16]; int sbn;
+} Q38MuxReq;
+
+static void q38_mux_bind(Model *m,int slot){
+    if(g_q38_mux_cur==slot)return;
+    for(int k=0;k<2;k++){   /* the held one back to its place, then the asked one in */
+        int x=k?slot:g_q38_mux_cur;
+        if(x<0)continue;
+        q38_seq_swap(m,&g_q38_mux_seq[x]);
+        Q38PrefixCache t=g_q38_prefix; g_q38_prefix=g_q38_mux_prefix[x]; g_q38_mux_prefix[x]=t;
+    }
+    g_q38_mux_cur=slot;
+}
+
+/* Slot 0 is the Model's own state; the others get theirs here. 0: out of memory. */
+static int q38_mux_alloc(Model *m){
+    int n=g_q38_mux_slots;
+    g_q38_mux_seq=(Q38Seq*)calloc((size_t)n,sizeof *g_q38_mux_seq);
+    g_q38_mux_prefix=(Q38PrefixCache*)calloc((size_t)n,sizeof *g_q38_mux_prefix);
+    if(!g_q38_mux_seq||!g_q38_mux_prefix)return 0;
+    for(int i=1;i<n;i++)if(!q38_seq_alloc(m,&g_q38_mux_seq[i]))return 0;
+    g_q38_mux_cur=0;
+    return 1;
+}
+static void q38_mux_free(Model *m){
+    if(!g_q38_mux_seq)return;
+    for(int i=0;i<g_q38_mux_slots;i++){q38_mux_bind(m,i);q38_prefix_cache_release(m);}
+    q38_mux_bind(m,0);   /* the Model's own state back where q38_model_free looks */
+    for(int i=1;i<g_q38_mux_slots;i++)q38_seq_free(m,&g_q38_mux_seq[i]);
+    free(g_q38_mux_seq);free(g_q38_mux_prefix);g_q38_mux_seq=NULL;g_q38_mux_prefix=NULL;
+}
+
+/* A request's end, as serve_one ends one: the UTF-8 tail, DONE and PROF, or the
+ * ERROR of a cancel. */
+static void q38_mux_finish(Model *m,Q38MuxReq *r){
+    free(r->lo);r->lo=NULL;free(r->ids);r->ids=NULL;r->active=0;
+    if(r->cancel){coli_serve_write_error(stdout,r->q.id,"CANCELLED");return;}
+    if(r->stop)r->limited=0;
+    unsigned char tail[3];int tail_n=0;
+    if(utf8_finish(r->sbuf,&r->sbn,tail,sizeof tail,&tail_n)<0){
+        fprintf(stderr,"[decode] invalid UTF-8 finalization\n");exit(1);
+    }
+    if(tail_n)serve_data(r->q.id,(char*)tail,tail_n);
+    double wall_s=now_s()-r->clk.started;
+    double decode_s=r->gen>1?r->last_token_at-r->first_token_at:0.0;
+    uint64_t hits=m->hits-r->clk.hits,misses=m->miss-r->clk.misses;
+    Q38Timers timers=q38_tm_delta(&m->timers,&r->clk.timers);
+    ColiServeDone done={r->gen,q38_decode_rate(r->gen,decode_s),
+                        q38_cache_hit_percent(hits,misses),rss_gb(),r->np,r->limited};
+    coli_serve_write_done(stdout,r->q.id,&done);
+    char profile[256];int profile_bytes=q38_format_prof(profile,sizeof profile,wall_s,r->np,r->gen,&timers);
+    if(profile_bytes>0)fwrite(profile,1,(size_t)profile_bytes,stdout);
+    else fprintf(stderr,"[qwen38] internal error: PROF frame overflow\n");
+    fflush(stdout);
+    serve_hits(m);
+    q38_tm_report_bank(&timers,"request");
+}
+
+/* The next token of an active request, as serve_one's loop picks and sends it: 1
+ * with the token when the request goes on, 0 when it ended. */
+static int q38_mux_pick(Model *m,Q38MuxReq *r,const int *eos_ids,int n_eos,int *tk_out){
+    if(r->cancel||r->stop||r->gen>=r->q.max_tok){q38_mux_finish(m,r);return 0;}
+    int tk=serve_sample(r->lo,m->c.vocab,r->q.temp,r->q.top_p);
+    char lptail[1024];lptail[0]=0;
+    if(r->q.logprobs>0)coli_logprob_tail(lptail,sizeof lptail,r->lo,m->c.vocab,tk,r->q.logprobs);
+    free(r->lo);r->lo=NULL;
+    for(int e=0;e<n_eos;e++)if(tk==eos_ids[e]){r->limited=0;q38_mux_finish(m,r);return 0;}
+    double token_at=now_s();
+    if(!r->gen)r->first_token_at=token_at;
+    r->last_token_at=token_at;
+    unsigned char *token=NULL;int token_n=0;
+    if(decode_id_alloc(tk,&token,&token_n)){fprintf(stderr,"[decode] out of memory\n");exit(1);}
+    if(token_n>(INT_MAX-3)/3){free(token);fprintf(stderr,"[decode] token is too large\n");exit(1);}
+    int chunk_cap=token_n*3+3;
+    unsigned char *chunk=(unsigned char*)malloc((size_t)chunk_cap);int chunk_n=0;
+    if(!chunk||utf8_drain(r->sbuf,&r->sbn,token,token_n,chunk,chunk_cap,&chunk_n)<0){
+        free(chunk);free(token);fprintf(stderr,"[decode] invalid output capacity\n");exit(1);
+    }
+    if(r->q.logprobs>0)serve_data_lp(r->q.id,(char*)chunk,chunk_n,lptail);
+    else if(chunk_n>0)serve_data(r->q.id,(char*)chunk,chunk_n);
+    free(chunk);free(token);
+    r->gen++;
+    /* the next logits are not needed after the last requested token (serve_one) */
+    if(r->gen>=r->q.max_tok){q38_mux_finish(m,r);return 0;}
+    *tk_out=tk;return 1;
+}
+
+/* One command: a SUBMIT on a free slot starts its request, STOP and CANCEL mark the
+ * request they name, IMAGE waits for its SUBMIT. -1 at the end of the input. */
+static int q38_serve_take_image(FILE *out,ColiServeCommand *command);
+static int q38_mux_read(Model *m,Q38MuxReq *rq,int n){
+    ColiServeCommand command;
+    ColiServeReadResult result=coli_serve_read_command(stdin,&q38_wire,&command);
+    if(result==COLI_SERVE_READ_EOF||result==COLI_SERVE_READ_BAD_FRAME)return -1;
+    if(result==COLI_SERVE_READ_NOMEM){coli_serve_write_error(stdout,command.id,"out of memory");return -1;}
+    if(result==COLI_SERVE_READ_BAD_REQUEST){
+        if(command.kind==COLI_SERVE_COMMAND_SUBMIT)
+            coli_serve_write_error(stdout,command.id,"bad submit header");
+        coli_serve_command_dispose(&command);return 0;
+    }
+    if(result!=COLI_SERVE_READ_OK)return 0;
+    if(command.kind==COLI_SERVE_COMMAND_STOP||command.kind==COLI_SERVE_COMMAND_CANCEL){
+        for(int i=0;i<n;i++)if(rq[i].active&&!strcmp(rq[i].q.id,command.id)){
+            if(command.kind==COLI_SERVE_COMMAND_STOP)rq[i].stop=1; else rq[i].cancel=1;
+        }
+        coli_serve_command_dispose(&command);return 0;
+    }
+    if(command.kind==COLI_SERVE_COMMAND_IMAGE)return q38_serve_take_image(stdout,&command);
+    if(command.kind!=COLI_SERVE_COMMAND_SUBMIT){coli_serve_command_dispose(&command);return 0;}
+    if(command.slot<0||command.slot>=n){
+        coli_serve_write_error(stdout,command.id,"invalid cache slot");
+        coli_serve_command_dispose(&command);return 0;
+    }
+    Q38MuxReq *r=&rq[command.slot];
+    if(r->active){
+        coli_serve_write_error(stdout,command.id,"cache slot busy");
+        coli_serve_command_dispose(&command);return 0;
+    }
+    memset(r,0,sizeof *r);
+    snprintf(r->q.id,sizeof(r->q.id),"%s",command.id);
+    r->q.slot=command.slot;
+    r->q.max_tok=command.max_tokens;r->q.temp=command.temperature;r->q.top_p=command.top_p;
+    r->q.payload=(char*)coli_serve_command_take_payload(&command);r->q.plen=(int)command.payload_bytes;
+    r->q.logprobs=command.logprobs;r->q.pin=command.pin;
+    coli_serve_command_dispose(&command);
+    q38_mux_bind(m,r->q.slot);
+    int ok=q38_serve_start(m,&r->q,&r->ids,&r->np,&r->lo,&r->clk);
+    free(r->q.payload);r->q.payload=NULL;
+    if(!ok)return 0;
+    q38_vision_detach(m);   /* the image's rows are the prompt's: no decode row reads them */
+    r->active=1;r->limited=1;
+    return 1;
+}
+
+static void serve_mux(Model *m){
+    int n=g_q38_mux_slots,V=m->c.vocab,input_eof=0;
+    Q38MuxReq *rq=(Q38MuxReq*)calloc((size_t)n,sizeof *rq);
+    Q38Row *rows=(Q38Row*)malloc((size_t)n*sizeof *rows);
+    int *tok=(int*)malloc((size_t)n*sizeof(int)),*who=(int*)malloc((size_t)n*sizeof(int));
+    if(!rq||!rows||!tok||!who){fprintf(stderr,"[serve] out of memory\n");exit(1);}
+    int eos_ids[4];int n_eos=serve_eos_ids(eos_ids,4,m->c.eos_id,V);
+    unsigned long long steps=0,nrows=0;
+    fprintf(stderr,"[qwen38] serving %d conversations at once (KV_SLOTS)\n",n);
+    for(;;){
+        int active=0;for(int i=0;i<n;i++)active+=rq[i].active;
+        /* idle: wait for a command; decoding: take one only when one is there */
+        if(!input_eof&&(!active||coli_stdin_readable())&&q38_mux_read(m,rq,n)<0)input_eof=1;
+        active=0;for(int i=0;i<n;i++)active+=rq[i].active;
+        if(!active){if(input_eof)break;continue;}
+        int S=0,ended=0;
+        for(int i=0;i<n;i++)if(rq[i].active){
+            int tk;
+            if(!q38_mux_pick(m,&rq[i],eos_ids,n_eos,&tk)){ended=1;continue;}
+            rows[S]=(Q38Row){&g_q38_mux_seq[i],rq[i].np+rq[i].gen-1};tok[S]=tk;who[S]=i;S++;
+        }
+        if(S){
+            /* every conversation parked: the rows read theirs from g_q38_mux_seq */
+            q38_mux_bind(m,-1);
+            float *lo=q38_forward_rows(m,rows,tok,S);
+            steps++;nrows+=(unsigned long long)S;
+            for(int s=0;s<S;s++){
+                Q38MuxReq *r=&rq[who[s]];
+                r->lo=falloc(V);memcpy(r->lo,lo+(int64_t)s*V,(size_t)V*sizeof(float));
+            }
+            free(lo);
+        }
+        if(ended){
+#ifdef COLI_VULKAN
+            q38_vk_report();
+            vkt_report("turn", m->hits, m->miss);
+#endif
+            serve_emap(m);
+        }
+    }
+    fprintf(stderr,"[qwen38] KV_SLOTS=%d: %llu decode steps, %llu rows (%.2f a step)\n",n,steps,nrows,
+            steps?(double)nrows/(double)steps:0.0);
+    free(rq);free(rows);free(tok);free(who);
+}
+
 static void serve_loop(Model *m){
     g_serve_model=m;
     coli_serve_binary_mode();
@@ -1960,6 +2181,9 @@ static void serve_loop(Model *m){
     if(!q38_serve_ensure_kv(m,max_ctx)){
         fprintf(stderr,"[serve] unable to allocate QSA state\n");return;
     }
+    if(g_q38_mux_slots>1&&!q38_mux_alloc(m)){
+        fprintf(stderr,"[serve] unable to allocate the state of %d conversations (KV_SLOTS)\n",g_q38_mux_slots);return;
+    }
     fputs("\x01\x01READY\x01\x01\n",stdout);
     /* between READY and STAT: the gateway reads it in the handshake, so it knows
      * the served modalities before the first request (docs/serve_protocol.md) */
@@ -1967,6 +2191,7 @@ static void serve_loop(Model *m){
     printf("STAT 0 0.00 0.0 %.2f\n",rss_gb());
     fflush(stdout);
     serve_emap(m);                       /* after READY and STAT: the boot reader discards what precedes them */
+    if(g_q38_mux_slots>1){serve_mux(m);q38_mux_free(m);return;}
     for(;;){
         ServeReq q={0}; int r;
         do r=serve_read_req(stdin,stdout,&q,NULL); while(r!=2&&r>=0);
@@ -2130,8 +2355,24 @@ int main(int argc, char **argv) {
 
     Model m; model_init(&m, snap, cap, bits);
     q38_expert_int4_attach(&m, snap);   /* <snap>/experts-int4g64/ when present (Q38_EXPERT_INT4) */
-    q38_mtp_attach(&m, cap);            /* Q38_MTP=1: the checkpoint's MTP head drafts (qwen38_core.h) */
+    if (serve_mode) {   /* KV_SLOTS: how many conversations the serve decodes at once */
+        const char *ks=getenv("KV_SLOTS");
+        if (ks && *ks) {
+            char *end=NULL; long v=strtol(ks,&end,10);
+            if (end==ks || *end || v<1 || v>16) { fprintf(stderr, "KV_SLOTS must be between 1 and 16\n"); return 2; }
+            g_q38_mux_slots=(int)v;
+        }
+    }
+    if (g_q38_mux_slots>1)
+        fprintf(stderr, "[qwen38] KV_SLOTS=%d: the MTP head stays unloaded and nothing drafts "
+                        "(speculation follows one conversation)\n", g_q38_mux_slots);
+    else q38_mtp_attach(&m, cap);       /* Q38_MTP=1: the checkpoint's MTP head drafts (qwen38_core.h) */
     q38_tier_start(&m, cap);   /* COLI_CUDA=1: hot experts stream to VRAM (qwen36_tier.c) */
+    if (g_q38_mux_slots>1 && m.dn_dev) {
+        m.dn_dev=0;
+        fprintf(stderr, "[qwen38] KV_SLOTS=%d: DeltaNet on the CPU (Q38_DN_GPU keeps one conversation's state on the card)\n",
+                g_q38_mux_slots);
+    }
     q38_trunk_cpu_int8(&m);    /* the trunk's int8 rows on the CPU, BF16 released (Q38_TRUNK_CPU_INT8=0 keeps BF16) */
     q38_expert_report(&m, cap);         /* expert format, bytes per expert, what the cache costs */
 #ifdef COLI_VULKAN
@@ -2145,6 +2386,11 @@ int main(int argc, char **argv) {
      * on an integrated GPU (docs/vulkan.md, "The dense chain") */
     if(g_vk_ready&&!qt_ready())
         g_vk_chain=coli_vk_chain_decide("qwen38",vkt_wanted()&&m.c.experts>0,COLI_VK_CHAIN_OFF);
+    if(g_vk_chain&&g_q38_mux_slots>1){
+        g_vk_chain=0;
+        fprintf(stderr,"[VK] qwen38: KV_SLOTS=%d: the dense chain is off (it keeps one conversation's state on the device); "
+                       "the expert tier runs every conversation's experts\n",g_q38_mux_slots);
+    }
     q38c_start(&m);      /* the layers that fit the device, before anything of the chain goes up (a partial chain placed now; qwen38_chain.h) */
     if(g_vk_chain&&!vkc_init())g_vk_chain=0;
     q38_dho_start(&m);   /* COLI_VK_DENSE_HOST: the trunk on the device only, before the tier sizes its budget */

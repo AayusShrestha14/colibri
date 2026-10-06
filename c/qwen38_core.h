@@ -160,6 +160,22 @@ typedef enum {
     Q38_EXPERT_BATCH_FALLBACK_LAYOUT,
 } Q38ExpertBatchFallback;
 
+/* One conversation's state for a multiplexed serve (KV_SLOTS>1, qwen38.c's
+ * serve_mux): everything a forward reads and writes that belongs to one token
+ * sequence. The Model holds the conversation being prefilled; the others wait
+ * here, and q38_seq_swap trades the two sets of pointers. A multiplexed decode
+ * step (q38_forward_rows) parks every conversation here and reads each row's
+ * from its Q38Row. */
+typedef struct Q38Seq {
+    float **K, **V, **IK, **DN_rec, **DN_conv;
+    int kv_len;
+    kv_prefix kvp;
+    int64_t *ple_history;
+    float *PLE_conv_state;
+    int ple_history_len;
+} Q38Seq;
+typedef struct { Q38Seq *seq; int pos; } Q38Row;
+
 typedef struct {
     Cfg c;
     shards S;
@@ -234,6 +250,10 @@ typedef struct {
     float **snap_rec[Q38_SPEC_SNAPS], **snap_conv[Q38_SPEC_SNAPS], *snap_ple[Q38_SPEC_SNAPS];
     int64_t snap_ple_history[Q38_SPEC_SNAPS][2];
     int snap_ple_history_len[Q38_SPEC_SNAPS];
+    /* A multiplexed decode step (q38_forward_rows): row s is the token at
+     * mux_rows[s].pos of mux_rows[s].seq, so the attention, DeltaNet and PLE
+     * read and write that conversation's state; NULL in every other forward. */
+    const Q38Row *mux_rows;
 #ifdef COLI_VULKAN
     void *vkchain;                 /* the dense chain's device state (qwen38_chain.h), NULL until it runs */
     void *vkchain2;                /* its layers on COLI_VK_DEV2's device, after the primary's (qwen38_chain.h) */
@@ -2072,9 +2092,14 @@ static void q38_ple_prefetch(Model *m,const int *ids,int S) {
 
     /* La finestra di due token viene SIMULATA, non mutata: q38_ple la aggiorna
      * per conto suo mentre gira, e toccarla qui la farebbe avanzare due volte. */
-    int64_t history[2]={m->ple_history[0],m->ple_history[1]};
-    int history_len=m->ple_history_len;
+    int64_t history[2]={0,0};
+    int history_len=0;
+    if(!m->mux_rows){history[0]=m->ple_history[0];history[1]=m->ple_history[1];history_len=m->ple_history_len;}
     for(int s=0;s<S;s++){
+        if(m->mux_rows){   /* a multiplexed step: every row is the next token of its own conversation */
+            const Q38Seq *q=m->mux_rows[s].seq;
+            history[0]=q->ple_history[0];history[1]=q->ple_history[1];history_len=q->ple_history_len;
+        }
         int64_t p1=history_len>=1?history[history_len-1]:c->eos_id;
         int64_t p2=history_len>=2?history[history_len-2]:c->eos_id;
         for(int h=0;h<c->ngram_heads;h++){
@@ -2120,8 +2145,10 @@ static void q38_ple(Model *m,const int *ids,int S,const float *hyper,float *out)
         int rows=S-base<B?S-base:B;
         for(int r=0;r<rows;r++){
             int s=base+r; float *emb=embs+(int64_t)r*E;
-            int64_t p1=m->ple_history_len>=1?m->ple_history[m->ple_history_len-1]:c->eos_id;
-            int64_t p2=m->ple_history_len>=2?m->ple_history[m->ple_history_len-2]:c->eos_id;
+            int64_t *hist=m->ple_history; int *hlen=&m->ple_history_len;
+            if(m->mux_rows){hist=m->mux_rows[s].seq->ple_history;hlen=&m->mux_rows[s].seq->ple_history_len;}
+            int64_t p1=*hlen>=1?hist[*hlen-1]:c->eos_id;
+            int64_t p2=*hlen>=2?hist[*hlen-2]:c->eos_id;
             if(m->ple_pref&&s<m->ple_pref_rows){
                 /* gia' in memoria: le ha portate q38_ple_prefetch mentre i primi
                  * layer calcolavano */
@@ -2131,10 +2158,10 @@ static void q38_ple(Model *m,const int *ids,int S,const float *hyper,float *out)
                 int ng=h<c->heads_per_ngram?2:3; int64_t row=q38_hash_row(m,h,ng,ids[s],p1,p2);
                 q38_ple_row(m,row,emb+(int64_t)h*c->ngram_head_dim);
             }
-            if(ids[s]==c->eos_id)m->ple_history_len=0;
-            else if(m->ple_history_len==0){m->ple_history[0]=ids[s];m->ple_history_len=1;}
-            else if(m->ple_history_len==1){m->ple_history[1]=ids[s];m->ple_history_len=2;}
-            else {m->ple_history[0]=m->ple_history[1];m->ple_history[1]=ids[s];}
+            if(ids[s]==c->eos_id)*hlen=0;
+            else if(*hlen==0){hist[0]=ids[s];*hlen=1;}
+            else if(*hlen==1){hist[1]=ids[s];*hlen=2;}
+            else {hist[0]=hist[1];hist[1]=ids[s];}
             if(s<m->snap_rows){   /* a verify: the history after this row (the ring below) */
                 memcpy(m->snap_ple_history[s],m->ple_history,sizeof(m->snap_ple_history[s]));
                 m->snap_ple_history_len[s]=m->ple_history_len;
@@ -2143,6 +2170,7 @@ static void q38_ple(Model *m,const int *ids,int S,const float *hyper,float *out)
         q38_dense_matmul(m,keysb,embs,&l->ple_key,rows,E,W);q38_dense_matmul(m,valueb,embs,&l->ple_value,rows,E,H);
         for(int r=0;r<rows;r++){
             int s=base+r; const float *keys=keysb+(int64_t)r*W,*value=valueb+(int64_t)r*H;
+            if(m->mux_rows) ring=m->mux_rows[s].seq->PLE_conv_state;
             for(int b=0;b<C;b++){
                 q38_rms0(kn+(int64_t)b*H,keys+(int64_t)b*H,l->ple_norm_key+(int64_t)b*H,H,c->eps);
                 q38_rms0(qn+(int64_t)b*H,hyper+(int64_t)s*W+(int64_t)b*H,l->ple_norm_query+(int64_t)b*H,H,c->eps);
@@ -2272,7 +2300,8 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
     float *conv=falloc(CD);
     float *q=falloc((int64_t)VH*KD),*k=falloc((int64_t)VH*KD);
     float *core=falloc(V);
-    float *rec=m->DN_rec[layer],*ring=m->DN_conv[layer];
+    /* a multiplexed step parks every conversation: each row's state below */
+    float *rec=m->DN_rec?m->DN_rec[layer]:NULL,*ring=m->DN_conv?m->DN_conv[layer]:NULL;
 
     /* Decode token with the layer on the card: the two gates on the CPU (b and
      * a, 48 outputs each), everything else -- in_proj qkv and z, conv,
@@ -2306,6 +2335,7 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
         q38_dense_matmul(m,aa,chunk,&l->dn_a,rows,H,VH);
 
         for(int s=0;s<rows;s++) {
+            if(m->mux_rows){rec=m->mux_rows[base+s].seq->DN_rec[layer];ring=m->mux_rows[base+s].seq->DN_conv[layer];}
             float *qkv_row=qkv+(int64_t)s*CD;
             float *z_row=z+(int64_t)s*V;
             float *b_row=bb+(int64_t)s*VH;
@@ -2399,15 +2429,18 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
      * (each s writes only its own row) and must be complete before the
      * ranking, which reads the whole IK[0..pos] prefix.  Guarded on S>1 so
      * decode keeps the serial path it has today. */
+    const Q38Row *mr=m->mux_rows;   /* a multiplexed step: each row's own conversation and position */
     #pragma omp parallel for schedule(static) if(S>1)
     for(int s=0;s<S;s++){
-        int pos=pos_base+s;
+        int pos=mr?mr[s].pos:pos_base+s;
+        float *Kl=mr?mr[s].seq->K[layer]:m->K[layer],*Vl=mr?mr[s].seq->V[layer]:m->V[layer];
+        float *IKl=mr?mr[s].seq->IK[layer]:m->IK[layer];
         for(int h=0;h<KVH;h++){
             float *kh=kp+(int64_t)s*KVH*D+(int64_t)h*D;q38_rms0(kh,kh,l->kn,D,c->eps);q38_rope(kh,D,c->rotary_dim,pos,theta);
-            memcpy(m->K[layer]+((int64_t)h*m->kv_cap+pos)*D,kh,(size_t)D*sizeof(float));
-            memcpy(m->V[layer]+((int64_t)h*m->kv_cap+pos)*D,vp+(int64_t)s*KVH*D+(int64_t)h*D,(size_t)D*sizeof(float));
+            memcpy(Kl+((int64_t)h*m->kv_cap+pos)*D,kh,(size_t)D*sizeof(float));
+            memcpy(Vl+((int64_t)h*m->kv_cap+pos)*D,vp+(int64_t)s*KVH*D+(int64_t)h*D,(size_t)D*sizeof(float));
         }
-        memcpy(m->IK[layer]+(int64_t)pos*ID,ip+(int64_t)s*(IQ+1)*ID+(int64_t)IQ*ID,(size_t)ID*sizeof(float));
+        memcpy(IKl+(int64_t)pos*ID,ip+(int64_t)s*(IQ+1)*ID+(int64_t)IQ*ID,(size_t)ID*sizeof(float));
     }
     float *heads=falloc((int64_t)S*QH*D);
     /* Ranking and attention are independent per position: no shared writes
@@ -2426,7 +2459,9 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
     double qsa_wall_started=now_s();
     #pragma omp parallel for schedule(dynamic,8) reduction(+:index_dt,attn_dt) if(S>1)
     for(int s=0;s<S;s++){
-        int pos=pos_base+s,visible=pos+1,blocks=visible/R,tail=blocks*R;
+        int pos=mr?mr[s].pos:pos_base+s,visible=pos+1,blocks=visible/R,tail=blocks*R;
+        const float *Kl=mr?mr[s].seq->K[layer]:m->K[layer],*Vl=mr?mr[s].seq->V[layer]:m->V[layer];
+        const float *IKl=mr?mr[s].seq->IK[layer]:m->IK[layer];
         double phase_started=now_s();
         float *qidx=falloc((int64_t)IQ*ID),*pool=falloc(ID);
         int *selected=(int*)malloc((size_t)maxsel*sizeof(int));
@@ -2436,7 +2471,7 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
         Q38Block *rank=blocks?(Q38Block*)malloc((size_t)blocks*sizeof(Q38Block)):NULL;
         if(blocks&&!rank){fprintf(stderr,"OOM QSA block ranking\n");exit(1);}
         for(int b=0;b<blocks;b++){
-            memset(pool,0,(size_t)ID*sizeof(float));for(int r=0;r<R;r++){const float *raw=m->IK[layer]+(int64_t)(b*R+r)*ID;for(int d=0;d<ID;d++)pool[d]+=raw[d]/R;}
+            memset(pool,0,(size_t)ID*sizeof(float));for(int r=0;r<R;r++){const float *raw=IKl+(int64_t)(b*R+r)*ID;for(int d=0;d<ID;d++)pool[d]+=raw[d]/R;}
             q38_rms0(pool,pool,l->idx_kn,ID,c->eps);q38_rope(pool,ID,c->rotary_dim,b*R,theta);
             float score=0.f;for(int h=0;h<IQ;h++){float a=0.f;for(int d=0;d<ID;d++)a+=qidx[(int64_t)h*ID+d]*pool[d];if(a>0.f)score+=a;}rank[b]=(Q38Block){score/sqrtf((float)ID),b};
         }
@@ -2448,10 +2483,10 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
             float *qraw=qp+(int64_t)s*QH*2*D+(int64_t)h*2*D;
             float *qh=falloc(D);memcpy(qh,qraw,(size_t)D*sizeof(float));q38_rms0(qh,qh,l->qn,D,c->eps);q38_rope(qh,D,c->rotary_dim,pos,theta);
             float *score=falloc(nsel);float mx=-INFINITY;
-            int khidx=h/(QH/KVH);for(int j=0;j<nsel;j++){const float *kh=m->K[layer]+((int64_t)khidx*m->kv_cap+selected[j])*D;float a=0.f;for(int d=0;d<D;d++)a+=qh[d]*kh[d];a/=sqrtf((float)D);score[j]=a;if(a>mx)mx=a;}
+            int khidx=h/(QH/KVH);for(int j=0;j<nsel;j++){const float *kh=Kl+((int64_t)khidx*m->kv_cap+selected[j])*D;float a=0.f;for(int d=0;d<D;d++)a+=qh[d]*kh[d];a/=sqrtf((float)D);score[j]=a;if(a>mx)mx=a;}
             float den=0.f;for(int j=0;j<nsel;j++){score[j]=expf(score[j]-mx);den+=score[j];}
             float *oh=heads+(int64_t)s*QH*D+(int64_t)h*D;memset(oh,0,(size_t)D*sizeof(float));
-            for(int j=0;j<nsel;j++){float a=score[j]/den;const float *vh=m->V[layer]+((int64_t)khidx*m->kv_cap+selected[j])*D;for(int d=0;d<D;d++)oh[d]+=a*vh[d];}
+            for(int j=0;j<nsel;j++){float a=score[j]/den;const float *vh=Vl+((int64_t)khidx*m->kv_cap+selected[j])*D;for(int d=0;d<D;d++)oh[d]+=a*vh[d];}
             for(int d=0;d<D;d++)oh[d]*=q38_sigmoid(qraw[D+d]);free(qh);free(score);
         }
         attn_dt+=now_s()-phase_started;
@@ -3364,6 +3399,101 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
     q38_tm_add(m,Q38_TM_LM_HEAD,phase_started);
     if(streams)*streams=hyper; else free(hyper);
     free(mixed);free(inject);free(block);return logit;
+}
+
+/* ---- several conversations at once (KV_SLOTS>1, qwen38.c's serve_mux) -------
+ * Each conversation owns a Q38Seq: its K, V and indexer rows, its DeltaNet state,
+ * its PLE history and ring, its record of the tokens its rows hold. The Model holds
+ * the conversation a prefill runs on (q38_seq_swap trades it for a parked one); a
+ * decode step parks them all and runs one forward over a row of each
+ * (q38_forward_rows). The MTP head stays unloaded and nothing drafts: speculation
+ * follows one sequence. */
+static void q38_seq_swap(Model *m,Q38Seq *q) {
+#define Q38_SEQ_SWAP(T,a,b) do{T t_=(a);(a)=(b);(b)=t_;}while(0)
+    Q38_SEQ_SWAP(float**,m->K,q->K); Q38_SEQ_SWAP(float**,m->V,q->V); Q38_SEQ_SWAP(float**,m->IK,q->IK);
+    Q38_SEQ_SWAP(float**,m->DN_rec,q->DN_rec); Q38_SEQ_SWAP(float**,m->DN_conv,q->DN_conv);
+    Q38_SEQ_SWAP(int,m->kv_len,q->kv_len); Q38_SEQ_SWAP(kv_prefix,m->kvp,q->kvp);
+    Q38_SEQ_SWAP(int64_t*,m->ple_history,q->ple_history);
+    Q38_SEQ_SWAP(float*,m->PLE_conv_state,q->PLE_conv_state);
+    Q38_SEQ_SWAP(int,m->ple_history_len,q->ple_history_len);
+#undef Q38_SEQ_SWAP
+}
+
+/* A conversation's state of its own, the shape the Model's has (q38_alloc_state,
+ * ensure_kv): 0 when out of memory, with what was allocated freed. */
+static void q38_seq_free(Model *m,Q38Seq *q);
+static int q38_seq_alloc(Model *m,Q38Seq *q) {
+    Cfg *c=&m->c; memset(q,0,sizeof *q);
+    q->K=(float**)calloc((size_t)c->layers+1,sizeof(float*)); q->V=(float**)calloc((size_t)c->layers+1,sizeof(float*));
+    q->IK=(float**)calloc((size_t)c->layers+1,sizeof(float*));
+    q->DN_rec=(float**)calloc((size_t)c->layers,sizeof(float*)); q->DN_conv=(float**)calloc((size_t)c->layers,sizeof(float*));
+    int ok=q->K&&q->V&&q->IK&&q->DN_rec&&q->DN_conv&&kv_prefix_alloc(&q->kvp,m->kv_cap);
+    for(int i=0;ok&&i<c->layers;i++){
+        if(c->is_attn[i]){
+            size_t kv=(size_t)c->kv_heads*m->kv_cap*c->head_dim;
+            q->K[i]=(float*)malloc(kv*sizeof(float)); q->V[i]=(float*)malloc(kv*sizeof(float));
+            q->IK[i]=(float*)malloc((size_t)m->kv_cap*c->idx_dim*sizeof(float));
+            ok=q->K[i]&&q->V[i]&&q->IK[i];
+        } else if(i>=m->range_begin&&i<m->range_end){
+            q->DN_rec[i]=(float*)calloc((size_t)c->dn_vheads*c->dn_kdim*c->dn_vdim,sizeof(float));
+            q->DN_conv[i]=(float*)calloc((size_t)c->dn_conv_dim*(c->dn_convk-1),sizeof(float));
+            ok=q->DN_rec[i]&&q->DN_conv[i];
+        }
+    }
+    if(ok&&c->ple_layer>=m->range_begin&&c->ple_layer<m->range_end){
+        q->ple_history=(int64_t*)calloc(2,sizeof(int64_t));
+        q->PLE_conv_state=(float*)calloc((size_t)c->hc_width*(c->ple_convk-1)*c->ngram_size,sizeof(float));
+        ok=q->ple_history&&q->PLE_conv_state;
+    }
+    if(!ok){q38_seq_free(m,q);return 0;}
+    return 1;
+}
+static void q38_seq_free(Model *m,Q38Seq *q) {
+    for(int i=0;i<m->c.layers;i++){
+        if(q->K)free(q->K[i]); if(q->V)free(q->V[i]); if(q->IK)free(q->IK[i]);
+        if(q->DN_rec)free(q->DN_rec[i]); if(q->DN_conv)free(q->DN_conv[i]);
+    }
+    free(q->K);free(q->V);free(q->IK);free(q->DN_rec);free(q->DN_conv);
+    kv_prefix_free(&q->kvp); free(q->ple_history); free(q->PLE_conv_state);
+    memset(q,0,sizeof *q);
+}
+
+/* One decode step of several conversations: row s is the token ids[s] at
+ * rows[s].pos of the conversation rows[s].seq, every conversation parked. The
+ * dense matrices, the routed experts, the residual reads and lm_head run once
+ * over the S rows; the attention, DeltaNet and PLE read and write each row's own
+ * conversation (m->mux_rows). The CPU kernels give a row the same bits whatever S
+ * is (as a verify's rows, below), so each conversation gets the logits it would
+ * alone. Decode rows are never an image's. S rows of logits come back. */
+static float *q38_forward_rows(Model *m,const Q38Row *rows,const int *ids,int S) {
+    Cfg *c=&m->c;int H=c->hidden,W=c->hc_width,C=c->hc_count;
+    m->timers.forwards++;
+    m->mux_rows=rows;
+    float *hyper=falloc((int64_t)S*W);
+    q38_ple_prefetch(m,ids,S);
+    for(int s=0;s<S;s++){
+        if(ids[s]<0||ids[s]>=c->vocab){fprintf(stderr,"token id %d outside vocabulary\n",ids[s]);exit(1);}
+        float *e=hyper+(int64_t)s*W;
+        q38_weight_row(&m->embed,ids[s],e);
+        for(int b=1;b<C;b++)memcpy(e+(int64_t)b*H,e,(size_t)H*sizeof(float));
+    }
+    float *mixed=falloc((int64_t)S*H),*inject=falloc((int64_t)S*C),*block=falloc((int64_t)S*H);
+    for(int i=0;i<c->layers;i++)
+        q38_layer_forward(m,i,hyper,ids,S,0,mixed,inject,block);
+    q38_gr_read(m,&m->final_gr,hyper,S,mixed,NULL);
+    m->mux_rows=NULL;
+    for(int s=0;s<S;s++){
+        Q38Seq *q=rows[s].seq;
+        q->kv_len=rows[s].pos+1;
+        if(q->kvp.len>rows[s].pos)q->kvp.len=rows[s].pos;
+        kv_prefix_record(&q->kvp,ids+s,rows[s].pos,1);
+    }
+    float *logit=falloc((int64_t)S*c->vocab);
+    double phase_started=now_s();
+    q38_weight_matmul(logit,mixed,&m->lm_head,S,H,c->vocab);
+    q38_tm_add(m,Q38_TM_LM_HEAD,phase_started);
+    free(hyper);free(mixed);free(inject);free(block);
+    return logit;
 }
 
 /* ---- the MTP head (Q38_MTP=1) ---------------------------------------------
