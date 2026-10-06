@@ -344,6 +344,11 @@ static void *xmalloc(size_t bytes, const char *what) {
     if (!p) { fprintf(stderr, "OOM allocating %s (%zu bytes)\n", what, bytes); exit(1); }
     return p;
 }
+static void *xcalloc(size_t count, size_t size, const char *what) {
+    void *p = calloc(count ? count : 1, size ? size : 1);
+    if (!p) { fprintf(stderr, "OOM allocating %s (%zu x %zu bytes)\n", what, count, size); exit(1); }
+    return p;
+}
 
 #ifdef COLI_VULKAN
 /* ---- dense weights on the device only (COLI_VK_DENSE_HOST) -------------------------
@@ -1176,6 +1181,21 @@ typedef struct {
      * (see kv_prefix.h). */
     kv_prefix kvp;
 } Model;
+
+/* One conversation's state for a multiplexed serve (KV_SLOTS>1, serve_mux below):
+ * the per-layer arrays it owns and the cross-layer state attention_run reads from the
+ * Model (v41_seq_swap trades the two sets). */
+typedef struct {
+    float **window, **ckv, **ikey, **cstate_kv, **cstate_score;
+    int **window_pos;
+    int pos;
+    kv_prefix kvp;
+    int32_t *history; int history_len, history_cap;
+    const float *published_index_k; int published_index_layer;
+    int *shared_topk; int shared_topk_rows, shared_topk_width;
+    uint8_t *candidates; int candidate_width, candidate_rows;
+} V41Seq;
+static int g_v41_mux_slots = 1;   /* KV_SLOTS: the conversations a serve decodes at once */
 
 /* ------------------------------------------------------------ rope --------- */
 
@@ -3291,6 +3311,10 @@ static int argmax(const float *values, int n);
 static void spec_load(Model *m, int ecap) {
     Cfg *c = &m->c;
     Spec *sp = &m->spec;
+    if (g_v41_mux_slots > 1) {   /* speculation follows one conversation */
+        fprintf(stderr, "[v41] KV_SLOTS=%d: DSpark stays unloaded, nothing drafts\n", g_v41_mux_slots);
+        return;
+    }
     /* 60%, and what it buys is not what I expected. The three cold runs:
      *
      *     drafts off                 24 forwards   116.6 s
@@ -3912,6 +3936,178 @@ static int argmax(const float *values, int n) {
 
 /* ---------------------------------------------------------------- serve ---- */
 
+/* ---- several conversations at once (KV_SLOTS>1, serve_mux) -------------------
+ * Each conversation owns a V41Seq: every layer's window ring and its positions, its
+ * compressed KV, index keys and partial compressor group, the engram history, what
+ * an index source last published (its keys and the shared top-k), the candidate
+ * mask, where it stands and the record of the tokens it holds. v41_mux_bind trades
+ * the Model's set for a parked one. A decode step runs one forward over a row of each
+ * conversation (forward_rows): the hyper-connection mixes, the routed experts and the
+ * head once over all rows, the attention and the engram row by row, each with its
+ * own conversation bound (attention_run reads the cross-layer state from the Model,
+ * so it is bound whole: pointers, not copies). Nothing drafts. */
+static V41Seq *g_v41_mux_seq;   /* [slots]: the conversations the Model does not hold */
+static int g_v41_mux_cur;       /* the slot the Model holds, -1 when every one is parked */
+
+static void v41_seq_swap(Model *m, V41Seq *q) {
+#define V41_SWAP(T,a,b) do { T t_ = (a); (a) = (b); (b) = t_; } while (0)
+    for (int i = 0; i < m->c.n_layers; i++) {
+        Layer *l = &m->L[i];
+        V41_SWAP(float *, l->window, q->window[i]); V41_SWAP(int *, l->window_pos, q->window_pos[i]);
+        V41_SWAP(float *, l->ckv, q->ckv[i]); V41_SWAP(float *, l->ikey, q->ikey[i]);
+        V41_SWAP(float *, l->cstate_kv, q->cstate_kv[i]); V41_SWAP(float *, l->cstate_score, q->cstate_score[i]);
+    }
+    V41_SWAP(int, m->pos, q->pos); V41_SWAP(kv_prefix, m->kvp, q->kvp);
+    V41_SWAP(int32_t *, m->engram.history, q->history);
+    V41_SWAP(int, m->engram.history_len, q->history_len); V41_SWAP(int, m->engram.history_cap, q->history_cap);
+    V41_SWAP(const float *, m->published_index_k, q->published_index_k);
+    V41_SWAP(int, m->published_index_layer, q->published_index_layer);
+    V41_SWAP(int *, m->shared_topk, q->shared_topk);
+    V41_SWAP(int, m->shared_topk_rows, q->shared_topk_rows); V41_SWAP(int, m->shared_topk_width, q->shared_topk_width);
+    V41_SWAP(uint8_t *, m->candidates, q->candidates);
+    V41_SWAP(int, m->candidate_width, q->candidate_width); V41_SWAP(int, m->candidate_rows, q->candidate_rows);
+#undef V41_SWAP
+}
+static void v41_mux_bind(Model *m, int slot) {
+    if (g_v41_mux_cur == slot) return;
+    if (g_v41_mux_cur >= 0) v41_seq_swap(m, &g_v41_mux_seq[g_v41_mux_cur]);
+    if (slot >= 0) v41_seq_swap(m, &g_v41_mux_seq[slot]);
+    g_v41_mux_cur = slot;
+}
+/* A conversation's state of its own, as model_load gives the Model's and model_reset
+ * clears it; slot 0's place holds only the pointer arrays. */
+static void v41_seq_alloc(Model *m, V41Seq *q, int with_state) {
+    Cfg *c = &m->c; int hd = c->head_dim;
+    memset(q, 0, sizeof *q);
+    q->window = xcalloc((size_t)c->n_layers, sizeof(float *), "seq windows");
+    q->window_pos = xcalloc((size_t)c->n_layers, sizeof(int *), "seq window positions");
+    q->ckv = xcalloc((size_t)c->n_layers, sizeof(float *), "seq compressed kv");
+    q->ikey = xcalloc((size_t)c->n_layers, sizeof(float *), "seq index keys");
+    q->cstate_kv = xcalloc((size_t)c->n_layers, sizeof(float *), "seq compressor groups");
+    q->cstate_score = xcalloc((size_t)c->n_layers, sizeof(float *), "seq compressor scores");
+    q->published_index_layer = m->published_index_layer;
+    if (!with_state) return;
+    kv_prefix_alloc(&q->kvp, c->max_positions);
+    for (int i = 0; i < c->n_layers; i++) {
+        q->window[i] = xcalloc((size_t)c->window * hd, sizeof(float), "window ring");
+        q->window_pos[i] = xmalloc((size_t)c->window * sizeof(int), "window positions");
+        for (int k = 0; k < c->window; k++) q->window_pos[i][k] = -1;
+        int ratio = c->compress_ratio[i];
+        if (c->kv_source[i]) {
+            if (ratio > 1) {
+                q->cstate_kv[i] = xcalloc((size_t)ratio * hd, sizeof(float), "compressor group");
+                q->cstate_score[i] = xmalloc((size_t)ratio * hd * sizeof(float), "compressor scores");
+                for (int k = 0; k < ratio * hd; k++) q->cstate_score[i][k] = -INFINITY;
+            }
+            int slots = c->max_positions / (ratio > 0 ? ratio : 1);
+            q->ckv[i] = xcalloc((size_t)slots * hd, sizeof(float), "compressed kv");
+            q->ikey[i] = xcalloc((size_t)slots * c->index_head_dim, sizeof(float), "index keys");
+        }
+    }
+}
+
+/* One decode step of several conversations: row t is the token ids[t] of the
+ * conversation in slot slots[t], at its next position. The streams, their mixes,
+ * the routed experts and the head run once over the n rows; the engram and the
+ * attention run row by row with that row's conversation bound. The CPU kernels give
+ * a row the same bits whatever n is, so each conversation gets the logits it would
+ * alone: [n, V] into logits. */
+static void forward_rows(Model *m, const int *slots, const int *ids, int n, float *logits) {
+    Cfg *c = &m->c;
+    int dim = c->dim, hc = c->hc_mult;
+    int *pos = xmalloc((size_t)n * sizeof(int), "row positions");
+    for (int t = 0; t < n; t++) {
+        v41_mux_bind(m, slots[t]);
+        pos[t] = m->pos;
+        if (pos[t] + 1 > c->max_positions) { fprintf(stderr, "CONTEXT_EXCEEDED %d %d\n", pos[t] + 1, c->max_positions); exit(1); }
+        if (m->engram.active) engram_push(&m->engram, ids + t, 1, NULL);
+    }
+    m->rollback_save = 0; m->pub_rows = 0;
+    float *h = xmalloc((size_t)n * hc * dim * sizeof(float), "residual streams");
+    for (int t = 0; t < n; t++) {
+        const uint16_t *row = m->embed.w + (size_t)ids[t] * dim;
+        for (int i = 0; i < dim; i++) h[(size_t)t * hc * dim + i] = bf16_to_f32(row[i]);
+        for (int copy = 1; copy < hc; copy++)
+            memcpy(h + ((size_t)t * hc + copy) * dim, h + (size_t)t * hc * dim, (size_t)dim * sizeof(float));
+    }
+    float *pre_mix = xmalloc((size_t)n * hc * sizeof(float), "pre mix");
+    for (int t = 0; t < n; t++)
+        for (int copy = 0; copy < hc; copy++) pre_mix[(size_t)t * hc + copy] = copy == 0 ? 1.0f : 0.0f;
+    float *branch_in = xmalloc((size_t)n * dim * sizeof(float), "sublayer input");
+    float *branch_out = xmalloc((size_t)n * dim * sizeof(float), "sublayer output");
+    float *residual = xmalloc((size_t)n * hc * dim * sizeof(float), "residual copy");
+    float *pre = xmalloc((size_t)n * hc * sizeof(float), "hc pre");
+    float *post = xmalloc((size_t)n * hc * sizeof(float), "hc post");
+    float *comb = xmalloc((size_t)n * hc * hc * sizeof(float), "hc comb");
+    float *collapsed = xmalloc((size_t)dim * sizeof(float), "collapsed stream");
+    for (int layer = 0; layer < c->n_layers; layer++) {
+        Layer *l = &m->L[layer];
+        if (l->engram_index >= 0)
+            for (int t = 0; t < n; t++) { v41_mux_bind(m, slots[t]); engram_run(m, layer, h + (size_t)t * hc * dim, 1, pos[t]); }
+        memcpy(residual, h, (size_t)n * hc * dim * sizeof(float));
+        for (int t = 0; t < n; t++) {
+            hc_mixes(m, l->hc_attn_fn.w, l->hc_attn_scale.w, l->hc_attn_base.w,
+                     h + (size_t)t * hc * dim, pre + (size_t)t * hc,
+                     post + (size_t)t * hc, comb + (size_t)t * hc * hc);
+            const float *mix = pre_mix + (size_t)t * hc;
+            for (int i = 0; i < dim; i++) {
+                float sum = 0.0f;
+                for (int copy = 0; copy < hc; copy++) sum += mix[copy] * h[((size_t)t * hc + copy) * dim + i];
+                collapsed[i] = sum;
+            }
+            rms_into(branch_in + (size_t)t * dim, collapsed, l->attn_norm.w, dim, c->norm_eps);
+        }
+        for (int t = 0; t < n; t++) {
+            v41_mux_bind(m, slots[t]);
+            attention_run(m, layer, branch_in + (size_t)t * dim, 1, pos[t], branch_out + (size_t)t * dim);
+        }
+        for (int t = 0; t < n; t++)
+            coli_hc_post(h + (size_t)t * hc * dim, branch_out + (size_t)t * dim,
+                         residual + (size_t)t * hc * dim, post + (size_t)t * hc,
+                         comb + (size_t)t * hc * hc, hc, dim);
+        memcpy(pre_mix, pre, (size_t)n * hc * sizeof(float));
+        memcpy(residual, h, (size_t)n * hc * dim * sizeof(float));
+        for (int t = 0; t < n; t++) {
+            hc_mixes(m, l->hc_ffn_fn.w, l->hc_ffn_scale.w, l->hc_ffn_base.w,
+                     h + (size_t)t * hc * dim, pre + (size_t)t * hc,
+                     post + (size_t)t * hc, comb + (size_t)t * hc * hc);
+            const float *mix = pre_mix + (size_t)t * hc;
+            for (int i = 0; i < dim; i++) {
+                float sum = 0.0f;
+                for (int copy = 0; copy < hc; copy++) sum += mix[copy] * h[((size_t)t * hc + copy) * dim + i];
+                collapsed[i] = sum;
+            }
+            rms_into(branch_in + (size_t)t * dim, collapsed, l->ffn_norm.w, dim, c->norm_eps);
+        }
+        moe_run(m, layer, branch_in, n, branch_out);
+        for (int t = 0; t < n; t++)
+            coli_hc_post(h + (size_t)t * hc * dim, branch_out + (size_t)t * dim,
+                         residual + (size_t)t * hc * dim, post + (size_t)t * hc,
+                         comb + (size_t)t * hc * hc, hc, dim);
+        memcpy(pre_mix, pre, (size_t)n * hc * sizeof(float));
+    }
+    for (int t = 0; t < n; t++) {
+        const float *mix = pre_mix + (size_t)t * hc;
+        for (int i = 0; i < dim; i++) {
+            float sum = 0.0f;
+            for (int copy = 0; copy < hc; copy++) sum += mix[copy] * h[((size_t)t * hc + copy) * dim + i];
+            collapsed[i] = sum;
+        }
+        rms_into(branch_in, collapsed, m->norm.w, dim, c->norm_eps);
+        mvb(logits + (size_t)t * c->vocab, &m->head, branch_in);
+    }
+    for (int t = 0; t < n; t++) {
+        v41_mux_bind(m, slots[t]);
+        kv_prefix_record(&m->kvp, ids + t, pos[t], 1);
+        m->pos = pos[t] + 1;
+        m->last_start = pos[t]; m->last_rows = 1;
+    }
+    m->forwards++;
+    free(pos); free(collapsed); free(comb); free(post); free(pre);
+    free(residual); free(branch_out); free(branch_in); free(pre_mix); free(h);
+}
+
+
 /* Every turn starts from a clean state: the window rings, the compressed caches, the
  * compressor's partial group and the engram history all describe one sequence. Prefix
  * reuse across turns is a later step (the KV here is four caches and a ring, not one
@@ -4220,7 +4416,313 @@ static int serve_budget(int prompt, int requested, int context, int logprobs) {
     return budget < room ? budget : room;
 }
 
+/* When a request was accepted, and the counters then: DONE, PROF and the turn's
+ * stderr report its share. */
+typedef struct {
+    double turn_started, disk0, expert0, attn0, engram0;
+    uint64_t forwards0, hits0, miss0, ebytes0;
+    uint64_t mir_bytes0[V41_MIR_REPS], mir_reads0[V41_MIR_REPS];
+    int n_prompt, budget;
+} V41Req;
+
+/* A request's prompt into the state the Model holds: its tokens and image, the budget,
+ * the prefix reuse and the photos, ACCEPT, the prefill and its read-out. 1 with the
+ * logits after the prompt; 0 when the request ended here, its ERROR written and its
+ * command disposed. serve_loop and serve_mux start every request here. */
+static int v41_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int *ids, float *logits,
+                           float **pending_image, int *pending_h, int *pending_w, V41Req *rq) {
+    Cfg *c = &m->c;
+    double turn_started = now_s();
+    double disk0 = m->t_disk, expert0 = m->t_expert, attn0 = m->t_attn, engram0 = m->t_engram;
+    uint64_t forwards0 = m->forwards, hits0 = m->hits, miss0 = m->miss;
+    uint64_t ebytes0 = m->expert_bytes;
+    uint64_t mir_bytes0[V41_MIR_REPS], mir_reads0[V41_MIR_REPS];
+    for (int r = 0; r < V41_MIR_REPS; r++) {
+        mir_bytes0[r] = g_mir_bytes[r];
+        mir_reads0[r] = g_mir_nread[r];
+    }
+    int n_prompt = tok_encode(tokenizer, (const char *)cmd->payload,
+                              (int)cmd->payload_bytes, ids, c->max_positions + 1);
+    int budget = serve_budget(n_prompt, cmd->max_tokens, c->max_positions,
+                              cmd->logprobs);
+    if (budget < 0) {
+        char message[128];
+        snprintf(message, sizeof(message),
+                 "CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d",
+                 n_prompt, cmd->max_tokens, c->max_positions);
+        coli_serve_write_error(stdout, cmd->id,
+                               n_prompt < 1 ? "EMPTY_PROMPT" : message);
+        coli_serve_command_dispose(cmd); return 0;
+    }
+    if (cmd->max_tokens > budget)
+        fprintf(stderr, "[serve] max_tokens %d clamped to %d (context %d - prompt %d); "
+                        "raise CTX for longer answers\n",
+                cmd->max_tokens, budget, c->max_positions, n_prompt);
+    /* Decided BEFORE the reset, because the reset is what it decides about.
+     * A chat client resends the whole transcript every turn; if this prompt
+     * begins with the ids the state was built from, that state already IS
+     * the state at those positions, so only the tail is fed. Reuse is all or
+     * nothing -- nothing here can rewind four caches and a ring. An image
+     * refuses it outright: the placeholder ids describe the span but not the
+     * picture, and the span's offsets are computed against the whole prompt.
+     * COLI_KV_PREFIX=0 disables it, COLI_PREFIX_LOG=1 reports the decision. */
+    int reuse = 0;
+    if (n_prompt >= 1 && kv_prefix_on() && !(*pending_image))
+        reuse = kv_prefix_reuse(&m->kvp, ids, n_prompt);
+    /* La fotografia si prova sempre: copre anche il caso in cui lo stato
+     * vivo e gia il prompt, dove senza di essa il primo token fresco
+     * resterebbe senza predittore e quindi senza logprob. */
+    g_pin_use_logit = 0; g_pin_logit = NULL;
+    if (n_prompt >= 1 && !(*pending_image)) {
+        /* Il piu profondo degli scatti valido: con due livelli annidati
+         * (istruzioni, istruzioni+domanda) vince il secondo, e se le sue
+         * righe non ci sono piu si ripiega sul primo. */
+        int ps = coli_pin_best(&g_pins, ids, n_prompt);
+        while (ps >= 0) {
+            ColiPin *k = &g_pins.slot[ps];
+            if (kv_prefix_holds(&m->kvp, k->ids, k->len)) {
+                kv_prefix_clear(&m->kvp);
+                kv_prefix_record(&m->kvp, k->ids, 0, k->len);
+                reuse = k->len;
+                g_pin_logit = k->logit; g_pin_use_logit = k->logit != NULL;
+                coli_pin_touch(&g_pins, ps);
+                break;
+            }
+            k->len = 0;
+            ps = coli_pin_best(&g_pins, ids, n_prompt);
+        }
+    }
+    if (getenv("COLI_PREFIX_LOG")) {
+        if (reuse)
+            fprintf(stderr, "[PREFIX] reusing %d of %d prompt tokens (%.0f%%)\n",
+                    reuse, n_prompt, 100.0 * reuse / n_prompt);
+        else
+            fprintf(stderr, "[PREFIX] no reuse: held=%d cap=%d prompt=%d%s%s%s\n",
+                    m->kvp.len, m->kvp.cap, n_prompt,
+                    m->kvp.tainted ? " tainted" : "",
+                    (*pending_image) ? " (image)" : "",
+                    kv_prefix_on() ? "" : " (off: set COLI_KV_PREFIX=1)");
+        fflush(stderr);
+    }
+    if (!reuse) model_reset(m);
+    coli_serve_write_accept(stdout, cmd->id, n_prompt);
+    float *aligned = NULL;
+    uint8_t *image_mask = NULL;
+    int image_at = -1, image_h = 0, image_w = 0;
+    if ((*pending_image) && m->vision && c->image_token_id >= 0) {
+        /* the span is the run of placeholder ids the gateway inserted */
+        for (int t = 0; t < n_prompt; t++)
+            if (ids[t] == c->image_token_id) { image_at = t; break; }
+        int ratio = c->vision_ratio;
+        image_h = ((*pending_h) + ratio - 1) / ratio;
+        image_w = ((*pending_w) + ratio - 1) / ratio;
+        int span = 1 + (image_w + 1) * image_h + 1;
+        int run = 0;
+        for (int t = image_at; t >= 0 && t < n_prompt && ids[t] == c->image_token_id; t++) run++;
+        if (image_at < 0 || run != span) {
+            fprintf(stderr, "[v41] image span is %d tokens, the %dx%d grid needs %d: "
+                            "answering without the image\n", run, image_h, image_w, span);
+            image_at = -1;
+        } else {
+            int rows = vision_tokens(c, (*pending_h), (*pending_w));
+            aligned = xmalloc((size_t)rows * c->dim * sizeof(float), "image rows");
+            double vision_started = now_s();
+            vision_forward(m, m->vision, (*pending_image), (*pending_h), (*pending_w), aligned);
+            fprintf(stderr, "[v41] image %dx%d patches -> %d rows in %.2fs\n",
+                    (*pending_h), (*pending_w), rows, now_s() - vision_started);
+            image_mask = xmalloc((size_t)n_prompt, "image mask");
+            memset(image_mask, 0, (size_t)n_prompt);
+            for (int t = image_at; t < image_at + span; t++) image_mask[t] = 1;
+        }
+    }
+    free((*pending_image)); (*pending_image) = NULL;
+    /* `reuse` is the ABSOLUTE position of the first fresh token: every cache
+     * here is position-indexed, so this has to be the real offset. */
+    int nfresh = n_prompt - reuse;
+    float *all = NULL;
+    int echoed = 0;   /* il prefill l'ha gia fatto il ramo della lettura */
+    if (cmd->logprobs > 0 && nfresh > 0 && !(*pending_image)) {
+        all = (float *)malloc((size_t)nfresh * (size_t)c->vocab * sizeof(float));
+        if (all) {
+            /* un prefill normale (spec_batch=0) che tiene tutte le righe */
+            forward_full(m, ids + reuse, nfresh, all, 0, NULL, -1, 0, 0, NULL, 1);
+            /* La posizione p predice il token p+1; il primo token fresco e
+             * predetto dalla fotografia. Cosi ogni token dell'opzione ha il
+             * suo logprob, anche se non e fra i primi k di nessuna classifica. */
+            if (g_pin_use_logit && g_pin_logit)
+                v41_echo(cmd->id, reuse, ids[reuse], g_pin_logit, c->vocab,
+                         cmd->logprobs, tokenizer);
+            for (int p = 0; p + 1 < nfresh; p++)
+                v41_echo(cmd->id, reuse + p + 1, ids[reuse + p + 1],
+                         all + (size_t)p * c->vocab, c->vocab, cmd->logprobs, tokenizer);
+            memcpy(logits, all + (size_t)(nfresh - 1) * c->vocab,
+                   (size_t)c->vocab * sizeof(float));
+            free(all);
+            echoed = 1;
+        }
+    }
+    if (!echoed)
+    forward_with_image(m, ids + reuse, n_prompt - reuse, logits, aligned,
+                       image_at, image_h, image_w, image_mask);
+    free(aligned); free(image_mask);
+    if (cmd->pin) {
+        coli_pin_pool_init(&g_pins, c->vocab);
+        if (coli_pin_store(&g_pins, ids, n_prompt, logits)) {
+            fprintf(stderr, "[PIN] scatto a %d token\n", n_prompt);
+            fflush(stderr);
+        }
+    }
+    rq->turn_started = turn_started; rq->disk0 = disk0; rq->expert0 = expert0; rq->attn0 = attn0;
+    rq->engram0 = engram0; rq->forwards0 = forwards0; rq->hits0 = hits0; rq->miss0 = miss0;
+    rq->ebytes0 = ebytes0; rq->n_prompt = n_prompt; rq->budget = budget;
+    memcpy(rq->mir_bytes0, mir_bytes0, sizeof mir_bytes0); memcpy(rq->mir_reads0, mir_reads0, sizeof mir_reads0);
+    return 1;
+}
+
+/* ---- several conversations at once (KV_SLOTS>1) ---------------------------------
+ * The gateway's cache slots, each a conversation with a state of its own (V41Seq). A
+ * SUBMIT on a free slot starts its request at once through v41_serve_start, on that
+ * slot's state: its prefix reuse and photos work as a lone serve's. Then every step
+ * picks the next token of each active request and runs one forward over a row of each
+ * (forward_rows). A request's frames are a lone request's; they interleave by id. As
+ * alone, STOP ends a request with DONE and CANCEL with ERROR CANCELLED. */
+typedef struct {
+    char id[COLI_SERVE_ID_CAP];
+    float temperature, top_p;
+    int logprobs, active, stop, cancel, limited, emitted;
+    float *logits;                /* the logits the next pick reads */
+    V41Req rq;
+} V41MuxReq;
+
+static void v41_mux_finish(Model *m, V41MuxReq *r) {
+    r->active = 0;
+    if (r->cancel) { coli_serve_write_error(stdout, r->id, "CANCELLED"); return; }
+    if (r->stop) r->limited = 0;
+    double wall = now_s() - r->rq.turn_started;
+    uint64_t turn_hits = m->hits - r->rq.hits0, turn_miss = m->miss - r->rq.miss0;
+    ColiServeDone done = {
+        r->emitted, wall > 0 ? r->emitted / wall : 0.0,
+        (turn_hits + turn_miss) ? 100.0 * turn_hits / (double)(turn_hits + turn_miss) : 0.0,
+        rss_gb(), r->rq.n_prompt, r->limited,
+    };
+    coli_serve_write_done(stdout, r->id, &done);
+    serve_line("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %llu\n", wall, r->rq.n_prompt, r->emitted,
+               m->t_disk - r->rq.disk0, 0.0, m->t_expert - r->rq.expert0, m->t_attn - r->rq.attn0,
+               m->t_engram - r->rq.engram0, (unsigned long long)(m->forwards - r->rq.forwards0));
+    serve_hits(m);
+}
+
+/* The next token of an active request, as serve_loop picks and sends it: 1 with the
+ * token when the request goes on, 0 when it ended. */
+static int v41_mux_pick(Model *m, Tok *tokenizer, V41MuxReq *r, const int *eos_ids, int n_eos, int *tk_out) {
+    Cfg *c = &m->c;
+    if (r->cancel || r->stop || r->emitted >= r->rq.budget) { v41_mux_finish(m, r); return 0; }
+    int token = serve_sample(r->logits, c->vocab, r->temperature, r->top_p);
+    for (int i = 0; i < n_eos; i++) if (token == eos_ids[i]) { r->limited = 0; v41_mux_finish(m, r); return 0; }
+    char piece[512];
+    int written = tok_decode(tokenizer, &token, 1, piece, (int)sizeof(piece));
+    if (written > 0) {
+        if (r->logprobs > 0) {
+            char lp[1024];
+            coli_logprob_tail(lp, sizeof lp, r->logits, c->vocab, token, r->logprobs);
+            coli_serve_write_data_lp(stdout, r->id, piece, (size_t)written, lp);
+        } else coli_serve_write_data(stdout, r->id, piece, (size_t)written);
+    }
+    r->emitted++;
+    if (r->emitted >= r->rq.budget) { v41_mux_finish(m, r); return 0; }
+    *tk_out = token; return 1;
+}
+
+static void serve_mux(Model *m, Tok *tokenizer, const char *snap) {
+    Cfg *c = &m->c;
+    int n = g_v41_mux_slots, V = c->vocab, input_eof = 0;
+    int eos_ids[8];
+    int n_eos = serve_eos(m, snap, eos_ids, 8);
+    coli_serve_write_ready_caps(stdout, rss_gb(), m->vision ? "vision=1" : "vision=0");
+    serve_emap(m);
+    V41MuxReq *rq = xcalloc((size_t)n, sizeof *rq, "requests");
+    int *slots = xmalloc((size_t)n * sizeof(int), "rows"), *tok = xmalloc((size_t)n * sizeof(int), "tokens");
+    float *lo = xmalloc((size_t)n * V * sizeof(float), "step logits");
+    int *ids = xmalloc(((size_t)c->max_positions + 1) * sizeof(int), "prompt ids");
+    for (int i = 0; i < n; i++) rq[i].logits = xmalloc((size_t)V * sizeof(float), "logits");
+    float *pending_image = NULL;
+    int pending_h = 0, pending_w = 0;
+    unsigned long long steps = 0, nrows = 0;
+    fprintf(stderr, "[v41] serving %d conversations at once (KV_SLOTS)\n", n);
+    for (;;) {
+        int active = 0; for (int i = 0; i < n; i++) active += rq[i].active;
+        /* idle: wait for a command; decoding: take one only when one is there */
+        if (!input_eof && (!active || coli_serve_stdin_ready())) {
+            ColiServeCommand command;
+            ColiServeReadResult result = coli_serve_read_command(stdin, &v41_wire, &command);
+            if (result == COLI_SERVE_READ_EOF || result == COLI_SERVE_READ_BAD_FRAME) input_eof = 1;
+            else if (result == COLI_SERVE_READ_NOMEM) { coli_serve_write_error(stdout, command.id, "out of memory"); input_eof = 1; }
+            else if (result == COLI_SERVE_READ_BAD_REQUEST) {
+                if (command.kind == COLI_SERVE_COMMAND_SUBMIT) coli_serve_write_error(stdout, command.id, "bad submit header");
+                coli_serve_command_dispose(&command);
+            } else if (command.kind == COLI_SERVE_COMMAND_IMAGE) {
+                int patch_in = 3 * c->vision_patch * c->vision_patch;
+                uint64_t expected = (uint64_t)command.grid_h * command.grid_w * patch_in * sizeof(float);
+                if (!m->vision) coli_serve_write_error(stdout, command.id, "this container has no vision tower");
+                else if (command.grid_h < 1 || command.grid_w < 1 || command.payload_bytes != expected)
+                    coli_serve_write_error(stdout, command.id, "IMAGE payload does not match its grid");
+                else {
+                    if (pending_image) fprintf(stderr, "[v41] a second IMAGE replaced the first\n");
+                    free(pending_image);
+                    pending_image = (float *)coli_serve_command_take_payload(&command);
+                    pending_h = command.grid_h; pending_w = command.grid_w;
+                }
+                coli_serve_command_dispose(&command);
+            } else if (command.kind == COLI_SERVE_COMMAND_CANCEL || command.kind == COLI_SERVE_COMMAND_STOP) {
+                int found = 0;
+                for (int i = 0; i < n; i++) if (rq[i].active && !strcmp(rq[i].id, command.id)) {
+                    found = 1;
+                    if (command.kind == COLI_SERVE_COMMAND_STOP) rq[i].stop = 1; else rq[i].cancel = 1;
+                }
+                if (!found && command.kind == COLI_SERVE_COMMAND_CANCEL) coli_serve_write_error(stdout, command.id, "NOT_FOUND");
+                coli_serve_command_dispose(&command);
+            } else if (command.kind != COLI_SERVE_COMMAND_SUBMIT) {
+                coli_serve_command_dispose(&command);
+            } else if (command.slot < 0 || command.slot >= n || rq[command.slot].active) {
+                coli_serve_write_error(stdout, command.id, command.slot < 0 || command.slot >= n ? "invalid cache slot" : "SLOT_BUSY");
+                coli_serve_command_dispose(&command);
+            } else {
+                V41MuxReq *t = &rq[command.slot];
+                float *keep = t->logits;
+                memset(t, 0, sizeof *t); t->logits = keep;
+                snprintf(t->id, sizeof t->id, "%s", command.id);
+                t->temperature = command.temperature; t->top_p = command.top_p; t->logprobs = command.logprobs;
+                v41_mux_bind(m, command.slot);
+                if (v41_serve_start(m, tokenizer, &command, ids, t->logits, &pending_image, &pending_h, &pending_w, &t->rq)) {
+                    t->active = 1; t->limited = 1;
+                    coli_serve_command_dispose(&command);
+                }
+            }
+        }
+        active = 0; for (int i = 0; i < n; i++) active += rq[i].active;
+        if (!active) { if (input_eof) break; continue; }
+        int S = 0, ended = 0;
+        for (int i = 0; i < n; i++) if (rq[i].active) {
+            int tk;
+            if (!v41_mux_pick(m, tokenizer, &rq[i], eos_ids, n_eos, &tk)) { ended = 1; continue; }
+            slots[S] = i; tok[S] = tk; S++;
+        }
+        if (S) {
+            forward_rows(m, slots, tok, S, lo);
+            steps++; nrows += (unsigned long long)S;
+            for (int s = 0; s < S; s++) memcpy(rq[slots[s]].logits, lo + (size_t)s * V, (size_t)V * sizeof(float));
+        }
+        if (ended) serve_emap(m);
+    }
+    fprintf(stderr, "[v41] KV_SLOTS=%d: %llu decode steps, %llu rows (%.2f a step)\n", n, steps, nrows,
+            steps ? (double)nrows / (double)steps : 0.0);
+    v41_mux_bind(m, 0);
+    for (int i = 0; i < n; i++) free(rq[i].logits);
+    free(rq); free(slots); free(tok); free(lo); free(ids); free(pending_image);
+}
+
 static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
+    if (g_v41_mux_slots > 1) { serve_mux(m, tokenizer, snap); return; }
     Cfg *c = &m->c;
     coli_serve_stdio_init();
     int eos_ids[8];
@@ -4279,146 +4781,15 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
             coli_serve_command_dispose(&command);
             continue;
         }
-        double turn_started = now_s();
-        double disk0 = m->t_disk, expert0 = m->t_expert, attn0 = m->t_attn, engram0 = m->t_engram;
-        uint64_t forwards0 = m->forwards, hits0 = m->hits, miss0 = m->miss;
-        uint64_t ebytes0 = m->expert_bytes;
+        V41Req rq;
+        if (!v41_serve_start(m, tokenizer, &command, ids, logits, &pending_image, &pending_h, &pending_w, &rq)) continue;
+        double turn_started = rq.turn_started;
+        double disk0 = rq.disk0, expert0 = rq.expert0, attn0 = rq.attn0, engram0 = rq.engram0;
+        uint64_t forwards0 = rq.forwards0, hits0 = rq.hits0, miss0 = rq.miss0;
+        uint64_t ebytes0 = rq.ebytes0;
         uint64_t mir_bytes0[V41_MIR_REPS], mir_reads0[V41_MIR_REPS];
-        for (int r = 0; r < V41_MIR_REPS; r++) {
-            mir_bytes0[r] = g_mir_bytes[r];
-            mir_reads0[r] = g_mir_nread[r];
-        }
-        int n_prompt = tok_encode(tokenizer, (const char *)command.payload,
-                                  (int)command.payload_bytes, ids, c->max_positions + 1);
-        int budget = serve_budget(n_prompt, command.max_tokens, c->max_positions,
-                                  command.logprobs);
-        if (budget < 0) {
-            char message[128];
-            snprintf(message, sizeof(message),
-                     "CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d",
-                     n_prompt, command.max_tokens, c->max_positions);
-            coli_serve_write_error(stdout, command.id,
-                                   n_prompt < 1 ? "EMPTY_PROMPT" : message);
-            coli_serve_command_dispose(&command); continue;
-        }
-        if (command.max_tokens > budget)
-            fprintf(stderr, "[serve] max_tokens %d clamped to %d (context %d - prompt %d); "
-                            "raise CTX for longer answers\n",
-                    command.max_tokens, budget, c->max_positions, n_prompt);
-        /* Decided BEFORE the reset, because the reset is what it decides about.
-         * A chat client resends the whole transcript every turn; if this prompt
-         * begins with the ids the state was built from, that state already IS
-         * the state at those positions, so only the tail is fed. Reuse is all or
-         * nothing -- nothing here can rewind four caches and a ring. An image
-         * refuses it outright: the placeholder ids describe the span but not the
-         * picture, and the span's offsets are computed against the whole prompt.
-         * COLI_KV_PREFIX=0 disables it, COLI_PREFIX_LOG=1 reports the decision. */
-        int reuse = 0;
-        if (n_prompt >= 1 && kv_prefix_on() && !pending_image)
-            reuse = kv_prefix_reuse(&m->kvp, ids, n_prompt);
-        /* La fotografia si prova sempre: copre anche il caso in cui lo stato
-         * vivo e gia il prompt, dove senza di essa il primo token fresco
-         * resterebbe senza predittore e quindi senza logprob. */
-        g_pin_use_logit = 0; g_pin_logit = NULL;
-        if (n_prompt >= 1 && !pending_image) {
-            /* Il piu profondo degli scatti valido: con due livelli annidati
-             * (istruzioni, istruzioni+domanda) vince il secondo, e se le sue
-             * righe non ci sono piu si ripiega sul primo. */
-            int ps = coli_pin_best(&g_pins, ids, n_prompt);
-            while (ps >= 0) {
-                ColiPin *k = &g_pins.slot[ps];
-                if (kv_prefix_holds(&m->kvp, k->ids, k->len)) {
-                    kv_prefix_clear(&m->kvp);
-                    kv_prefix_record(&m->kvp, k->ids, 0, k->len);
-                    reuse = k->len;
-                    g_pin_logit = k->logit; g_pin_use_logit = k->logit != NULL;
-                    coli_pin_touch(&g_pins, ps);
-                    break;
-                }
-                k->len = 0;
-                ps = coli_pin_best(&g_pins, ids, n_prompt);
-            }
-        }
-        if (getenv("COLI_PREFIX_LOG")) {
-            if (reuse)
-                fprintf(stderr, "[PREFIX] reusing %d of %d prompt tokens (%.0f%%)\n",
-                        reuse, n_prompt, 100.0 * reuse / n_prompt);
-            else
-                fprintf(stderr, "[PREFIX] no reuse: held=%d cap=%d prompt=%d%s%s%s\n",
-                        m->kvp.len, m->kvp.cap, n_prompt,
-                        m->kvp.tainted ? " tainted" : "",
-                        pending_image ? " (image)" : "",
-                        kv_prefix_on() ? "" : " (off: set COLI_KV_PREFIX=1)");
-            fflush(stderr);
-        }
-        if (!reuse) model_reset(m);
-        coli_serve_write_accept(stdout, command.id, n_prompt);
-        float *aligned = NULL;
-        uint8_t *image_mask = NULL;
-        int image_at = -1, image_h = 0, image_w = 0;
-        if (pending_image && m->vision && c->image_token_id >= 0) {
-            /* the span is the run of placeholder ids the gateway inserted */
-            for (int t = 0; t < n_prompt; t++)
-                if (ids[t] == c->image_token_id) { image_at = t; break; }
-            int ratio = c->vision_ratio;
-            image_h = (pending_h + ratio - 1) / ratio;
-            image_w = (pending_w + ratio - 1) / ratio;
-            int span = 1 + (image_w + 1) * image_h + 1;
-            int run = 0;
-            for (int t = image_at; t >= 0 && t < n_prompt && ids[t] == c->image_token_id; t++) run++;
-            if (image_at < 0 || run != span) {
-                fprintf(stderr, "[v41] image span is %d tokens, the %dx%d grid needs %d: "
-                                "answering without the image\n", run, image_h, image_w, span);
-                image_at = -1;
-            } else {
-                int rows = vision_tokens(c, pending_h, pending_w);
-                aligned = xmalloc((size_t)rows * c->dim * sizeof(float), "image rows");
-                double vision_started = now_s();
-                vision_forward(m, m->vision, pending_image, pending_h, pending_w, aligned);
-                fprintf(stderr, "[v41] image %dx%d patches -> %d rows in %.2fs\n",
-                        pending_h, pending_w, rows, now_s() - vision_started);
-                image_mask = xmalloc((size_t)n_prompt, "image mask");
-                memset(image_mask, 0, (size_t)n_prompt);
-                for (int t = image_at; t < image_at + span; t++) image_mask[t] = 1;
-            }
-        }
-        free(pending_image); pending_image = NULL;
-        /* `reuse` is the ABSOLUTE position of the first fresh token: every cache
-         * here is position-indexed, so this has to be the real offset. */
-        int nfresh = n_prompt - reuse;
-        float *all = NULL;
-        int echoed = 0;   /* il prefill l'ha gia fatto il ramo della lettura */
-        if (command.logprobs > 0 && nfresh > 0 && !pending_image) {
-            all = (float *)malloc((size_t)nfresh * (size_t)c->vocab * sizeof(float));
-            if (all) {
-                /* un prefill normale (spec_batch=0) che tiene tutte le righe */
-                forward_full(m, ids + reuse, nfresh, all, 0, NULL, -1, 0, 0, NULL, 1);
-                /* La posizione p predice il token p+1; il primo token fresco e
-                 * predetto dalla fotografia. Cosi ogni token dell'opzione ha il
-                 * suo logprob, anche se non e fra i primi k di nessuna classifica. */
-                if (g_pin_use_logit && g_pin_logit)
-                    v41_echo(command.id, reuse, ids[reuse], g_pin_logit, c->vocab,
-                             command.logprobs, tokenizer);
-                for (int p = 0; p + 1 < nfresh; p++)
-                    v41_echo(command.id, reuse + p + 1, ids[reuse + p + 1],
-                             all + (size_t)p * c->vocab, c->vocab, command.logprobs, tokenizer);
-                memcpy(logits, all + (size_t)(nfresh - 1) * c->vocab,
-                       (size_t)c->vocab * sizeof(float));
-                free(all);
-                echoed = 1;
-            }
-        }
-        if (!echoed)
-        forward_with_image(m, ids + reuse, n_prompt - reuse, logits, aligned,
-                           image_at, image_h, image_w, image_mask);
-        free(aligned); free(image_mask);
-        if (command.pin) {
-            coli_pin_pool_init(&g_pins, c->vocab);
-            if (coli_pin_store(&g_pins, ids, n_prompt, logits)) {
-                fprintf(stderr, "[PIN] scatto a %d token\n", n_prompt);
-                fflush(stderr);
-            }
-        }
+        memcpy(mir_bytes0, rq.mir_bytes0, sizeof mir_bytes0); memcpy(mir_reads0, rq.mir_reads0, sizeof mir_reads0);
+        int n_prompt = rq.n_prompt, budget = rq.budget;
         uint64_t prefill_bytes = m->expert_bytes - ebytes0;
         double prefill_disk = m->t_disk - disk0;
         double prefill_expert = m->t_expert - expert0, prefill_wall = now_s() - turn_started;
@@ -4712,6 +5083,14 @@ int main(int argc, char **argv) {
     coli_omp_tune_threads("deepseek-v41");
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "SNAP=<container dir> is required\n"); return 2; }
+    if (getenv("SERVE") && atoi(getenv("SERVE"))) {   /* KV_SLOTS: the conversations decoded at once */
+        const char *ks = getenv("KV_SLOTS");
+        if (ks && *ks) {
+            char *end = NULL; long v = strtol(ks, &end, 10);
+            if (end == ks || *end || v < 1 || v > 16) { fprintf(stderr, "KV_SLOTS must be between 1 and 16\n"); return 2; }
+            g_v41_mux_slots = (int)v;
+        }
+    }
     int cap = argc > 1 ? coli_arg_int(argv[1], "cache/layer") : 8;
     const char *ref_path = argc > 2 ? argv[2] : NULL;
     int engram_rows = getenv("V41_ENGRAM_ROWS") ? atoi(getenv("V41_ENGRAM_ROWS")) : 65536;
@@ -4755,6 +5134,11 @@ int main(int argc, char **argv) {
         snprintf(path, sizeof(path), "%s/tokenizer.json", snap);
         Tok tokenizer;
         tok_load(&tokenizer, path);
+        if (g_v41_mux_slots > 1) {   /* slot 0 is the Model's own state */
+            g_v41_mux_seq = xcalloc((size_t)g_v41_mux_slots, sizeof *g_v41_mux_seq, "conversations");
+            for (int i = 0; i < g_v41_mux_slots; i++) v41_seq_alloc(&m, &g_v41_mux_seq[i], i > 0);
+            g_v41_mux_cur = 0;
+        }
         const char *seed = getenv("SEED");
         srand(seed ? (unsigned)strtoul(seed, NULL, 10) : (unsigned)time(NULL));
         serve_loop(&m, &tokenizer, snap);

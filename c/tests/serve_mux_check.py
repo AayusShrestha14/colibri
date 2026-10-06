@@ -14,7 +14,7 @@ bits in a batch of any size), and the engine's report must show decode steps of 
 than one row.
 
 usage: serve_mux_check.py <engine> <snapshot> <slots> [KEY=VALUE ...]   (extra environment)
-MUX_TOL: compare logprobs within this bound instead of byte for byte (an engine whose
+MUX_LONG=k: prompts k times longer. MUX_TOL: compare logprobs within this bound instead of byte for byte (an engine whose
 batched kernels sum in another order). MUX_IDS=numeric: request ids 1, 2, ... instead of
 r0, r1, ...; MUX_GBYTES=1: the grammar-bytes field (0) before the options (colibri).
 """
@@ -28,7 +28,9 @@ READY = b"\x01\x01READY\x01\x01"
 
 
 def waves(n):
-    base = bytes(range(65, 65 + 23))
+    # MUX_LONG=k: the prompts k times longer (an engine whose state changes shape past
+    # a few dozen positions: compression groups, index top-k, windows that wrap)
+    base = bytes(range(65, 65 + 23)) * int(os.environ.get("MUX_LONG", "1"))
     one = [(base[:7 + 3 * i] + bytes([97 + i]) * (i + 1), 4 + 2 * (i % 3), "logprobs=2" if i % 2 else "")
            for i in range(n)]
     two = []
