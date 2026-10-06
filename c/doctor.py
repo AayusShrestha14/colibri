@@ -10,8 +10,8 @@ from pathlib import Path
 
 from family_registry import (FamilyConfigError, PlannerUnsupportedError, UnknownFamilyError,
                              public_metadata, resolve_model)
-from resource_plan import (GB, SSD_PROBE_PENDING, build_plan, discover_gpus, format_plan,
-                           memory_available)
+from resource_plan import (GB, SSD_PROBE_PENDING, CgroupError, build_plan, discover_gpus,
+                           format_plan, memory_available)
 
 SAFETENSORS_MAX_HEADER = 512 << 20
 MODEL_INDEX_MAX_BYTES = SAFETENSORS_MAX_HEADER
@@ -550,6 +550,25 @@ def missing_shared_libraries(engine_path):
                    for line in result.stdout.splitlines() if "not found" in line})
 
 
+def _decision_head_check(model, resolved):
+    """A decision head beside a chat model's shards (Clef): its config must read
+    and fit the backbone, or the engine refuses to start."""
+    from family_registry import decision_head_of
+    head = decision_head_of(resolved)
+    try:
+        config = json.loads((Path(model) / head.files[0]).read_text(encoding="utf-8"))
+        hidden = config.get("hidden_size")
+    except (OSError, ValueError, AttributeError) as error:
+        return _check("model.decision_head", "fail", f"{head.files[0]} is unreadable: {error}")
+    want = resolved.family_config.get("hidden_size")
+    if hidden != want:
+        return _check("model.decision_head", "fail",
+                      f"{head.display_name} head reads hidden size {hidden}, the backbone has {want}")
+    return _check("model.decision_head", "pass",
+                  f"{head.display_name} decision head: POST /v1/systemone answers natively",
+                  head=head.id, hidden_size=hidden)
+
+
 def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
                engine_path, available_memory=None, available_disk=None, gpus=None,
                linkage=None, deep=False, mirror_dir=None, kv_slots=1,
@@ -582,6 +601,8 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
                                  family_id=resolved.descriptor.id,
                                  model_type=resolved.model_type,
                                  descriptor=public_metadata(resolved.descriptor)))
+            if resolved.decision_head:
+                checks.append(_decision_head_check(model, resolved))
         except (FamilyConfigError, UnknownFamilyError) as error:
             checks.append(_check("model.family", "fail", str(error)))
     else:
@@ -622,7 +643,6 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
     else:
         checks.append(_check("engine.binary", "fail", "engine is not built", path=str(engine)))
 
-    available_memory = memory_available() if available_memory is None else available_memory
     detected_gpus = discover_gpus() if gpus is None else list(gpus)
     linkage = cuda_linkage(engine) if linkage is None else linkage
     selected_gpus = detected_gpus
@@ -662,6 +682,9 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         plan = build_plan(model, ram_gb, context, plan_gpu_indices, plan_vram_gb,
                           available_memory=available_memory, available_disk=available_disk,
                           gpus=plan_gpus, kv_slots=kv_slots)
+        # build_plan() owns the single memory probe -- min(host MemAvailable,
+        # finite cgroup headroom); 0 means nothing could measure it (T15).
+        available_memory = plan["memory"]["available_bytes"]
         model_info = plan["model"]
         checks.append(_check("model.shards", "pass", "safetensors headers are valid",
                              shards=model_info["shards"], model_bytes=model_info["model_bytes"]))
@@ -712,6 +735,15 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         checks.append(_check("placement.plan", "skip", str(error)))
         checks.append(_check("storage.ssd_probe", "skip",
                              "probe surfacing requires a family planner"))
+    except CgroupError as error:
+        # A present but malformed, incomplete or unreadable cgroup/procfs input
+        # is a refusal with a reason, not "could not be measured" (T15 A1).
+        checks.append(_check("model.shards", "skip", "shard summary requires an admissible memory budget"))
+        checks.append(_check("storage.disk", "skip", "storage check requires an admissible memory budget"))
+        checks.append(_check("memory.ram", "fail", str(error)))
+        checks.append(_check("placement.plan", "skip", "placement requires an admissible memory budget"))
+        checks.append(_check("storage.ssd_probe", "skip",
+                             "probe surfacing requires an admissible memory budget"))
     except (OSError, ValueError, KeyError, TypeError) as error:
         checks.append(_check("model.shards", "fail", str(error)))
         checks.append(_check("storage.disk", "skip", "storage check requires a valid model"))
@@ -763,6 +795,133 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
             "mode": "deep" if deep else "standard", "checks": checks, "plan": plan}
 
 
+def run_image_doctor(model, engine_path, available_memory=None):
+    """doctor for a text-to-image pipeline: the checks that apply to it.
+
+    There is no config.json, no expert cache and no KV state to place, so the
+    text checks would report failures that are not failures. What can be wrong
+    here is a missing component, a missing tokenizer, an engine that is not
+    built, or weights that do not fit in RAM even with the text encoder loaded
+    on demand."""
+    from image_engine import COMPONENTS, TOKENIZER_FILE, plan_image_model
+    model = Path(model).expanduser().resolve()
+    checks = []
+    readable = model.is_dir() and os.access(model, os.R_OK)
+    checks.append(_check("model.path", "pass" if readable else "fail",
+                         "model directory is readable" if readable else
+                         "model directory is missing or not readable", path=str(model)))
+    try:
+        resolved = resolve_model(model)
+        checks.append(_check("model.family", "pass",
+                             f"{resolved.descriptor.display_name} pipeline is registered",
+                             family_id=resolved.descriptor.id, model_type=resolved.model_type,
+                             descriptor=public_metadata(resolved.descriptor)))
+    except (FamilyConfigError, UnknownFamilyError) as error:
+        checks.append(_check("model.family", "fail", str(error)))
+    missing = [name for name in COMPONENTS if not (model / name).is_dir()]
+    checks.append(_check("model.components", "fail" if missing else "pass",
+                         "missing: " + ", ".join(f"{name}/" for name in missing) if missing
+                         else "text_encoder, transformer, vae, processor and scheduler present"))
+    tokenizer = model / TOKENIZER_FILE
+    checks.append(_check("model.tokenizer", "pass" if tokenizer.is_file() else "fail",
+                         f"{TOKENIZER_FILE} found" if tokenizer.is_file()
+                         else f"{TOKENIZER_FILE} is missing"))
+    engine = Path(engine_path)
+    engine_ok = engine.is_file() and (sys.platform == "win32" or os.access(engine, os.X_OK))
+    checks.append(_check("engine.binary", "pass" if engine_ok else "fail",
+                         "engine executable is ready" if engine_ok else "engine is not built",
+                         path=str(engine)))
+    available_memory = memory_available() if available_memory is None else available_memory
+    plan = None
+    try:
+        plan = plan_image_model(model, available_memory or None)
+        on_demand = plan["modes"]["text_encoder_on_demand"]
+        resident = plan["modes"]["resident"]
+        if not available_memory:
+            status, summary = "warn", "available RAM could not be measured"
+        elif resident.get("fits"):
+            status, summary = "pass", "all weights fit in RAM together"
+        elif on_demand.get("fits"):
+            status, summary = ("warn", "weights fit only with the text encoder loaded on demand")
+        else:
+            status, summary = "fail", "the weights do not fit in the available RAM"
+        checks.append(_check("memory.ram", status, summary, available_bytes=available_memory,
+                             resident_bytes=resident["peak_bytes"],
+                             on_demand_peak_bytes=on_demand["peak_bytes"]))
+        for warning in plan["warnings"]:
+            checks.append(_check("model.weights", "warn", warning))
+    except (OSError, ValueError, KeyError) as error:
+        checks.append(_check("model.weights", "fail", str(error)))
+    statuses = {item["status"] for item in checks}
+    status = "error" if "fail" in statuses else "warning" if "warn" in statuses else "ok"
+    # The image plan has its own shape; it rides in `image_plan` so a consumer
+    # of `plan` (the text placement report) never meets a document it cannot read.
+    return {"schema_version": 1, "status": status, "model": str(model), "mode": "standard",
+            "checks": checks, "plan": None, "image_plan": plan}
+
+
+def run_decision_doctor(model, engine_path, available_memory=None):
+    """doctor for a decision model (Laya, GLiNER2.5-Decide): no experts and no
+    KV state. What can be wrong is a missing file of the checkpoint, an engine
+    that is not built, or weights that do not fit in RAM as f32."""
+    import json
+    import struct
+    model = Path(model).expanduser().resolve()
+    checks = []
+    readable = model.is_dir() and os.access(model, os.R_OK)
+    checks.append(_check("model.path", "pass" if readable else "fail",
+                         "model directory is readable" if readable else
+                         "model directory is missing or not readable", path=str(model)))
+    try:
+        resolved = resolve_model(model)
+        checks.append(_check("model.family", "pass",
+                             f"{resolved.descriptor.display_name} decision model is registered",
+                             family_id=resolved.descriptor.id, model_type=resolved.model_type,
+                             descriptor=public_metadata(resolved.descriptor)))
+        files = (resolved.descriptor.tokenizer_file,) + resolved.descriptor.checkpoint_files
+    except (FamilyConfigError, UnknownFamilyError) as error:
+        checks.append(_check("model.family", "fail", str(error)))
+        files = ()
+    for name in files:
+        present = (model / name).is_file()
+        checks.append(_check("model.files", "pass" if present else "fail",
+                             f"{name} found" if present else f"{name} is missing"))
+    engine = Path(engine_path)
+    engine_ok = engine.is_file() and (sys.platform == "win32" or os.access(engine, os.X_OK))
+    checks.append(_check("engine.binary", "pass" if engine_ok else "fail",
+                         "engine executable is ready" if engine_ok else "engine is not built",
+                         path=str(engine)))
+    try:
+        with open(model / "model.safetensors", "rb") as handle:
+            size = struct.unpack("<Q", handle.read(8))[0]
+            if size > 64 << 20:
+                raise ValueError("model.safetensors: implausible header size")
+            header = json.loads(handle.read(size))
+        params = 0
+        for name, entry in header.items():
+            if name != "__metadata__" and isinstance(entry, dict):
+                count = 1
+                for dim in entry.get("shape", []):
+                    count *= int(dim)
+                params += count
+        needed = params * 4
+        available_memory = memory_available() if available_memory is None else available_memory
+        if not available_memory:
+            status, summary = "warn", "available RAM could not be measured"
+        elif needed < available_memory:
+            status, summary = "pass", f"{needed / 1e9:.1f} GB of f32 weights fit in RAM"
+        else:
+            status, summary = "fail", f"{needed / 1e9:.1f} GB of f32 weights do not fit in RAM"
+        checks.append(_check("memory.ram", status, summary, available_bytes=available_memory,
+                             weight_bytes=needed, params=params))
+    except (OSError, ValueError, struct.error) as error:
+        checks.append(_check("model.weights", "fail", f"model.safetensors: {error}"))
+    statuses = {item["status"] for item in checks}
+    status = "error" if "fail" in statuses else "warning" if "warn" in statuses else "ok"
+    return {"schema_version": 1, "status": status, "model": str(model), "mode": "standard",
+            "checks": checks, "plan": None}
+
+
 def format_doctor(report):
     icons = {"pass": "ok", "warn": "warn", "fail": "fail", "skip": "skip"}
     # model is null in the JSON when none was given (#724); say that rather than "None"
@@ -771,6 +930,9 @@ def format_doctor(report):
         lines.append(f"[{icons[check['status']]:>4}] {check['id']:<18} {check['summary']}")
     if report["plan"]:
         lines.extend(["", format_plan(report["plan"])])
+    elif report.get("image_plan"):
+        from image_engine import format_image_plan
+        lines.extend(["", format_image_plan(report["image_plan"])])
     lines.extend(["", f"result {report['status']}"])
     return "\n".join(lines)
 
