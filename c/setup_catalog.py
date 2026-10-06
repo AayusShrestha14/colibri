@@ -76,7 +76,7 @@ CATALOG = (
         # docs/qwen36.md: 6.5 GB resident at 32 experts/layer, 15.2 GB with all 128.
         ram_min_gb=8, ram_good_gb=18, dense_gb=3.6, rank=2, size_class="small",
         summary="coding model with tool calls, no thinking; int4-gs64 container",
-        prebuilt_since="1.12.2", doc="docs/qwen36.md#qwen3-coder-30b-a3b"),
+        prebuilt_since="2.0.0", doc="docs/qwen36.md#qwen3-coder-30b-a3b"),
     CatalogModel(
         id="deepseek-v4-flash-reap", family="deepseek_v4", name="DeepSeek V4 Flash REAP 150B",
         repo="puwaer/DeepSeek-V4-Flash-0731-reap-150b", disk_gb=84.7,
@@ -104,7 +104,7 @@ CATALOG = (
         # The engine never loads these three (docs/mimo.md, measured on Pro,
         # the same engine and layout).
         exclude=("dflash/*", "audio_tokenizer/*", "model_mtp.safetensors"),
-        prebuilt_since="1.12.2", doc="docs/mimo.md"),
+        prebuilt_since="2.0.0", doc="docs/mimo.md"),
     CatalogModel(
         id="glm-5.2", family="glm", name="GLM-5.2",
         repo="mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp", disk_gb=429.3,
@@ -123,7 +123,7 @@ CATALOG = (
         ram_min_gb=54, ram_good_gb=64, dense_gb=32.4, rank=9, size_class="large",
         summary="1.02T with vision and tools, official checkpoint",
         exclude=("dflash/*", "audio_tokenizer/*", "model_mtp.safetensors"),
-        prebuilt_since="1.12.2", doc="docs/mimo.md#pro"),
+        prebuilt_since="2.0.0", doc="docs/mimo.md#pro"),
     CatalogModel(
         id="inkling", family="inkling", name="Inkling",
         repo="nbeerbower/Inkling-colibri-int4", disk_gb=514.1,
@@ -148,7 +148,7 @@ CATALOG = (
         ram_min_gb=12, ram_good_gb=18, dense_gb=8.5, rank=1, size_class="small",
         modality="image", summary="text to image (pictures, not chat)",
         license_note="Qwen Research License: non-commercial use only",
-        prebuilt_since="1.12.2", doc="docs/qwen-image.md"),
+        prebuilt_since="2.0.0", doc="docs/qwen-image.md"),
 )
 
 
