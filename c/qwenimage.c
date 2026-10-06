@@ -123,9 +123,38 @@ static st_tensor *need_tensor(shards *S, const char *name, int64_t n0, int64_t n
     return t;
 }
 
+/* How many layers load at once (COLI_IMG_LOAD_THREADS, default 4): each thread holds
+ * one matrix's bf16 bytes while it quantizes them (up to ~140 MB for the text encoder's
+ * MLP), so the count bounds the load's transient memory as well as its speed. */
+static int qi_load_threads(void){
+    static int n = 0;
+    if (!n) {
+        const char *e = getenv("COLI_IMG_LOAD_THREADS");
+        n = e && atoi(e) > 0 ? atoi(e) : 4;
+#ifdef _OPENMP
+        if (n > omp_get_max_threads()) n = omp_get_max_threads();
+#endif
+        if (n < 1) n = 1;
+    }
+    return n;
+}
+
 /* bits: 8 = int8 rows, 16 = bf16, 32 = f32. Small matrices ask for 32. */
 static void lin_load(shards *S, const char *name, int N, int K, int bits, Lin *out){
-    need_tensor(S, name, N, K);
+    st_tensor *t = need_tensor(S, name, N, K);
+    if (bits == 8 && t->dtype == 0 && t->nbytes == (int64_t)N * K * 2) {
+        /* bf16 rows straight to int8 rows: the same values as through an f32 copy */
+        uint16_t *raw = xmalloc((size_t)N * K * 2);
+        st_read_raw_cap(S, name, raw, (int64_t)N * K * 2, 1);
+        memset(out, 0, sizeof *out);
+        out->m.N = N; out->m.K = K;
+        int8_t *q = xmalloc((size_t)N * K);
+        float *sc = fmalloc(N);
+        qi_quantize_i8_bf16(raw, N, K, q, sc);
+        free(raw);
+        out->m.fmt = QI_I8; out->m.w = out->own = q; out->m.sc = out->own_sc = sc;
+        return;
+    }
     float *tmp = fmalloc((size_t)N * K);
     st_read_f32_cap(S, name, tmp, (int64_t)N * K, 1);
     memset(out, 0, sizeof *out);
@@ -330,10 +359,12 @@ static void te_load(Te *te, const char *model){
     double t0 = now_s();
     te->L = calloc(te->layers, sizeof(TeLayer));
     int H = te->hidden, qd = te->heads * te->hd, kd = te->kv * te->hd;
-    char n[256];
     size_t bytes = 0;
+    /* a few layers at once: each reads and quantizes its own matrices (COLI_IMG_LOAD_THREADS) */
+    #pragma omp parallel for schedule(dynamic, 1) num_threads(qi_load_threads()) reduction(+:bytes)
     for (int l = 0; l < te->layers; l++) {
         TeLayer *L = &te->L[l];
+        char n[256];
 #define TN(s) (snprintf(n, sizeof n, "model.language_model.layers.%d.%s", l, s), n)
         lin_load(&te->S, TN("self_attn.q_proj.weight"), qd, H, g_bits, &L->q);
         lin_load(&te->S, TN("self_attn.k_proj.weight"), kd, H, g_bits, &L->k);
@@ -510,6 +541,9 @@ static void dit_config(Dit *d, const char *model){
     }
 }
 
+#ifdef COLI_VULKAN
+static void qic_plan(Dit *d);   /* qwenimage_chain.h: the blocks the device keeps */
+#endif
 static void dit_load(Dit *d, const char *model){
     if (d->loaded) return;
     char dir[2048]; snprintf(dir, sizeof dir, "%s/transformer", model);
@@ -527,10 +561,11 @@ static void dit_load(Dit *d, const char *model){
     lin_load(&S, "txt_in.out_layer.weight", D, D, g_bits, &d->txt2);
     d->txt_norm = vec_load(&S, "txt_in.text_norm.weight", d->ctx);
     d->B = calloc(d->layers, sizeof(DitBlock));
-    char n[256];
     size_t bytes = 0;
+    #pragma omp parallel for schedule(dynamic, 1) num_threads(qi_load_threads()) reduction(+:bytes)
     for (int l = 0; l < d->layers; l++) {
         DitBlock *B = &d->B[l];
+        char n[256];
 #define BN(s) (snprintf(n, sizeof n, "transformer_blocks.%d.%s", l, s), n)
         lin_load(&S, BN("attn.to_q.weight"), D, D, g_bits, &B->q);
         lin_load(&S, BN("attn.to_k.weight"), D, D, g_bits, &B->k);
@@ -556,7 +591,10 @@ static void dit_load(Dit *d, const char *model){
             now_s() - t0);
 #ifdef COLI_VULKAN
     /* after the DiT's weights, once: a missing device costs one line */
-    if (!g_vk_tried) { g_vk_tried = 1; g_vk_ready = coli_vk_init_env("qwenimage"); }
+    if (!g_vk_tried) {
+        g_vk_tried = 1; g_vk_ready = coli_vk_init_env("qwenimage");
+        if (g_vk_ready) qic_plan(d);   /* before the prompt's prefix uploads anything */
+    }
 #endif
 }
 
@@ -625,7 +663,8 @@ static void dit_rope_apply(float *x, int T, int heads, int hd, const float *cs, 
 
 /* The prompt side of the DiT, computed once per prompt: per block, the keys and
  * values of the text tokens (after norm and RoPE). */
-typedef struct { int L; float **K, **V; } Prefix;
+typedef struct { int L; float **K, **V; unsigned gen; } Prefix;
+static unsigned g_qi_gen;   /* every prefix and step layout a number of its own (the device chain's uploads) */
 
 static void prefix_free(Prefix *p, int layers){
     if (p->K) for (int l = 0; l < layers; l++) { free(p->K[l]); free(p->V[l]); }
@@ -689,7 +728,7 @@ static void dit_prefix(Dit *d, const float *emb, int L, Prefix *p, float *txt_ou
     for (int t = 0; t < L; t++) pos[3 * t] = pos[3 * t + 1] = pos[3 * t + 2] = t;
     float *cs = fmalloc((size_t)L * d->hd / 2), *sn = fmalloc((size_t)L * d->hd / 2);
     dit_rope_table(d, pos, L, cs, sn);
-    p->L = L;
+    p->L = L; p->gen = ++g_qi_gen;
     p->K = calloc(d->layers, sizeof(float *)); p->V = calloc(d->layers, sizeof(float *));
     DitScratch w; scratch_alloc(&w, d, L);
     for (int l = 0; l < d->layers; l++) {
@@ -702,11 +741,11 @@ static void dit_prefix(Dit *d, const float *emb, int L, Prefix *p, float *txt_ou
 }
 
 /* noise_pred[N][in_ch] for the image tokens at timestep t. */
-typedef struct { float *kbuf, *vbuf, *cs, *sn, *x; DitScratch w; int N; } DitStep;
+typedef struct { float *kbuf, *vbuf, *cs, *sn, *x; DitScratch w; int N; unsigned gen; } DitStep;
 
 static void dit_step_init(DitStep *s, Dit *d, const Prefix *p, int gh, int gw){
     int N = gh * gw, T = p->L + N;
-    s->N = N;
+    s->N = N; s->gen = ++g_qi_gen;
     s->kbuf = fmalloc((size_t)T * d->dim); s->vbuf = fmalloc((size_t)T * d->dim);
     s->cs = fmalloc((size_t)N * d->hd / 2); s->sn = fmalloc((size_t)N * d->hd / 2);
     s->x = fmalloc((size_t)N * d->dim);
@@ -727,7 +766,26 @@ static void dit_step_free(DitStep *s){
     free(s->kbuf); free(s->vbuf); free(s->cs); free(s->sn); free(s->x); scratch_free(&s->w);
 }
 
+#ifdef COLI_VULKAN
+#include "qwenimage_chain.h"   /* COLI_VK_CHAIN: every block of a step on the device */
+#ifdef QI_HAVE_VAE
+#include "qwenimage_vae_vk.h"  /* and the VAE decoder after it */
+#endif
+#endif
+#ifdef QI_HAVE_VAE
+/* The VAE decode: on the device when the transformer's chain runs, else (or when the
+ * device's decode fails) the CPU's. */
+static int qi_vae_decode(QiVae *v, const float *z, int h, int w, uint8_t *rgba, float *out_f){
+#ifdef COLI_VULKAN
+    if (g_qic_on > 0 && !g_qic.failed && !g_qic.streamed && qvv_decode(v, z, h, w, rgba, out_f) == 0) return 0;
+#endif
+    return qiv_decode(v, z, h, w, rgba, out_f);
+}
+#endif
 static void dit_forward(Dit *d, const Prefix *p, DitStep *s, const float *lat, float t, float *out){
+#ifdef COLI_VULKAN
+    if (qic_forward(d, p, s, lat, t, out)) return;
+#endif
     int D = d->dim, N = s->N, L = p->L;
     float *mod = fmalloc(4 * (size_t)D), *outs = fmalloc(D);
     dit_modulation(d, t, mod, outs);
@@ -1031,7 +1089,7 @@ static int engine_generate(Engine *e, const char *prompt, int width, int height,
         emit_progress(pg, "decode", steps, steps, t0);
 #ifdef QI_HAVE_VAE
         if (!e->vae && !(e->vae = engine_vae(e, msg, msgn))) rc = -1;
-        if (rc == 0 && qiv_decode(e->vae, lat, gh, gw, rgba, NULL) != 0) { snprintf(msg, msgn, "VAE decode failed"); rc = -1; }
+        if (rc == 0 && qi_vae_decode(e->vae, lat, gh, gw, rgba, NULL) != 0) { snprintf(msg, msgn, "VAE decode failed"); rc = -1; }
 #else
         /* no VAE compiled in: show the first three latent channels, stretched */
         for (int y = 0; y < height; y++)
@@ -1348,7 +1406,7 @@ static int run_oracle(Engine *e, const char *refdir){
         if (vae && fin) {
             uint8_t *rgba = xmalloc((size_t)width * height * 4);
             float *of = fmalloc((size_t)4 * width * height);
-            qiv_decode(vae, fin, gh, gw, rgba, of);
+            qi_vae_decode(vae, fin, gh, gw, rgba, of);
             float *img_ref = ref_tensor(&R, "vae_out", NULL);
             if (img_ref) fails += cmp("VAE output (ref latents)", of, img_ref, (size_t)4 * width * height) > LOOSE;
             st_tensor *rt = st_find(&R, "rgba");
@@ -1364,7 +1422,7 @@ static int run_oracle(Engine *e, const char *refdir){
             }
             const char *tag = getenv("QWENIMAGE_ORACLE_TAG");
             char out[2200]; snprintf(out, sizeof out, "%s/oracle_c%s%s.png", refdir, tag ? "_" : "", tag ? tag : "");
-            qiv_decode(vae, mine, gh, gw, rgba, NULL);
+            qi_vae_decode(vae, mine, gh, gw, rgba, NULL);
             if (!write_png(out, rgba, width, height)) fprintf(stderr, "[oracle] our own chained image: %s\n", out);
             /* PSNR of the RGB of our chained image against the reference's: the
              * number that says what int8 weights or activations cost in pixels */
@@ -1394,6 +1452,10 @@ static int run_oracle(Engine *e, const char *refdir){
 static void qi_vk_report(void){
 #ifdef COLI_VULKAN
     if (g_vk_ready) fprintf(stderr, "[VK] qwenimage: %llu matmuls on the GPU\n", coli_vk_matmul_calls());
+    qic_report();
+#ifdef QI_HAVE_VAE
+    if (g_qvv.decodes) fprintf(stderr, "[VK] qwenimage vae: %llu decodes on the device\n", g_qvv.decodes);
+#endif
 #endif
 }
 
@@ -1404,7 +1466,11 @@ static void usage(void){
         "       qwenimage --model DIR --ref REFDIR\n"
         "env:   COLI_IMG_BITS=8|16|32 weight storage (default 8: int8 rows)\n"
         "       COLI_IMG_ACT8=0  f32 activations in the DiT (default where VNNI exists: int8, about 2x per step)\n"
-        "       COLI_IMG_TE=resident|stage  keep the text encoder loaded between prompts (serve default: resident)\n");
+        "       COLI_IMG_TE=resident|stage  keep the text encoder loaded between prompts (serve default: resident)\n"
+        "       COLI_IMG_LOAD_THREADS=n  layers loaded at once (default 4)\n"
+        "       COLI_VK_QI_RESIDENT=n  transformer blocks kept on the GPU (default: what its free memory holds)\n"
+        "       COLI_VULKAN=1 (a VK=1 build): the transformer on the GPU; COLI_VK_CHAIN=0 keeps each step's blocks\n"
+        "                    off the device chain (the matrices one by one)\n");
 }
 
 int main(int argc, char **argv){

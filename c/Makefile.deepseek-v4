@@ -228,12 +228,9 @@ V4_VK_OBJ =
 V4_VK_SPV =
 ifeq ($(VK),1)
 CFLAGS += -DCOLI_VULKAN
-ifneq ($(IS_WIN),)
-# As in the parent: the loader is vulkan-1.dll, and -static would skip its
-# import library, so search dynamically for this one library only.
-LDFLAGS += -Wl,-Bdynamic -lvulkan-1 -Wl,-Bstatic
-else
-LDFLAGS += -lvulkan
+# As in the parent: the loader is opened at run time (vk_load.h), never linked.
+ifeq ($(IS_WIN),)
+LDFLAGS += -ldl
 endif
 V4_VK_OBJ = backend_vulkan_v4.o vk_tier_v4.o
 V4_VK_SPV = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv \

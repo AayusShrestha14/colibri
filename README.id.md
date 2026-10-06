@@ -80,7 +80,8 @@ menekan Enter akan menerima rekomendasi. Kemudian proses penyiapan:
    RAM, ditambah cache minimum pakar, harus muat di RAM Anda, dan unduhannya
    harus muat di disk;
 3. **menyiapkan engine**: engine akan di-build untuk mesin Anda jika compiler
-   tersedia; jika tidak, versi prebuilt yang berjalan di CPU akan diunduh.
+   tersedia; jika tidak, versi prebuilt akan diunduh, yang berjalan di CPU dan,
+   di Linux dan Windows, juga di GPU Vulkan.
    Build untuk GPU dibuat ketika memberikan keuntungan: CUDA untuk kartu NVIDIA
    di Linux jika CUDA toolkit sudah terinstal, jika tidak maka Vulkan. Pada GPU
    diskret, build GPU selalu digunakan; pada GPU terintegrasi yang berbagi RAM
