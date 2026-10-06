@@ -1435,6 +1435,55 @@ class ServerControl(HomeTestCase):
         self.assertEqual(moved["args"][moved["args"].index("--port") + 1], str(moved["port"]))
         self.port = moved["port"]                                 # cleanup stops this one
 
+    def test_foreign_http_health_does_not_prevent_starting_the_configured_server(self):
+        for payload in ({"service": "other program"}, ["healthy"]):
+            with self.subTest(payload=payload):
+                class ForeignHealth(SimpleHTTPRequestHandler):
+                    def log_message(self, *_): pass
+                    def do_GET(self):
+                        body = json.dumps(payload).encode()
+                        self.send_response(200)
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                blocker = ThreadingHTTPServer(("127.0.0.1", 0), ForeignHealth)
+                thread = threading.Thread(target=blocker.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    occupied = blocker.server_port
+                    args = list(self.cfg["args"])
+                    args[args.index("--port") + 1] = str(occupied)
+                    cfg = setup_flow.save_config(dict(self.cfg, args=args, port=occupied))
+                    self.assertEqual(setup_flow.server_status(cfg)["state"], "stopped")
+                    setup_flow.start_server(cfg, background=True, open_browser=False,
+                                            out=lambda *_: None, wait=10)
+                    moved = setup_flow.load_config()
+                    self.port = moved["port"]
+                    self.assertNotEqual(self.port, occupied)
+                    self.assertEqual(self.wait_state(moved, "ready")["state"], "ready")
+                    self.cleanup_server()
+                finally:
+                    blocker.shutdown()
+                    blocker.server_close()
+                    thread.join(timeout=2)
+
+    def test_actual_protected_colibri_health_remains_ready_without_a_pidfile(self):
+        from openai_server import APIServer
+        server = APIServer(("127.0.0.1", 0), None, "health-control", api_key="fixture-key")
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            cfg = dict(self.cfg, port=server.server_port)
+            self.assertFalse(os.path.exists(setup_flow.serve_pidfile(server.server_port)))
+            code, health = setup_flow._get_json(f"http://127.0.0.1:{server.server_port}/health")
+            self.assertEqual((code, health), (200, {"status": "ok"}))
+            self.assertEqual(setup_flow.server_status(cfg)["state"], "ready")
+        finally:
+            server.shutdown()
+            server.server_close()
+            server.scheduler.close()
+            thread.join(timeout=2)
+
 
 class ForegroundLogs(HomeTestCase):
     """#1852: the server the setup starts in the foreground prints to its terminal,
