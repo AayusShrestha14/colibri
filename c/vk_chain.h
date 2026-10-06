@@ -141,6 +141,7 @@ int  vkc_attn_part_chunks(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, const Vk
  * parts, into out at o_off + g*d and so_off + 2g. */
 typedef struct { int n, d, nz, a_off, a_z, sa_off, sa_z, o_off, so_off; } VkcKvsJoin;
 int  vkc_kvs_join(VkcBuf *parts, VkcBuf *out, const VkcKvsJoin *p);
+int  vkc_attn_flash_rows(void);   /* COLI_VK_CHAIN_FLASH: rows from which chain_attn_flash runs (0 = never) */
 /* The attention ops (vkc_attn, vkc_attn_w, vkc_mla_core, vkc_relattn) whose rows x positions
  * x heads x head dim pass COLI_VK_ATTN_SLICE (2^32; 0 = never) record their rows in slices,
  * each ending its frame (submitted, not waited for) and the next in a new one: no single
@@ -675,7 +676,9 @@ typedef struct {
     double wait_ms;               /* host time blocked in fence waits */
     size_t dev_bytes;             /* live chain buffers */
     unsigned long long attn_blocked;   /* attention calls through chain_attnb (blocks of rows) */
+    unsigned long long attn_flash;     /* attention calls through chain_attn_flash (matrix units) */
     unsigned long long attn_slices;    /* extra submissions that cut a long attention (COLI_VK_ATTN_SLICE) */
+    unsigned long long tile_gemms;     /* prompt matmuls through chain_gemm.comp (matrix units) */
 } VkcStats;
 void vkc_stats(VkcStats *st);
 /* COLI_VK_CHAIN_PROF=1: one stderr line of device time per kind of op */

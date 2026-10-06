@@ -710,7 +710,7 @@ endif
 VK_OBJ    = backend_vulkan.o vk_tier.o
 VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/attention_absorb.spv shaders/rmsnorm.spv \
             shaders/qmatmul_gemm.spv shaders/qmatmul_coop.spv shaders/expert_act.spv \
-            shaders/expert_act_v4.spv
+            shaders/expert_act_v4.spv shaders/qmatmul_grp.spv shaders/qmatmul_grp_gate_up.spv shaders/expert_sum.spv shaders/qmatmul_grp_gemv.spv shaders/qmatmul_grp_gemv_gate_up.spv
 # vk_chain.o: a layer's dense chain recorded into one submission (vk_chain.h), and
 # its shaders; an engine that does not call it links nothing from it.
 VK_OBJ   += vk_chain.o
@@ -722,6 +722,8 @@ VK_SPV   += shaders/chain_norm.spv shaders/chain_rope.spv shaders/chain_attn.spv
 VK_SPV   += shaders/chain_mla.spv shaders/chain_hgemv.spv shaders/chain_dsa.spv
 # Kimi Delta Attention and manifold-constrained hyper-connections (vk_chain.h)
 VK_SPV   += shaders/chain_kda.spv shaders/chain_mhc.spv
+# the int8 decode GEMV with per-matrix rows per workgroup (optional at run time)
+VK_SPV   += shaders/chain_gemv2.spv
 # DeepSeek V4.1 Flash and DeepSeek V4 attention (vk_chain.h: vkc_dsv4_*)
 VK_SPV   += shaders/chain_dsv4.spv
 # Kimi K3's attention residuals and SiTU-GLU (vk_chain.h)
@@ -731,12 +733,16 @@ VK_SPV   += shaders/chain_ares.spv
 VK_SPV   += shaders/chain_sconv.spv shaders/chain_relattn.spv
 # blocked attention for prompt chunks (made on first use; vk_chain.c, chain_attnb.comp)
 VK_SPV   += shaders/chain_attnb.spv
+# the int8/int4 prompt GEMM on the matrix units (optional at run time)
+VK_SPV   += shaders/chain_gemm.spv
 # the KV cache split between the device and the host past the device's budget
 # (vk_chain.h: vkc_kvs_*; vk_kvsplit.h)
 VK_SPV   += shaders/chain_kvs.spv
 # the decision engines' encoders (laya, gliner_decide): bidirectional attention over row
 # ranges with DeBERTa's relative terms, LayerNorm, GeGLU, RoPE (made on first use)
 VK_SPV   += shaders/chain_enc.spv
+# the attention core on the matrix units for prompt chunks (optional at run time)
+VK_SPV   += shaders/chain_attn_flash.spv
 endif
 
 # Optional AMD XDNA2 (Ryzen AI NPU) lane, Windows. Same opt-in shape as VK=1:
@@ -872,15 +878,41 @@ backend_vulkan.o: backend_vulkan.c .build-config
 	$(CC) $(CFLAGS) -c backend_vulkan.c -o $@
 vk_tier.o: vk_tier.c .build-config
 	$(CC) $(CFLAGS) -c vk_tier.c -o $@
+# The expert batch's grouped GEMM (qmatmul_grp.comp): down, and gate+up+SwiGLU with
+# -DGATE_UP. Same glslc requirement and fallback as qmatmul_coop.spv; at run
+# time the batch keeps its per-expert route without them.
+shaders/qmatmul_grp.spv: shaders/qmatmul_grp.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
+shaders/qmatmul_grp_gate_up.spv: shaders/qmatmul_grp.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
+shaders/qmatmul_grp_gemv_gate_up.spv: shaders/qmatmul_grp_gemv.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
 vk_chain.o: vk_chain.c .build-config
 	$(CC) $(CFLAGS) -c vk_chain.c -o $@
 shaders/%.spv: shaders/%.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@
+# chain_attn_flash.comp needs the same glslc as qmatmul_coop.comp below, with the same
+# fallback; without its .spv the chain keeps chain_attn.comp.
+shaders/chain_attn_flash.spv: shaders/chain_attn_flash.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
 # The cooperative-matrix GEMM needs a glslc that knows GL_KHR_cooperative_matrix
 # (shaderc 2023.6+). An older one keeps the committed .spv instead of failing the build;
 # at run time the shader is optional anyway (the fp32 GEMM takes over without it).
 shaders/qmatmul_coop.spv: shaders/qmatmul_coop.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
+# chain_gemm.comp needs the same glslc as qmatmul_coop.comp above, with the same
+# fallback; without its .spv the chain keeps its other GEMMs.
+shaders/chain_gemm.spv: shaders/chain_gemm.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@ || { [ -f $@ ] && touch $@ && \
 	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }

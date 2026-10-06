@@ -96,11 +96,17 @@ typedef struct {
     VkDescriptorSetLayout dsl;
     VkPipelineLayout pl;
     VkShaderModule mod[P_NPIPE], mod_gemm, mod_dnrec;
+    VkShaderModule mod_gv2; VkPipeline gv2;   /* chain_gemv2.comp: int8 decode GEMVs (COLI_VK_CHAIN_GEMV2) */
     VkPipeline pipe[P_NPIPE];
     VkPipeline gemm[VKC_GEMM_MAX]; int gemm_bm[VKC_GEMM_MAX], gemm_bn[VKC_GEMM_MAX], ngemm;
     VkPipeline dnrec[VKC_DNREC_MAX]; int dnrec_kd[VKC_DNREC_MAX], ndnrec;
     VkShaderModule mod_gemv4; VkPipeline gemv4; int gemv4_xs;   /* chain_gemv.comp: the vectorized decode GEMV */
+    /* chain_gemm.comp: int8/int4 prompt GEMMs, x rounded to f16 once (COLI_VK_CHAIN_GEMM) */
+    VkShaderModule mod_tg; VkPipeline tg;
     VkShaderModule mmod[PM_N]; VkPipeline mpipe[PM_N]; int mla_ok;   /* chain_mla, chain_hgemv, chain_dsa */
+    /* chain_attn_flash.comp: the attention core on the matrix units for prompt chunks,
+     * one pipeline per (head dim, query heads per kv head) */
+    VkShaderModule mod_fa; VkPipeline fa[4]; int fa_hd[4], fa_gq[4], nfa;
     VkPipeline kdarec[VKC_KDA_MAX]; int kdarec_kd[VKC_KDA_MAX], nkdarec;   /* chain_kda's recurrence per key dim */
     VkCommandPool cpool;
     VkcFrame fr[VKC_FRAMES];
@@ -349,6 +355,17 @@ int vkc_init(void) {
             if ((KC.gemv4 = make_pipe(KC.mod_gemv4, &si))) KC.gemv4_xs = xs;
         }
     }
+    /* the int8/int4 decode GEMV with lanes per row and rows per workgroup chosen per
+     * matrix (chain_gemv2.comp): needs clustered subgroup operations */
+    {
+        const char *e = getenv("COLI_VK_CHAIN_GEMV2");
+        VkPhysicalDeviceSubgroupProperties sgp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &sgp};
+        vkGetPhysicalDeviceProperties2((VkPhysicalDevice)KC.core.phys, &p2);
+        int ok = (sgp.supportedOperations & VK_SUBGROUP_FEATURE_CLUSTERED_BIT) && (sgp.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+                 sgp.subgroupSize >= 16 && !(e && *e == '0');
+        if (ok && (KC.mod_gv2 = load_module(KC.core.spv_path, "chain_gemv2.spv"))) KC.gv2 = make_pipe(KC.mod_gv2, NULL);
+    }
     /* the MLA, KDA and mHC shaders, optional: without one only its ops decline */
     for (int i = 0; i < PM_N; i++) {
         char path[1200];
@@ -363,7 +380,29 @@ int vkc_init(void) {
         if (f && (KC.mmod[i] = load_module(KC.core.spv_path, mla_file[i]))) KC.mpipe[i] = make_pipe(KC.mmod[i], NULL);
     }
     KC.mla_ok = KC.mpipe[PM_MLA] && KC.mpipe[PM_HGEMV] && KC.mpipe[PM_DSA];
+    /* the attention core on the matrix units (vkc_attn_flash_rows): subgroups of 64 with
+     * cooperative matrices, the shader's tiling assumes four of them */
+    if (KC.core.coop_sg == 64) KC.mod_fa = load_module(KC.core.spv_path, "chain_attn_flash.spv");
     dsv4_init();
+    /* the int8/int4 prompt GEMM on the matrix units (chain_gemm.comp, subgroups of 64);
+     * COLI_VK_CHAIN_GEMM=0 leaves those formats to the GEMMs below */
+    {
+        const char *e = getenv("COLI_VK_CHAIN_GEMM");
+        if (KC.core.coop_sg == 64 && !(e && *e == '0') && (KC.mod_tg = load_module(KC.core.spv_path, "chain_gemm.spv"))) {
+            int32_t tt = 4;
+            VkSpecializationMapEntry me = {0, 0, 4};
+            VkSpecializationInfo si = {1, &me, 4, &tt};
+            VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss = {
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+                .requiredSubgroupSize = 64};
+            VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = &rss,
+                          .flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT,
+                          .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = KC.mod_tg, .pName = "main",
+                          .pSpecializationInfo = &si}, .layout = KC.pl};
+            if (vkCreateComputePipelines(KC.dev, VK_NULL_HANDLE, 1, &ci, NULL, &KC.tg) != VK_SUCCESS) KC.tg = VK_NULL_HANDLE;
+        }
+    }
     /* the fp32 tiled GEMM at the backend's tiles; none = every S on the GEMV */
     KC.mod_gemm = KC.core.gemm_tiles ? load_module(KC.core.spv_path, "qmatmul_gemm.spv") : VK_NULL_HANDLE;
     for (int k = 0; KC.mod_gemm && k < KC.core.gemm_tiles && k < VKC_GEMM_MAX; k++) {
@@ -737,7 +776,17 @@ static int matmul_aligned(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcB
     int v4 = path < 0 && KC.gemv4 && per && ti->rowWords % 4 == 0 && ti->I % 4 == 0 &&
              (ti->fmt != 4 || (ti->gs > 0 && ti->gs % 32 == 0)) && (ti->rowWords / 4) * per / 4 <= KC.gemv4_xs;
     KC.kind = path >= 0 ? PK_GEMM : ti->fmt == 1 ? PK_GEMV8 : PK_GEMV;
-    if (v4) {
+    int g2 = path < 0 && KC.gv2 && S <= 4 && ti->fmt == 1 &&   /* int4 measured slower than chain_gemv here */
+             ti->I % 32 == 0 && ti->I <= 16384 && ti->rowWords % 4 == 0;
+    if (g2) {
+        /* rows a workgroup: short matrices in small blocks, so they still fill the device */
+        int rpw = ti->O <= 1024 ? 16 : ti->O <= 4096 ? 32 : 64;
+        /* a speculative verify's rows (S <= 4) share each weight load */
+        int nr = S <= 4 && S * ti->I <= 16384 ? S : 1;
+        struct { int fmt, S, I, O, rowWords, gs, rpw, nr; } pc8 = {ti->fmt, S, ti->I, ti->O, ti->rowWords, ti->gs, rpw, nr};
+        ok = record(KC.gv2, bd, 4, &pc8, sizeof pc8, (uint32_t)((ti->O + rpw - 1) / rpw), (uint32_t)((S + nr - 1) / nr), 1);
+    }
+    else if (v4) {
         /* each workgroup stages x once: give it enough rows that the staging does not
          * rival the weights, while keeping enough workgroups to fill the device */
         /* lanes per row: about sixteen 16-byte steps each (COLI_VK_CHAIN_GEMV_LPR overrides) */
@@ -749,6 +798,11 @@ static int matmul_aligned(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcB
         int rows_wg = 256 / lpr;   /* at least, at subgroups of 64 */
         int wg = (ti->O + rows_wg - 1) / rows_wg; if (wg > 1024) wg = 1024;
         ok = record(KC.gemv4, bd, 4, &pc7, sizeof pc7, (uint32_t)wg, (uint32_t)S, 1);
+    }
+    else if (path >= 0 && KC.tg && (ti->fmt == 1 || ti->fmt == 2 || (ti->fmt == 4 && ti->gs >= 8 && ti->gs % 8 == 0)) &&
+             ti->I % 64 == 0 && ti->O % 128 == 0 && ti->rowWords % 4 == 0) {
+        ok = record(KC.tg, bd, 4, &pc, sizeof pc, (uint32_t)((S + 63) / 64), (uint32_t)(ti->O / 128), 1);
+        KC.st.tile_gemms += ok;
     }
     else if (path >= 0)
         ok = record(KC.gemm[path], bd, 4, &pc, sizeof pc, (uint32_t)((ti->O + KC.gemm_bm[path] - 1) / KC.gemm_bm[path]),
@@ -855,6 +909,38 @@ static int attn_slice_next(void) {   /* the open frame out, a new one in */
     KC.st.attn_slices++;
     return vkc_submit(0) && vkc_begin();
 }
+/* chain_attn_flash.comp's pipeline for this head dim and grouping, made on first use;
+ * NULL when the shader is missing or the pipeline fails */
+static VkPipeline fa_pipe(int hd, int gq) {
+    for (int i = 0; i < KC.nfa; i++) if (KC.fa_hd[i] == hd && KC.fa_gq[i] == gq) return KC.fa[i];
+    if (!KC.mod_fa || KC.nfa == 4) return VK_NULL_HANDLE;
+    int32_t sv[2] = {hd, gq};
+    VkSpecializationMapEntry me[2] = {{0, 0, 4}, {1, 4, 4}};
+    VkSpecializationInfo si = {2, me, sizeof sv, sv};
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+        .requiredSubgroupSize = 64};
+    VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = &rss,
+                  .flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT,
+                  .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = KC.mod_fa, .pName = "main",
+                  .pSpecializationInfo = &si}, .layout = KC.pl};
+    VkPipeline p = VK_NULL_HANDLE;
+    if (vkCreateComputePipelines(KC.dev, VK_NULL_HANDLE, 1, &ci, NULL, &p) != VK_SUCCESS) {
+        vkDestroyShaderModule(KC.dev, KC.mod_fa, NULL); KC.mod_fa = VK_NULL_HANDLE;   /* not again */
+        return VK_NULL_HANDLE;
+    }
+    KC.fa[KC.nfa] = p; KC.fa_hd[KC.nfa] = hd; KC.fa_gq[KC.nfa++] = gq;
+    return p;
+}
+/* From COLI_VK_CHAIN_FLASH rows (16; 0 = never) a plain causal attention (no list,
+ * window, ring, sink or second V width, head dim a multiple of 64) takes
+ * chain_attn_flash where the device has it, ahead of the blocked shader. */
+int vkc_attn_flash_rows(void) {
+    const char *e = getenv("COLI_VK_CHAIN_FLASH");
+    int v = e && *e ? atoi(e) : 16;
+    return v < 0 ? 0 : v;
+}
 int vkc_attn_block_rows(void) {
     const char *e = getenv("COLI_VK_ATTN_BLOCK");
     int v = e && *e ? atoi(e) : 16;
@@ -867,9 +953,14 @@ int vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBu
     if (w.vd <= 0) w.vd = w.a.hd;
     if (w.a.hd > 256 || w.vd > 256 || w.a.H % w.a.KVH || w.win < 0 || w.ring < 0 || (w.sink && !snk)) return 0;
     VkcBind bd[7] = {B(q, 0), B(kc, 0), B(vc, 0), B(o, 1), B(gate, 0), B(sel, 0), B(snk, 0)};
-    int G = w.a.H / w.a.KVH, blk = vkc_attn_block_rows();
-    int blocked = blk > 0 && w.a.S >= blk && G <= 32 && kab_pipe(), br = w.a.sel_row > 0 ? 1 : 32 / G;
-    int S = w.a.S, rr = attn_slice_rows(S, w.a.pos_base, (double)w.a.H * (w.a.hd > w.vd ? w.a.hd : w.vd), blocked ? br : 1);
+    int G = w.a.H / w.a.KVH, blk = vkc_attn_block_rows(), fl = vkc_attn_flash_rows();
+    /* a prompt chunk's plain causal attention on the matrix units (chain_attn_flash),
+     * 16 / G rows a workgroup; else the blocked shader, else chain_attn */
+    VkPipeline fp = KC.mod_fa && fl > 0 && w.a.S >= fl && !(sel && w.a.sel_row > 0) && !w.win && !w.ring && !w.kv_pm &&
+                    !w.sink && w.vd == w.a.hd && w.a.hd % 64 == 0 && 16 % G == 0 ? fa_pipe(w.a.hd, G) : VK_NULL_HANDLE;
+    int blocked = !fp && blk > 0 && w.a.S >= blk && G <= 32 && kab_pipe(), br = w.a.sel_row > 0 ? 1 : 32 / G;
+    int S = w.a.S, rr = attn_slice_rows(S, w.a.pos_base, (double)w.a.H * (w.a.hd > w.vd ? w.a.hd : w.vd),
+                                        fp ? 16 / G : blocked ? br : 1);
     int ok = 1;
     for (int r0 = 0; ok && r0 < S; r0 += rr) {
         VkcAttnW x = w;
@@ -878,7 +969,10 @@ int vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBu
         x.a.q_off += r0 * w.a.q_row; x.a.g_off += r0 * w.a.g_row; x.a.o_off += r0 * w.a.o_row;
         if (w.a.sel_row > 0) x.a.sel_off += r0 * w.a.sel_row;
         if (r0 && !attn_slice_next()) return 0;
-        if (blocked) {
+        if (fp) {
+            ok = record(fp, bd, 7, &x, sizeof x, (uint32_t)((x.a.S + 16 / G - 1) / (16 / G)), (uint32_t)x.a.KVH, 1);
+            KC.st.attn_flash += ok;
+        } else if (blocked) {
             struct { VkcAttnW w; int br, B, anchor, part, st_off; } pc = {x, br, 0, 0, 0, 0};
             ok = record(KAB.pipe, bd, 7, &pc, sizeof pc, (uint32_t)x.a.KVH, (uint32_t)((x.a.S + br - 1) / br), 1);
             KC.st.attn_blocked += ok;
@@ -1573,11 +1667,17 @@ void vkc_shutdown(void) {
         if (KC.mmod[i]) vkDestroyShaderModule(KC.dev, KC.mmod[i], NULL);
     }
     for (int i = 0; i < KC.ngemm; i++) vkDestroyPipeline(KC.dev, KC.gemm[i], NULL);
+    if (KC.tg) vkDestroyPipeline(KC.dev, KC.tg, NULL);
+    if (KC.mod_tg) vkDestroyShaderModule(KC.dev, KC.mod_tg, NULL);
     for (int i = 0; i < KC.ndnrec; i++) vkDestroyPipeline(KC.dev, KC.dnrec[i], NULL);
     if (KC.gemv4) vkDestroyPipeline(KC.dev, KC.gemv4, NULL);
     if (KC.mod_gemv4) vkDestroyShaderModule(KC.dev, KC.mod_gemv4, NULL);
+    if (KC.gv2) vkDestroyPipeline(KC.dev, KC.gv2, NULL);
+    if (KC.mod_gv2) vkDestroyShaderModule(KC.dev, KC.mod_gv2, NULL);
     if (KC.mod_gemm) vkDestroyShaderModule(KC.dev, KC.mod_gemm, NULL);
     if (KC.mod_dnrec) vkDestroyShaderModule(KC.dev, KC.mod_dnrec, NULL);
+    for (int i = 0; i < KC.nfa; i++) vkDestroyPipeline(KC.dev, KC.fa[i], NULL);
+    if (KC.mod_fa) vkDestroyShaderModule(KC.dev, KC.mod_fa, NULL);
     if (KC.pl) vkDestroyPipelineLayout(KC.dev, KC.pl, NULL);
     if (KC.dsl) vkDestroyDescriptorSetLayout(KC.dev, KC.dsl, NULL);
     dsv4_shutdown();
