@@ -28,6 +28,8 @@
 #        the first N layers on the device (COLI_VK_CHAIN_LAYERS, COLI_VK_DEVICE_CAP_MB),
 #        tests/vulkan_partial_<group>.sh
 #   bash tests/vulkan_engines.sh decide | decide-sanitize   # Laya, GLiNER2.5-Decide and Clef's DECIDE
+#   bash tests/vulkan_engines.sh mux | mux-sanitize | mux-deepseek | mux-deepseek-sanitize   # several
+#        conversations at once (KV_SLOTS), every engine but colibri and glm53 (glm-chain has theirs)
 #   bash tests/vulkan_engines.sh dev2 | dev2-deepseek-kimi-mimo | dev2-sanitize   # the expert tier on
 #        two devices (COLI_VK_DEV2), every MoE engine, tests/vulkan_dev2.sh
 #
@@ -4215,6 +4217,85 @@ family_decide() {
   [ -z "${SAN:-}" ] || make clean >/dev/null 2>&1 || true
 }
 
+# Several conversations at once (KV_SLOTS, tests/serve_mux_check.py): every engine that
+# decodes its serve's conversations together, each request's frames against the same
+# request served alone. On the CPU bit for bit (with KV_SLOTS 4, and 3 with prompts three
+# times longer), then with the routed-expert tier on the device within 1e-4 (a batch's
+# rows go through the device's GEMM, which sums in another order than one row's).
+# SAN=1: the same under ASan and UBSan, no diagnostic. One VK=1 build per engine runs
+# both: without COLI_VULKAN it is the CPU engine. colibri and glm53 have theirs in
+# glm-chain (vulkan_chain_mux.py), with the dense chain.
+mux_gate() {  # <engine> <snapshot> <slots> <env...>
+  local eng=$1 snap=$2 n=$3 out; shift 3
+  local mx=(MUX_LONG=${MUX_LONG:-1} MUX_TOL=${MUX_TOL:-0})
+  if [ "${SAN:-0}" = 1 ]; then
+    env "${mx[@]}" ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1 \
+      $PY tests/serve_mux_check.py ./$eng $snap $n OMP_NUM_THREADS=2 "$@" > san.log 2>&1 || { cat san.log; fail "asan mux $eng $n $*"; }
+    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan mux $eng $n $*: sanitizer diagnostic"; fi
+    out=$(tail -1 san.log)
+  else
+    out=$(env "${mx[@]}" $PY tests/serve_mux_check.py ./$eng $snap $n "$@") || { echo "$out"; fail "mux $eng $n $*"; }
+  fi
+  echo "${SAN:+asan }$out${MUX_LONG:+ (prompts $MUX_LONG times longer)}${1:+ [$*]}"
+}
+mux_engine() {  # <engine> <snapshot> <env...>; VKENV: more environment for the Vulkan gate
+  local eng=$1 snap=$2 vk=(${VKENV:-}); shift 2
+  mux_gate "$eng" "$snap" 4 "$@"
+  MUX_LONG=3 mux_gate "$eng" "$snap" 3 "$@"
+  MUX_TOL=1e-4 mux_gate "$eng" "$snap" 4 COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 COLI_VK_CHAIN=0 "${vk[@]}" "$@"
+}
+mux_build() {  # <make targets...>
+  if [ "${SAN:-0}" = 1 ]; then
+    local F="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+    make "$@" VK=1 LTO=0 EXTRA_CFLAGS="$F" EXTRA_LDFLAGS="$F"
+  else
+    make "$@" VK=1
+  fi
+}
+byte_tokenizer() {  # <fixture> <vocabulary>: a one-token-per-byte tokenizer in place of its own
+  rm -f "$1/tokenizer.json"
+  $PY -c "import sys; sys.path.insert(0, 'tests'); from pathlib import Path; from prefix_serve_harness import ensure_byte_tokenizer as t; t(Path('$1'), $2)"
+}
+family_mux() {
+  make clean >/dev/null 2>&1 || true
+  mux_build qwen36 qwen38 olmoe inkling kimi_k3 mimo
+  $PY tools/make_qwen36_tiny.py --out qwen36_tiny --ref-mode full --emit-ref qwen36_tiny/ref_full.json
+  $PY tools/convert_qwen36.py --model qwen36_tiny --out qwen36_tiny_c --ebits 8
+  byte_tokenizer qwen36_tiny_c 256
+  mux_engine qwen36 qwen36_tiny_c
+  $PY tools/make_qwen38_tiny.py --out qwen38_tiny
+  $PY tools/make_edge_tiny_tokenizer.py --vocab-size 64 ./qwen38_tiny
+  mux_engine qwen38 qwen38_tiny
+  $PY tools/make_olmoe_tiny.py --output olmoe_tiny --force
+  $PY tools/convert_olmoe_merged.py --model olmoe_tiny --out olmoe_tiny_c
+  $PY tools/make_edge_tiny_tokenizer.py --vocab-size 128 olmoe_tiny_c
+  mux_engine olmoe olmoe_tiny_c
+  $PY tools/make_tiny_inkling.py tiny_inkling
+  $PY -c 'import sys; from pathlib import Path; sys.path.insert(0, "."); from tests.test_inkling_prefix_serve import ensure_tokenizer; ensure_tokenizer(Path("tiny_inkling"))'
+  mux_engine inkling tiny_inkling
+  $PY tools/make_kimi_k3_tiny.py --output ./kimi_k3_tiny --force
+  byte_tokenizer kimi_k3_tiny 256
+  # the tier's experts compute as the CPU's with K3_IDOT=0 (float activations); with
+  # the default int8 ones an expert's result depends on whether it is resident, which
+  # the reference sessions and the shared one reach in another order
+  VKENV=K3_IDOT=0 mux_engine kimi_k3 kimi_k3_tiny
+  $PY tools/make_mimo_tiny.py --output ./mimo_tiny --force --vision
+  mimo_served_fixture
+  mux_engine mimo mimo_tiny_served
+  make clean >/dev/null 2>&1 || true
+}
+family_mux_deepseek() {
+  make clean >/dev/null 2>&1 || true
+  mux_build deepseek_v41 deepseek-v4
+  $PY tools/make_dsv41_tiny.py --out dsv41_tiny --emit-ref dsv41_tiny/ref.json
+  mux_engine deepseek_v41 dsv41_tiny
+  # V4's fixture speaks <tNNN> tokens; the check's prompts are bytes
+  $PY tools/make_deepseek_v4_tiny.py --output deepseek_v4_mux --force
+  byte_tokenizer deepseek_v4_mux 128
+  mux_engine deepseek_v4 deepseek_v4_mux
+  make clean >/dev/null 2>&1 || true
+}
+
 case "${1:-}" in
   shader)         shader_formats ;;
   qwen)           family_qwen ;;
@@ -4271,6 +4352,10 @@ case "${1:-}" in
   staged-faults)  family_staged_faults ;;
   staged-faults-sanitize) SAN=1 family_staged_faults ;;
   decide)         family_decide ;;
+  mux)            family_mux ;;
+  mux-sanitize)   SAN=1 family_mux ;;
+  mux-deepseek)   family_mux_deepseek ;;
+  mux-deepseek-sanitize) SAN=1 family_mux_deepseek ;;
   dev2)           family_dev2 ;;
   dev2-deepseek-kimi-mimo) family_dev2_deepseek_kimi_mimo ;;
   dev2-sanitize)  family_dev2_sanitize ;;
@@ -4281,5 +4366,5 @@ case "${1:-}" in
   partial-*)      g=${1#partial-}; fn=ptl_family_${g//-/_}
                   declare -F "$fn" >/dev/null || { echo "no partial-chain group ${g}" >&2; exit 2; }
                   "$fn" ;;
-  *) echo "usage: $0 decide|decide-sanitize|staged|<family>-staged|shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize|qwen-spec|qwen-spec-sanitize|mimo-chain|mimo-chain-sanitize|inkling-olmoe-chain|inkling-olmoe-chain-sanitize|glm-chain|glm-chain-sanitize|kimi-chain|kimi-chain-sanitize|deepseek-chain|deepseek-chain-sanitize|dense-only-<group>[-sanitize]|partial-<group>[-sanitize]|prefill-qwen|prefill-qwen-sanitize|prefill-inkling-olmoe|prefill-mimo-kimi|prefill-glm|prefill-deepseek|kv-split|kv-split-sanitize|kv-split-cold|kv-split-cold-sanitize|layers-dev2[-mla|-deepseek][-sanitize]|layers-dev2-<engine>|kv-split-deepseek|kv-split-deepseek-sanitize|dev2|dev2-deepseek-kimi-mimo|dev2-sanitize" >&2; exit 2 ;;
+  *) echo "usage: $0 mux|mux-sanitize|mux-deepseek|mux-deepseek-sanitize|decide|decide-sanitize|staged|<family>-staged|shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize|qwen-spec|qwen-spec-sanitize|mimo-chain|mimo-chain-sanitize|inkling-olmoe-chain|inkling-olmoe-chain-sanitize|glm-chain|glm-chain-sanitize|kimi-chain|kimi-chain-sanitize|deepseek-chain|deepseek-chain-sanitize|dense-only-<group>[-sanitize]|partial-<group>[-sanitize]|prefill-qwen|prefill-qwen-sanitize|prefill-inkling-olmoe|prefill-mimo-kimi|prefill-glm|prefill-deepseek|kv-split|kv-split-sanitize|kv-split-cold|kv-split-cold-sanitize|layers-dev2[-mla|-deepseek][-sanitize]|layers-dev2-<engine>|kv-split-deepseek|kv-split-deepseek-sanitize|dev2|dev2-deepseek-kimi-mimo|dev2-sanitize" >&2; exit 2 ;;
 esac
