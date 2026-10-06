@@ -347,7 +347,11 @@ Proses penyiapan membuat build CUDA di Linux ketika CUDA toolkit terinstal,
 untuk engine yang memiliki jalur CUDA: GLM-5.2/5.3, GLM-5.3-Flash, Inkling,
 Kimi K3, DeepSeek V4 Flash, Qwen3.8-Flash-Next, dan Qwen3.6 dengan Qwen3-Coder.
 Di Windows, engine CUDA merupakan DLL terpisah
-([windows.md](docs/windows.md)).
+([windows.md](docs/windows.md)), dan setiap rilis menyertakannya dalam keadaan
+sudah di-build: `colibri-<versi>-windows-x86_64-cuda.zip` berisi `coli_cuda.dll`
+(kartu dengan compute capability 8.0 ke atas) serta engine colibri, qwen36 dan
+kimi_k3 yang memuatnya. Ekstrak di atas archive utama, dan proses penyiapan
+memilih CUDA.
 
 - **VRAM expert tier** menyimpan pakar yang paling sering digunakan di kartu,
   dipilih berdasarkan routing yang terukur; cache miss dihitung di CPU pada saat
@@ -377,8 +381,11 @@ Selengkapnya: [docs/cuda.md](docs/cuda.md).
 ### Apple Silicon
 
 Backend Metal menjalankan perhitungan pakar pada GPU unified-memory untuk
-beberapa engine; build dengan `METAL=1` ([docs/metal.md](docs/metal.md)). Pada
-macOS, proses penyiapan satu langkah membuat build untuk CPU.
+beberapa engine ([docs/metal.md](docs/metal.md)). Archive macOS dari rilis berisi
+`colibri`, `inkling` dan `kimi_k3` yang di-build dengan Metal: `COLI_METAL=1`
+(`K3_METAL=1` untuk Kimi K3) menyalakannya, dan tanpanya engine berjalan di CPU.
+Dari source, build dengan `METAL=1`; proses penyiapan satu langkah membuat build
+untuk CPU.
 
 <a id="system-one-mode-ask-a-closed-question"></a>
 
@@ -481,7 +488,10 @@ dengan beberapa API:
   dan digambar langsung di terminal oleh `coli chat`
   ([qwen-image.md](docs/qwen-image.md));
 - **keputusan** pada `POST /v1/systemone`
-  ([di atas](#system-one-a-decision-with-a-probability)).
+  ([di atas](#system-one-a-decision-with-a-probability));
+- **beberapa percakapan sekaligus** di setiap engine teks: `coli serve
+  --kv-slots N` menyimpan hingga 16, masing-masing dengan cache sendiri, dan
+  mendekode token berikutnya bersama-sama ([api.md](docs/api.md#isolated-kv-contexts)).
 
 CLI coding dan editor terhubung seperti ke provider lain yang kompatibel dengan
 OpenAI: base URL `http://127.0.0.1:8000/v1`, model id yang ditampilkan
@@ -582,7 +592,9 @@ hasil pengukurannya.
 **1. Programnya.** Ambil archive untuk platform Anda dari
 [Releases](https://github.com/JustVugg/colibri/releases) (Linux x86_64, macOS,
 Windows; tidak memerlukan compiler, hanya [Python 3](https://www.python.org/downloads/)
-untuk launcher dan API), ekstrak, lalu jalankan `python3 coli info`. Atau build
+untuk launcher dan API), ekstrak, lalu jalankan `python3 coli info`. Engine
+Linux dan Windows sudah berisi Vulkan, dengan `shaders/` di sampingnya, dan engine
+macOS berisi Metal; untuk kartu NVIDIA di Windows tambahkan archive CUDA. Atau build
 dari source menggunakan `gcc` (atau clang) dan OpenMP:
 
 ```bash

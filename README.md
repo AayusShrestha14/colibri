@@ -319,7 +319,11 @@ a word ([vulkan.md](docs/vulkan.md#the-other-engines)).
 The setup builds CUDA on Linux when the CUDA toolkit is installed, for the
 engines that have a CUDA path: GLM-5.2/5.3, GLM-5.3-Flash, Inkling, Kimi K3,
 DeepSeek V4 Flash, Qwen3.8-Flash-Next, and Qwen3.6 with Qwen3-Coder. On
-Windows the CUDA engine is a separate DLL ([windows.md](docs/windows.md)).
+Windows the CUDA engine is a separate DLL ([windows.md](docs/windows.md)), and
+every release ships it built: `colibri-<version>-windows-x86_64-cuda.zip` has
+`coli_cuda.dll` (cards of compute capability 8.0 and newer) and the colibri,
+qwen36 and kimi_k3 engines that load it. Unpack it over the main archive and the
+setup picks CUDA.
 
 - **The VRAM expert tier** keeps the hottest experts on the card, chosen from
   measured routing; misses compute on the CPU at the same time. Qwen3.6 on two
@@ -347,8 +351,10 @@ All of it: [docs/cuda.md](docs/cuda.md).
 ### Apple Silicon
 
 A Metal backend does the expert math on the unified-memory GPU for several
-engines; build with `METAL=1` ([docs/metal.md](docs/metal.md)). On macOS the
-one-step setup builds for the CPU.
+engines ([docs/metal.md](docs/metal.md)). The release's macOS archive has
+`colibri`, `inkling` and `kimi_k3` built with it: `COLI_METAL=1` (`K3_METAL=1`
+for Kimi K3) turns it on, and without it they run on the CPU. From source,
+build with `METAL=1`; the one-step setup builds for the CPU.
 
 <a id="system-one-mode-ask-a-closed-question"></a>
 
@@ -439,7 +445,10 @@ with the last 30 turns as a trend.
 - **pictures out** with Qwen-Image-2.1 on `POST /v1/images/generations`,
   and drawn inside the terminal by `coli chat`
   ([qwen-image.md](docs/qwen-image.md));
-- **decisions** on `POST /v1/systemone` ([above](#system-one-a-decision-with-a-probability)).
+- **decisions** on `POST /v1/systemone` ([above](#system-one-a-decision-with-a-probability));
+- **several conversations at once** on every text engine: `coli serve
+  --kv-slots N` keeps up to 16, each with its own cache, and decodes their next
+  tokens together ([api.md](docs/api.md#isolated-kv-contexts)).
 
 Coding CLIs and editors connect as to any OpenAI-compatible provider: base URL
 `http://127.0.0.1:8000/v1`, the model id `coli status` prints, any non-empty key
@@ -530,7 +539,9 @@ the numbers.
 **1. The program.** Take the archive for your platform from
 [Releases](https://github.com/JustVugg/colibri/releases) (Linux x86_64, macOS,
 Windows; no compiler needed, only [Python 3](https://www.python.org/downloads/)
-for the launcher and the API) and unpack it, then `python3 coli info`. Or build
+for the launcher and the API) and unpack it, then `python3 coli info`. The Linux
+and Windows engines have Vulkan built in, with their `shaders/` beside them, and
+the macOS ones Metal; for an NVIDIA card on Windows add the CUDA archive. Or build
 from source with `gcc` (or clang) and OpenMP:
 
 ```bash

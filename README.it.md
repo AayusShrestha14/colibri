@@ -336,7 +336,11 @@ discostarsi da quella della CPU di una parola
 L'installazione compila CUDA su Linux quando è installato il CUDA toolkit, per i
 motori che hanno un percorso CUDA: GLM-5.2/5.3, GLM-5.3-Flash, Inkling, Kimi K3,
 DeepSeek V4 Flash, Qwen3.8-Flash-Next, e Qwen3.6 con Qwen3-Coder. Su Windows il
-motore CUDA è una DLL separata ([windows.md](docs/windows.md)).
+motore CUDA è una DLL separata ([windows.md](docs/windows.md)), e ogni release la
+porta già compilata: `colibri-<versione>-windows-x86_64-cuda.zip` contiene
+`coli_cuda.dll` (schede con compute capability 8.0 o superiore) e i motori
+colibri, qwen36 e kimi_k3 che la caricano. Estrailo sopra l'archivio principale e
+l'installazione sceglie CUDA.
 
 - **Il livello degli expert in VRAM** tiene sulla scheda gli expert più caldi,
   scelti in base al routing misurato; i miss vengono calcolati sulla CPU nello
@@ -365,8 +369,10 @@ Tutti i dettagli: [docs/cuda.md](docs/cuda.md).
 ### Apple Silicon
 
 Un backend Metal esegue i calcoli degli expert sulla GPU a memoria unificata per
-diversi motori; compila con `METAL=1` ([docs/metal.md](docs/metal.md)). Su macOS
-l'installazione in un passo compila per la CPU.
+diversi motori ([docs/metal.md](docs/metal.md)). Nell'archivio macOS della release
+`colibri`, `inkling` e `kimi_k3` sono compilati con Metal: `COLI_METAL=1`
+(`K3_METAL=1` per Kimi K3) lo accende, e senza girano sulla CPU. Dai sorgenti
+compila con `METAL=1`; l'installazione in un passo compila per la CPU.
 
 <a id="system-one-mode-ask-a-closed-question"></a>
 <a id="system-one-a-decision-with-a-probability"></a>
@@ -461,7 +467,10 @@ API:
 - **immagini in uscita** con Qwen-Image-2.1 su `POST /v1/images/generations`,
   disegnate anche dentro il terminale da `coli chat`
   ([qwen-image.md](docs/qwen-image.md));
-- **decisioni** su `POST /v1/systemone` ([sopra](#system-one-a-decision-with-a-probability)).
+- **decisioni** su `POST /v1/systemone` ([sopra](#system-one-a-decision-with-a-probability));
+- **più conversazioni insieme** su ogni motore di testo: `coli serve --kv-slots N`
+  ne tiene fino a 16, ognuna con la sua cache, e decodifica insieme i loro token
+  successivi ([api.md](docs/api.md#isolated-kv-contexts)).
 
 Le CLI di programmazione e gli editor si collegano come a qualsiasi provider
 compatibile OpenAI: base URL `http://127.0.0.1:8000/v1`, l'id del modello che
@@ -562,7 +571,9 @@ issue con i numeri.
 **1. Il programma.** Prendi l'archivio per la tua piattaforma da
 [Releases](https://github.com/JustVugg/colibri/releases) (Linux x86_64, macOS,
 Windows; non serve un compilatore, solo [Python 3](https://www.python.org/downloads/)
-per il launcher e l'API) ed estrailo, poi `python3 coli info`. Oppure compila dai
+per il launcher e l'API) ed estrailo, poi `python3 coli info`. I motori Linux e
+Windows hanno Vulkan dentro, con le loro `shaders/` accanto, quelli macOS Metal;
+per una scheda NVIDIA su Windows aggiungi l'archivio CUDA. Oppure compila dai
 sorgenti con `gcc` (o clang) e OpenMP:
 
 ```bash

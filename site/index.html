@@ -304,7 +304,7 @@ cd colibri
   <ol class="steps">
     <li><b>It looks at your machine:</b> RAM, free disk, CPU and GPUs.</li>
     <li><b>It recommends a model that fits</b>, and Enter takes it. <code>--list</code> shows every model against your machine, <code>--model ID</code> picks another.</li>
-    <li><b>It gets the engine:</b> built for your machine when a compiler is there, or the prebuilt one. It uses your GPU when that pays: CUDA for an NVIDIA card on Linux with the CUDA toolkit, otherwise Vulkan; on an integrated GPU only for the models measured faster there. A missing package is printed as the exact command to run.</li>
+    <li><b>It gets the engine:</b> built for your machine when a compiler is there, or the prebuilt one from the release, with Vulkan built in on Linux and Windows. It uses your GPU when that pays: CUDA for an NVIDIA card on Linux with the CUDA toolkit, otherwise Vulkan; on an integrated GPU only for the models measured faster there. A missing package is printed as the exact command to run.</li>
     <li><b>It downloads the model</b> with resume: stop it any time, run it again and it continues.</li>
     <li><b>It starts colibri and opens the dashboard</b>, and prints the OpenAI and Anthropic addresses for other apps. Next time it starts straight away.</li>
   </ol>
@@ -504,7 +504,9 @@ cd colibri
         experts and runs whole layers: on the integrated Radeon 780M of an 8-core desktop,
         Qwen3.6 went from 6.0 to 9.9 tok/s. A small model can lose on an integrated GPU, so the
         setup turns it on only where it was measured faster; no discrete GPU has run the new
-        expert tier yet. With CUDA, NVIDIA cards keep the hottest experts in VRAM.
+        expert tier yet. With CUDA, NVIDIA cards keep the hottest experts in VRAM. The release
+        archives carry these backends ready to run: Vulkan on Linux and Windows, Metal on macOS,
+        and a CUDA package for NVIDIA cards on Windows.
         <a href="https://github.com/JustVugg/colibri/blob/main/docs/vulkan.md" style="text-decoration:underline;text-underline-offset:3px">Vulkan notes</a></p>
       <a class="more" href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md">See the benchmarks &rarr;</a>
     </div>
@@ -521,7 +523,8 @@ cd colibri
         DeepSeek V4.1 Flash, MiMo-V2.6 Flash (and Pro, on the same engine).
         And for images, Qwen-Image-2.1: text to picture, drawn inside the terminal.
         And for decisions, Laya and GLiNER2.5-Decide, with Clef on the Qwen3.6 engine: typed
-        questions in, a probability per option out.</p>
+        questions in, a probability per option out. Every language engine serves up to 16
+        conversations at once, their next tokens decoded together.</p>
       <a class="more" href="#models">Browse all models &rarr;</a>
     </div>
 

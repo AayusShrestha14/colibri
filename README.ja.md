@@ -218,7 +218,7 @@ CI は、ソフトウェアドライバ上で、すべてのエンジンの Vulk
 
 ### CUDA：NVIDIA カード
 
-Linux で CUDA ツールキットがインストールされている場合、セットアップは CUDA の経路を持つエンジンを CUDA 向けにビルドします：GLM-5.2/5.3、GLM-5.3-Flash、Inkling、Kimi K3、DeepSeek V4 Flash、Qwen3.8-Flash-Next、そして Qwen3.6 と Qwen3-Coder です。Windows では CUDA エンジンは別の DLL です（[windows.md](docs/windows.md)）。
+Linux で CUDA ツールキットがインストールされている場合、セットアップは CUDA の経路を持つエンジンを CUDA 向けにビルドします：GLM-5.2/5.3、GLM-5.3-Flash、Inkling、Kimi K3、DeepSeek V4 Flash、Qwen3.8-Flash-Next、そして Qwen3.6 と Qwen3-Coder です。Windows では CUDA エンジンは別の DLL です（[windows.md](docs/windows.md)）。各リリースにはビルド済みのものが含まれます：`colibri-<バージョン>-windows-x86_64-cuda.zip` には `coli_cuda.dll`（compute capability 8.0 以上のカード）と、それを読み込む colibri、qwen36、kimi_k3 のエンジンが入っています。メインのアーカイブの上に展開すると、セットアップは CUDA を選びます。
 
 - **VRAM エキスパートティア** は、計測されたルーティングから選んだ最もホットなエキスパートをカード上に置きます。ミスしたエキスパートは同時に CPU で計算されます。8 GB のカード 2 枚（RTX 3070 と Quadro RTX 4000）での Qwen3.6 は、履歴が温まった状態で 11.3 tok/s でデコードしました（[qwen36-cuda-tier.md](docs/qwen36-cuda-tier.md)）。全エキスパートを常駐させた RTX 5090 6 枚での GLM-5.2 は 9.0-9.2 tok/s（[benchmarks.md](docs/benchmarks.md)）。RTX 5080 での DeepSeek V4 Flash は 1.5-1.6 tok/s で、3,324 トークンのプロンプトを 90 秒で処理しました（[deepseek-v4.md](docs/deepseek-v4.md)）。
 - **Qwen3.6 の新機能：DeltaNet レイヤーをカード上で実行**（`Q36_DN_GPU=1`、オプトイン）。これまで Qwen3.6 の 30 個の DeltaNet レイヤーはそれぞれ、1 トークンごとに 4 回、カードと CPU の間でデータをコピーしていました。現在はデコード時の 1 トークンがレイヤー全体をカード上で実行し、そのリカレント状態は VRAM に保持されます。密レイヤーを VRAM に置いた RTX 3070 で：25.4 から 30.0 tok/s に向上しました（[qwen36-cuda-tier.md](docs/qwen36-cuda-tier.md#the-deltanet-layer-on-the-card-q36_dn_gpu1)）。
@@ -228,7 +228,7 @@ Linux で CUDA ツールキットがインストールされている場合、�
 
 ### Apple Silicon
 
-いくつかのエンジンでは、Metal バックエンドがユニファイドメモリ GPU 上でエキスパートの演算を行います。`METAL=1` でビルドしてください（[docs/metal.md](docs/metal.md)）。macOS では、ワンステップのセットアップは CPU 向けにビルドします。
+いくつかのエンジンでは、Metal バックエンドがユニファイドメモリ GPU 上でエキスパートの演算を行います（[docs/metal.md](docs/metal.md)）。リリースの macOS アーカイブの `colibri`、`inkling`、`kimi_k3` は Metal 付きでビルドされています：`COLI_METAL=1`（Kimi K3 は `K3_METAL=1`）で有効になり、指定しなければ CPU で動きます。ソースからは `METAL=1` でビルドしてください。ワンステップのセットアップは CPU 向けにビルドします。
 
 <a id="system-one-mode-ask-a-closed-question"></a>
 <a id="system-one-a-decision-with-a-probability"></a>
@@ -292,6 +292,7 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 - **画像入力**：GLM-5.3-Flash、DeepSeek V4.1 Flash、MiMo-V2.6、Qwen3.8-Flash-Next、Qwen3.8-27B で使えます。`coli chat` のメッセージ内のパス、`coli web` での添付、または `image_url` パートで渡します。
 - **画像出力**：Qwen-Image-2.1 で `POST /v1/images/generations` から生成します。`coli chat` ではターミナル内に描画されます（[qwen-image.md](docs/qwen-image.md)）。
 - **判定**：`POST /v1/systemone` で行います（[前述](#system-one-a-decision-with-a-probability)）。
+- **複数の会話を同時に**：すべてのテキストエンジンで、`coli serve --kv-slots N` が最大 16 の会話をそれぞれのキャッシュとともに保持し、次のトークンをまとめてデコードします（[api.md](docs/api.md#isolated-kv-contexts)）。
 
 コーディング用の CLI やエディタは、ほかの OpenAI 互換プロバイダーと同じように接続できます：base URL は `http://127.0.0.1:8000/v1`、モデル ID は `coli status` が表示するもの、キーは空でなければ何でもかまいません（[docs/api.md](docs/api.md#connect-a-coding-cli-or-editor)）。
 
@@ -341,7 +342,7 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 
 <a id="1-get-colibri"></a>
 
-**1. プログラム。** [Releases](https://github.com/JustVugg/colibri/releases) から自分のプラットフォーム用のアーカイブ（Linux x86_64、macOS、Windows。コンパイラは不要で、必要なのはランチャーと API のための [Python 3](https://www.python.org/downloads/) だけ）を取得して展開し、`python3 coli info` を実行します。または、`gcc`（または clang）と OpenMP を使ってソースからビルドします：
+**1. プログラム。** [Releases](https://github.com/JustVugg/colibri/releases) から自分のプラットフォーム用のアーカイブ（Linux x86_64、macOS、Windows。コンパイラは不要で、必要なのはランチャーと API のための [Python 3](https://www.python.org/downloads/) だけ）を取得して展開し、`python3 coli info` を実行します。Linux と Windows のエンジンには Vulkan が組み込まれ（`shaders/` が隣にあります）、macOS のエンジンには Metal が組み込まれています。Windows で NVIDIA のカードを使うなら、CUDA のアーカイブも追加してください。または、`gcc`（または clang）と OpenMP を使ってソースからビルドします：
 
 ```bash
 git clone https://github.com/JustVugg/colibri && cd colibri/c

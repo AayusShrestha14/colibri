@@ -314,7 +314,10 @@ GPU 加總數字的順序不同，而且會把某些中間結果（activation）
 在 Linux 上，若已安裝 CUDA toolkit，安裝程式會為具有 CUDA 路徑的引擎建置 CUDA：
 GLM-5.2/5.3、GLM-5.3-Flash、Inkling、Kimi K3、
 DeepSeek V4 Flash、Qwen3.8-Flash-Next，以及 Qwen3.6 與 Qwen3-Coder。
-在 Windows 上，CUDA 引擎是一個獨立的 DLL（[windows.md](docs/windows.md)）。
+在 Windows 上，CUDA 引擎是一個獨立的 DLL（[windows.md](docs/windows.md)），
+每個版本都附上已建置好的版本：`colibri-<版本>-windows-x86_64-cuda.zip` 包含
+`coli_cuda.dll`（適用於計算能力 8.0 以上的顯示卡）以及載入它的 colibri、qwen36
+與 kimi_k3 引擎。把它解壓縮到主壓縮檔之上，安裝程式就會選擇 CUDA。
 
 - **VRAM 專家層級**把最熱門的專家放在顯示卡上，依據實測的路由挑選；
   未命中的專家則同時在 CPU 上計算。Qwen3.6 在兩張
@@ -341,9 +344,10 @@ DeepSeek V4 Flash、Qwen3.8-Flash-Next，以及 Qwen3.6 與 Qwen3-Coder。
 
 ### Apple Silicon
 
-Metal 後端會為多個引擎在統一記憶體 GPU 上執行專家運算；
-使用 `METAL=1` 建置（[docs/metal.md](docs/metal.md)）。在 macOS 上，
-一步安裝會建置 CPU 版本。
+Metal 後端會為多個引擎在統一記憶體 GPU 上執行專家運算（[docs/metal.md](docs/metal.md)）。
+版本的 macOS 壓縮檔中，`colibri`、`inkling` 與 `kimi_k3` 已用 Metal 建置：
+`COLI_METAL=1`（Kimi K3 用 `K3_METAL=1`）開啟它，不設定時在 CPU 上執行。
+從原始碼建置請用 `METAL=1`；一步安裝會建置 CPU 版本。
 
 <a id="system-one-mode-ask-a-closed-question"></a>
 <a id="system-one-a-decision-with-a-probability"></a>
@@ -433,6 +437,8 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
   `coli chat` 也會直接在終端機中繪出圖片
   （[qwen-image.md](docs/qwen-image.md)）；
 - **決策**：透過 `POST /v1/systemone` 提供（[見上文](#system-one-a-decision-with-a-probability)）。
+- **同時進行多個對話**：在每個文字引擎上，`coli serve --kv-slots N` 最多保留 16 個對話，
+  每個都有自己的快取，並把它們的下一個 token 一起解碼（[api.md](docs/api.md#isolated-kv-contexts)）。
 
 程式設計 CLI 與編輯器的連線方式，就和連接任何相容 OpenAI 的服務供應商一樣：base URL 設為
 `http://127.0.0.1:8000/v1`，模型 id 使用 `coli status` 印出的值，金鑰可填任何非空字串
@@ -521,7 +527,8 @@ GLM-5.2 的解碼速度，取自[完整表格](docs/benchmarks.md)：
 **1. 程式**。從 [Releases](https://github.com/JustVugg/colibri/releases)
 下載適用你平台的壓縮檔（Linux x86_64、macOS、Windows；不需要編譯器，
 只需要供啟動器與 API 使用的 [Python 3](https://www.python.org/downloads/)），
-解壓縮後執行 `python3 coli info`。或者使用 `gcc`（或 clang）與 OpenMP 從原始碼建置：
+解壓縮後執行 `python3 coli info`。Linux 與 Windows 的引擎內建 Vulkan（`shaders/` 就在旁邊），
+macOS 的引擎內建 Metal；在 Windows 上使用 NVIDIA 顯示卡時，再加上 CUDA 壓縮檔。或者使用 `gcc`（或 clang）與 OpenMP 從原始碼建置：
 
 ```bash
 git clone https://github.com/JustVugg/colibri && cd colibri/c
