@@ -269,6 +269,89 @@ static void test_attn_hk(int S, int pos_base, int H, int KVH, int hd, int use_li
 }
 static void test_attn(int S, int pos_base, int hd, int use_list) { test_attn_hk(S, pos_base, 4, 2, hd, use_list); }
 
+/* chain_vae.comp (Qwen-Image's VAE): a band's 3x3 taps, with and without the 2x upsample,
+ * and the DupUp3D shortcut added; both are copies, so the bytes must be the CPU's. */
+static void test_vae_ops(int H, int W, int C, int u2, int y0, int nb) {
+    int Ho = H << u2, Wo = W << u2, C9 = 9 * C;
+    size_t xn = (size_t)H * W * C, qn = (size_t)nb * Wo * C9;
+    float *x = fvec(xn + 5, 1.f), *ref = malloc(qn * sizeof *ref);
+    for (int px = 0; px < nb * Wo; px++)
+        for (int kx = 0; kx < 3; kx++) for (int ky = 0; ky < 3; ky++) for (int c = 0; c < C; c++) {
+            int row = y0 + px / Wo, col = px % Wo, sy = row + ky - 1, sx = col + kx - 1;
+            ref[(size_t)px * C9 + kx * 3 * C + ky * C + c] =
+                sy >= 0 && sy < Ho && sx >= 0 && sx < Wo ? x[5 + ((size_t)(sy >> u2) * W + (sx >> u2)) * C + c] : 0.f;
+        }
+    VkcBuf *xb = up(x, xn + 5), *qb = vkc_buf((qn + 3) * 4, VKC_DOWN);
+    VkcVae p = {0, C, H, W, u2, Ho, Wo, y0, (int)qn, 5, 3, 0, 0};
+    vkc_begin(); int ok = vkc_vae(xb, qb, NULL, &p); ok = vkc_submit(1) && ok;
+    CHECK(ok && memcmp((float *)vkc_ptr(qb) + 3, ref, qn * 4) == 0, "vae taps H %d W %d C %d up %d rows %d+%d", H, W, C, u2, y0, nb);
+    /* DupUp3D: the half-size map x (C channels) into a 2H x 2W map of Co channels */
+    int Co = 4, *tab = malloc((size_t)Co * 4 * sizeof *tab);
+    for (int i = 0; i < Co * 4; i++) tab[i] = (i * 7 + 3) % C;
+    size_t yn = (size_t)(2 * H) * (2 * W) * Co;
+    float *y = fvec(yn, 1.f), *yr = malloc(yn * sizeof *yr);
+    for (int px = 0; px < 4 * H * W; px++) for (int o = 0; o < Co; o++) {
+        int row = px / (2 * W), col = px % (2 * W), src = (row >> 1) * W + (col >> 1), sub = (row & 1) * 2 + (col & 1);
+        yr[(size_t)px * Co + o] = y[(size_t)px * Co + o] + x[5 + (size_t)src * C + tab[o * 4 + sub]];
+    }
+    VkcBuf *yb = up(y, yn), *tb = vkc_buf((size_t)Co * 4 * sizeof(int), VKC_DEV);
+    VkcVae d = {1, C, H, W, 1, 2 * H, 2 * W, 0, (int)yn, 5, 0, Co, C};
+    vkc_begin(); ok = vkc_write(tb, 0, tab, (size_t)Co * 4 * sizeof(int)) && vkc_vae(xb, yb, tb, &d); ok = vkc_submit(1) && ok;
+    float *got = down(yb, 0, yn);
+    CHECK(ok && memcmp(got, yr, yn * 4) == 0, "vae dup H %d W %d C %d", H, W, C);
+    vkc_free(xb); vkc_free(qb); vkc_free(yb); vkc_free(tb);
+    free(x); free(ref); free(tab); free(y); free(yr); free(got);
+}
+
+/* GATE_ADD (Qwen-Image's gated residual): y = a + e[col] * b, a gate per column. */
+static void test_ew_gate(void) {
+    int R = 5, D = 70;
+    size_t n = (size_t)R * D;
+    float *a = fvec(n, 2.f), *b = fvec(n, 2.f), *e = fvec(D + 3, 1.f), *ref = malloc(n * sizeof *ref);
+    for (size_t i = 0; i < n; i++) ref[i] = a[i] + e[3 + i % D] * b[i];
+    VkcBuf *ab = up(a, n), *bb = up(b, n), *eb = up(e, D + 3);
+    VkcEw p = {VKC_EW_GATE_ADD, (int)n, D, 1, 0, 0, 0, 0, 0, 0, 3, 1.f};
+    vkc_begin(); int ok = vkc_ew(ab, ab, bb, NULL, eb, &p); vkc_submit(1);   /* in place, as the chain runs it */
+    float *y = down(ab, 0, n);
+    double err = relerr(y, ref, n, 1e-3);
+    CHECK(ok && err < 1e-6, "ew gate-add: err %.2e", err);
+    free(y); vkc_free(ab); vkc_free(bb); vkc_free(eb); free(a); free(b); free(e); free(ref);
+}
+
+/* A diffusion step's attention (vkc_attn_full, Qwen-Image's DiT): S query rows, each over
+ * all T key rows, token-major in one buffer (q, then k and v at their offsets), heads of
+ * hd; S and T away from the shader's tiles of 64. */
+static void test_attn_full_k(int S, int T, int H, int hd, int coop);
+static void test_attn_full(int S, int T, int H, int hd) { test_attn_full_k(S, T, H, hd, 0); }
+static void test_attn_full_k(int S, int T, int H, int hd, int coop) {
+    int D = H * hd, qrow = D + 8, kvrow = D + 24, qoff = 4, koff = qoff + S * qrow + 16, voff = koff + T * kvrow + 8;
+    size_t n = (size_t)voff + (size_t)T * kvrow + 8;
+    float *x = fvec(n, 1.f), scale = 1.f / sqrtf((float)hd);
+    float *ref = malloc((size_t)S * D * sizeof *ref);
+    double *sc = malloc((size_t)T * sizeof *sc);
+    for (int s = 0; s < S; s++) for (int h = 0; h < H; h++) {
+        double mx = -1e300, sum = 0;
+        for (int t = 0; t < T; t++) {
+            double a = 0;
+            for (int d = 0; d < hd; d++) a += (double)x[qoff + (size_t)s * qrow + h * hd + d] * x[koff + (size_t)t * kvrow + h * hd + d];
+            sc[t] = a * scale; if (sc[t] > mx) mx = sc[t];
+        }
+        for (int t = 0; t < T; t++) { sc[t] = exp(sc[t] - mx); sum += sc[t]; }
+        for (int d = 0; d < hd; d++) {
+            double a = 0;
+            for (int t = 0; t < T; t++) a += sc[t] / sum * x[voff + (size_t)t * kvrow + h * hd + d];
+            ref[(size_t)s * D + h * hd + d] = (float)a;
+        }
+    }
+    VkcBuf *xb = up(x, n), *ob = vkc_buf(((size_t)S * D + 32) * 4, VKC_DOWN);
+    VkcAttnFull p = {S, T, H, hd, qoff, qrow, koff, voff, kvrow, 32, D, scale};
+    vkc_begin(); int ok = coop ? vkc_attn_full_coop(xb, ob, &p) : vkc_attn_full(xb, ob, &p); ok = vkc_submit(1) && ok;
+    double e = relerr((float *)vkc_ptr(ob) + 32, ref, (size_t)S * D, 1e-3);
+    /* the matrix units' operands are f16: a bound of f16's rounding */
+    CHECK(ok && e < (coop ? 4e-3 : 2e-5), "attn full%s S %d T %d H %d hd %d: err %.2e", coop ? " coop" : "", S, T, H, hd, e);
+    vkc_free(xb); vkc_free(ob); free(x); free(ref); free(sc);
+}
+
 /* MiMo's attention (vkc_attn_w): row s at pos = pos_base + s sees the positions
  * max(0, pos - win + 1)..pos (win 0: from 0); position t sits in row t % ring of the
  * cache (ring 0: row t), rows position-major (kv_pm) or head-major; V has its own head
@@ -2681,6 +2764,19 @@ int main(int argc, char **argv) {
     if (!vkc_kvs_ready()) { fails++; printf("FAIL: the split KV shader did not load\n"); }
     else { test_kvs(); test_kvs_cold(); printf("kvs done\n"); }
     if (getenv("COLI_VK_DEV2")) { test_dev2(spv); printf("dev2 done\n"); }
+    /* a diffusion step's attention: one tile, partial tiles of rows and keys, every head
+     * dim (last: the shared random stream the tests above draw from stays theirs) */
+    test_attn_full(5, 9, 2, 32); test_attn_full(64, 64, 1, 128); test_attn_full(130, 200, 3, 128);
+    test_attn_full(70, 129, 2, 64); test_attn_full(1, 300, 4, 128);
+    printf("attn full done\n");
+    if (vkc_attn_full_coop_ready(128)) {   /* on the matrix units, where the device has them */
+        test_attn_full_k(64, 64, 1, 128, 1); test_attn_full_k(130, 200, 3, 128, 1);
+        test_attn_full_k(70, 129, 2, 64, 1); test_attn_full_k(1, 300, 4, 128, 1);
+        printf("attn full coop done\n");
+    } else printf("attn full coop: no matrix units here\n");
+    test_ew_gate();
+    test_vae_ops(5, 7, 3, 0, 0, 5); test_vae_ops(5, 7, 3, 1, 3, 4); test_vae_ops(4, 4, 16, 1, 0, 8);
+    printf("vae ops done\n");
     VkcStats st; vkc_stats(&st);
     printf("chain: %llu frames, %llu ops, %llu matmuls (%llu GEMM), %llu barriers\n", st.frames, st.ops, st.matmuls, st.gemms, st.barriers);
     vkc_shutdown();
