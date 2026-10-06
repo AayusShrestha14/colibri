@@ -12633,7 +12633,7 @@ int main(int argc, char **argv){
     }
 #endif
     const char *snap=getenv("SNAP");
-    if(!snap){ coli_print_launcher_help("GLM-5.2"); return 1; }
+    if(!snap){ coli_print_launcher_help("GLM-5.2", "SNAP=<model directory> ./colibri ..."); return 1; }
     g_nopack = getenv("NOPACK")?1:0;
     g_drop = getenv("DROP")?1:0;
     g_prefetch = getenv("PREFETCH")?atoi(getenv("PREFETCH")):0;
