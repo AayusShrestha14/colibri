@@ -369,6 +369,7 @@ static struct {
     VkGemmTile gemm_t[VK_GEMM_SLOTS];
     VkCoopTile coop_t[VK_COOP_SLOTS];
     int gemm_min_s, gemm_min_so, has_coop, coop_sg, coop_off;
+    int pin_sg;            /* the subgroup size the chain pins its pipelines to (vk_pin_sg); 0 = none */
     int has_bda;           /* bufferDeviceAddress on: the expert batch's grouped GEMM reads weights by address */
     /* fused dual gate+up+silu pipeline (6 bindings): x, Wg, gscale, Wu, uscale, hidden */
     VkShaderModule shader_gu; VkDescriptorSetLayout dsl_gu; VkPipelineLayout plyt_gu;
@@ -444,6 +445,57 @@ static void async_end(int dev);
 struct PCN { int S, D; float eps; };
 /* Push constants of the absorb attention kernel (must match attention_absorb.comp). */
 struct PCAttn { int fmt, S, H, Q, R, V, K, st0, T, rowWords, cap; float scale; int gs; };
+
+/* The subgroup size the dense chain pins its pipelines to (vk_chain.c, make_pipe): the
+ * one the device reports, on a device that compiles compute shaders at more than one
+ * subgroup size and can be told which (VK_EXT_subgroup_size_control). The chain's
+ * shaders size their work by gl_SubgroupSize and gl_SubgroupID; an Intel Iris Xe
+ * (8 to 32) ran chain_gemv and chain_gemv2 at another width than the one they read,
+ * and every decode GEMV of the chain came out wrong. 0: a device with one size (NVIDIA,
+ * Lavapipe), no control, or COLI_VK_SUBGROUP=0 (the driver's choice, as before). */
+static int vk_pin_sg(VkPhysicalDevice phys, int has_ext) {
+#ifdef VK_EXT_subgroup_size_control
+    const char *e = getenv("COLI_VK_SUBGROUP");
+    if (!has_ext || (e && *e == '0')) return 0;
+    VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(phys, &pp);
+    if (pp.apiVersion < VK_API_VERSION_1_1) return 0;
+    VkPhysicalDeviceSubgroupSizeControlFeaturesEXT f = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT};
+    VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f};
+    vkGetPhysicalDeviceFeatures2(phys, &f2);
+    VkPhysicalDeviceSubgroupSizeControlPropertiesEXT sp = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES_EXT};
+    VkPhysicalDeviceSubgroupProperties sg = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES, .pNext = &sp};
+    VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &sg};
+    vkGetPhysicalDeviceProperties2(phys, &p2);
+    uint32_t n = sg.subgroupSize;
+    if (!f.subgroupSizeControl || !(sp.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) ||
+        sp.minSubgroupSize >= sp.maxSubgroupSize || n < sp.minSubgroupSize || n > sp.maxSubgroupSize || (n & (n - 1)))
+        return 0;
+    return (int)n;
+#else
+    (void)phys; (void)has_ext;
+    return 0;
+#endif
+}
+/* vkCreateDevice with subgroup size control on, for vk_pin_sg: 1 with the device. */
+static int vk_create_device_pinned(VkPhysicalDevice phys, const VkDeviceCreateInfo *di, VkDevice *dev) {
+#ifdef VK_EXT_subgroup_size_control
+    VkPhysicalDeviceSubgroupSizeControlFeaturesEXT f = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT,
+        .pNext = (void *)di->pNext, .subgroupSizeControl = VK_TRUE};
+    const char *ext[16]; uint32_t n = 0;
+    for (uint32_t i = 0; i < di->enabledExtensionCount && n < 15; i++) ext[n++] = di->ppEnabledExtensionNames[i];
+    ext[n++] = VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME;
+    VkDeviceCreateInfo dc = *di;
+    dc.pNext = &f; dc.enabledExtensionCount = n; dc.ppEnabledExtensionNames = ext;
+    if (vkCreateDevice(phys, &dc, NULL, dev) == VK_SUCCESS) return 1;
+    *dev = VK_NULL_HANDLE;
+#else
+    (void)phys; (void)di; (void)dev;
+#endif
+    return 0;
+}
 
 static int pick_memtype(VkPhysicalDevice phys) {
     VkPhysicalDeviceMemoryProperties m;
@@ -1012,6 +1064,8 @@ int coli_vk_init(const char *spv_path) {
 #endif
 #ifdef VK_KHR_cooperative_matrix
                 if (!strcmp(ep[i].extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) has_cm = 1;
+#endif
+#ifdef VK_EXT_subgroup_size_control
                 if (!strcmp(ep[i].extensionName, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME)) has_ssc = 1;
 #endif
             }
@@ -1109,8 +1163,11 @@ int coli_vk_init(const char *spv_path) {
         dc.enabledExtensionCount = nc; dc.ppEnabledExtensionNames = cext;
         if (vkCreateDevice(G.phys, &dc, NULL, &G.dev) != VK_SUCCESS) { G.has_coop = 0; G.has_bda = 0; G.dev = VK_NULL_HANDLE; }
     }
-    if (!G.dev)
 #endif
+    /* the cooperative-matrix device enables subgroup size control already */
+    G.pin_sg = vk_pin_sg(G.phys, has_ssc);
+    if (!G.dev && G.pin_sg && !vk_create_device_pinned(G.phys, &di, &G.dev)) G.pin_sg = 0;
+    if (!G.dev)
     VKCHECK(vkCreateDevice(G.phys, &di, NULL, &G.dev), "vkCreateDevice");
     vk_mem_device(0, G.phys, G.dev);   /* the device memory books, and COLI_VK_DEVICE_CAP_MB */
     vk_pool_blocks(0);
@@ -2553,7 +2610,7 @@ static struct {
     VkDescriptorPool pool; VkDescriptorSet gu[64], dn[64]; int nsets;
     Scratch x, h, y;
     int inflight; size_t pending_yb;
-    int has_budget, has_hostmem;
+    int has_budget, has_hostmem, pin_sg;
     /* what the expert batch's context on this device needs (xb_bind) */
     uint32_t memtype_dev, ts_bits; float ts_period;
     size_t ssbo_align, ssbo_range, buf_align;
@@ -2652,6 +2709,9 @@ int coli_vk_init_dev2(const char *spv_path, int devidx) {
 #ifdef VK_EXT_external_memory_host
                 if (!strcmp(ep[i].extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) G2.has_hostmem = 1;
 #endif
+#ifdef VK_EXT_subgroup_size_control
+                if (!strcmp(ep[i].extensionName, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME)) G2.pin_sg = 1;
+#endif
             }
             free(ep);
         }
@@ -2665,6 +2725,9 @@ int coli_vk_init_dev2(const char *spv_path, int devidx) {
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi,
         .enabledExtensionCount = ndext, .ppEnabledExtensionNames = ndext ? dext : NULL};
+    G2.pin_sg = vk_pin_sg(G2.phys, G2.pin_sg);
+    if (G2.pin_sg && !vk_create_device_pinned(G2.phys, &di, &G2.dev)) G2.pin_sg = 0;
+    if (!G2.dev)
     VKCHECK(vkCreateDevice(G2.phys, &di, NULL, &G2.dev), "d2 vkCreateDevice");
     vk_mem_device(1, G2.phys, G2.dev);
     vk_pool_blocks(1);
@@ -5005,6 +5068,7 @@ int coli_vk_core(ColiVkCore *o) {
     o->gemm_min_s = G.gemm_min_s; o->gemm_min_so = G.gemm_min_so;
     o->integrated = coli_vk_device_integrated(); o->shares_ram = coli_vk_device_shares_ram();
     o->coop_sg = G.has_coop ? G.coop_sg : 0;
+    o->pin_sg = G.pin_sg;
     return 1;
 }
 int coli_vk_tensor_info(const ColiVkTensor *t, ColiVkTensorInfo *o) {
@@ -5032,6 +5096,7 @@ int coli_vk_core_dev(int d, ColiVkCore *o) {
     o->has_prio = 0;
     o->integrated = G2.integrated; o->shares_ram = G2.shares_ram;
     o->coop_sg = 0;   /* the second device's cooperative matrices are not probed: its chain keeps the plain shaders */
+    o->pin_sg = G2.pin_sg;
     return 1;
 }
 int coli_vk_available_dev(int d) { return d == 1 ? G2.ready : G.ready; }
