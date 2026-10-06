@@ -5917,7 +5917,7 @@ static void serve_mux(Model *m){
             } else if (r == 2 || r == 3) {
                 int bad = q.slot < 0 || q.slot >= n;
                 if (bad || rq[q.slot].active) {
-                    printf("ERROR %s %s\n", q.id, bad ? "invalid cache slot" : "cache slot busy"); fflush(stdout);
+                    printf("ERROR %s %s\n", q.id, bad ? "invalid cache slot" : "SLOT_BUSY"); fflush(stdout);
                 } else if (r == 3) {
                     q36_mux_bind(m, q.slot); clef_serve_one(m, &q);
                 } else {

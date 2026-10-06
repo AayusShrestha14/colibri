@@ -3500,7 +3500,7 @@ static void serve_mux(Model *m, Tok *T) {
                     for (int i = 0; i < n; i++) if (rq[i].active && !strcmp(rq[i].q.id, command.id)) rq[i].cancel = 1;
                 } else if (command.kind == COLI_SERVE_COMMAND_SUBMIT) {
                     if (command.slot < 0 || command.slot >= n) coli_serve_write_error(stdout, command.id, "invalid cache slot");
-                    else if (rq[command.slot].active) coli_serve_write_error(stdout, command.id, "cache slot busy");
+                    else if (rq[command.slot].active) coli_serve_write_error(stdout, command.id, "SLOT_BUSY");
                     else {
                         InkMuxReq *t = &rq[command.slot];
                         memset(t, 0, sizeof *t);

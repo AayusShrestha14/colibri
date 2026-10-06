@@ -2108,7 +2108,7 @@ static int q38_mux_read(Model *m,Q38MuxReq *rq,int n){
     }
     Q38MuxReq *r=&rq[command.slot];
     if(r->active){
-        coli_serve_write_error(stdout,command.id,"cache slot busy");
+        coli_serve_write_error(stdout,command.id,"SLOT_BUSY");
         coli_serve_command_dispose(&command);return 0;
     }
     memset(r,0,sizeof *r);
