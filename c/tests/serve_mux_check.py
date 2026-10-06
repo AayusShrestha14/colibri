@@ -150,8 +150,17 @@ def main():
             # it was through before the command arrived
             body, end = b[:-1], b[-1:]
             full = b == a
-            ok = len(body) >= 1 and body == a[:len(body)] and (
-                full or end == ([b"DONE"] if controls[rid] == b"STOP" else [b"ERROR CANCELLED"]))
+            # the bytes it sent, not the frames: an engine flushes the partial UTF-8 it
+            # held when a request ends early, a frame the reference split otherwise
+            def text(frames):
+                return b"".join(f.split(b" ", 1)[1] if b" " in f else b"" for f in frames
+                                if not f.startswith((b"DONE", b"ERROR")))
+            if not full and body and text(body) == text(a)[:len(text(body))]:
+                body = a[:len(body)]
+            # a STOP ends in DONE, or in ERROR CANCELLED on an engine that treats it as one
+            # (qwen36 does, alone or not)
+            ends = [[b"DONE"], [b"ERROR CANCELLED"]] if controls[rid] == b"STOP" else [[b"ERROR CANCELLED"]]
+            ok = len(body) >= 1 and body == a[:len(body)] and (full or end in ends)
             if not ok:
                 bad.append(f"{rid}: {controls[rid].decode()} after the first token gave {b}, the reference {a}")
             continue
