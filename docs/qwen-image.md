@@ -260,17 +260,39 @@ Measured on a server with 8 Zen 4 cores (AVX-512, 8 OpenMP threads), 768x512,
   scores 30.1 dB with them and 35.6 dB without, and by eye the two cannot be
   told apart.
 
-On a GPU, a `make qwenimage VK=1` build with `COLI_VULKAN=1` runs every
-matrix of the transformer through the shared Vulkan backend, in the storage
-`COLI_IMG_BITS` gave it (int8 by default, bf16 or f32) and with every image
-token of a product in one call: the blocks, the prompt's input layers, the
-timestep embedding, the modulation and the output layers. The activations
-stay f32 there, so `COLI_IMG_ACT8` does not apply to those matrices and the
-result is the CPU's `COLI_IMG_ACT8=0` run up to summation order. The text
-encoder (run once per prompt), the VAE and attention stay on the CPU. The
-run ends with one line saying how many products the GPU took. No GPU timing has been measured yet: the path has
-been checked on Lavapipe, a software driver, which tests the numbers and not
-the speed.
+On a GPU, a `make qwenimage VK=1` build with `COLI_VULKAN=1` runs the
+transformer there. With the device chain (`qwenimage_chain.h`, on by default on a
+discrete GPU and on a Radeon 780M, `COLI_VK_CHAIN=0` to keep it off) every block of
+a step runs on the device with the image tokens resident from the input layer to
+the output layer: the modulated norms, q/k/v, the per-head norms and RoPE, the
+attention of the image tokens over the prompt's tokens and their own, the gated
+residuals and the MLP. The prompt's keys and values go up once per prompt, the
+timestep's modulation once per step, the latents up and the prediction down once
+per step. Without the chain (`COLI_VK_CHAIN=0`, or a device that refuses the
+chain's buffers) the matrices run there one by one and the attention on the CPU,
+as before. The weights keep the storage `COLI_IMG_BITS` gave them (int8 by default,
+bf16 or f32) and the activations stay f32, so `COLI_IMG_ACT8` does not apply on the
+device and the result is the CPU's `COLI_IMG_ACT8=0` run up to summation order. The
+text encoder and the VAE run on the CPU.
+
+Measured on a Radeon 780M (an integrated GPU sharing the RAM of the 8-core Zen 4
+above), 8 steps:
+
+| | 512x512, a step | 1024x1024, a step | 512x512, one image |
+|---|---|---|---|
+| CPU | 11.6 s | 67 s | 1 min 52 s |
+| GPU, the matrices one by one | 11.8 s | 63 s | |
+| GPU, the chain | 5.4 s | 39 s | 62 s |
+
+The image's time with the chain: 11 s to load and encode the prompt, 43 s of
+denoising, 8 s of VAE. Loading went from 34 s to 7.5 s in this release: four
+layers at once, each matrix quantized straight from its bf16 rows
+(`COLI_IMG_LOAD_THREADS` sets how many; each holds one matrix's bf16 bytes, up to
+about 140 MB, while it quantizes). On a 1024x1024 step the 780M spends half the
+time in the attention (the image tokens over each other, 4096 of them), the other
+half in the matrices. A discrete card has not been measured on this path yet; the
+matrices-one-by-one path took a 512x512 step in 4.5 s on an RTX 5060 Ti 16 GB
+(#1910), the attention still on the CPU.
 
 Every stage of the engine is checked against the diffusers pipeline: on the
 real checkpoint in f32 the text encoder, all eight denoising steps and the VAE

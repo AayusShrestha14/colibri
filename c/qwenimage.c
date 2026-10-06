@@ -1444,7 +1444,10 @@ static void usage(void){
         "       qwenimage --model DIR --ref REFDIR\n"
         "env:   COLI_IMG_BITS=8|16|32 weight storage (default 8: int8 rows)\n"
         "       COLI_IMG_ACT8=0  f32 activations in the DiT (default where VNNI exists: int8, about 2x per step)\n"
-        "       COLI_IMG_TE=resident|stage  keep the text encoder loaded between prompts (serve default: resident)\n");
+        "       COLI_IMG_TE=resident|stage  keep the text encoder loaded between prompts (serve default: resident)\n"
+        "       COLI_IMG_LOAD_THREADS=n  layers loaded at once (default 4)\n"
+        "       COLI_VULKAN=1 (a VK=1 build): the transformer on the GPU; COLI_VK_CHAIN=0 keeps each step's blocks\n"
+        "                    off the device chain (the matrices one by one)\n");
 }
 
 int main(int argc, char **argv){

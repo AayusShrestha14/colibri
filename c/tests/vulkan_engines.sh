@@ -886,6 +886,44 @@ print(f"OK qwenimage picture: {sum(t > 0 for t in d)} of {len(d)} bytes differ f
 PY
   # the serve protocol with the device on
   COLI_VULKAN=1 QWENIMAGE_TINY=qwenimage_tiny $PY -m unittest tests.test_qwenimage_engine_serve
+  # the DiT on the chain (qwenimage_chain.h; off by default on Lavapipe, a CPU device):
+  # every oracle stage against the CPU's at 8, 16 and 32 bits, the attention in slices of
+  # rows, the device lost in a step's frames (the CPU takes the step again), a picture
+  qi_chain() {  # <tag> <bits> <env...>
+    local tag=$1 bits=$2; shift 2
+    COLI_IMG_BITS=$bits COLI_IMG_ACT8=0 ./qwenimage --model qwenimage_tiny --ref qwenimage_tiny/ref > qi-cpu.log 2>&1 || true
+    env "$@" COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_IMG_BITS=$bits COLI_IMG_ACT8=0 ./qwenimage --model qwenimage_tiny --ref qwenimage_tiny/ref \
+      > qi-vk.log 2>&1 || true
+    grep -qa 'qwenimage chain: [0-9]* blocks on the device' qi-vk.log || { cat qi-vk.log; fail "$tag: the chain never ran"; }
+    TAG="$tag" $PY - <<'QIPY'
+import os, re
+def stages(p):
+    return {k.strip(): float(r) for k, r in
+            re.findall(r"\[oracle\] (.+?)\s+n=\d+\s+max\|err\| \S+\s+rel (\S+)", open(p).read())}
+c, v = stages("qi-cpu.log"), stages("qi-vk.log")
+assert len(c) >= 10 and c.keys() == v.keys(), (c, v)
+for k in c:
+    assert abs(c[k] - v[k]) <= 0.25 * c[k] + 2e-7, (k, c[k], v[k])
+print(f"OK {os.environ['TAG']}: {len(c)} stages match the CPU run")
+QIPY
+  }
+  for bits in 8 16 32; do qi_chain "qwenimage chain bits=$bits" $bits; done
+  qi_chain "qwenimage chain, the attention in slices" 32 COLI_VK_ATTN_SLICE=60000
+  grep -qa 'qwenimage chain: [0-9]* steps' qi-vk.log || { cat qi-vk.log; fail "qwenimage chain, slices: no step on the device"; }
+  qi_chain "qwenimage chain, the device lost" 32 COLI_VK_CHAIN_FAULT=9
+  grep -qa 'qwenimage chain: a frame failed' qi-vk.log || { cat qi-vk.log; fail "qwenimage chain, device lost: no loss handled"; }
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_IMG_BITS=8 COLI_IMG_ACT8=0 ./qwenimage --model qwenimage_tiny --prompt "a red fox in the snow" \
+    --width 256 --height 256 --steps 2 --seed 1 --out qi-vk.png 2> qi-vk-gen.err
+  grep -qa 'qwenimage chain: [0-9]* steps' qi-vk-gen.err || { cat qi-vk-gen.err; fail "qwenimage chain picture: the chain never ran"; }
+  $PY - <<'QIPY'
+import sys; sys.path.insert(0, ".")
+import image_engine as e
+_, _, _, a = e.decode_png(open("qi-cpu.png", "rb").read())
+_, _, _, b = e.decode_png(open("qi-vk.png", "rb").read())
+d = [abs(x - y) for x, y in zip(a, b)]
+assert len(a) == len(b) and max(d) <= 2 and sum(t > 0 for t in d) <= len(d) // 1000, (max(d), sum(t > 0 for t in d))
+print(f"OK qwenimage chain picture: {sum(t > 0 for t in d)} of {len(d)} bytes differ from the CPU's, max {max(d)}")
+QIPY
 }
 
 family_deepseek() {
@@ -1193,7 +1231,7 @@ family_kimi() {
 # experts on the device.
 family_kimi_mimo_sanitize() {
   make clean >/dev/null 2>&1 || true
-  make kimi_k3 mimo VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  make kimi_k3 mimo qwenimage VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
   $PY tools/make_kimi_k3_tiny.py --output ./kimi_k3_tiny --force
   $PY tools/make_mimo_tiny.py --output ./mimo_tiny --force --vision
   ksan() {  # <engine> <tag> <env and argv...>
@@ -1218,6 +1256,17 @@ family_kimi_mimo_sanitize() {
   ksan mimo "asan mimo eviction (MIMO_VK_EXPERTS=2)" MIMO_DENSE_BITS=32 COLI_TEMP=0 MIMO_VK_EXPERTS=2 ./mimo mimo_tiny --ids "$MIDS" --ngen 6
   ksan mimo "asan mimo picture, native dense on the device" MIMO_DENSE_BITS=0 COLI_TEMP=0 COLI_VK_DENSE=1 ./mimo mimo_tiny --ids "$IMG" --ngen 6 --image mimo_tiny/patches.f32 --grid $GRID
   ksan mimo "asan mimo prefill blocks of 3, cache 4" MIMO_DENSE_BITS=32 COLI_TEMP=0 MIMO_CHUNK=3 MIMO_CAP=4 ./mimo mimo_tiny --ids "$MIDS" --ngen 6
+  # qwenimage's DiT on the chain: the oracle, then the attention in slices
+  $PY tools/make_qwenimage_tiny.py qwenimage_tiny
+  local qa
+  for qa in COLI_VK_ATTN_SLICE=0 COLI_VK_ATTN_SLICE=60000; do
+    env ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2 \
+      COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_IMG_BITS=32 COLI_IMG_ACT8=0 $qa ./qwenimage --model qwenimage_tiny --ref qwenimage_tiny/ref \
+      > san.log 2>&1 || { cat san.log; fail "asan qwenimage chain $qa: the oracle"; }
+    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan qwenimage chain $qa: sanitizer diagnostic"; fi
+    grep -qa 'qwenimage chain: [0-9]* steps' san.log || { cat san.log; fail "asan qwenimage chain $qa: the chain never ran"; }
+    echo "OK asan qwenimage chain $qa: sanitizers clean, the oracle within tolerance"
+  done
   make clean >/dev/null 2>&1 || true
 }
 

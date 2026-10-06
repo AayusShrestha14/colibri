@@ -155,7 +155,7 @@ static int qic_attn(const VkcEncAttn *at, int N, int L) {
 /* One denoising step on the device: out[N][in_ch]. 0: not taken (the CPU runs it). */
 static int qic_forward(Dit *d, const Prefix *p, DitStep *s, const float *lat, float t, float *out) {
     if (g_qic_on < 0) g_qic_on = g_vk_ready && vkc_init() &&
-                                 coli_vk_chain_decide("qwenimage", 0, COLI_VK_CHAIN_UNMEASURED) == COLI_VK_CHAIN_ON;
+                                 coli_vk_chain_decide("qwenimage", -1, COLI_VK_CHAIN_ON) == COLI_VK_CHAIN_ON;
     if (!g_qic_on || g_qic.failed || vkc_lost()) return 0;
     if (!g_qic.ok && !qic_setup(d)) return 0;
     int N = s->N, L = p->L, D = d->dim, H = d->heads, hd = d->hd, M = d->mlp, C = d->in_ch;

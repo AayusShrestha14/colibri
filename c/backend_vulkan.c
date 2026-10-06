@@ -2204,6 +2204,9 @@ unsigned long long coli_vk_dense_host_dropped_bytes(void) { return __atomic_load
  *   olmoe ON (OLMoE-1B-7B: the chain decoded 17.3 against 12.8 tok/s and prefilled 512
  *   tokens in 5.5 against 6.4 s; the CPU alone decodes 23.1 tok/s, its trunk being f32).
  *   inkling passes COLI_VK_CHAIN_UNMEASURED (no checkpoint of it runs on the box).
+ *   An engine with no expert tier passes tier_on < 0: `igpu` alone decides on an
+ *   integrated GPU. qwenimage passes ON (Qwen-Image-2.1 on the 780M: a 512x512 step in
+ *   5.4 s against the CPU's 11.6, the per-matrix path's 11.8).
  *   Unset, a CPU device (Lavapipe): off.
  * Printed as a [VK] line with an engine name (NULL: silent). */
 int coli_vk_chain_decide(const char *engine, int tier_on, int igpu) {
@@ -2221,14 +2224,14 @@ int coli_vk_chain_decide(const char *engine, int tier_on, int igpu) {
         int measured = igpu != COLI_VK_CHAIN_UNMEASURED;
         on = tier_on && measured ? igpu : COLI_VK_CHAIN_OFF;
         snprintf(why, sizeof why, "an integrated GPU%s: %s; COLI_VK_CHAIN=0 off, 1 on, 2 prompts only",
-                 tier_on ? " with the expert tier" : " without the expert tier",
+                 tier_on < 0 ? "" : tier_on ? " with the expert tier" : " without the expert tier",
                  on == COLI_VK_CHAIN_ON ? "measured faster on decode and prefill"
                  : on == COLI_VK_CHAIN_PREFILL ? "measured faster on prefill, slower on decode"
                  : tier_on && measured ? "measured slower on decode" : "not measured");
     } else if (coli_vk_device_shares_ram()) {
         on = COLI_VK_CHAIN_OFF;
         snprintf(why, sizeof why, "a CPU device; COLI_VK_CHAIN=1 turns it on");
-    } else { on = COLI_VK_CHAIN_ON; snprintf(why, sizeof why, "a discrete GPU%s", tier_on ? ", beside the expert tier" : ""); }
+    } else { on = COLI_VK_CHAIN_ON; snprintf(why, sizeof why, "a discrete GPU%s", tier_on > 0 ? ", beside the expert tier" : ""); }
     if (engine) fprintf(stderr, "[VK] %s: dense chain %s (%s)\n", engine,
                         on == COLI_VK_CHAIN_ON ? "on" : on == COLI_VK_CHAIN_PREFILL ? "on for prompts" : "off", why);
     return on;
