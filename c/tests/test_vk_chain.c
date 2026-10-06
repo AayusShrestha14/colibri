@@ -269,6 +269,52 @@ static void test_attn_hk(int S, int pos_base, int H, int KVH, int hd, int use_li
 }
 static void test_attn(int S, int pos_base, int hd, int use_list) { test_attn_hk(S, pos_base, 4, 2, hd, use_list); }
 
+/* GATE_ADD (Qwen-Image's gated residual): y = a + e[col] * b, a gate per column. */
+static void test_ew_gate(void) {
+    int R = 5, D = 70;
+    size_t n = (size_t)R * D;
+    float *a = fvec(n, 2.f), *b = fvec(n, 2.f), *e = fvec(D + 3, 1.f), *ref = malloc(n * sizeof *ref);
+    for (size_t i = 0; i < n; i++) ref[i] = a[i] + e[3 + i % D] * b[i];
+    VkcBuf *ab = up(a, n), *bb = up(b, n), *eb = up(e, D + 3);
+    VkcEw p = {VKC_EW_GATE_ADD, (int)n, D, 1, 0, 0, 0, 0, 0, 0, 3, 1.f};
+    vkc_begin(); int ok = vkc_ew(ab, ab, bb, NULL, eb, &p); vkc_submit(1);   /* in place, as the chain runs it */
+    float *y = down(ab, 0, n);
+    double err = relerr(y, ref, n, 1e-3);
+    CHECK(ok && err < 1e-6, "ew gate-add: err %.2e", err);
+    free(y); vkc_free(ab); vkc_free(bb); vkc_free(eb); free(a); free(b); free(e); free(ref);
+}
+
+/* A diffusion step's attention (vkc_attn_full, Qwen-Image's DiT): S query rows, each over
+ * all T key rows, token-major in one buffer (q, then k and v at their offsets), heads of
+ * hd; S and T away from the shader's tiles of 64. */
+static void test_attn_full(int S, int T, int H, int hd) {
+    int D = H * hd, qrow = D + 8, kvrow = D + 24, qoff = 4, koff = qoff + S * qrow + 16, voff = koff + T * kvrow + 8;
+    size_t n = (size_t)voff + (size_t)T * kvrow + 8;
+    float *x = fvec(n, 1.f), scale = 1.f / sqrtf((float)hd);
+    float *ref = malloc((size_t)S * D * sizeof *ref);
+    double *sc = malloc((size_t)T * sizeof *sc);
+    for (int s = 0; s < S; s++) for (int h = 0; h < H; h++) {
+        double mx = -1e300, sum = 0;
+        for (int t = 0; t < T; t++) {
+            double a = 0;
+            for (int d = 0; d < hd; d++) a += (double)x[qoff + (size_t)s * qrow + h * hd + d] * x[koff + (size_t)t * kvrow + h * hd + d];
+            sc[t] = a * scale; if (sc[t] > mx) mx = sc[t];
+        }
+        for (int t = 0; t < T; t++) { sc[t] = exp(sc[t] - mx); sum += sc[t]; }
+        for (int d = 0; d < hd; d++) {
+            double a = 0;
+            for (int t = 0; t < T; t++) a += sc[t] / sum * x[voff + (size_t)t * kvrow + h * hd + d];
+            ref[(size_t)s * D + h * hd + d] = (float)a;
+        }
+    }
+    VkcBuf *xb = up(x, n), *ob = vkc_buf(((size_t)S * D + 32) * 4, VKC_DOWN);
+    VkcAttnFull p = {S, T, H, hd, qoff, qrow, koff, voff, kvrow, 32, D, scale};
+    vkc_begin(); int ok = vkc_attn_full(xb, ob, &p); ok = vkc_submit(1) && ok;
+    double e = relerr((float *)vkc_ptr(ob) + 32, ref, (size_t)S * D, 1e-3);
+    CHECK(ok && e < 2e-5, "attn full S %d T %d H %d hd %d: err %.2e", S, T, H, hd, e);
+    vkc_free(xb); vkc_free(ob); free(x); free(ref); free(sc);
+}
+
 /* MiMo's attention (vkc_attn_w): row s at pos = pos_base + s sees the positions
  * max(0, pos - win + 1)..pos (win 0: from 0); position t sits in row t % ring of the
  * cache (ring 0: row t), rows position-major (kv_pm) or head-major; V has its own head
@@ -2681,6 +2727,12 @@ int main(int argc, char **argv) {
     if (!vkc_kvs_ready()) { fails++; printf("FAIL: the split KV shader did not load\n"); }
     else { test_kvs(); test_kvs_cold(); printf("kvs done\n"); }
     if (getenv("COLI_VK_DEV2")) { test_dev2(spv); printf("dev2 done\n"); }
+    /* a diffusion step's attention: one tile, partial tiles of rows and keys, every head
+     * dim (last: the shared random stream the tests above draw from stays theirs) */
+    test_attn_full(5, 9, 2, 32); test_attn_full(64, 64, 1, 128); test_attn_full(130, 200, 3, 128);
+    test_attn_full(70, 129, 2, 64); test_attn_full(1, 300, 4, 128);
+    printf("attn full done\n");
+    test_ew_gate();
     VkcStats st; vkc_stats(&st);
     printf("chain: %llu frames, %llu ops, %llu matmuls (%llu GEMM), %llu barriers\n", st.frames, st.ops, st.matmuls, st.gemms, st.barriers);
     vkc_shutdown();

@@ -1,0 +1,117 @@
+#version 450
+// The image rows' attention of a diffusion step (vk_chain.c, vkc_attn_full; Qwen-Image's
+// DiT): S query rows, each over all T key rows, every head. No mask but the end of the
+// keys and no cache: q, k and v are rows of one buffer, token-major,
+//   q[q_off + i*q_row + h*HD + d], k[k_off + t*kv_row + h*HD + d], v[v_off + t*kv_row + h*HD + d]
+//   o[o_off + i*o_row + h*HD + d] = sum_t softmax_t(scale * q_i,h . k_t,h) v_t,h[d]
+// One workgroup of 256 threads takes 64 query rows of one head through the keys in tiles
+// of 64. Thread (ty, tx) = (t / 16, t % 16) scores rows 4ty..4ty+3 against keys
+// 4tx..4tx+3, from chunks of 32 dims of Q and K staged in shared memory, and accumulates
+// the dims tx, tx+16, ... of the same rows' output from 32 keys of V at a time. The
+// softmax runs online in float: each tile's row max, the running sum and the output
+// rescaled by exp(old max - new max); the CPU normalizes the scores first and sums the
+// row in double, so the two agree to rounding. HD (a specialization constant) is 32, 64
+// or 128. Shared memory: 37.5 KB.
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const int HD = 128;
+#define BR 64
+#define BC 64
+#define DC 32
+#define DPT (HD / 16)
+
+layout(std430, binding = 0) readonly buffer QKV { float x[]; };
+layout(std430, binding = 1) writeonly buffer OB { float o[]; };
+layout(push_constant) uniform P {
+    int S, T, H, hd, q_off, q_row, k_off, v_off, kv_row, o_off, o_row;
+    float scale;
+} p;
+
+shared float sb[2 * BR * (DC + 1)];   // Q and K chunks, [64][33] each; later a V chunk, [32][HD]
+shared float ps[BR * (BC + 1)];       // the tile's exp(score - max), [64][65]
+shared float red[BR * 16];            // per-row partial maxima, then sums
+
+void main() {
+    int t = int(gl_LocalInvocationID.x), ty = t / 16, tx = t % 16;
+    int h = int(gl_WorkGroupID.y), r0 = int(gl_WorkGroupID.x) * BR, hb = h * HD;
+    float acc[4][DPT], m[4], l[4];
+    for (int i = 0; i < 4; i++) {
+        m[i] = -1e30; l[i] = 0.0;
+        for (int dd = 0; dd < DPT; dd++) acc[i][dd] = 0.0;
+    }
+    for (int kb = 0; kb < p.T; kb += BC) {
+        float s[4][4];
+        for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) s[i][j] = 0.0;
+        for (int dc = 0; dc < HD; dc += DC) {
+            barrier();   // the previous chunk (or V) is read
+            for (int e = t; e < BR * DC; e += 256) {
+                int r = e / DC, c = e - r * DC, row = r0 + r, key = kb + r;
+                sb[r * (DC + 1) + c] = row < p.S ? x[p.q_off + row * p.q_row + hb + dc + c] : 0.0;
+                sb[BR * (DC + 1) + r * (DC + 1) + c] = key < p.T ? x[p.k_off + key * p.kv_row + hb + dc + c] : 0.0;
+            }
+            barrier();
+            for (int c = 0; c < DC; c++) {
+                float a[4], b[4];
+                for (int i = 0; i < 4; i++) a[i] = sb[(4 * ty + i) * (DC + 1) + c];
+                for (int j = 0; j < 4; j++) b[j] = sb[BR * (DC + 1) + (4 * tx + j) * (DC + 1) + c];
+                for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) s[i][j] += a[i] * b[j];
+            }
+        }
+        // the tile's row maxima across the 16 threads that share the rows
+        float mn[4];
+        for (int i = 0; i < 4; i++) {
+            float mt = -1e30;
+            for (int j = 0; j < 4; j++) {
+                s[i][j] = kb + 4 * tx + j < p.T ? s[i][j] * p.scale : -1e30;
+                mt = max(mt, s[i][j]);
+            }
+            red[(4 * ty + i) * 16 + tx] = mt;
+        }
+        barrier();
+        for (int i = 0; i < 4; i++) {
+            float mx = m[i];
+            for (int k = 0; k < 16; k++) mx = max(mx, red[(4 * ty + i) * 16 + k]);
+            mn[i] = mx;
+        }
+        barrier();   // red is read: the sums take it
+        for (int i = 0; i < 4; i++) {
+            float rs = 0.0;
+            for (int j = 0; j < 4; j++) {
+                float e = kb + 4 * tx + j < p.T ? exp(s[i][j] - mn[i]) : 0.0;
+                ps[(4 * ty + i) * (BC + 1) + 4 * tx + j] = e;
+                rs += e;
+            }
+            red[(4 * ty + i) * 16 + tx] = rs;
+        }
+        barrier();
+        for (int i = 0; i < 4; i++) {
+            float sum = 0.0;
+            for (int k = 0; k < 16; k++) sum += red[(4 * ty + i) * 16 + k];
+            float al = exp(m[i] - mn[i]);
+            l[i] = l[i] * al + sum; m[i] = mn[i];
+            for (int dd = 0; dd < DPT; dd++) acc[i][dd] *= al;
+        }
+        // P . V, 32 keys of V at a time in the chunks' space
+        for (int kc = 0; kc < BC; kc += 32) {
+            barrier();   // the chunks and the sums are read
+            for (int e = t; e < 32 * HD; e += 256) {
+                int kk = e / HD, d = e - kk * HD, key = kb + kc + kk;
+                sb[e] = key < p.T ? x[p.v_off + key * p.kv_row + hb + d] : 0.0;
+            }
+            barrier();
+            for (int kk = 0; kk < 32; kk++) {
+                float pv[4];
+                for (int i = 0; i < 4; i++) pv[i] = ps[(4 * ty + i) * (BC + 1) + kc + kk];
+                for (int dd = 0; dd < DPT; dd++) {
+                    float vv = sb[kk * HD + tx + 16 * dd];
+                    for (int i = 0; i < 4; i++) acc[i][dd] += pv[i] * vv;
+                }
+            }
+        }
+    }
+    for (int i = 0; i < 4; i++) {
+        int row = r0 + 4 * ty + i;
+        if (row >= p.S) continue;
+        float inv = 1.0 / l[i];
+        for (int dd = 0; dd < DPT; dd++) o[p.o_off + row * p.o_row + hb + tx + 16 * dd] = acc[i][dd] * inv;
+    }
+}

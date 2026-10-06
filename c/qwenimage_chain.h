@@ -133,13 +133,21 @@ static int qic_attn(const VkcEncAttn *at, int N, int L) {
     long long b = vkc_attn_slice_budget(), per = (long long)(L + N) * at->H * at->hd;
     int rr = b > 0 ? (int)(b / per / 16 * 16) : N;
     if (rr < 16) rr = 16;
-    int ok = 1;
+    /* chain_attn_full where it loads (head dims 32, 64 and 128), the encoders'
+     * attention over row ranges otherwise */
+    int full = (at->hd == 32 || at->hd == 64 || at->hd == 128) && vkc_attn_full_ready(), ok = 1;
     for (int r0 = 0; ok && r0 < N; r0 += rr) {
-        VkcEncAttn x = *at;
-        x.S = N - r0 < rr ? N - r0 : rr;
-        x.q_off = at->q_off + r0 * at->kv_row; x.o_off = at->o_off + r0 * at->o_row;
-        ok = vkc_enc_attn(g_qic.qkv, NULL, NULL, g_qic.a, g_qic.rng, NULL, NULL, &x) &&
-             (r0 + rr >= N || (vkc_submit(0) && vkc_begin()));
+        int n = N - r0 < rr ? N - r0 : rr;
+        if (full) {
+            VkcAttnFull f = {n, L + N, at->H, at->hd, at->q_off + r0 * at->kv_row, at->kv_row, at->k_off, at->v_off,
+                             at->kv_row, at->o_off + r0 * at->o_row, at->o_row, at->scale};
+            ok = vkc_attn_full(g_qic.qkv, g_qic.a, &f);
+        } else {
+            VkcEncAttn x = *at;
+            x.S = n; x.q_off = at->q_off + r0 * at->kv_row; x.o_off = at->o_off + r0 * at->o_row;
+            ok = vkc_enc_attn(g_qic.qkv, NULL, NULL, g_qic.a, g_qic.rng, NULL, NULL, &x);
+        }
+        ok = ok && (r0 + rr >= N || (vkc_submit(0) && vkc_begin()));
     }
     return ok;
 }

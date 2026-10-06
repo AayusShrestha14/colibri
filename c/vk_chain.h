@@ -678,6 +678,15 @@ int vkc_enc_attn(VkcBuf *qkv, VkcBuf *c2p, VkcBuf *p2c, VkcBuf *o, VkcBuf *rng, 
 typedef struct { int mode, S, H, hd, x_off, x_row, p_off, p_row, y_off, nr, r0; } VkcEncRel;
 int vkc_enc_rel(VkcBuf *x, VkcBuf *pt, VkcBuf *y, const VkcEncRel *p);
 
+/* chain_attn_full.comp: a diffusion step's attention (Qwen-Image's DiT). S query rows, each
+ * over all T key rows, H heads of hd (32, 64 or 128) floats, q, k and v token-major in one
+ * buffer: q[q_off + i*q_row + h*hd + d], k and v at k_off and v_off + t*kv_row + h*hd + d,
+ * the output at o_off + i*o_row + h*hd + d; the softmax's scale. 64 query rows of a head a
+ * workgroup, the keys in tiles of 64, the softmax online in float. Made on first use. */
+typedef struct { int S, T, H, hd, q_off, q_row, k_off, v_off, kv_row, o_off, o_row; float scale; } VkcAttnFull;
+int vkc_attn_full(VkcBuf *qkv, VkcBuf *o, const VkcAttnFull *p);
+int vkc_attn_full_ready(void);
+
 /* counters, for the engines' [VK] lines */
 typedef struct {
     unsigned long long frames, waits, ops, matmuls, gemms, barriers, bytes_up, bytes_down;

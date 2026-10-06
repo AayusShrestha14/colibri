@@ -743,6 +743,9 @@ VK_SPV   += shaders/chain_kvs.spv
 VK_SPV   += shaders/chain_enc.spv
 # the attention core on the matrix units for prompt chunks (optional at run time)
 VK_SPV   += shaders/chain_attn_flash.spv
+# a diffusion step's attention, every query row over every key row (made on first use;
+# qwenimage_chain.h)
+VK_SPV   += shaders/chain_attn_full.spv
 endif
 
 # Optional AMD XDNA2 (Ryzen AI NPU) lane, Windows. Same opt-in shape as VK=1:

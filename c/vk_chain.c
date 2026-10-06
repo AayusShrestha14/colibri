@@ -1393,6 +1393,37 @@ int vkc_relattn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *kvs, VkcBu
 /* ---- the decision engines' encoders: chain_enc.comp, made on first use ---- */
 static struct { VkShaderModule mod; VkPipeline pipe; int tried; } g_ke[2];
 #define KE (g_ke[g_kd])
+/* chain_attn_full.comp (a diffusion step's attention): made on first use, a pipeline per
+ * head dim (its specialization constant) */
+static struct { VkShaderModule mod; VkPipeline pipe[3]; int tried; } g_kf[2];
+#define KF (g_kf[g_kd])
+static void kf_shutdown(void) {
+    for (int i = 0; i < 3; i++) if (KF.pipe[i]) vkDestroyPipeline(KC.dev, KF.pipe[i], NULL);
+    if (KF.mod) vkDestroyShaderModule(KC.dev, KF.mod, NULL);
+    memset(&KF, 0, sizeof KF);
+}
+int vkc_attn_full(VkcBuf *qkv, VkcBuf *o, const VkcAttnFull *p) {
+    if (!vkc_ready() || p->S < 1 || p->T < 1 || p->H < 1 || (p->hd != 32 && p->hd != 64 && p->hd != 128) ||
+        (int64_t)p->S > 65535LL * 64 || p->H > 65535) return 0;
+    int k = p->hd == 32 ? 0 : p->hd == 64 ? 1 : 2;
+    if (!KF.pipe[k]) {
+        if (!KF.mod && !KF.tried) { KF.tried = 1; KF.mod = load_module(KC.core.spv_path, "chain_attn_full.spv"); }
+        if (!KF.mod) return 0;
+        int hd = p->hd;
+        VkSpecializationMapEntry me = {0, 0, sizeof(int)};
+        VkSpecializationInfo si = {1, &me, sizeof(int), &hd};
+        if (!(KF.pipe[k] = make_pipe(KF.mod, &si))) return 0;
+    }
+    KC.kind = PK_ATTN;
+    VkcBind bd[2] = {B(qkv, 0), B(o, 1)};
+    return record(KF.pipe[k], bd, 2, p, sizeof *p, (uint32_t)((p->S + 63) / 64), (uint32_t)p->H, 1);
+}
+int vkc_attn_full_ready(void) {
+    if (!vkc_ready()) return 0;
+    if (!KF.mod && !KF.tried) { KF.tried = 1; KF.mod = load_module(KC.core.spv_path, "chain_attn_full.spv"); }
+    return KF.mod != VK_NULL_HANDLE;
+}
+
 static VkPipeline ke_pipe(void) {
     if (KE.pipe || KE.tried || !vkc_ready()) return KE.pipe;
     KE.tried = 1;
@@ -1687,6 +1718,7 @@ void vkc_shutdown(void) {
     kx_shutdown();
     kab_shutdown();
     ke_shutdown();
+    kf_shutdown();
     for (int i = 0; i < P_NPIPE; i++) {
         if (KC.pipe[i]) vkDestroyPipeline(KC.dev, KC.pipe[i], NULL);
         if (KC.mod[i]) vkDestroyShaderModule(KC.dev, KC.mod[i], NULL);
