@@ -4527,6 +4527,7 @@ int coli_vk_core(ColiVkCore *o) {
     }
     o->gemm_min_s = G.gemm_min_s; o->gemm_min_so = G.gemm_min_so;
     o->integrated = coli_vk_device_integrated(); o->shares_ram = coli_vk_device_shares_ram();
+    o->coop_sg = G.has_coop ? G.coop_sg : 0;
     return 1;
 }
 int coli_vk_tensor_info(const ColiVkTensor *t, ColiVkTensorInfo *o) {
@@ -4553,6 +4554,7 @@ int coli_vk_core_dev(int d, ColiVkCore *o) {
     o->ssbo_align = G2.ssbo_align; o->ssbo_range = G2.ssbo_range;
     o->has_prio = 0;
     o->integrated = G2.integrated; o->shares_ram = G2.shares_ram;
+    o->coop_sg = 0;   /* the second device's cooperative matrices are not probed: its chain keeps the plain shaders */
     return 1;
 }
 int coli_vk_available_dev(int d) { return d == 1 ? G2.ready : G.ready; }

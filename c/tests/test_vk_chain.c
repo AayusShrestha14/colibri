@@ -257,9 +257,12 @@ static void test_attn_hk(int S, int pos_base, int H, int KVH, int hd, int use_li
     VkcAttn p = {S, H, KVH, hd, pos_base, cap, 0, H * qseg, qseg, hd, H * qseg, qseg, 1, 0, H * hd, 0, use_list ? selrow : 0, scale, koff, koff};
     vkc_begin(); int ok = vkc_attn(qb, kb, vb, ob, qb, lb, &p); vkc_submit(1);
     float *o = vkc_ptr(ob);
+    /* chain_attn_flash's operands are f16: its bound where it may have run */
+    int fl = vkc_attn_flash_rows();
     double e = relerr(o, ref, (size_t)S * H * hd, 1e-3);
-    CHECK(ok && e < 2e-5, "attn S %d pos %d H %d/%d hd %d list %d (block from %d): err %.2e", S, pos_base, H, KVH, hd,
-          use_list, vkc_attn_block_rows(), e);
+    double tol = fl > 0 && S >= fl && !use_list && hd % 64 == 0 && 16 % (H / KVH) == 0 ? 2e-3 : 2e-5;
+    CHECK(ok && e < tol, "attn S %d pos %d H %d/%d hd %d list %d (block from %d, flash from %d): err %.2e", S, pos_base, H, KVH, hd,
+          use_list, vkc_attn_block_rows(), fl, e);
     vkc_free(qb); vkc_free(kb); vkc_free(vb); vkc_free(ob); vkc_free(lb);
     free(q); free(kc); free(vc); free(sel); free(ref);
 }
@@ -2471,6 +2474,21 @@ int main(int argc, char **argv) {
     test_rope();
     test_chunk_rows();
     test_attn(1, 0, 16, 0); test_attn(1, 140, 32, 0); test_attn(5, 200, 64, 0); test_attn(6, 9, 256, 1); test_attn(130, 3, 24, 0);
+    /* prompt chunks on the matrix units where the device has them (chain_attn_flash, from
+     * 16 rows): Qwen3.6's heads (hd 256, 8 query heads per kv head) from position 0 and
+     * after earlier rows, a chunk over several 64-key blocks with a partial last token
+     * group, hd 64 with GQA 2, hd 128 with GQA 16; then cut in slices */
+    {
+        VkcStats s0; vkc_stats(&s0);
+        test_attn_hk(16, 0, 16, 2, 256, 0); test_attn_hk(37, 200, 16, 2, 256, 0); test_attn_hk(130, 3, 4, 2, 64, 0);
+        test_attn_hk(21, 70, 16, 1, 128, 0);
+        setenv("COLI_VK_ATTN_SLICE", "60000", 1);
+        test_attn_hk(40, 7, 16, 2, 256, 0); test_attn_hk(130, 3, 4, 2, 64, 0);
+        unsetenv("COLI_VK_ATTN_SLICE");
+        VkcStats s1; vkc_stats(&s1);
+        printf("  attention on the matrix units: %llu calls\n", s1.attn_flash - s0.attn_flash);
+    }
+    setenv("COLI_VK_CHAIN_FLASH", "0", 1);   /* the blocked and plain cases below: their own shaders */
     /* MiMo: a prompt's rows through a window (from position 0, and past it), a decode row
      * over a ring as large as the window, prefill rows over a larger ring, full attention
      * with V's own head dim, a window wider than a tile, the head-major layout with a
@@ -2509,6 +2527,7 @@ int main(int argc, char **argv) {
         printf("  attention in slices: %llu extra submissions\n", s1.attn_slices - s0.attn_slices);
         unsetenv("COLI_VK_ATTN_SLICE");
     }
+    unsetenv("COLI_VK_CHAIN_FLASH");
     printf("attn done\n");
     test_dnconv(0); test_dnconv(1);
     test_dnrec(8, 8, 8, 4, 0); test_dnrec(4, 4, 4, 2, 1); test_dnrec(128, 128, 4, 2, 0); test_dnrec(32, 100, 6, 3, 1);
