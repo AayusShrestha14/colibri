@@ -368,7 +368,7 @@ jobs:
           if [ "${{ matrix.ext }}" = ".exe" ]; then
             # no GPU on the runner: whatever it finds, a [VK] line and not a missing DLL
             (cd .. && COLI_NO_OMP_TUNE=1 COLI_VULKAN=1 SNAP="$(cygpath -w "$here/probe")" \
-              timeout 120 "$here/colibri.exe" > vk.log 2>&1; echo "exit $?" >> vk.log)
+              timeout 120 "$here/colibri.exe" > vk.log 2>&1 || true)   # no device: the engine exits 2, as asked
             cat ../vk.log
             grep -q '^\[VK\]' ../vk.log || { echo "FAIL: the packaged engine did not reach its Vulkan backend"; exit 1; }
           else
