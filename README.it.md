@@ -307,6 +307,16 @@ GPU integrata solo per Qwen3.6, Qwen3-Coder e Qwen3.8-Flash-Next, e perché ogni
 motore decide da sé se usare lì la catena densa (Qwen3.6 sì, Qwen3.8 no).
 `--backend vulkan` chiede Vulkan comunque.
 
+**Accendere o spegnere la GPU.** `coli setup --backend vulkan` usa la GPU per
+qualunque modello, e `coli setup --backend cpu` (o `--no-gpu`) tiene tutto sulla
+CPU. Un motore compilato con Vulkan usa la GPU solo con `COLI_VULKAN=1`
+nell'ambiente di `coli chat`, `serve` o `web` (l'installazione lo imposta quando ha
+scelto Vulkan); senza, il motore gira sulla CPU. Con la GPU accesa, `COLI_VK_CHAIN=0`
+tiene il tier degli expert e fa girare gli strati densi sulla CPU. Su una GPU
+integrata prova entrambe le strade: su un portatile con una Intel Iris Xe (Core
+i7-1355U) Qwen3.6 ha decodificato a 2,1 tok/s sulla CPU, da 1,7 a 1,9 con Vulkan
+e 2,1 con la catena densa spenta.
+
 Su una GPU dedicata l'installazione compila Vulkan per ogni motore (prima CUDA,
 dove il motore ce l'ha e il toolkit è installato), con i layer densi sulla
 scheda. È il caso per cui il progetto è pensato. **Non abbiamo ancora misurato

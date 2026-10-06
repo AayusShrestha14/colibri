@@ -503,7 +503,8 @@ cd colibri
       <p class="src">A GPU is optional on every engine. With Vulkan, any GPU keeps the hottest
         experts and runs whole layers: on the integrated Radeon 780M of an 8-core desktop,
         Qwen3.6 went from 6.0 to 9.9 tok/s. A small model can lose on an integrated GPU, so the
-        setup turns it on only where it was measured faster; no discrete GPU has run the new
+        setup turns it on only where it was measured faster (<code>coli setup --backend vulkan</code>
+        or <code>--backend cpu</code> decides for you); no discrete GPU has run the new
         expert tier yet. With CUDA, NVIDIA cards keep the hottest experts in VRAM. The release
         archives carry these backends ready to run: Vulkan on Linux and Windows, Metal on macOS,
         and a CUDA package for NVIDIA cards on Windows.

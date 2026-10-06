@@ -316,6 +316,16 @@ Qwen3-Coder, dan Qwen3.8-Flash-Next, dan setiap engine memutuskan sendiri apakah
 dense chain dijalankan di sana (Qwen3.6 ya, Qwen3.8 tidak). `--backend vulkan`
 tetap meminta Vulkan secara eksplisit.
 
+**Menyalakan atau mematikan GPU.** `coli setup --backend vulkan` memakai GPU untuk
+model apa pun, dan `coli setup --backend cpu` (atau `--no-gpu`) menjalankan
+semuanya di CPU. Engine yang di-build dengan Vulkan memakai GPU hanya jika ada
+`COLI_VULKAN=1` di environment `coli chat`, `serve` atau `web` (proses penyiapan
+mengaturnya ketika memilih Vulkan); tanpanya, engine berjalan di CPU. Dengan GPU
+menyala, `COLI_VK_CHAIN=0` mempertahankan expert tier dan menjalankan layer dense
+di CPU. Pada GPU terintegrasi, coba keduanya: pada laptop dengan Intel Iris Xe
+(Core i7-1355U), Qwen3.6 mendekode 2,1 tok/s di CPU, 1,7 sampai 1,9 dengan Vulkan,
+dan 2,1 dengan dense chain dimatikan.
+
 Pada GPU diskret, proses penyiapan membuat build Vulkan untuk setiap engine
 (CUDA terlebih dahulu jika engine memilikinya dan toolkit sudah terinstal),
 dengan layer dense berada di kartu. Inilah skenario yang menjadi sasaran desain

@@ -288,6 +288,14 @@ Qwen3.8-Flash-Next 在內建顯示晶片上開啟 Vulkan，
 也是為什麼每個引擎會自行決定是否在那裡執行稠密鏈（Qwen3.6 會，Qwen3.8 不會）。
 `--backend vulkan` 則無論如何都會要求使用 Vulkan。
 
+**開啟或關閉 GPU。** `coli setup --backend vulkan` 對任何模型都使用 GPU，
+`coli setup --backend cpu`（或 `--no-gpu`）則全部在 CPU 上執行。用 Vulkan 建置的引擎
+只有在 `coli chat`、`serve` 或 `web` 的環境中有 `COLI_VULKAN=1` 時才使用 GPU
+（安裝程式選擇 Vulkan 時會自動設定）；沒有它，引擎就在 CPU 上執行。GPU 開啟時，
+`COLI_VK_CHAIN=0` 保留專家層 (tier)，讓稠密層在 CPU 上執行。在內建顯示晶片上，
+兩種都試試看：在一台 Intel Iris Xe（Core i7-1355U）筆電上，Qwen3.6 在 CPU 上解碼
+2.1 tok/s，用 Vulkan 為 1.7 到 1.9，關閉稠密鏈後為 2.1。
+
 在獨立顯示卡上，安裝程式會為每個引擎建置 Vulkan（若引擎有 CUDA 路徑且已安裝 toolkit，
 則優先使用 CUDA），並把稠密層放在顯示卡上。這正是此設計所針對的情況。
 **我們自己還沒有實測過獨立顯示卡。** 第一份數據來自一位使用者：Qwen3.6 在
