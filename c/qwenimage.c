@@ -123,9 +123,38 @@ static st_tensor *need_tensor(shards *S, const char *name, int64_t n0, int64_t n
     return t;
 }
 
+/* How many layers load at once (COLI_IMG_LOAD_THREADS, default 4): each thread holds
+ * one matrix's bf16 bytes while it quantizes them (up to ~140 MB for the text encoder's
+ * MLP), so the count bounds the load's transient memory as well as its speed. */
+static int qi_load_threads(void){
+    static int n = 0;
+    if (!n) {
+        const char *e = getenv("COLI_IMG_LOAD_THREADS");
+        n = e && atoi(e) > 0 ? atoi(e) : 4;
+#ifdef _OPENMP
+        if (n > omp_get_max_threads()) n = omp_get_max_threads();
+#endif
+        if (n < 1) n = 1;
+    }
+    return n;
+}
+
 /* bits: 8 = int8 rows, 16 = bf16, 32 = f32. Small matrices ask for 32. */
 static void lin_load(shards *S, const char *name, int N, int K, int bits, Lin *out){
-    need_tensor(S, name, N, K);
+    st_tensor *t = need_tensor(S, name, N, K);
+    if (bits == 8 && t->dtype == 0 && t->nbytes == (int64_t)N * K * 2) {
+        /* bf16 rows straight to int8 rows: the same values as through an f32 copy */
+        uint16_t *raw = xmalloc((size_t)N * K * 2);
+        st_read_raw_cap(S, name, raw, (int64_t)N * K * 2, 1);
+        memset(out, 0, sizeof *out);
+        out->m.N = N; out->m.K = K;
+        int8_t *q = xmalloc((size_t)N * K);
+        float *sc = fmalloc(N);
+        qi_quantize_i8_bf16(raw, N, K, q, sc);
+        free(raw);
+        out->m.fmt = QI_I8; out->m.w = out->own = q; out->m.sc = out->own_sc = sc;
+        return;
+    }
     float *tmp = fmalloc((size_t)N * K);
     st_read_f32_cap(S, name, tmp, (int64_t)N * K, 1);
     memset(out, 0, sizeof *out);
@@ -330,10 +359,12 @@ static void te_load(Te *te, const char *model){
     double t0 = now_s();
     te->L = calloc(te->layers, sizeof(TeLayer));
     int H = te->hidden, qd = te->heads * te->hd, kd = te->kv * te->hd;
-    char n[256];
     size_t bytes = 0;
+    /* a few layers at once: each reads and quantizes its own matrices (COLI_IMG_LOAD_THREADS) */
+    #pragma omp parallel for schedule(dynamic, 1) num_threads(qi_load_threads()) reduction(+:bytes)
     for (int l = 0; l < te->layers; l++) {
         TeLayer *L = &te->L[l];
+        char n[256];
 #define TN(s) (snprintf(n, sizeof n, "model.language_model.layers.%d.%s", l, s), n)
         lin_load(&te->S, TN("self_attn.q_proj.weight"), qd, H, g_bits, &L->q);
         lin_load(&te->S, TN("self_attn.k_proj.weight"), kd, H, g_bits, &L->k);
@@ -527,10 +558,11 @@ static void dit_load(Dit *d, const char *model){
     lin_load(&S, "txt_in.out_layer.weight", D, D, g_bits, &d->txt2);
     d->txt_norm = vec_load(&S, "txt_in.text_norm.weight", d->ctx);
     d->B = calloc(d->layers, sizeof(DitBlock));
-    char n[256];
     size_t bytes = 0;
+    #pragma omp parallel for schedule(dynamic, 1) num_threads(qi_load_threads()) reduction(+:bytes)
     for (int l = 0; l < d->layers; l++) {
         DitBlock *B = &d->B[l];
+        char n[256];
 #define BN(s) (snprintf(n, sizeof n, "transformer_blocks.%d.%s", l, s), n)
         lin_load(&S, BN("attn.to_q.weight"), D, D, g_bits, &B->q);
         lin_load(&S, BN("attn.to_k.weight"), D, D, g_bits, &B->k);
