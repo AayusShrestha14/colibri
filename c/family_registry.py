@@ -1357,7 +1357,7 @@ FAMILIES = (
         # e' una ghigliottina che cade DENTRO al blocco di pensiero e chiude il
         # turno senza risposta (#1278). 16384 e' il valore che hanno gia' tutte
         # le famiglie con lo stesso contesto massimo di 1048576.
-        limits=FamilyLimits(8192, 1048576, 1024, 16384, 1, 8, "CTX_MAX"),
+        limits=FamilyLimits(8192, 1048576, 1024, 16384, 16, 8, "CTX_MAX"),
         capabilities=FamilyCapabilities(False, False, True, True),
         has_gateway_adapter=True,
         tune_prompt_template="<|user|>{prompt}<|assistant|>",
@@ -1391,7 +1391,7 @@ FAMILIES = (
         # e' una ghigliottina che cade DENTRO al blocco di pensiero e chiude il
         # turno senza risposta (#1278). 16384 e' il valore che hanno gia' tutte
         # le famiglie con lo stesso contesto massimo di 1048576.
-        limits=FamilyLimits(8192, 1048576, 1024, 16384, 1, 8, "K3_MAXT"),
+        limits=FamilyLimits(8192, 1048576, 1024, 16384, 16, 8, "K3_MAXT"),
         # tools=True: this family DOES render and parse tool calls. It used to
         # share COMMON_CAP, which says otherwise -- the flag is descriptive
         # (it only feeds the capability dict) so nothing broke, but a client
@@ -1436,7 +1436,7 @@ FAMILIES = (
         # slower than the cache the same machine could hold: measured on a
         # 1204-token prefill, cap 8 gives 22.8% expert hit rate and 0.045 tok/s,
         # cap 64 gives 99.4% and 0.215 tok/s.
-        limits=FamilyLimits(4096, 4096, 1024, 1024, 1, 0, "CTX"),
+        limits=FamilyLimits(4096, 4096, 1024, 1024, 16, 0, "CTX"),
         capabilities=FamilyCapabilities(False, False, False, False),
         has_gateway_adapter=True,
         has_cli_adapter=True,
@@ -1487,7 +1487,7 @@ FAMILIES = (
         planner_unsupported_reason="",
         expert_inventory=_individual_expert_inventory(_GLM_EXPERT),
         config_section="text_config",
-        limits=FamilyLimits(8192, 262144, 1024, 8192, 1, 8, "Q36_MAXT"),
+        limits=FamilyLimits(8192, 262144, 1024, 8192, 16, 8, "Q36_MAXT"),
         capabilities=FamilyCapabilities(False, False, False, True, image=True),
         has_gateway_adapter=True,
         # coli run stays unwired on purpose: cmd_run dispatches per arch after
@@ -1520,7 +1520,7 @@ FAMILIES = (
         resident_inventory=_qwen38_resident_inventory,
         fixed_resident_inventory=_qwen38_fixed_resident_inventory,
         config_section="text_config",
-        limits=FamilyLimits(8192, 262144, 1024, 8192, 1, 1, "Q38_MAXT"),
+        limits=FamilyLimits(8192, 262144, 1024, 8192, 16, 1, "Q38_MAXT"),
         capabilities=FamilyCapabilities(True, False, False, True, image=True),
         has_gateway_adapter=True,
         # Like Qwen3.6, direct `coli run` is intentionally not exposed until
@@ -1561,7 +1561,7 @@ FAMILIES = (
         planner_unsupported_reason="",
         expert_inventory=_individual_expert_inventory(_V4_EXPERT),
         config_section="root",
-        limits=FamilyLimits(4096, 1048576, 1024, 16384, 1, 8, "CTX"),
+        limits=FamilyLimits(4096, 1048576, 1024, 16384, 16, 8, "CTX"),
         capabilities=FamilyCapabilities(True, False, False, True),
         has_gateway_adapter=True,
         has_cli_adapter=True,
@@ -1598,7 +1598,7 @@ FAMILIES = (
         expert_inventory=_dsv41_expert_inventory,
         resident_inventory=_dsv41_resident_inventory,
         config_section="text_config",
-        limits=FamilyLimits(4096, 1048576, 1024, 16384, 1, 8, "CTX"),
+        limits=FamilyLimits(4096, 1048576, 1024, 16384, 16, 8, "CTX"),
         # tools yes (DSML, see v41_dsml.py), grammars no: the engine reads the six-field
         # SUBMIT header and has no constrained decoder, so a grammar has to be refused
         # at the gateway rather than desync the wire.
@@ -1648,7 +1648,7 @@ FAMILIES = (
         resident_inventory=_mimo_resident_inventory,
         config_section="root",
         # top-8 routing: the engine raises any smaller cache to one routing step
-        limits=FamilyLimits(8192, 1048576, 1024, 16384, 1, 16, "CTX"),
+        limits=FamilyLimits(8192, 1048576, 1024, 16384, 16, 16, "CTX"),
         # tools (the XML call form, parse_mimo_tool_calls), thinking (on by default,
         # as the template has it); no grammars, no audio in or out
         capabilities=FamilyCapabilities(True, False, False, True, image=True),
