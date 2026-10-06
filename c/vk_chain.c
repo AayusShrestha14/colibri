@@ -895,6 +895,7 @@ static long long attn_slice_budget(void) {
     long long v = e && *e ? atoll(e) : (1LL << 32);
     return v < 0 ? 0 : v;
 }
+long long vkc_attn_slice_budget(void) { return attn_slice_budget(); }
 static int attn_slice_rows(int S, int pos_base, double width, int align) {
     long long b = attn_slice_budget();
     if (align < 1) align = 1;

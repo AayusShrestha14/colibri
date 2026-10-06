@@ -142,6 +142,7 @@ int  vkc_attn_part_chunks(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, const Vk
 typedef struct { int n, d, nz, a_off, a_z, sa_off, sa_z, o_off, so_off; } VkcKvsJoin;
 int  vkc_kvs_join(VkcBuf *parts, VkcBuf *out, const VkcKvsJoin *p);
 int  vkc_attn_flash_rows(void);   /* COLI_VK_CHAIN_FLASH: rows from which chain_attn_flash runs (0 = never) */
+long long vkc_attn_slice_budget(void);   /* COLI_VK_ATTN_SLICE below: rows x positions x width a submission (0 = never) */
 /* The attention ops (vkc_attn, vkc_attn_w, vkc_mla_core, vkc_relattn) whose rows x positions
  * x heads x head dim pass COLI_VK_ATTN_SLICE (2^32; 0 = never) record their rows in slices,
  * each ending its frame (submitted, not waited for) and the next in a new one: no single

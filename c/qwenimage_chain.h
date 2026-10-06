@@ -126,6 +126,24 @@ static int qic_prefix(Dit *d, const Prefix *p) {
     return 1;
 }
 
+/* The image rows' attention, in slices of rows that end their submission (the chain's
+ * COLI_VK_ATTN_SLICE budget of rows x positions x width): a 1024x1024 step's attention
+ * is seconds a block on an integrated GPU, past a driver's job timeout (amdgpu 10 s). */
+static int qic_attn(const VkcEncAttn *at, int N, int L) {
+    long long b = vkc_attn_slice_budget(), per = (long long)(L + N) * at->H * at->hd;
+    int rr = b > 0 ? (int)(b / per / 16 * 16) : N;
+    if (rr < 16) rr = 16;
+    int ok = 1;
+    for (int r0 = 0; ok && r0 < N; r0 += rr) {
+        VkcEncAttn x = *at;
+        x.S = N - r0 < rr ? N - r0 : rr;
+        x.q_off = at->q_off + r0 * at->kv_row; x.o_off = at->o_off + r0 * at->o_row;
+        ok = vkc_enc_attn(g_qic.qkv, NULL, NULL, g_qic.a, g_qic.rng, NULL, NULL, &x) &&
+             (r0 + rr >= N || (vkc_submit(0) && vkc_begin()));
+    }
+    return ok;
+}
+
 /* One denoising step on the device: out[N][in_ch]. 0: not taken (the CPU runs it). */
 static int qic_forward(Dit *d, const Prefix *p, DitStep *s, const float *lat, float t, float *out) {
     if (g_qic_on < 0) g_qic_on = g_vk_ready && vkc_init() &&
@@ -179,7 +197,7 @@ static int qic_forward(Dit *d, const Prefix *p, DitStep *s, const float *lat, fl
              vkc_norm(g_qic.qkv, g_qic.prm, g_qic.qkv, &nq) && vkc_norm(g_qic.qkv, g_qic.prm, g_qic.qkv, &nk) &&
              vkc_mla_rope(g_qic.qkv, g_qic.cs, g_qic.qkv, &rq) && vkc_mla_rope(g_qic.qkv, g_qic.cs, g_qic.qkv, &rk) &&
              vkc_copy(g_qic.qkv, KO, g_qic.pk[l], 0, (size_t)L * D) && vkc_copy(g_qic.qkv, VO, g_qic.pv[l], 0, (size_t)L * D) &&
-             vkc_enc_attn(g_qic.qkv, NULL, NULL, g_qic.a, g_qic.rng, NULL, NULL, &at) &&
+             qic_attn(&at, N, L) &&
              vkc_matmul(qic_tensor(&B->o), g_qic.a, 0, g_qic.h, 0, N) &&
              vkc_ew(g_qic.x, g_qic.x, g_qic.h, NULL, g_qic.mod, &g1) &&
              vkc_enc_norm(g_qic.x, NULL, g_qic.mod, g_qic.h, &n2) &&
