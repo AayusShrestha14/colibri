@@ -321,7 +321,9 @@ static void test_ew_gate(void) {
 /* A diffusion step's attention (vkc_attn_full, Qwen-Image's DiT): S query rows, each over
  * all T key rows, token-major in one buffer (q, then k and v at their offsets), heads of
  * hd; S and T away from the shader's tiles of 64. */
-static void test_attn_full(int S, int T, int H, int hd) {
+static void test_attn_full_k(int S, int T, int H, int hd, int coop);
+static void test_attn_full(int S, int T, int H, int hd) { test_attn_full_k(S, T, H, hd, 0); }
+static void test_attn_full_k(int S, int T, int H, int hd, int coop) {
     int D = H * hd, qrow = D + 8, kvrow = D + 24, qoff = 4, koff = qoff + S * qrow + 16, voff = koff + T * kvrow + 8;
     size_t n = (size_t)voff + (size_t)T * kvrow + 8;
     float *x = fvec(n, 1.f), scale = 1.f / sqrtf((float)hd);
@@ -343,9 +345,10 @@ static void test_attn_full(int S, int T, int H, int hd) {
     }
     VkcBuf *xb = up(x, n), *ob = vkc_buf(((size_t)S * D + 32) * 4, VKC_DOWN);
     VkcAttnFull p = {S, T, H, hd, qoff, qrow, koff, voff, kvrow, 32, D, scale};
-    vkc_begin(); int ok = vkc_attn_full(xb, ob, &p); ok = vkc_submit(1) && ok;
+    vkc_begin(); int ok = coop ? vkc_attn_full_coop(xb, ob, &p) : vkc_attn_full(xb, ob, &p); ok = vkc_submit(1) && ok;
     double e = relerr((float *)vkc_ptr(ob) + 32, ref, (size_t)S * D, 1e-3);
-    CHECK(ok && e < 2e-5, "attn full S %d T %d H %d hd %d: err %.2e", S, T, H, hd, e);
+    /* the matrix units' operands are f16: a bound of f16's rounding */
+    CHECK(ok && e < (coop ? 4e-3 : 2e-5), "attn full%s S %d T %d H %d hd %d: err %.2e", coop ? " coop" : "", S, T, H, hd, e);
     vkc_free(xb); vkc_free(ob); free(x); free(ref); free(sc);
 }
 
@@ -2766,6 +2769,11 @@ int main(int argc, char **argv) {
     test_attn_full(5, 9, 2, 32); test_attn_full(64, 64, 1, 128); test_attn_full(130, 200, 3, 128);
     test_attn_full(70, 129, 2, 64); test_attn_full(1, 300, 4, 128);
     printf("attn full done\n");
+    if (vkc_attn_full_coop_ready(128)) {   /* on the matrix units, where the device has them */
+        test_attn_full_k(64, 64, 1, 128, 1); test_attn_full_k(130, 200, 3, 128, 1);
+        test_attn_full_k(70, 129, 2, 64, 1); test_attn_full_k(1, 300, 4, 128, 1);
+        printf("attn full coop done\n");
+    } else printf("attn full coop: no matrix units here\n");
     test_ew_gate();
     test_vae_ops(5, 7, 3, 0, 0, 5); test_vae_ops(5, 7, 3, 1, 3, 4); test_vae_ops(4, 4, 16, 1, 0, 8);
     printf("vae ops done\n");

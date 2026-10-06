@@ -1395,11 +1395,13 @@ static struct { VkShaderModule mod; VkPipeline pipe; int tried; } g_ke[2];
 #define KE (g_ke[g_kd])
 /* chain_attn_full.comp (a diffusion step's attention): made on first use, a pipeline per
  * head dim (its specialization constant) */
-static struct { VkShaderModule mod; VkPipeline pipe[3]; int tried; } g_kf[2];
+static struct { VkShaderModule mod; VkPipeline pipe[3]; int tried; VkShaderModule cmod; VkPipeline cpipe[2]; int ctried; } g_kf[2];
 #define KF (g_kf[g_kd])
 static void kf_shutdown(void) {
     for (int i = 0; i < 3; i++) if (KF.pipe[i]) vkDestroyPipeline(KC.dev, KF.pipe[i], NULL);
+    for (int i = 0; i < 2; i++) if (KF.cpipe[i]) vkDestroyPipeline(KC.dev, KF.cpipe[i], NULL);
     if (KF.mod) vkDestroyShaderModule(KC.dev, KF.mod, NULL);
+    if (KF.cmod) vkDestroyShaderModule(KC.dev, KF.cmod, NULL);
     memset(&KF, 0, sizeof KF);
 }
 int vkc_attn_full(VkcBuf *qkv, VkcBuf *o, const VkcAttnFull *p) {
@@ -1418,6 +1420,41 @@ int vkc_attn_full(VkcBuf *qkv, VkcBuf *o, const VkcAttnFull *p) {
     VkcBind bd[2] = {B(qkv, 0), B(o, 1)};
     return record(KF.pipe[k], bd, 2, p, sizeof *p, (uint32_t)((p->S + 63) / 64), (uint32_t)p->H, 1);
 }
+/* The same on the matrix units (chain_attn_coop.comp): a device with cooperative matrices
+ * at subgroups of 32 or 64, head dims 64 and 128; its pipeline requires that subgroup
+ * size. 0: not here (nothing recorded). */
+static VkPipeline kf_coop_pipe(int hd) {
+    int k = hd == 128, sg = KC.core.coop_sg;
+    if (KF.cpipe[k]) return KF.cpipe[k];
+    if ((sg != 32 && sg != 64) || (hd != 64 && hd != 128)) return VK_NULL_HANDLE;
+    if (!KF.cmod) {
+        if (KF.ctried) return VK_NULL_HANDLE;
+        KF.ctried = 1;
+        if (!(KF.cmod = load_module(KC.core.spv_path, "chain_attn_coop.spv"))) return VK_NULL_HANDLE;
+    }
+    int32_t sv[2] = {hd, sg};
+    VkSpecializationMapEntry me[2] = {{0, 0, 4}, {1, 4, 4}};
+    VkSpecializationInfo si = {2, me, sizeof sv, sv};
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+        .requiredSubgroupSize = (uint32_t)sg};
+    VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = &rss,
+                  .flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT,
+                  .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = KF.cmod, .pName = "main",
+                  .pSpecializationInfo = &si}, .layout = KC.pl};
+    if (vkCreateComputePipelines(KC.dev, VK_NULL_HANDLE, 1, &ci, NULL, &KF.cpipe[k]) != VK_SUCCESS) KF.cpipe[k] = VK_NULL_HANDLE;
+    return KF.cpipe[k];
+}
+int vkc_attn_full_coop(VkcBuf *qkv, VkcBuf *o, const VkcAttnFull *p) {
+    if (!vkc_ready() || p->S < 1 || p->T < 1 || p->H < 1 || (int64_t)p->S > 65535LL * 64 || p->H > 65535) return 0;
+    VkPipeline pipe = kf_coop_pipe(p->hd);
+    if (!pipe) return 0;
+    KC.kind = PK_ATTN;
+    VkcBind bd[2] = {B(qkv, 0), B(o, 1)};
+    return record(pipe, bd, 2, p, sizeof *p, (uint32_t)((p->S + 63) / 64), (uint32_t)p->H, 1);
+}
+int vkc_attn_full_coop_ready(int hd) { return vkc_ready() && kf_coop_pipe(hd) != VK_NULL_HANDLE; }
 int vkc_attn_full_ready(void) {
     if (!vkc_ready()) return 0;
     if (!KF.mod && !KF.tried) { KF.tried = 1; KF.mod = load_module(KC.core.spv_path, "chain_attn_full.spv"); }

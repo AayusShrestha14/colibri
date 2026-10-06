@@ -686,6 +686,11 @@ int vkc_enc_rel(VkcBuf *x, VkcBuf *pt, VkcBuf *y, const VkcEncRel *p);
 typedef struct { int S, T, H, hd, q_off, q_row, k_off, v_off, kv_row, o_off, o_row; float scale; } VkcAttnFull;
 int vkc_attn_full(VkcBuf *qkv, VkcBuf *o, const VkcAttnFull *p);
 int vkc_attn_full_ready(void);
+/* The same on the matrix units (chain_attn_coop.comp, cooperative matrices at subgroups of
+ * 32 or 64, hd 64 or 128): Q, K, V and P rounded to f16, the result the f32 one's to about
+ * 1e-3. 0: not on this device (nothing recorded). */
+int vkc_attn_full_coop(VkcBuf *qkv, VkcBuf *o, const VkcAttnFull *p);
+int vkc_attn_full_coop_ready(int hd);
 
 /* chain_vae.comp: Qwen-Image's VAE decoder (qwenimage_vae_vk.h), the two steps of its
  * convolutions that are not a GEMM; maps channel-last [H][W][C]. mode 0: the 3x3 taps of

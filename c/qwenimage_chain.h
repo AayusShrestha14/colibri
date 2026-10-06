@@ -55,6 +55,7 @@ typedef struct {
     unsigned long long steps;
     double wait_ms;
     int resident, streamed;      /* blocks the device keeps (0..resident-1), blocks uploaded each step */
+    int coop_attn;               /* the attention on the matrix units (int8 weights) */
     int slot[2];                 /* the streamed block in each of the two places (-1: none) */
     unsigned long long ser[2];   /* the frame that last read it */
     unsigned long long stream_bytes;
@@ -108,6 +109,12 @@ static void qic_plan(Dit *d) {
         if (R > L) R = L;
     }
     g_qic.resident = R; g_qic.streamed = L - R; g_qic.slot[0] = g_qic.slot[1] = -1;
+    const char *ae = getenv("COLI_VK_QI_ATTN");
+    /* opt-in: on a Radeon 780M the f32 tiles beat the matrix units (a 1024x1024 step's
+     * attention 17.9 s against 32.5: RDNA3's f16 MMA is twice its f32 rate, and the two
+     * passes cost more than that); a card whose matrix units outrun its f32 by more may
+     * gain, not measured yet */
+    g_qic.coop_attn = ae && !strcmp(ae, "coop") && d->B[0].q.m.fmt == QI_I8;
     if (R == L) return;
     for (int l = R; l < L; l++) {   /* the per-matrix path leaves them on the CPU */
         Lin *m[7]; qic_block_mats(&d->B[l], m);
@@ -218,15 +225,17 @@ static int qic_attn(const VkcEncAttn *at, int N, int L) {
     long long b = vkc_attn_slice_budget(), per = (long long)(L + N) * at->H * at->hd;
     int rr = b > 0 ? (int)(b / per / 16 * 16) : N;
     if (rr < 16) rr = 16;
-    /* chain_attn_full where it loads (head dims 32, 64 and 128), the encoders'
-     * attention over row ranges otherwise */
-    int full = (at->hd == 32 || at->hd == 64 || at->hd == 128) && vkc_attn_full_ready(), ok = 1;
+    /* on the matrix units with COLI_VK_QI_ATTN=coop and int8 weights (their f16
+     * operands cost less than the weights' own rounding), else chain_attn_full where it
+     * loads (head dims 32, 64 and 128), else the encoders' attention over row ranges */
+    int coop = g_qic.coop_attn && vkc_attn_full_coop_ready(at->hd);
+    int full = coop || ((at->hd == 32 || at->hd == 64 || at->hd == 128) && vkc_attn_full_ready()), ok = 1;
     for (int r0 = 0; ok && r0 < N; r0 += rr) {
         int n = N - r0 < rr ? N - r0 : rr;
         if (full) {
             VkcAttnFull f = {n, L + N, at->H, at->hd, at->q_off + r0 * at->kv_row, at->kv_row, at->k_off, at->v_off,
                              at->kv_row, at->o_off + r0 * at->o_row, at->o_row, at->scale};
-            ok = vkc_attn_full(g_qic.qkv, g_qic.a, &f);
+            ok = coop ? vkc_attn_full_coop(g_qic.qkv, g_qic.a, &f) : vkc_attn_full(g_qic.qkv, g_qic.a, &f);
         } else {
             VkcEncAttn x = *at;
             x.S = n; x.q_off = at->q_off + r0 * at->kv_row; x.o_off = at->o_off + r0 * at->o_row;
