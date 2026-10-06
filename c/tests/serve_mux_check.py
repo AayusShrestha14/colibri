@@ -30,8 +30,9 @@ READY = b"\x01\x01READY\x01\x01"
 def waves(n):
     # MUX_LONG=k: the prompts k times longer (an engine whose state changes shape past
     # a few dozen positions: compression groups, index top-k, windows that wrap)
-    base = bytes(range(65, 65 + 23)) * int(os.environ.get("MUX_LONG", "1"))
-    one = [(base[:7 + 3 * i] + bytes([97 + i]) * (i + 1), 4 + 2 * (i % 3), "logprobs=2" if i % 2 else "")
+    k = int(os.environ.get("MUX_LONG", "1"))
+    base = bytes(range(65, 65 + 23)) * 3 * k
+    one = [(base[:(7 + 3 * i) * k] + bytes([97 + i]) * (i + 1), 4 + 2 * (i % 3), "logprobs=2" if i % 2 else "")
            for i in range(n)]
     two = []
     for i, (prompt, _, _) in enumerate(one):
