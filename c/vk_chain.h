@@ -163,6 +163,7 @@ int  vkc_dnrec(int KD, VkcBuf *cv, VkcBuf *ab, VkcBuf *z, VkcBuf *st, VkcBuf *pr
 #define VKC_EW_HC_INJ   5
 #define VKC_EW_HC_APPLY 6
 #define VKC_EW_SCALE    7
+#define VKC_EW_GATE_ADD 8
 typedef struct { int op, n, D, C, flags, e_row, y_off, a_off, b_off, c_off, e_off; float fc; } VkcEw;
 int  vkc_ew(VkcBuf *y, VkcBuf *a, VkcBuf *b, VkcBuf *c, VkcBuf *e, const VkcEw *p);
 /* chain_qsa.comp (mode 0: nb block keys from b0; mode 1: S rows' selections) */

@@ -657,7 +657,8 @@ static void dit_rope_apply(float *x, int T, int heads, int hd, const float *cs, 
 
 /* The prompt side of the DiT, computed once per prompt: per block, the keys and
  * values of the text tokens (after norm and RoPE). */
-typedef struct { int L; float **K, **V; } Prefix;
+typedef struct { int L; float **K, **V; unsigned gen; } Prefix;
+static unsigned g_qi_gen;   /* every prefix and step layout a number of its own (the device chain's uploads) */
 
 static void prefix_free(Prefix *p, int layers){
     if (p->K) for (int l = 0; l < layers; l++) { free(p->K[l]); free(p->V[l]); }
@@ -721,7 +722,7 @@ static void dit_prefix(Dit *d, const float *emb, int L, Prefix *p, float *txt_ou
     for (int t = 0; t < L; t++) pos[3 * t] = pos[3 * t + 1] = pos[3 * t + 2] = t;
     float *cs = fmalloc((size_t)L * d->hd / 2), *sn = fmalloc((size_t)L * d->hd / 2);
     dit_rope_table(d, pos, L, cs, sn);
-    p->L = L;
+    p->L = L; p->gen = ++g_qi_gen;
     p->K = calloc(d->layers, sizeof(float *)); p->V = calloc(d->layers, sizeof(float *));
     DitScratch w; scratch_alloc(&w, d, L);
     for (int l = 0; l < d->layers; l++) {
@@ -734,11 +735,11 @@ static void dit_prefix(Dit *d, const float *emb, int L, Prefix *p, float *txt_ou
 }
 
 /* noise_pred[N][in_ch] for the image tokens at timestep t. */
-typedef struct { float *kbuf, *vbuf, *cs, *sn, *x; DitScratch w; int N; } DitStep;
+typedef struct { float *kbuf, *vbuf, *cs, *sn, *x; DitScratch w; int N; unsigned gen; } DitStep;
 
 static void dit_step_init(DitStep *s, Dit *d, const Prefix *p, int gh, int gw){
     int N = gh * gw, T = p->L + N;
-    s->N = N;
+    s->N = N; s->gen = ++g_qi_gen;
     s->kbuf = fmalloc((size_t)T * d->dim); s->vbuf = fmalloc((size_t)T * d->dim);
     s->cs = fmalloc((size_t)N * d->hd / 2); s->sn = fmalloc((size_t)N * d->hd / 2);
     s->x = fmalloc((size_t)N * d->dim);
@@ -759,7 +760,13 @@ static void dit_step_free(DitStep *s){
     free(s->kbuf); free(s->vbuf); free(s->cs); free(s->sn); free(s->x); scratch_free(&s->w);
 }
 
+#ifdef COLI_VULKAN
+#include "qwenimage_chain.h"   /* COLI_VK_CHAIN: every block of a step on the device */
+#endif
 static void dit_forward(Dit *d, const Prefix *p, DitStep *s, const float *lat, float t, float *out){
+#ifdef COLI_VULKAN
+    if (qic_forward(d, p, s, lat, t, out)) return;
+#endif
     int D = d->dim, N = s->N, L = p->L;
     float *mod = fmalloc(4 * (size_t)D), *outs = fmalloc(D);
     dit_modulation(d, t, mod, outs);
@@ -1426,6 +1433,7 @@ static int run_oracle(Engine *e, const char *refdir){
 static void qi_vk_report(void){
 #ifdef COLI_VULKAN
     if (g_vk_ready) fprintf(stderr, "[VK] qwenimage: %llu matmuls on the GPU\n", coli_vk_matmul_calls());
+    qic_report();
 #endif
 }
 
