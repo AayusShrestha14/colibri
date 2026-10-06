@@ -1252,7 +1252,7 @@ def server_status(cfg):
     alive = _pid_alive(pid)
     shown = "127.0.0.1" if host in ("0.0.0.0", "") else host
     code, health = _get_json(f"http://{shown}:{port}/health")
-    if code == 200:
+    if code == 200 and isinstance(health, dict) and health.get("status") == "ok":
         state = "ready"
     elif alive:
         state = "loading"
