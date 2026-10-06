@@ -306,8 +306,8 @@ def toolchain(here=None):
                 if os.path.isfile(os.path.join(ucrt, "bin", "gcc.exe")) else None
             tc["glslc"] = os.path.join(ucrt, "bin", "glslc.exe") \
                 if os.path.isfile(os.path.join(ucrt, "bin", "glslc.exe")) else None
-            tc["vulkan_headers"] = (os.path.isfile(os.path.join(ucrt, "include", "vulkan", "vulkan.h"))
-                                    and os.path.isfile(os.path.join(ucrt, "lib", "libvulkan-1.dll.a")))
+            # the headers only: nothing links the loader (vk_load.h)
+            tc["vulkan_headers"] = os.path.isfile(os.path.join(ucrt, "include", "vulkan", "vulkan.h"))
         elif tc["cc"]:
             prefix = os.path.dirname(os.path.dirname(tc["cc"]))
             tc["vulkan_headers"] = os.path.isfile(os.path.join(prefix, "include", "vulkan", "vulkan.h"))
@@ -355,13 +355,14 @@ PACKAGES = {
                                      "python": ["python3"]}),
     "msys2": ("pacman -S --needed", {"build": ["mingw-w64-ucrt-x86_64-gcc", "mingw-w64-ucrt-x86_64-libgomp", "make"],
                                      "vulkan": ["mingw-w64-ucrt-x86_64-vulkan-headers",
-                                                "mingw-w64-ucrt-x86_64-vulkan-loader",
                                                 "mingw-w64-ucrt-x86_64-shaderc"]}),
 }
 #: What is not one package: said in words, with where to get it.
 TEXT_HINTS = {
     "cuda": "install the CUDA Toolkit from https://developer.nvidia.com/cuda-downloads",
     "cuda-win32": "the Windows CUDA build needs the CUDA Toolkit and MSVC: see docs/windows.md",
+    "cuda-win32-release": ("unpack the release's windows-x86_64-cuda.zip next to the engines "
+                           "(coli_cuda.dll and the CUDA builds of colibri, qwen36 and kimi_k3)"),
     "build-other": "install gcc (with OpenMP) and make from your distribution",
     "vulkan-other": ("install the Vulkan loader development files, glslc (shaderc) and the "
                      "Mesa Vulkan drivers from your distribution"),
@@ -502,7 +503,8 @@ def choose_backend(hw, family, tc, requested="auto", exclude=()):
     CUDA first for an NVIDIA card when this engine has a CUDA path (CUDA_ENGINES)
     and the toolkit here builds for every card (cuda_problem); its VRAM expert
     tier is the measured fast path. Else Vulkan when a Vulkan GPU answered and
-    the build has its headers and glslc; else the CPU. On an integrated GPU,
+    the build has its headers and glslc, or a Vulkan engine needs no build (a
+    release archive's, prebuilt_vulkan); else the CPU. On an integrated GPU,
     Vulkan only for the engines measured faster there (VULKAN_IGPU_MEASURED)
     unless Vulkan was asked for by name. Every GPU path the machine has but
     cannot build yet comes back in `missing` with what would enable it.
@@ -518,9 +520,24 @@ def choose_backend(hw, family, tc, requested="auto", exclude=()):
         decision["reason"] = "CPU only, as requested"
         return decision
     cuda_engine = family.id in CUDA_ENGINES and host_os().startswith("linux")
+    win_cuda = host_os() == "win32" and family.id in WINDOWS_CUDA_ENGINES
     blocked = None
     if nvidia and requested in ("auto", "cuda") and "cuda" not in exclude:
-        if cuda_engine and tc.get("can_build_cuda"):
+        if win_cuda and prebuilt_runs(family, "cuda"):
+            card = nvidia[0]
+            sm = setup_hw.compute_cap_sm(card.get("compute_cap"))
+            if requested == "cuda" or (sm is not None and sm >= WINDOWS_CUDA_FLOOR):
+                detail = f" (compute {card['compute_cap']})" if card.get("compute_cap") else ""
+                decision.update(backend="cuda", gpu=card["name"],
+                                reason=f"NVIDIA {card['name']}{detail} with coli_cuda.dll beside the engine")
+                return decision
+            blocked = {"why": f"the coli_cuda.dll here runs on compute {WINDOWS_CUDA_FLOOR / 10:.1f} and "
+                              f"newer, and the {card['name']} is "
+                              + (f"compute {card['compute_cap']}" if sm is not None else "of unknown compute"),
+                       "fix": ""}
+        elif win_cuda:
+            decision["missing"].append(("cuda", TEXT_HINTS["cuda-win32-release"]))
+        elif cuda_engine and tc.get("can_build_cuda"):
             blocked = cuda_problem(nvidia, family, tc)
             if blocked is None:
                 card = nvidia[0]
@@ -561,7 +578,7 @@ def choose_backend(hw, family, tc, requested="auto", exclude=()):
         decision["reason"] = igpu if blocked is None else f"{because('the CPU', '')}. {igpu}"
         return decision
     if vk and requested in ("auto", "vulkan", "cuda") and "vulkan" not in exclude:
-        if tc.get("can_build_vulkan"):
+        if tc.get("can_build_vulkan") or prebuilt_vulkan(family, tc):
             kind = vk.get("type")
             decision.update(backend="vulkan", gpu=vk["name"],
                             reason=because("Vulkan", f"{vk['name']}, {kind} GPU"))
@@ -600,12 +617,53 @@ def binary_links(path, needles):
     return any(needle.lower() in lowered for needle in needles)
 
 
-def binary_backend(path):
+def binary_backends(path):
+    """The GPU backends the binary was built with: none for a CPU build; a Windows
+    release engine can have both (CUDA through coli_cuda.dll, Vulkan)."""
+    found = set()
     if binary_links(path, (b"libcudart", b"coli_cuda.dll", b"libamdhip64")):
-        return "cuda"
+        found.add("cuda")
     if binary_links(path, (b"libvulkan.so", b"vulkan-1.dll", b"libvulkan.1.dylib")):
-        return "vulkan"
-    return "cpu"
+        found.add("vulkan")
+    return found
+
+
+def binary_backend(path):
+    """The kind of build the binary is, which a rebuild keeps: CUDA before Vulkan."""
+    found = binary_backends(path)
+    return "cuda" if "cuda" in found else "vulkan" if "vulkan" in found else "cpu"
+
+
+def prebuilt_runs(family, backend, directory=None):
+    """Does the engine in `directory` (default: next to this file) run `backend` as it
+    is, with nothing to build: a release archive's engines (Vulkan builds since 2.0),
+    or one built here before. A Vulkan engine needs its shaders beside it."""
+    path = engine_path(directory or HERE, family)
+    if not os.path.isfile(path) or backend not in binary_backends(path):
+        return False
+    if backend == "vulkan":
+        return os.path.isfile(os.path.join(os.path.dirname(path), "shaders", "qmatmul.spv"))
+    if backend == "cuda" and host_os() == "win32":   # the engine loads its backend at run time
+        return os.path.isfile(os.path.join(os.path.dirname(path), "coli_cuda.dll"))
+    return True
+
+
+#: The release archives whose engines are built with Vulkan (release.yml, VK=1).
+RELEASE_VULKAN = ("linux-x86_64.tar.gz", "windows-x86_64.zip")
+#: The engines the release's windows-x86_64-cuda.zip carries, built against
+#: coli_cuda.dll (release.yml, the cuda-windows job), and the oldest card its DLL
+#: runs on: CUDA_ARCH=portable is SASS for sm_80 and newer plus compute_120 PTX.
+WINDOWS_CUDA_ENGINES = ("glm", "qwen36", "kimi")
+WINDOWS_CUDA_FLOOR = 80
+
+
+def prebuilt_vulkan(family, tc):
+    """A Vulkan engine with nothing to build: the one here when there is one (a
+    release archive's, or built before), else, where nothing here can build one, the
+    release's that resolve_engine downloads for this system."""
+    if os.path.isfile(engine_path(HERE, family)):
+        return prebuilt_runs(family, "vulkan")
+    return not tc.get("can_build") and release_asset_suffix() in RELEASE_VULKAN
 
 
 def engine_path(directory, family):
@@ -862,11 +920,11 @@ def current_version():
 def resolve_engine(family, entry, decision, tc, out=print, allow_prebuilt=True):
     """Make sure an engine for this family exists. Returns
     {"launcher_dir", "engine", "backend", "source"}; may lower the backend to
-    "cpu" when only a prebuilt (CPU) engine is possible."""
+    "cpu" when only a prebuilt engine without it is possible."""
     local = engine_path(HERE, family)
     if os.path.exists(local):
         have = binary_backend(local)
-        if decision["backend"] == "cpu" or have == decision["backend"]:
+        if decision["backend"] == "cpu" or decision["backend"] in binary_backends(local):
             make_args = decision.get("make_args", ()) if have == decision["backend"] else ()
             source = refresh_engine(family, have, tc, local, out=out, make_args=make_args)
             return {"launcher_dir": HERE, "engine": local, "backend": decision["backend"],
@@ -895,10 +953,12 @@ def resolve_engine(family, entry, decision, tc, out=print, allow_prebuilt=True):
     engine = engine_path(runtime, family)
     if not os.path.exists(engine):
         raise SetupError(f"release {tag} has no {family.engine_artifact} engine for this system")
-    if decision["backend"] != "cpu":
-        out(f"  the prebuilt engine runs on the CPU; the {decision['backend']} build needs a "
-            f"source checkout and a compiler: {package_hint(['build', decision['backend']])}")
-    return {"launcher_dir": runtime, "engine": engine, "backend": "cpu", "source": f"release {tag}"}
+    backend = decision["backend"]
+    if backend != "cpu" and not prebuilt_runs(family, backend, runtime):
+        out(f"  the prebuilt engine has no {backend} build; it needs a source checkout and a "
+            f"compiler: {package_hint(['build', backend])}")
+        backend = "cpu"
+    return {"launcher_dir": runtime, "engine": engine, "backend": backend, "source": f"release {tag}"}
 
 
 # Starting expert histories, one per catalog model that has one (profiles/<id>.coli_usage).

@@ -335,7 +335,7 @@ card fails at launch with `"no kernel image is available"` rather than producing
 a wrong answer. Build with `portable-pre-ampere` for those cards.
 ## Vulkan (`VK=1`, any GPU with a Vulkan 1.2 driver)
 
-`make deepseek-v4 VK=1` (libvulkan and `glslc` at build time) links the shared
+`make deepseek-v4 VK=1` (the Vulkan headers and `glslc` at build time) links the shared
 Vulkan backend and its routed-expert tier; `COLI_VULKAN=1` opens the device once
 the engine has loaded. No usable device, or no shaders, and the run stays on the
 CPU with one `[VK] deepseek_v4:` line that says so. Two things go to the device:

@@ -84,7 +84,7 @@ same_tokens() {  # <cpu log> <vk log> <tag>: the engines' "C engine" token lines
 # tier (vk_tier.c) on a synthetic model in every source format.
 shader_formats() {
   make tests/test_vk_tier tests/test_glm53_vk_f32 VK=1   # every shader too: the harness's expert batch needs them
-  cc -O2 -pthread -DVK_TEST backend_vulkan.c -o vk_test -lvulkan -lm
+  cc -O2 -pthread -DVK_TEST backend_vulkan.c -o vk_test -ldl -lm
   COLI_VK_TEST_MATMUL_ONLY=1 ./vk_test shaders/qmatmul.spv | tee vk_test.log
   tail -1 vk_test.log | grep -qx PASS || fail "qmatmul format cases"
   ./tests/test_vk_tier shaders/qmatmul.spv | tee vk_tier.log
@@ -108,7 +108,7 @@ staged_check() {  # <err log> <tag>: staged, and nothing resident left in host m
 }
 family_staged() {
   make tests/test_vk_tier tests/test_vk_chain VK=1   # the shaders too
-  cc -O2 -pthread -DVK_TEST backend_vulkan.c -o vk_test -lvulkan -lm
+  cc -O2 -pthread -DVK_TEST backend_vulkan.c -o vk_test -ldl -lm
   local m e d d0=""
   for m in mapped staged staged-again staged-noimport window; do
     case $m in

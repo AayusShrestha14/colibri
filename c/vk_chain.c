@@ -14,7 +14,7 @@
  * never cause one. */
 #include "vk_chain.h"
 #include "vk_alloc.h"
-#include <vulkan/vulkan.h>
+#include "vk_load.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,6 +32,8 @@ static void vkc_mem_free(VkDevice d, VkDeviceMemory m, const VkAllocationCallbac
     (void)cb;
     coli_vk_mem_free((void *)d, &m);
 }
+#undef vkAllocateMemory   /* vk_load.h's: the chain's go through the books above */
+#undef vkFreeMemory
 #define vkAllocateMemory vkc_mem_alloc
 #define vkFreeMemory vkc_mem_free
 
@@ -288,6 +290,10 @@ VkcBuf *vkc_host(const void *ptr, size_t bytes, size_t *off) {
 static VkShaderModule load_module(const char *dir_spv, const char *file) {
     char path[1200];
     const char *sl = strrchr(dir_spv, '/');
+#ifdef _WIN32
+    const char *bs = strrchr(dir_spv, '\\');
+    if (bs && (!sl || bs > sl)) sl = bs;
+#endif
     size_t pre = sl ? (size_t)(sl - dir_spv) + 1 : 0;
     if (pre + strlen(file) + 1 >= sizeof path) return VK_NULL_HANDLE;
     memcpy(path, dir_spv, pre); strcpy(path + pre, file);

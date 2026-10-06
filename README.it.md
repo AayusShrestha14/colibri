@@ -80,7 +80,8 @@ l'installazione:
    RAM, più una cache minima di expert, deve entrare nella tua RAM, e il
    download sul tuo disco;
 3. **prepara il motore**: lo compila per la tua macchina se c'è un compilatore,
-   altrimenti scarica quello già compilato, che gira sulla CPU. Lo compila per
+   altrimenti scarica quello già compilato, che gira sulla CPU e, su Linux e
+   Windows, anche su una GPU Vulkan. Lo compila per
    la tua GPU quando conviene: CUDA per una scheda NVIDIA su Linux se è
    installato il CUDA toolkit, altrimenti Vulkan. Su una GPU dedicata lo fa
    sempre; su una GPU integrata, che condivide la RAM della CPU, solo per i
