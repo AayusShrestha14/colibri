@@ -287,14 +287,19 @@ VkcBuf *vkc_host(const void *ptr, size_t bytes, size_t *off) {
 }
 
 /* ---- init ------------------------------------------------------------------------ */
-static VkShaderModule load_module(const char *dir_spv, const char *file) {
-    char path[1200];
-    const char *sl = strrchr(dir_spv, '/');
+/* The length of a path's directory with its separator, 0 without one: the shaders'
+ * directory from qmatmul.spv's path (a backslash ends it too on Windows). */
+static size_t dir_prefix(const char *path) {
+    const char *sl = strrchr(path, '/');
 #ifdef _WIN32
-    const char *bs = strrchr(dir_spv, '\\');
+    const char *bs = strrchr(path, '\\');
     if (bs && (!sl || bs > sl)) sl = bs;
 #endif
-    size_t pre = sl ? (size_t)(sl - dir_spv) + 1 : 0;
+    return sl ? (size_t)(sl - path) + 1 : 0;
+}
+static VkShaderModule load_module(const char *dir_spv, const char *file) {
+    char path[1200];
+    size_t pre = dir_prefix(dir_spv);
     if (pre + strlen(file) + 1 >= sizeof path) return VK_NULL_HANDLE;
     memcpy(path, dir_spv, pre); strcpy(path + pre, file);
     FILE *f = fopen(path, "rb");
@@ -311,10 +316,19 @@ static VkShaderModule load_module(const char *dir_spv, const char *file) {
     if (!m) fprintf(stderr, "[VK] chain: cannot load %s\n", path);
     return m;
 }
+/* The chain's shaders size their work by gl_SubgroupSize and gl_SubgroupID, so each
+ * pipeline runs at the subgroup size the device reports (ColiVkCore.pin_sg), not one
+ * the compiler picks: an Intel Iris Xe (subgroups of 8 to 32) compiled chain_gemv and
+ * chain_gemv2 at another width than the shader saw, and every decode GEMV came out
+ * wrong. 0 (no subgroup size control, COLI_VK_SUBGROUP=0): the driver's choice. */
 static VkPipeline make_pipe(VkShaderModule m, const VkSpecializationInfo *si) {
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+        .requiredSubgroupSize = (uint32_t)KC.core.pin_sg};
     VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-                  .module = m, .pName = "main", .pSpecializationInfo = si}, .layout = KC.pl};
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = KC.core.pin_sg > 0 ? &rss : NULL,
+                  .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main", .pSpecializationInfo = si},
+        .layout = KC.pl};
     VkPipeline p = VK_NULL_HANDLE;
     if (vkCreateComputePipelines(KC.dev, VK_NULL_HANDLE, 1, &ci, NULL, &p) != VK_SUCCESS) return VK_NULL_HANDLE;
     return p;
@@ -375,8 +389,7 @@ int vkc_init(void) {
     /* the MLA, KDA and mHC shaders, optional: without one only its ops decline */
     for (int i = 0; i < PM_N; i++) {
         char path[1200];
-        const char *sl = strrchr(KC.core.spv_path, '/');
-        size_t pre = sl ? (size_t)(sl - KC.core.spv_path) + 1 : 0;
+        size_t pre = dir_prefix(KC.core.spv_path);
         FILE *f = NULL;
         if (pre + strlen(mla_file[i]) + 1 < sizeof path) {
             memcpy(path, KC.core.spv_path, pre); strcpy(path + pre, mla_file[i]);
@@ -1822,8 +1835,7 @@ static struct { VkShaderModule mod; VkPipeline pipe; } g_d4[2];
 #define D4 (g_d4[g_kd])
 static void dsv4_init(void) {
     char path[1200];
-    const char *sl = strrchr(KC.core.spv_path, '/');
-    size_t pre = sl ? (size_t)(sl - KC.core.spv_path) + 1 : 0;
+    size_t pre = dir_prefix(KC.core.spv_path);
     const char *file = "chain_dsv4.spv";
     if (pre + strlen(file) + 1 >= sizeof path) return;
     memcpy(path, KC.core.spv_path, pre); strcpy(path + pre, file);
@@ -1930,8 +1942,7 @@ static VkPipeline kvs_pipe(void) {
     if (KS.pipe || KS.tried || !vkc_ready()) return KS.pipe;
     KS.tried = 1;
     char path[1200];
-    const char *sl = strrchr(KC.core.spv_path, '/');
-    size_t pre = sl ? (size_t)(sl - KC.core.spv_path) + 1 : 0;
+    size_t pre = dir_prefix(KC.core.spv_path);
     const char *file = "chain_kvs.spv";
     if (pre + strlen(file) + 1 >= sizeof path) return VK_NULL_HANDLE;
     memcpy(path, KC.core.spv_path, pre); strcpy(path + pre, file);

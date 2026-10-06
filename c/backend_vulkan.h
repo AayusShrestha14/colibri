@@ -424,6 +424,7 @@ typedef struct {
     int gemm_min_s, gemm_min_so;
     int has_prio, integrated, shares_ram;
     int coop_sg;                          /* subgroup size the cooperative-matrix shaders run at; 0 = none */
+    int pin_sg;                           /* the subgroup size every chain pipeline requires; 0 = the driver's */
 } ColiVkCore;
 int  coli_vk_core(ColiVkCore *out);
 /* A resident tensor's buffers (VkBuffer as void *) and layout; 0 for a COLI_VK_DEV2 one. */

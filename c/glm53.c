@@ -1698,7 +1698,7 @@ static int glm53_mirror_probe_weight(GModel *m, int rep) {
         } while (got < 0 && errno == EINTR);
 
         if (got > 0) bytes += got;
-        free(buf);
+        compat_aligned_free(buf);   /* _aligned_malloc on Windows */
     }
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
