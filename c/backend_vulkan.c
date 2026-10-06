@@ -2116,7 +2116,7 @@ const char *coli_vk_shader_path(char *buf, size_t n) {
     k = readlink("/proc/self/exe", buf, n - 1);
 #elif defined(_WIN32)
     k = (long)GetModuleFileNameA(NULL, buf, (DWORD)n);
-    if (k >= (long)n - 1) k = -1;   /* truncated */
+    if (k >= (long)n) k = -1;   /* truncated: n, without the terminator */
 #elif defined(__APPLE__)
     uint32_t sz = (uint32_t)n;
     if (_NSGetExecutablePath(buf, &sz) == 0) k = (long)strlen(buf);

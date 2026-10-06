@@ -12828,7 +12828,7 @@ int main(int argc, char **argv){
     if(getenv("COLI_VULKAN") && atoi(getenv("COLI_VULKAN"))){
         char spvbuf[512]; const char *spv = vk_resolve_spv(spvbuf, sizeof(spvbuf));
         g_vulkan = coli_vk_init(spv);
-        if(!g_vulkan){ fprintf(stderr,"[VK] Vulkan backend unavailable (tried %s; need libvulkan + "
+        if(!g_vulkan){ fprintf(stderr,"[VK] Vulkan backend unavailable (tried %s; needs a Vulkan driver and "
                                "the compiled shaders — point COLI_VK_SHADERS at the shader directory "
                                "or the qmatmul.spv file, or run `make VK=1` to build them)\n", spv); return 2; }
         /* The routed experts go to the shared tier (vk_tier.c), sized by its budget
