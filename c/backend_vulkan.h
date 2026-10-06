@@ -269,6 +269,7 @@ int  coli_vk_xb_issue_w(ColiVkExpert *const *ex, const int *rows, int count, con
 int  coli_vk_xb_join(const float **yrows, double *device_ms);
 typedef struct {
     unsigned long long batches, experts, rows, gemm_experts;
+    unsigned long long grouped_batches;   /* batches that took the grouped GEMM (qmatmul_grp.comp) */
     double device_ms;                 /* summed batch device time (timestamps) */
     int timestamps, queue_shared, gemm_rows;
     size_t scratch_bytes;
@@ -277,6 +278,18 @@ typedef struct {
     unsigned long long cooperative_matmuls; /* all projections, including sub-batches */
 } ColiVkXbStats;
 void coli_vk_xb_stats(ColiVkXbStats *st);
+/* A big step's whole-step buffers on the primary device (the grouped GEMM): the step's
+ * S token rows x[S*D] uploaded once; returns its S*K output rows (s*K + k, host-readable)
+ * or NULL when the device cannot (the tier then packs and copies as before). Sub-batches
+ * of the step go through coli_vk_xb_sub_issue_step (assign[j]: packed row j's s*K + k)
+ * and land in those rows; coli_vk_xb_step_sum then adds a token's used rows in rank order
+ * (w[i] * row i as an fma chain from 0) on the device and returns S*D rows, valid until
+ * the next step. coli_vk_xb_step_end closes the step either way. */
+float *coli_vk_xb_step_begin(int S, int K, const float *x);
+int   coli_vk_xb_sub_issue_step(int h, ColiVkExpert *const *ex, const int *rows, int count, const int *assign,
+                                const float *wrows);   /* wrows: as coli_vk_xb_sub_issue's (a batch off the grouped route) */
+const float *coli_vk_xb_step_sum(const float *w, const uint8_t *use, double *device_ms);
+void  coli_vk_xb_step_end(void);
 /* Sub-batches, for a prefill step too big for one batch (vk_tier.c's streaming): batch k
  * of a step goes to half k % 2 of the scratch, so two run at once and the host fills one
  * while the device computes the other. _reserve sizes each half for a batch of up to
