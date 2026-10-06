@@ -2188,6 +2188,17 @@ family_glm_chain() {
   CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 DSA_TOPK=4 DRAFT=3
   CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 KV_SLOTS=2
   COLI_VK_CHAIN=2 CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 DSA_TOPK=4
+  # several conversations at once (KV_SLOTS' batched decode): each row over its own
+  # conversation's mirror and DSA list; one mirror beside the chain's (evictions, and the
+  # steps it cannot hold on the CPU); the device lost in a multiplexed step; MUX=0
+  $PY tests/vulkan_chain_mux.py ./colibri glm_tiny_serve 3 SERVE_BATCH=1 IDOT=0
+  CHAIN_MUX_LOG=mux.log $PY tests/vulkan_chain_mux.py ./colibri glm_tiny_serve 3 SERVE_BATCH=1 IDOT=0 DSA_TOPK=4
+  CHAIN_MUX_EXPECT='[1-9][0-9]* evicted' $PY tests/vulkan_chain_mux.py ./colibri glm_tiny_serve 4 SERVE_BATCH=1 IDOT=0 COLI_VK_CHAIN_MUX=1
+  local fr; fr=$(grep -o '[0-9]* frames' mux.log | head -1 | cut -d' ' -f1)
+  CHAIN_MUX_EXPECT='lost in a multiplexed step' $PY tests/vulkan_chain_mux.py ./colibri glm_tiny_serve 3 SERVE_BATCH=1 IDOT=0 DSA_TOPK=4 \
+    COLI_VK_CHAIN_FAULT=$((fr / 2))
+  CHAIN_MUX_STEPS=0 $PY tests/vulkan_chain_mux.py ./colibri glm_tiny_serve 3 SERVE_BATCH=1 IDOT=0 COLI_VK_CHAIN_MUX=0
+  rm -f mux.log chain-mux.usage
 
   # glm53
   local ids bits
@@ -2256,6 +2267,11 @@ family_glm_chain_sanitize() {
       $PY tests/vulkan_chain_serve.py $args > san.log 2>&1 || { cat san.log; fail "asan chain serve $args"; }
     if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan chain serve $args: sanitizer diagnostic"; fi
     echo "OK asan chain serve ${args%% *}: $(tail -1 san.log)"
+  done
+  for args in "3 SERVE_BATCH=1 IDOT=0 DSA_TOPK=4" "4 SERVE_BATCH=1 IDOT=0 COLI_VK_CHAIN_MUX=1"; do
+    # shellcheck disable=SC2086
+    $PY tests/vulkan_chain_mux.py ./colibri glm_tiny_serve $args > san.log 2>&1 || { cat san.log; fail "asan chain mux $args"; }
+    echo "OK asan chain mux: $(tail -1 san.log)"
   done
   unset OMP_NUM_THREADS CAP_RAISE
   make clean >/dev/null 2>&1 || true
@@ -3796,6 +3812,8 @@ kv_split_colibri() {
     CHAIN_SERVE_EXPECT="$E" CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 $K
     CHAIN_SERVE_EXPECT="$E" CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 DSA_TOPK=4 DRAFT=3 $K
     CHAIN_SERVE_EXPECT="$E" CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 KV_SLOTS=2 $K
+    # several conversations at once with the split on: those steps on the CPU
+    CHAIN_MUX_EXPECT="$E" CHAIN_MUX_STEPS=0 $PY tests/vulkan_chain_mux.py ./colibri glm_tiny_serve 3 SERVE_BATCH=1 IDOT=0 DSA_TOPK=4 $K
   }
   unset CAP_RAISE
 }

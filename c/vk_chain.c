@@ -1303,6 +1303,35 @@ int vkc_mla_attn(const VkcMla *m, VkcMlaScratch *s, int S, int pos_base, int kv_
     if (ok && m->o && out) ok = vkc_matmul(m->o, s->ctx, 0, out, out_off, S);
     return ok;
 }
+/* vkc_mla_attn for rows of different sequences: row s attends its own cache c[s] over
+ * positions 0..pos[s] (or sel's list at sel_off + s*sel_row); the absorption, the values
+ * and o_proj take every row at once, the core one row at a time. */
+int vkc_mla_attn_rows(const VkcMla *m, VkcMlaScratch *s, int S, const int *pos, VkcMlaCache *const *c,
+                      VkcBuf *sel, size_t sel_off, int sel_row, VkcBuf *out, size_t out_off) {
+    int H = m->H, QR = m->Q + m->R, HK = H * m->K, HV = H * m->V;
+    if (!KC.mla_ok || S < 1 || S > s->rows) return 0;
+    for (int r = 0; r < S; r++) if (!c[r] || pos[r] < 0 || (int64_t)pos[r] + 1 > c[r]->cap) return 0;
+    if (m->kv_b ? !mla_shape(m->kv_b, H * (m->Q + m->V), m->K)
+                : !(mla_shape(m->k_abs, HK, m->Q) && mla_shape(m->v_abs, HV, m->K))) return 0;
+    if (m->o && out && !mla_shape(m->o, m->D, HV)) return 0;
+    int ok;
+    if (m->kv_b) {
+        VkcHgemv a = {1, S, H, m->Q, m->Q + m->V, 0, 0, H * QR, QR, 0, HK, m->K, 0, 0, 0};
+        ok = vkc_mla_hgemv(m->kv_b, s->q, s->qabs, NULL, &a);
+    } else {
+        VkcHgemv a = {0, S, H, m->K, m->K, 0, 0, H * QR, QR, 0, HK, m->K, 0, 0, 0};
+        ok = vkc_mla_hgemv(m->k_abs, s->q, s->qabs, NULL, &a);
+    }
+    for (int r = 0; ok && r < S; r++) {
+        VkcMlaCore cp = {1, H, m->K, m->R, pos[r], 0, r * HK, HK, m->K, m->Q + r * H * QR, H * QR, QR, 0, m->K, 0, m->R,
+                         (int)sel_off + (sel ? r * sel_row : 0), sel ? sel_row : 0, r * HK, HK, m->K, m->scale};
+        ok = vkc_mla_core(s->qabs, s->q, c[r]->lat, c[r]->rope, sel, s->clat, &cp);
+    }
+    VkcHgemv v = {0, S, H, m->V, m->kv_b ? m->Q + m->V : m->V, m->kv_b ? m->Q : 0, 0, HK, m->K, 0, HV, m->V, 0, HV, 0};
+    ok = ok && vkc_mla_hgemv(m->kv_b ? m->kv_b : m->v_abs, s->clat, s->ctx, NULL, &v);
+    if (ok && m->o && out) ok = vkc_matmul(m->o, s->ctx, 0, out, out_off, S);
+    return ok;
+}
 int vkc_mla(const VkcMla *m, VkcMlaScratch *s, VkcBuf *x, size_t x_off, int S, int pos_base, int kv_start,
             VkcBuf *cs, VkcMlaCache *c, VkcBuf *out, size_t out_off) {
     return vkc_mla_qkv(m, s, x, x_off, S, pos_base, cs, c, NULL, 0) &&

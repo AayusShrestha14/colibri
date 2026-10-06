@@ -294,6 +294,12 @@ int vkc_mla_qkv(const VkcMla *m, VkcMlaScratch *s, VkcBuf *x, size_t x_off, int 
  * out[out_off + s*D] = o(ctx) when m->o and out are given. */
 int vkc_mla_attn(const VkcMla *m, VkcMlaScratch *s, int S, int pos_base, int kv_start, VkcMlaCache *c,
                  VkcBuf *sel, size_t sel_off, int sel_row, VkcBuf *gate, size_t gate_off, VkcBuf *out, size_t out_off);
+/* The same for rows of different sequences (a multiplexed decode step): row s attends its
+ * own cache c[s] over positions 0..pos[s] (or sel's list at sel_off + s*sel_row; sel's
+ * row count -1 is that causal range); the projections take every row at once, the core
+ * one row at a time. */
+int vkc_mla_attn_rows(const VkcMla *m, VkcMlaScratch *s, int S, const int *pos, VkcMlaCache *const *c,
+                      VkcBuf *sel, size_t sel_off, int sel_row, VkcBuf *out, size_t out_off);
 /* both, the causal range */
 int vkc_mla(const VkcMla *m, VkcMlaScratch *s, VkcBuf *x, size_t x_off, int S, int pos_base, int kv_start,
             VkcBuf *cs, VkcMlaCache *c, VkcBuf *out, size_t out_off);

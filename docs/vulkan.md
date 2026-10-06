@@ -1506,7 +1506,31 @@ rebuilds the KDA state on the CPU from the input rows the chain records since th
 copy was last current (embedding rows, or the vision tower's), a prefill's worth of CPU
 work.
 
-**Declined** (the CPU path runs, the state synced first): a ragged multi-slot decode
+**Several conversations at once (colibri).** `KV_SLOTS`' batched decode (one row from
+each active conversation, each at its own position) runs on the chain: the norms, the
+projections and the MoE take the batch's rows as one; each row's new KV rows go to its
+own conversation's mirror, and its attention core runs over that mirror
+(`vkc_mla_attn_rows`) with its own DSA list over its own index keys. A conversation's
+mirror is the chain's own when the chain holds it (the last one a prompt or a one-row
+step ran for), else one of up to `COLI_VK_CHAIN_MUX` (default 16) beside it: whole,
+with its own watermarks, which a turn that goes back in its conversation lowers as on
+the host. Past that count the mirror read longest ago gives way, and its conversation's
+rows go up again from the host when it comes back. A mirror holds `positions x
+(kv_lora + qk_rope)` floats a layer (and `positions x index_hd` on a full DSA layer),
+positions in powers of two up to the context, and is placed only within four fifths of
+the device's free memory. A step whose conversations the mirrors cannot all hold, a
+step with the KV split on, and `COLI_VK_CHAIN_MUX=0` run on the CPU as before. With a
+second device each chain runs its layers for the whole batch, the DSA lists crossing as
+in one conversation's step; a partial chain hands the rows (and their lists) to the CPU
+after its layers. The `[VK] colibri chain: n multiplexed steps (r rows), ...` line at
+exit says what ran. `tests/vulkan_chain_mux.py` compares every frame with the CPU's:
+waves of requests on 3 and 4 slots sent at once (the batches grow and shrink; the
+second wave extends, rewinds and replaces each conversation), DSA top-4, one mirror
+beside the chain's, the device lost in a multiplexed step, the partial chain and two
+devices with a shared indexer at their edges. Not yet measured with a real checkpoint.
+glm53 still runs such steps on the CPU.
+
+**Declined** (the CPU path runs, the state synced first): glm53's multi-slot decode
 batch (a single-slot serve's one-row batch takes the chain), a layer range (a segment),
 a quantized KV cache (KV8, KV_TQ), PILOT, LOOKA, the exact verify of
 `COLI_EXACT_VERIFY`, the CUDA backend, matrices with no device form (int2, E8/IQ3, fp8
@@ -3009,7 +3033,7 @@ hit-rate line is the tier-effectiveness number.
   GEMM shaders would save both copies; it is not written.
 - Without the dense chain, DSA top-k selection, ragged multi-slot serving, and
   quantized-KV caches fall back to the CPU attention path; with it, the DSA selection
-  runs on the device.
+  and colibri's multi-slot serving run on the device.
 - Not yet done: a fully resident-layer pipeline for the engines other than qwen36,
   qwen38, colibri and glm53 ([the dense chain](#the-dense-chain-vk_chainc) is theirs), Polaris/gfx803 validation on real
   hardware (the shaders use dynamic subgroup sizes and are wave64-safe by
