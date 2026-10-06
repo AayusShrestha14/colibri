@@ -288,6 +288,13 @@ every block costs 0.3 s on a 512x512 step (5.64 s against 5.35); a discrete card
 moves them over PCIe, about 6.5 GB a step. With blocks streamed, the VAE decodes on
 the CPU.
 
+`COLI_VK_QI_ATTN=coop` runs the attention on the device's matrix units (tensor
+cores, WMMA, XMX; cooperative matrices at subgroups of 32 or 64) with int8 weights:
+f16 operands, the result the f32 attention's to about one part in a thousand. It is
+off by default because on the 780M it is slower (a 1024x1024 step's attention 32.5 s
+against 17.9): RDNA3's matrix units are only twice its f32 rate. A card whose matrix
+units outrun its f32 by more may gain; that has not been measured.
+
 Measured on a Radeon 780M (an integrated GPU sharing the RAM of the 8-core Zen 4
 above), 8 steps:
 
