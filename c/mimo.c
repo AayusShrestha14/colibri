@@ -593,6 +593,20 @@ typedef struct {
     int rows;
 } Layer;
 
+/* One conversation's caches for a multiplexed serve (KV_SLOTS>1, serve_mux below):
+ * every layer's K and V (a full layer's rows, a sliding window's ring and its
+ * positions), where it stands, and the record of the tokens it holds. The Model's
+ * layers hold the conversation a prefill runs on (mimo_seq_swap trades it for a parked
+ * one); a multiplexed decode step parks them all and reads each row's from its MimoRow. */
+typedef struct {
+    float *K[MIMO_MAX_LAYERS], *V[MIMO_MAX_LAYERS];
+    int *ring_pos[MIMO_MAX_LAYERS];
+    int pos;
+    kv_prefix kvp;
+} MimoSeq;
+typedef struct { MimoSeq *seq; int pos; } MimoRow;
+static int g_mimo_mux_slots = 1;   /* KV_SLOTS: the conversations a serve decodes at once */
+
 typedef struct {
     Cfg c;
     shards S;
@@ -613,6 +627,9 @@ typedef struct {
     void *vkchain;               /* the dense chain's device state (mimo_chain.h), NULL until it runs */
     void *vkchain2;              /* its layers on COLI_VK_DEV2's device, after the primary's (mimo_chain.h) */
 #endif
+    /* A multiplexed decode step (forward_rows): row t is the token at mux_rows[t].pos
+     * of mux_rows[t].seq; NULL in every other forward. */
+    const MimoRow *mux_rows;
 } Model;
 
 static void expert_table_init(Model *m) {
@@ -858,7 +875,105 @@ static void rope(float *v, int rd, float theta, int pos) {
 
 /* Attention of `n` rows at positions p0.. of layer li. `xn` is the normed input
  * [n, H], `out` receives o_proj's output [n, H]. */
+/* A multiplexed decode step's attention (KV_SLOTS, m->mux_rows): row t is the next
+ * token of its own conversation, at mux_rows[t].pos, over that conversation's cache --
+ * a full layer's rows, or a sliding window's ring. Each row's numbers are attention()'s
+ * for a block of that one token; the projections run once over the n rows. */
+static void attention_rows(Model *m, int li, const float *xn, int n, float *out) {
+    Cfg *c = &m->c;
+    Layer *l = &m->L[li];
+    const MimoRow *mr = m->mux_rows;
+    int k = c->swa[li];
+    int nh = c->heads[k], kvh = c->kv_heads[k], hd = c->head_dim[k], vd = c->v_dim[k];
+    int qd = nh * hd, kd = kvh * hd, vdd = kvh * vd, rows = qd + kd + vdd;
+    double t0 = now_s();
+    float *qkv = xmalloc((size_t)n * rows * sizeof(float), "qkv");
+    dw_matmul(qkv, xn, n, &l->qkv);
+    for (int t = 0; t < n; t++) {
+        float *q = qkv + (size_t)t * rows, *kk = q + qd, *vv = kk + kd;
+        for (int h = 0; h < nh; h++) rope(q + h * hd, c->rope_dim[k], c->theta[k], mr[t].pos);
+        for (int h = 0; h < kvh; h++) rope(kk + h * hd, c->rope_dim[k], c->theta[k], mr[t].pos);
+        for (int i = 0; i < vdd; i++) vv[i] *= c->v_scale;
+    }
+    int window = k ? c->window : 0, most = 1;
+    const float **Kc = xmalloc((size_t)n * sizeof *Kc, "row keys"), **Vc = xmalloc((size_t)n * sizeof *Vc, "row values");
+    int *lo = xmalloc((size_t)n * sizeof(int), "row first keys");
+    for (int t = 0; t < n; t++) {
+        MimoSeq *q = mr[t].seq;
+        int p = mr[t].pos;
+        const float *src = qkv + (size_t)t * rows + qd;
+        if (k) {   /* the window's keys before p from the ring, then this token's */
+            int l0 = p - (window - 1) > 0 ? p - (window - 1) : 0;
+            float *kc = xmalloc((size_t)(p + 1 - l0) * kd * sizeof(float), "window keys");
+            float *vc = xmalloc((size_t)(p + 1 - l0) * vdd * sizeof(float), "window values");
+            for (int pp = l0; pp < p; pp++) {
+                int slot = pp % l->rows;
+                if (q->ring_pos[li][slot] != pp) { fprintf(stderr, "[mimo] window ring lost position %d\n", pp); exit(1); }
+                memcpy(kc + (size_t)(pp - l0) * kd, q->K[li] + (size_t)slot * kd, (size_t)kd * sizeof(float));
+                memcpy(vc + (size_t)(pp - l0) * vdd, q->V[li] + (size_t)slot * vdd, (size_t)vdd * sizeof(float));
+            }
+            memcpy(kc + (size_t)(p - l0) * kd, src, (size_t)kd * sizeof(float));
+            memcpy(vc + (size_t)(p - l0) * vdd, src + kd, (size_t)vdd * sizeof(float));
+            Kc[t] = kc; Vc[t] = vc; lo[t] = l0;
+        } else {   /* the full cache, this token written in first */
+            memcpy(q->K[li] + (size_t)p * kd, src, (size_t)kd * sizeof(float));
+            memcpy(q->V[li] + (size_t)p * vdd, src + kd, (size_t)vdd * sizeof(float));
+            Kc[t] = q->K[li]; Vc[t] = q->V[li]; lo[t] = 0;
+        }
+        if (p + 1 - lo[t] > most) most = p + 1 - lo[t];
+    }
+    float *ctxv = xmalloc((size_t)n * nh * vd * sizeof(float), "attention output");
+    float scale = 1.0f / sqrtf((float)hd);
+    int group = nh / kvh;
+    #pragma omp parallel
+    {
+        float *score = xmalloc((size_t)most * sizeof(float), "scores");
+        #pragma omp for collapse(2) schedule(static)
+        for (int t = 0; t < n; t++) {
+            for (int h = 0; h < nh; h++) {
+                int p = mr[t].pos, kh = h / group, first = lo[t];
+                const float *q = qkv + (size_t)t * rows + (size_t)h * hd;
+                float best = -INFINITY;
+                for (int j = first; j <= p; j++) {
+                    const float *kr = Kc[t] + (size_t)(j - lo[t]) * kd + (size_t)kh * hd;
+                    float s = 0;
+                    for (int i = 0; i < hd; i++) s += q[i] * kr[i];
+                    s *= scale;
+                    score[j - first] = s;
+                    if (s > best) best = s;
+                }
+                float sink = l->sink ? l->sink[h] : -INFINITY;
+                if (sink > best) best = sink;
+                float den = l->sink ? expf(sink - best) : 0.0f;
+                for (int j = first; j <= p; j++) { score[j - first] = expf(score[j - first] - best); den += score[j - first]; }
+                float *o = ctxv + ((size_t)t * nh + h) * vd;
+                for (int i = 0; i < vd; i++) o[i] = 0;
+                for (int j = first; j <= p; j++) {
+                    const float *vr = Vc[t] + (size_t)(j - lo[t]) * vdd + (size_t)kh * vd;
+                    float w = score[j - first] / den;
+                    for (int i = 0; i < vd; i++) o[i] += w * vr[i];
+                }
+            }
+        }
+        free(score);
+    }
+    if (k)   /* the ring keeps each conversation's last `window` positions */
+        for (int t = 0; t < n; t++) {
+            MimoSeq *q = mr[t].seq;
+            int p = mr[t].pos, slot = p % l->rows;
+            const float *src = qkv + (size_t)t * rows + qd;
+            memcpy(q->K[li] + (size_t)slot * kd, src, (size_t)kd * sizeof(float));
+            memcpy(q->V[li] + (size_t)slot * vdd, src + kd, (size_t)vdd * sizeof(float));
+            q->ring_pos[li][slot] = p;
+            free((void *)Kc[t]); free((void *)Vc[t]);
+        }
+    dw_matmul(out, ctxv, n, &l->o);
+    free(ctxv); free(qkv); free(Kc); free(Vc); free(lo);
+    m->t_attn += now_s() - t0;
+}
+
 static void attention(Model *m, int li, const float *xn, int n, int p0, float *out) {
+    if (m->mux_rows) { attention_rows(m, li, xn, n, out); return; }
     Cfg *c = &m->c;
     Layer *l = &m->L[li];
     int k = c->swa[li];
@@ -1272,6 +1387,60 @@ static void forward(Model *m, const int *ids, int n, float *logits, int all_rows
     if (lc && nc > 0) head_cpu(m, hc, nc, lc, all_rows, xn);
     kv_prefix_record(&m->kvp, ids, m->pos, n);
     m->pos += n;
+    m->forwards++;
+    free(h); free(xn); free(tmp);
+}
+
+/* ---- several conversations at once (KV_SLOTS>1, serve_mux) -------------------
+ * Each conversation owns a MimoSeq. The Model's layers hold the conversation a
+ * prefill runs on (mimo_seq_swap trades it for a parked one); a decode step parks
+ * them all and runs one forward over a row of each (forward_rows). */
+static void mimo_seq_swap(Model *m, MimoSeq *q) {
+    for (int li = 0; li < m->c.n_layers; li++) {
+        Layer *l = &m->L[li];
+        float *K = l->K, *V = l->V; int *rp = l->ring_pos;
+        l->K = q->K[li]; l->V = q->V[li]; l->ring_pos = q->ring_pos[li];
+        q->K[li] = K; q->V[li] = V; q->ring_pos[li] = rp;
+    }
+    int pos = m->pos; kv_prefix p = m->kvp;
+    m->pos = q->pos; m->kvp = q->kvp;
+    q->pos = pos; q->kvp = p;
+}
+/* A conversation's caches of its own, the shape kv_alloc gives the Model's. */
+static void mimo_seq_alloc(Model *m, MimoSeq *q) {
+    Cfg *c = &m->c;
+    memset(q, 0, sizeof *q);
+    for (int li = 0; li < c->n_layers; li++) {
+        Layer *l = &m->L[li];
+        int k = c->swa[li];
+        q->K[li] = xmalloc((size_t)l->rows * c->kv_heads[k] * c->head_dim[k] * sizeof(float), "K cache");
+        q->V[li] = xmalloc((size_t)l->rows * c->kv_heads[k] * c->v_dim[k] * sizeof(float), "V cache");
+        q->ring_pos[li] = xmalloc((size_t)l->rows * sizeof(int), "ring positions");
+        for (int r = 0; r < l->rows; r++) q->ring_pos[li][r] = -1;
+    }
+    kv_prefix_alloc(&q->kvp, m->ctx);
+}
+
+/* One decode step of several conversations: row t is the token ids[t] at rows[t].pos
+ * of the conversation rows[t].seq, every conversation parked. The matrices, the routed
+ * experts and lm_head run once over the n rows; the attention reads and writes each
+ * row's own caches (attention_rows). The CPU kernels give a row the same bits whatever
+ * n is, so each conversation gets the logits it would alone: [n, V] into logits. */
+static void forward_rows(Model *m, const MimoRow *rows, const int *ids, int n, float *logits) {
+    Cfg *c = &m->c;
+    int H = c->hidden;
+    float *h = xmalloc((size_t)n * H * sizeof(float), "residual");
+    float *xn = xmalloc((size_t)n * H * sizeof(float), "normed");
+    float *tmp = xmalloc((size_t)n * H * sizeof(float), "block out");
+    embed_rows(m, ids, n, h);
+    m->mux_rows = rows;
+    layers_cpu(m, h, n, 0, 0, xn, tmp, NULL);
+    m->mux_rows = NULL;
+    head_cpu(m, h, n, logits, 1, xn);
+    for (int t = 0; t < n; t++) {
+        kv_prefix_record(&rows[t].seq->kvp, ids + t, rows[t].pos, 1);
+        rows[t].seq->pos = rows[t].pos + 1;
+    }
     m->forwards++;
     free(h); free(xn); free(tmp);
 }
@@ -1910,7 +2079,264 @@ static int serve_budget(int prompt, int requested, int context, int logprobs) {
     return budget < room ? budget : room;
 }
 
+/* When a request was accepted, and the counters then: DONE and PROF report its share. */
+typedef struct { double started, disk0, expert0, attn0; uint64_t hits0, miss0, fw0; int n_prompt, budget; } MimoReq;
+
+/* A request's prompt into the caches the Model's layers hold: its tokens, the budget,
+ * the image, the prefix reuse and the photos, ACCEPT, the prefill and its read-out.
+ * 1 with the logits after the prompt; 0 when the request ended here, its ERROR written
+ * and its command disposed. serve_loop and serve_mux start every request here. */
+static int mimo_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int *ids, float *logits,
+                            float **pending, int *pending_h, int *pending_w, MimoReq *rq) {
+    Cfg *c = &m->c;
+    double started = now_s();
+    double disk0 = m->t_disk, expert0 = m->t_expert, attn0 = m->t_attn;
+    uint64_t hits0 = m->hits, miss0 = m->miss, fw0 = m->forwards;
+    int n_prompt = tok_encode(tokenizer, (const char *)cmd->payload, (int)cmd->payload_bytes,
+                              ids, m->ctx + 1);
+    int budget = serve_budget(n_prompt, cmd->max_tokens, m->ctx, cmd->logprobs);
+    if (budget < 0) {
+        char message[160];
+        snprintf(message, sizeof(message), "CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d",
+                 n_prompt, cmd->max_tokens, m->ctx);
+        coli_serve_write_error(stdout, cmd->id, n_prompt < 1 ? "EMPTY_PROMPT" : message);
+        free((*pending)); (*pending) = NULL;
+        coli_serve_command_dispose(cmd);
+        return 0;
+    }
+    /* An image: its rows replace the pad ids, which must be exactly as many
+     * as the tower produces. Checked before ACCEPT so a mismatch is a clean
+     * 400, not a half-answered turn. */
+    float *image = NULL;
+    int image_rows = 0;
+    if ((*pending)) {
+        int pads = 0;
+        for (int t = 0; t < n_prompt; t++) pads += ids[t] == c->image_token_id;
+        int want = ((*pending_h) / 2) * ((*pending_w) / 2);
+        if (pads != want) {
+            char message[160];
+            snprintf(message, sizeof(message), "BAD_IMAGE prompt has %d image pads, the %dx%d grid needs %d",
+                     pads, (*pending_h), (*pending_w), want);
+            coli_serve_write_error(stdout, cmd->id, message);
+            free((*pending)); (*pending) = NULL;
+            coli_serve_command_dispose(cmd);
+            return 0;
+        }
+    }
+    /* Where this prompt starts. A chat client resends the whole transcript:
+     * if this prompt begins with the ids the state was built from, only the
+     * tail is fed (COLI_KV_PREFIX=0 turns that off). A photo (SUBMIT pin=1
+     * earlier) resumes a prompt that begins with it.
+     *
+     * With the read-out on (logprobs=k) only a photo will do. The read-out
+     * owes a frame to every position it does not inherit a predictor for,
+     * and a live prefix comes with none: the frames before it would simply
+     * be missing. So such a prompt resumes from the deepest photo, which
+     * carries the logits that predict its first fresh token, or is read out
+     * from position 0. It resumes at the photo even when the live state
+     * shares more: two options share the text before them, and stopping at
+     * that would leave the first option token without its predictor.
+     *
+     * An image refuses both: the pad ids do not describe the picture. */
+    int prefix_on = env_int("COLI_KV_PREFIX", 1) != 0;
+    int reuse = 0;
+    const float *pin_logit = NULL;
+    if (!(*pending)) {
+        if (cmd->logprobs > 0) reuse = pin_restore(m, ids, n_prompt, &pin_logit);
+        else {
+            reuse = prefix_on ? kv_prefix_reuse(&m->kvp, ids, n_prompt) : 0;
+            if (!reuse) reuse = pin_restore(m, ids, n_prompt, &pin_logit);
+        }
+    }
+    if (getenv("COLI_PREFIX_LOG"))
+        fprintf(stderr, "[PREFIX] %s %d of %d prompt tokens%s\n", reuse ? "reusing" : "no reuse,", reuse,
+                n_prompt, pin_logit ? " (photo)" : "");
+    if (pin_logit) {
+        fprintf(stderr, "[PIN] resumed from the photo of %d tokens, %d to prefill\n", reuse, n_prompt - reuse);
+        fflush(stderr);
+    }
+    if (!reuse) model_reset(m);
+    coli_serve_write_accept(stdout, cmd->id, n_prompt);
+    if ((*pending)) {
+        image = vision_run(m, (*pending), (*pending_h), (*pending_w), &image_rows);
+        free((*pending)); (*pending) = NULL;
+    }
+    ImageRows img = { image, image_rows };
+    Echo echo = { cmd->id, cmd->logprobs, tokenizer, pin_logit };
+    prefill(m, ids + reuse, n_prompt - reuse, logits, NULL, image ? &img : NULL,
+            cmd->logprobs > 0 ? &echo : NULL);
+    if (image) kv_prefix_taint(&m->kvp);
+    if (cmd->pin) {
+        /* a photo is described by its ids, and these do not describe the picture */
+        if (image) fprintf(stderr, "[PIN] no photo: the prompt carries a picture\n");
+        else pin_save(m, ids, n_prompt, logits);
+    }
+    free(image);
+    rq->started = started; rq->disk0 = disk0; rq->expert0 = expert0; rq->attn0 = attn0;
+    rq->hits0 = hits0; rq->miss0 = miss0; rq->fw0 = fw0; rq->n_prompt = n_prompt; rq->budget = budget;
+    return 1;
+}
+
+/* ---- several conversations at once (KV_SLOTS>1) ---------------------------------
+ * The gateway's cache slots, each a conversation with caches of its own (MimoSeq). A
+ * SUBMIT on a free slot starts its request at once through mimo_serve_start, on that
+ * slot's caches: its prefix reuse and photos work as a lone serve's. Then every step
+ * picks the next token of each active request and runs one forward over a row of each
+ * (forward_rows): the matrices and the experts are read once for all of them. A
+ * request's frames are a lone request's; they interleave by id. As alone, STOP ends a
+ * request with DONE and CANCEL with ERROR CANCELLED. */
+static MimoSeq *g_mimo_mux_seq;   /* [slots]: the conversations the Model does not hold */
+static int g_mimo_mux_cur;        /* the slot the Model holds, -1 when every one is parked */
+
+typedef struct {
+    char id[COLI_SERVE_ID_CAP];
+    float temperature, top_p;
+    int logprobs, active, stop, cancel, limited, emitted;
+    float *logits;                /* the logits the next pick reads */
+    MimoReq rq;
+} MimoMuxReq;
+
+static void mimo_mux_bind(Model *m, int slot) {
+    if (g_mimo_mux_cur == slot) return;
+    if (g_mimo_mux_cur >= 0) mimo_seq_swap(m, &g_mimo_mux_seq[g_mimo_mux_cur]);
+    if (slot >= 0) mimo_seq_swap(m, &g_mimo_mux_seq[slot]);
+    g_mimo_mux_cur = slot;
+}
+
+/* A request's end, as serve_loop ends one. */
+static void mimo_mux_finish(Model *m, MimoMuxReq *r) {
+    r->active = 0;
+    if (r->cancel) { coli_serve_write_error(stdout, r->id, "CANCELLED"); return; }
+    if (r->stop) r->limited = 0;
+    double wall = now_s() - r->rq.started;
+    uint64_t th = m->hits - r->rq.hits0, tm = m->miss - r->rq.miss0;
+    ColiServeDone done = { r->emitted, wall > 0 ? r->emitted / wall : 0.0,
+                           (th + tm) ? 100.0 * th / (double)(th + tm) : 0.0, rss_gb(), r->rq.n_prompt, r->limited };
+    coli_serve_write_done(stdout, r->id, &done);
+    serve_line("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %llu\n", wall, r->rq.n_prompt, r->emitted,
+               m->t_disk - r->rq.disk0, 0.0, m->t_expert - r->rq.expert0, m->t_attn - r->rq.attn0, 0.0,
+               (unsigned long long)(m->forwards - r->rq.fw0));
+    serve_hits(m);
+}
+
+/* The next token of an active request, as serve_loop picks and sends it: 1 with the
+ * token when the request goes on, 0 when it ended. */
+static int mimo_mux_pick(Model *m, Tok *tokenizer, MimoMuxReq *r, const int *eos, int n_eos, int *tk_out) {
+    Cfg *c = &m->c;
+    if (r->cancel || r->stop || r->emitted >= r->rq.budget) { mimo_mux_finish(m, r); return 0; }
+    int token = sample(r->logits, c->vocab, r->temperature, r->top_p);
+    for (int i = 0; i < n_eos; i++) if (token == eos[i]) { r->limited = 0; mimo_mux_finish(m, r); return 0; }
+    char piece[512];
+    int written = tok_decode(tokenizer, &token, 1, piece, (int)sizeof(piece));
+    if (written > 0) {
+        if (r->logprobs > 0) {
+            char tail[1024];
+            coli_logprob_tail(tail, sizeof(tail), r->logits, c->vocab, token, r->logprobs);
+            coli_serve_write_data_lp(stdout, r->id, piece, (size_t)written, tail);
+        } else coli_serve_write_data(stdout, r->id, piece, (size_t)written);
+    }
+    r->emitted++;
+    if (r->emitted >= r->rq.budget) { mimo_mux_finish(m, r); return 0; }
+    *tk_out = token; return 1;
+}
+
+static void serve_mux(Model *m, Tok *tokenizer, const char *dir) {
+    Cfg *c = &m->c;
+    int n = g_mimo_mux_slots, V = c->vocab, input_eof = 0;
+    int eos[8];
+    int n_eos = coli_load_stop_ids(dir, eos, 8, NULL);
+    coli_serve_write_ready_caps(stdout, rss_gb(), g_vision ? "vision=1" : "vision=0");
+    serve_emap(m);
+    MimoMuxReq *rq = xcalloc((size_t)n, sizeof *rq, "requests");
+    MimoRow *rows = xmalloc((size_t)n * sizeof *rows, "rows");
+    int *tok = xmalloc((size_t)n * sizeof(int), "tokens"), *who = xmalloc((size_t)n * sizeof(int), "slots");
+    float *lo = xmalloc((size_t)n * V * sizeof(float), "step logits");
+    int *ids = xmalloc(((size_t)m->ctx + 1) * sizeof(int), "prompt ids");
+    for (int i = 0; i < n; i++) rq[i].logits = xmalloc((size_t)V * sizeof(float), "logits");
+    float *pending = NULL;
+    int pending_h = 0, pending_w = 0;
+    unsigned long long steps = 0, nrows = 0;
+    fprintf(stderr, "[mimo] serving %d conversations at once (KV_SLOTS)\n", n);
+    for (;;) {
+        int active = 0; for (int i = 0; i < n; i++) active += rq[i].active;
+        /* idle: wait for a command; decoding: take one only when one is there */
+        if (!input_eof && (!active || coli_serve_stdin_ready())) {
+            ColiServeCommand command;
+            ColiServeReadResult result = coli_serve_read_command(stdin, &mimo_wire, &command);
+            if (result == COLI_SERVE_READ_EOF || result == COLI_SERVE_READ_BAD_FRAME) input_eof = 1;
+            else if (result == COLI_SERVE_READ_NOMEM) { coli_serve_write_error(stdout, command.id, "out of memory"); input_eof = 1; }
+            else if (result == COLI_SERVE_READ_BAD_REQUEST) {
+                if (command.kind == COLI_SERVE_COMMAND_SUBMIT) coli_serve_write_error(stdout, command.id, "bad submit header");
+                coli_serve_command_dispose(&command);
+            } else if (command.kind == COLI_SERVE_COMMAND_IMAGE) {
+                /* one image waits for the SUBMIT that names it; a second replaces it */
+                uint64_t expected = g_vision ? (uint64_t)command.grid_h * command.grid_w * g_vision->patch_in * sizeof(float) : 0;
+                if (!g_vision) coli_serve_write_error(stdout, command.id, "this container has no vision tower");
+                else if (command.grid_h < 2 || command.grid_w < 2 || command.grid_h % 2 || command.grid_w % 2 ||
+                         command.payload_bytes != expected)
+                    coli_serve_write_error(stdout, command.id, "BAD_IMAGE payload does not match its grid");
+                else {
+                    free(pending);
+                    pending = (float *)coli_serve_command_take_payload(&command);
+                    pending_h = command.grid_h; pending_w = command.grid_w;
+                }
+                coli_serve_command_dispose(&command);
+            } else if (command.kind == COLI_SERVE_COMMAND_CANCEL || command.kind == COLI_SERVE_COMMAND_STOP) {
+                int found = 0;
+                for (int i = 0; i < n; i++) if (rq[i].active && !strcmp(rq[i].id, command.id)) {
+                    found = 1;
+                    if (command.kind == COLI_SERVE_COMMAND_STOP) rq[i].stop = 1; else rq[i].cancel = 1;
+                }
+                if (!found && command.kind == COLI_SERVE_COMMAND_CANCEL) coli_serve_write_error(stdout, command.id, "NOT_FOUND");
+                coli_serve_command_dispose(&command);
+            } else if (command.kind != COLI_SERVE_COMMAND_SUBMIT) {
+                coli_serve_command_dispose(&command);
+            } else if (command.slot < 0 || command.slot >= n || rq[command.slot].active) {
+                coli_serve_write_error(stdout, command.id, command.slot < 0 || command.slot >= n ? "invalid cache slot" : "SLOT_BUSY");
+                coli_serve_command_dispose(&command);
+            } else {
+                MimoMuxReq *t = &rq[command.slot];
+                float *keep = t->logits;
+                memset(t, 0, sizeof *t); t->logits = keep;
+                snprintf(t->id, sizeof t->id, "%s", command.id);
+                t->temperature = command.temperature; t->top_p = command.top_p; t->logprobs = command.logprobs;
+                mimo_mux_bind(m, command.slot);
+                if (mimo_serve_start(m, tokenizer, &command, ids, t->logits, &pending, &pending_h, &pending_w, &t->rq)) {
+                    t->active = 1; t->limited = 1;
+                    coli_serve_command_dispose(&command);
+                }
+            }
+        }
+        active = 0; for (int i = 0; i < n; i++) active += rq[i].active;
+        if (!active) { if (input_eof) break; continue; }
+        int S = 0, ended = 0;
+        for (int i = 0; i < n; i++) if (rq[i].active) {
+            int tk;
+            if (!mimo_mux_pick(m, tokenizer, &rq[i], eos, n_eos, &tk)) { ended = 1; continue; }
+            rows[S] = (MimoRow){&g_mimo_mux_seq[i], g_mimo_mux_cur == i ? m->pos : g_mimo_mux_seq[i].pos};
+            tok[S] = tk; who[S] = i; S++;
+        }
+        if (S) {
+            mimo_mux_bind(m, -1);   /* every conversation parked: the rows read theirs */
+            for (int s = 0; s < S; s++) rows[s].pos = g_mimo_mux_seq[who[s]].pos;
+            forward_rows(m, rows, tok, S, lo);
+            steps++; nrows += (unsigned long long)S;
+            for (int s = 0; s < S; s++) memcpy(rq[who[s]].logits, lo + (size_t)s * V, (size_t)V * sizeof(float));
+        }
+        if (ended) {
+            serve_emap(m);
+            vkt_report("turn", m->hits, m->miss);
+        }
+    }
+    fprintf(stderr, "[mimo] KV_SLOTS=%d: %llu decode steps, %llu rows (%.2f a step)\n", n, steps, nrows,
+            steps ? (double)nrows / (double)steps : 0.0);
+    mimo_mux_bind(m, 0);
+    for (int i = 0; i < n; i++) free(rq[i].logits);
+    free(rq); free(rows); free(tok); free(who); free(lo); free(ids); free(pending);
+}
+
 static void serve_loop(Model *m, Tok *tokenizer, const char *dir) {
+    if (g_mimo_mux_slots > 1) { serve_mux(m, tokenizer, dir); return; }
     Cfg *c = &m->c;
     coli_serve_stdio_init();
     int eos[8];
@@ -1957,89 +2383,12 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *dir) {
             coli_serve_command_dispose(&command);
             continue;
         }
-        double started = now_s();
-        double disk0 = m->t_disk, expert0 = m->t_expert, attn0 = m->t_attn;
-        uint64_t hits0 = m->hits, miss0 = m->miss, fw0 = m->forwards;
-        int n_prompt = tok_encode(tokenizer, (const char *)command.payload, (int)command.payload_bytes,
-                                  ids, m->ctx + 1);
-        int budget = serve_budget(n_prompt, command.max_tokens, m->ctx, command.logprobs);
-        if (budget < 0) {
-            char message[160];
-            snprintf(message, sizeof(message), "CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d",
-                     n_prompt, command.max_tokens, m->ctx);
-            coli_serve_write_error(stdout, command.id, n_prompt < 1 ? "EMPTY_PROMPT" : message);
-            free(pending); pending = NULL;
-            coli_serve_command_dispose(&command);
-            continue;
-        }
-        /* An image: its rows replace the pad ids, which must be exactly as many
-         * as the tower produces. Checked before ACCEPT so a mismatch is a clean
-         * 400, not a half-answered turn. */
-        float *image = NULL;
-        int image_rows = 0;
-        if (pending) {
-            int pads = 0;
-            for (int t = 0; t < n_prompt; t++) pads += ids[t] == c->image_token_id;
-            int want = (pending_h / 2) * (pending_w / 2);
-            if (pads != want) {
-                char message[160];
-                snprintf(message, sizeof(message), "BAD_IMAGE prompt has %d image pads, the %dx%d grid needs %d",
-                         pads, pending_h, pending_w, want);
-                coli_serve_write_error(stdout, command.id, message);
-                free(pending); pending = NULL;
-                coli_serve_command_dispose(&command);
-                continue;
-            }
-        }
-        /* Where this prompt starts. A chat client resends the whole transcript:
-         * if this prompt begins with the ids the state was built from, only the
-         * tail is fed (COLI_KV_PREFIX=0 turns that off). A photo (SUBMIT pin=1
-         * earlier) resumes a prompt that begins with it.
-         *
-         * With the read-out on (logprobs=k) only a photo will do. The read-out
-         * owes a frame to every position it does not inherit a predictor for,
-         * and a live prefix comes with none: the frames before it would simply
-         * be missing. So such a prompt resumes from the deepest photo, which
-         * carries the logits that predict its first fresh token, or is read out
-         * from position 0. It resumes at the photo even when the live state
-         * shares more: two options share the text before them, and stopping at
-         * that would leave the first option token without its predictor.
-         *
-         * An image refuses both: the pad ids do not describe the picture. */
-        int prefix_on = env_int("COLI_KV_PREFIX", 1) != 0;
-        int reuse = 0;
-        const float *pin_logit = NULL;
-        if (!pending) {
-            if (command.logprobs > 0) reuse = pin_restore(m, ids, n_prompt, &pin_logit);
-            else {
-                reuse = prefix_on ? kv_prefix_reuse(&m->kvp, ids, n_prompt) : 0;
-                if (!reuse) reuse = pin_restore(m, ids, n_prompt, &pin_logit);
-            }
-        }
-        if (getenv("COLI_PREFIX_LOG"))
-            fprintf(stderr, "[PREFIX] %s %d of %d prompt tokens%s\n", reuse ? "reusing" : "no reuse,", reuse,
-                    n_prompt, pin_logit ? " (photo)" : "");
-        if (pin_logit) {
-            fprintf(stderr, "[PIN] resumed from the photo of %d tokens, %d to prefill\n", reuse, n_prompt - reuse);
-            fflush(stderr);
-        }
-        if (!reuse) model_reset(m);
-        coli_serve_write_accept(stdout, command.id, n_prompt);
-        if (pending) {
-            image = vision_run(m, pending, pending_h, pending_w, &image_rows);
-            free(pending); pending = NULL;
-        }
-        ImageRows img = { image, image_rows };
-        Echo echo = { command.id, command.logprobs, tokenizer, pin_logit };
-        prefill(m, ids + reuse, n_prompt - reuse, logits, NULL, image ? &img : NULL,
-                command.logprobs > 0 ? &echo : NULL);
-        if (image) kv_prefix_taint(&m->kvp);
-        if (command.pin) {
-            /* a photo is described by its ids, and these do not describe the picture */
-            if (image) fprintf(stderr, "[PIN] no photo: the prompt carries a picture\n");
-            else pin_save(m, ids, n_prompt, logits);
-        }
-        free(image);
+        MimoReq rq;
+        if (!mimo_serve_start(m, tokenizer, &command, ids, logits, &pending, &pending_h, &pending_w, &rq)) continue;
+        double started = rq.started;
+        double disk0 = rq.disk0, expert0 = rq.expert0, attn0 = rq.attn0;
+        uint64_t hits0 = rq.hits0, miss0 = rq.miss0, fw0 = rq.fw0;
+        int n_prompt = rq.n_prompt, budget = rq.budget;
         int emitted = 0, limited = 1, cancelled = 0, done_early = 0;
         char piece[512];
         while (emitted < budget && !cancelled && !done_early) {
@@ -2134,6 +2483,14 @@ int main(int argc, char **argv) {
      * the tests: mimo <dir> [--ids "..." | --prompt "..."] [--ngen N] [--cap N]. */
     const char *dir = getenv("SNAP");
     int cap = env_int("MIMO_CAP", 0);
+    if (env_int("SERVE", 0)) {   /* KV_SLOTS: the conversations a serve decodes at once */
+        const char *ks = getenv("KV_SLOTS");
+        if (ks && *ks) {
+            char *end = NULL; long v = strtol(ks, &end, 10);
+            if (end == ks || *end || v < 1 || v > 16) { fprintf(stderr, "KV_SLOTS must be between 1 and 16\n"); return 2; }
+            g_mimo_mux_slots = (int)v;
+        }
+    }
     const char *ids_text = NULL, *prompt = NULL, *image_path = NULL;
     int ngen = 32, grid_h = 0, grid_w = 0;
     for (int i = 1; i < argc; i++) {
@@ -2174,6 +2531,11 @@ int main(int argc, char **argv) {
          * MiMo checkpoint: an integrated GPU keeps it opt-in (docs/vulkan.md). */
         if (g_vk_ready) {
             g_vk_chain = coli_vk_chain_decide("mimo", tier, COLI_VK_CHAIN_UNMEASURED);
+            if (g_vk_chain && g_mimo_mux_slots > 1) {
+                g_vk_chain = 0;
+                fprintf(stderr, "[VK] mimo: KV_SLOTS=%d: the dense chain is off (it keeps one conversation's caches on the device); "
+                                "the expert tier runs every conversation's experts\n", g_mimo_mux_slots);
+            }
             /* the chain's fit before any upload: its first n layers on the device, the
              * others, the head and the tower on the CPU when they do not all fit */
             if (g_vk_chain) mc_fit_start(m);
@@ -2219,6 +2581,11 @@ int main(int argc, char **argv) {
 
     if (env_int("SERVE", 0)) {
         if (!have_tok) { fprintf(stderr, "[mimo] SERVE needs %s\n", tok_path); return 1; }
+        if (g_mimo_mux_slots > 1) {   /* slot 0 is the Model's own caches */
+            g_mimo_mux_seq = xcalloc((size_t)g_mimo_mux_slots, sizeof *g_mimo_mux_seq, "conversations");
+            for (int i = 1; i < g_mimo_mux_slots; i++) mimo_seq_alloc(m, &g_mimo_mux_seq[i]);
+            g_mimo_mux_cur = 0;
+        }
         serve_loop(m, &tokenizer, dir);
         vk_report(m);
         return 0;
