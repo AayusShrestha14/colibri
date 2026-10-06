@@ -5,7 +5,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [2.0.0] - 2026-10-06
 
-166 pull requests since v1.12.1, 87 of them from contributors. Every MoE
+169 pull requests since v1.12.1, 88 of them from contributors. Every MoE
 engine now runs on any GPU a Vulkan driver can see: the routed experts on a
 shared device tier, the dense layers on a device chain (all of them, or the
 first N that fit), and a second GPU for more experts. Three model families
@@ -162,6 +162,9 @@ decision API (System One).
   on a Radeon 780M Qwen3.6's first run went from about 6 to 11 tok/s.
 - **#1817**: in `coli chat`, a line that starts with a picture's path is a
   message, not a command.
+- **#1959** (@rudycelekli): `coli setup` counts a server on its port as a running
+  colibri only when `/health` answers as colibri does; another program's HTTP 200
+  no longer passes for one, and the setup starts its own on the next free port.
 - **#1315** (@Avicennasis): resumable, hash-verified qpack installers for
   Hugging Face and static mirrors.
 - **#1316** (@Avicennasis): the planner honours cgroup memory limits.

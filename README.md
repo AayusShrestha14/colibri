@@ -292,6 +292,15 @@ Qwen3.8-Flash-Next, and why each engine decides for itself whether to run the
 dense chain there (Qwen3.6 yes, Qwen3.8 no). `--backend vulkan` asks for Vulkan
 anyway.
 
+**Turning the GPU on or off.** `coli setup --backend vulkan` uses the GPU for any
+model, and `coli setup --backend cpu` (or `--no-gpu`) keeps everything on the
+CPU. An engine built with Vulkan uses the GPU only with `COLI_VULKAN=1` in the
+environment of `coli chat`, `serve` or `web` (the setup sets it when it chose
+Vulkan); without it, the engine runs on the CPU. With the GPU on, `COLI_VK_CHAIN=0`
+keeps the expert tier and runs the dense layers on the CPU. On an integrated GPU,
+try both: on a laptop with an Intel Iris Xe (Core i7-1355U), Qwen3.6 decoded
+2.1 tok/s on the CPU, 1.7 to 1.9 with Vulkan, and 2.1 with the dense chain off.
+
 On a discrete GPU the setup builds Vulkan for every engine (CUDA first, where
 the engine has it and the toolkit is installed), with the dense layers on the
 card. That is the case the design is for. **We have not measured a discrete
@@ -319,7 +328,11 @@ a word ([vulkan.md](docs/vulkan.md#the-other-engines)).
 The setup builds CUDA on Linux when the CUDA toolkit is installed, for the
 engines that have a CUDA path: GLM-5.2/5.3, GLM-5.3-Flash, Inkling, Kimi K3,
 DeepSeek V4 Flash, Qwen3.8-Flash-Next, and Qwen3.6 with Qwen3-Coder. On
-Windows the CUDA engine is a separate DLL ([windows.md](docs/windows.md)).
+Windows the CUDA engine is a separate DLL ([windows.md](docs/windows.md)), and
+every release ships it built: `colibri-<version>-windows-x86_64-cuda.zip` has
+`coli_cuda.dll` (cards of compute capability 8.0 and newer) and the colibri,
+qwen36 and kimi_k3 engines that load it. Unpack it over the main archive and the
+setup picks CUDA.
 
 - **The VRAM expert tier** keeps the hottest experts on the card, chosen from
   measured routing; misses compute on the CPU at the same time. Qwen3.6 on two
@@ -347,8 +360,10 @@ All of it: [docs/cuda.md](docs/cuda.md).
 ### Apple Silicon
 
 A Metal backend does the expert math on the unified-memory GPU for several
-engines; build with `METAL=1` ([docs/metal.md](docs/metal.md)). On macOS the
-one-step setup builds for the CPU.
+engines ([docs/metal.md](docs/metal.md)). The release's macOS archive has
+`colibri`, `inkling` and `kimi_k3` built with it: `COLI_METAL=1` (`K3_METAL=1`
+for Kimi K3) turns it on, and without it they run on the CPU. From source,
+build with `METAL=1`; the one-step setup builds for the CPU.
 
 <a id="system-one-mode-ask-a-closed-question"></a>
 
@@ -439,7 +454,10 @@ with the last 30 turns as a trend.
 - **pictures out** with Qwen-Image-2.1 on `POST /v1/images/generations`,
   and drawn inside the terminal by `coli chat`
   ([qwen-image.md](docs/qwen-image.md));
-- **decisions** on `POST /v1/systemone` ([above](#system-one-a-decision-with-a-probability)).
+- **decisions** on `POST /v1/systemone` ([above](#system-one-a-decision-with-a-probability));
+- **several conversations at once** on every text engine: `coli serve
+  --kv-slots N` keeps up to 16, each with its own cache, and decodes their next
+  tokens together ([api.md](docs/api.md#isolated-kv-contexts)).
 
 Coding CLIs and editors connect as to any OpenAI-compatible provider: base URL
 `http://127.0.0.1:8000/v1`, the model id `coli status` prints, any non-empty key
@@ -530,7 +548,9 @@ the numbers.
 **1. The program.** Take the archive for your platform from
 [Releases](https://github.com/JustVugg/colibri/releases) (Linux x86_64, macOS,
 Windows; no compiler needed, only [Python 3](https://www.python.org/downloads/)
-for the launcher and the API) and unpack it, then `python3 coli info`. Or build
+for the launcher and the API) and unpack it, then `python3 coli info`. The Linux
+and Windows engines have Vulkan built in, with their `shaders/` beside them, and
+the macOS ones Metal; for an NVIDIA card on Windows add the CUDA archive. Or build
 from source with `gcc` (or clang) and OpenMP:
 
 ```bash

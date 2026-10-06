@@ -206,6 +206,8 @@ Starting colibri
 
 集成显卡与 CPU 共用内存。它节省的是它所持有的那些专家的计算量和磁盘读取，因此在 Qwen3.6 这样的模型上有收益，而像 OLMoE 这样专家本来就在内存中的小模型，反而可能变慢。正因如此，安装程序只为 Qwen3.6、Qwen3-Coder 和 Qwen3.8-Flash-Next 在集成显卡上开启 Vulkan，并且每个引擎自行决定是否在集成显卡上运行稠密链（Qwen3.6 会，Qwen3.8 不会）。`--backend vulkan` 则无论如何都会使用 Vulkan。
 
+**开启或关闭 GPU。** `coli setup --backend vulkan` 对任何模型都使用 GPU，`coli setup --backend cpu`（或 `--no-gpu`）则全部在 CPU 上运行。用 Vulkan 编译的引擎只有在 `coli chat`、`serve` 或 `web` 的环境中有 `COLI_VULKAN=1` 时才使用 GPU（安装程序选择 Vulkan 时会自动设置）；没有它，引擎就在 CPU 上运行。GPU 开启时，`COLI_VK_CHAIN=0` 保留专家层 (tier)，让稠密层在 CPU 上运行。在集成显卡上，两种都试一试：在一台 Intel Iris Xe（Core i7-1355U）笔记本上，Qwen3.6 在 CPU 上解码 2.1 tok/s，用 Vulkan 为 1.7 到 1.9，关闭稠密链后为 2.1。
+
 在独立显卡上，安装程序会为每个引擎编译 Vulkan 版本（如果引擎有 CUDA 路径且装有 toolkit，则优先使用 CUDA），并把稠密层放在显卡上。这正是该设计所针对的情形。**我们自己还没有实测过独立显卡。**第一份数据来自一位用户：Qwen3.6 在 Tesla V100 16 GB 上，配合专家层级和稠密链，解码速度为 17 到 19 tok/s（[#1852](https://github.com/JustVugg/colibri/issues/1852)）。（在它们之前，GLM-5.2 较早的 Vulkan 路径在独立显卡 RX 9070 上的解码速度为 1.7-1.8 tok/s。）欢迎提供你的显卡上的数据。
 
 **没有 Resizable BAR 的显卡**现在也能用了。这类显卡（所有 Turing 显卡、使用首发固件的 Ampere 显卡、关闭了该选项的较旧 AMD 显卡）只允许 CPU 直接写入其显存中约 256 MB 的部分；colibri 现在会自动通过一个暂存缓冲区（staging buffer）把权重复制进去。这条路径已通过强制启用以及在三种设备上模拟小窗口进行了测试，在 780M 上没有可测量的开销；尚未在真正没有 Resizable BAR 的显卡上实测（[vulkan.md](docs/vulkan.md#memory-placement-without-resizable-bar)）。
@@ -214,7 +216,7 @@ CI 在软件驱动上将每个引擎的 Vulkan 路径与 CPU 的 token 对照检
 
 ### CUDA：NVIDIA 显卡
 
-在 Linux 上，如果装有 CUDA toolkit，安装程序会为具有 CUDA 路径的引擎编译 CUDA 版本：GLM-5.2/5.3、GLM-5.3-Flash、Inkling、Kimi K3、DeepSeek V4 Flash、Qwen3.8-Flash-Next，以及 Qwen3.6 和 Qwen3-Coder。在 Windows 上，CUDA 引擎是一个单独的 DLL（[windows.md](docs/windows.md)）。
+在 Linux 上，如果装有 CUDA toolkit，安装程序会为具有 CUDA 路径的引擎编译 CUDA 版本：GLM-5.2/5.3、GLM-5.3-Flash、Inkling、Kimi K3、DeepSeek V4 Flash、Qwen3.8-Flash-Next，以及 Qwen3.6 和 Qwen3-Coder。在 Windows 上，CUDA 引擎是一个单独的 DLL（[windows.md](docs/windows.md)），每个版本都附带编译好的版本：`colibri-<版本>-windows-x86_64-cuda.zip` 包含 `coli_cuda.dll`（适用于计算能力 8.0 及以上的显卡）以及加载它的 colibri、qwen36 和 kimi_k3 引擎。把它解压到主压缩包之上，安装程序就会选择 CUDA。
 
 - **显存专家层级**把最热的专家放在显卡上，这些专家根据实测路由选出；未命中的专家同时在 CPU 上计算。Qwen3.6 在两张 8 GB 显卡（RTX 3070 和 Quadro RTX 4000）上、有热的路由历史时，解码速度为 11.3 tok/s（[qwen36-cuda-tier.md](docs/qwen36-cuda-tier.md)）；GLM-5.2 在六张 RTX 5090 上、全部专家常驻时为 9.0-9.2 tok/s（[benchmarks.md](docs/benchmarks.md)）；DeepSeek V4 Flash 在一张 RTX 5080 上为 1.5-1.6 tok/s，3,324 个 token 的提示词用时 90 秒（[deepseek-v4.md](docs/deepseek-v4.md)）。
 - **Qwen3.6 新功能：DeltaNet 层放在显卡上**（`Q36_DN_GPU=1`，需手动开启）。以前，Qwen3.6 的 30 个 DeltaNet 层中，每一层对每个 token 都要在显卡和 CPU 之间复制四次数据；现在，解码一个 token 时整个层都在显卡上运行，其循环状态保留在显存中。在 RTX 3070 上、稠密层位于显存时：从 25.4 提升到 30.0 tok/s（[qwen36-cuda-tier.md](docs/qwen36-cuda-tier.md#the-deltanet-layer-on-the-card-q36_dn_gpu1)）。
@@ -224,7 +226,7 @@ CI 在软件驱动上将每个引擎的 Vulkan 路径与 CPU 的 token 对照检
 
 ### Apple Silicon
 
-Metal 后端为多个引擎在统一内存 GPU 上执行专家运算；用 `METAL=1` 编译（[docs/metal.md](docs/metal.md)）。在 macOS 上，一步安装程序编译的是 CPU 版本。
+Metal 后端为多个引擎在统一内存 GPU 上执行专家运算（[docs/metal.md](docs/metal.md)）。版本的 macOS 压缩包中，`colibri`、`inkling` 和 `kimi_k3` 已带 Metal 编译：`COLI_METAL=1`（Kimi K3 用 `K3_METAL=1`）开启它，不设置时在 CPU 上运行。从源码编译请用 `METAL=1`；一步安装程序编译的是 CPU 版本。
 
 <a id="system-one-mode-ask-a-closed-question"></a>
 <a id="system-one-a-decision-with-a-probability"></a>
@@ -284,6 +286,7 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 - **图像输入**：GLM-5.3-Flash、DeepSeek V4.1 Flash、MiMo-V2.6、Qwen3.8-Flash-Next 和 Qwen3.8-27B 支持，方式可以是 `coli chat` 消息中的一个路径、`coli web` 中的一个附件，或一个 `image_url` 部分；
 - **图像输出**：Qwen-Image-2.1 通过 `POST /v1/images/generations` 提供，`coli chat` 还能直接在终端中显示图片（[qwen-image.md](docs/qwen-image.md)）；
 - **决策**：通过 `POST /v1/systemone`（[见上文](#system-one-a-decision-with-a-probability)）。
+- **同时进行多个对话**：在每个文本引擎上，`coli serve --kv-slots N` 最多保留 16 个对话，每个都有自己的缓存，并把它们的下一个 token 一起解码（[api.md](docs/api.md#isolated-kv-contexts)）。
 
 编程 CLI 和编辑器的连接方式与连接任何兼容 OpenAI 的服务商相同：base URL 为 `http://127.0.0.1:8000/v1`，模型 id 用 `coli status` 打印出的那个，密钥任意非空即可（[docs/api.md](docs/api.md#connect-a-coding-cli-or-editor)）。
 
@@ -333,7 +336,7 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 
 <a id="1-get-colibri"></a>
 
-**1. 程序。** 从 [Releases](https://github.com/JustVugg/colibri/releases) 下载对应平台的压缩包（Linux x86_64、macOS、Windows；不需要编译器，只需要供启动器和 API 使用的 [Python 3](https://www.python.org/downloads/)）并解压，然后运行 `python3 coli info`。或者用 `gcc`（或 clang）和 OpenMP 从源码编译：
+**1. 程序。** 从 [Releases](https://github.com/JustVugg/colibri/releases) 下载对应平台的压缩包（Linux x86_64、macOS、Windows；不需要编译器，只需要供启动器和 API 使用的 [Python 3](https://www.python.org/downloads/)）并解压，然后运行 `python3 coli info`。Linux 和 Windows 的引擎内置 Vulkan（`shaders/` 就在旁边），macOS 的引擎内置 Metal；在 Windows 上使用 NVIDIA 显卡时，再加上 CUDA 压缩包。或者用 `gcc`（或 clang）和 OpenMP 从源码编译：
 
 ```bash
 git clone https://github.com/JustVugg/colibri && cd colibri/c
