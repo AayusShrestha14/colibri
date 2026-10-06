@@ -216,6 +216,20 @@ typedef struct {
     int n, cap;
 } LCache;
 
+/* One conversation's state for a multiplexed serve (KV_SLOTS>1, serve_mux below):
+ * every KDA layer's recurrent state and its three convolution windows, every MLA
+ * layer's latent caches and its index keys, their capacity and the record of the
+ * tokens they hold. The Model holds the conversation a prefill runs on (k3_seq_swap
+ * trades it for a parked one); a multiplexed decode step parks them all and reads
+ * each row's from its K3Row. */
+typedef struct {
+    float **kstate, **cwq, **cwk, **cwv, **Lc, **Rc, **Ic;
+    int max_t;
+    kv_prefix kvp;
+} K3Seq;
+typedef struct { K3Seq *seq; int pos; } K3Row;
+static int g_k3_mux_slots=1;   /* KV_SLOTS: the conversations a serve decodes at once */
+
 typedef struct {
     Cfg c;
     shards S;
@@ -246,6 +260,9 @@ typedef struct {
     uint64_t clock, hits, miss, ebytes;
     double t_attn, t_moe, t_eload, t_head;
     FILE *trace;
+    /* A multiplexed decode step (k3_step_rows): row t is the token at
+     * mux_rows[t].pos of mux_rows[t].seq; NULL in every other forward. */
+    const K3Row *mux_rows;
 } Model;
 
 static double now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
@@ -1167,7 +1184,9 @@ static void model_init_range(Model *m, const char *snap, int layer_begin,
 #endif
 #ifdef COLI_METAL
     { const char *ev=getenv("K3_METAL");
-      if(ev&&atoi(ev)){
+      if(ev&&atoi(ev)&&g_k3_mux_slots>1)
+        fprintf(stderr,"[K3-METAL] KV_SLOTS=%d: Metal keeps one conversation's KDA state; CPU only\n",g_k3_mux_slots);
+      else if(ev&&atoi(ev)){
         fprintf(stderr,"[K3-METAL] attempting init (K3_METAL=%s)\n", ev);
         g_k3_metal=coli_metal_init();
         if(!g_k3_metal) fprintf(stderr,"[K3-METAL] FAILED — CPU only\n");
@@ -1484,7 +1503,8 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
         }
 #endif
         {
-            float *wins_cpu[3]={m->cwq[li],m->cwk[li],m->cwv[li]};
+            const K3Seq *rq=m->mux_rows?m->mux_rows[t].seq:NULL;   /* a multiplexed step: the row's own */
+            float *wins_cpu[3]={rq?rq->cwq[li]:m->cwq[li],rq?rq->cwk[li]:m->cwk[li],rq?rq->cwv[li]:m->cwv[li]};
             float *vecs_cpu[3]={qt,kt,tv}; float *taps_cpu[3]={a->conv_q,a->conv_k,a->conv_v};
             for(int w2=0;w2<3;w2++){
                 float *win=wins_cpu[w2], *vec=vecs_cpu[w2]; const float *cw=taps_cpu[w2];
@@ -1514,7 +1534,7 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
                 alpha[i]=expf(c->gate_lb*sigmoidf_(a->A[h]*z));
             }
             float beta=sigmoidf_(bt[h]);
-            float *S=m->kstate[li]+(int64_t)h*hd*hd;
+            float *S=(m->mux_rows?m->mux_rows[t].seq->kstate[li]:m->kstate[li])+(int64_t)h*hd*hd;
             memset(kS,0,sizeof(kS));
 #ifdef __AVX2__
             if(!(hd&7)){
@@ -1612,9 +1632,11 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
      * and at row 0 instead of row pos_base — so on Metal the host cache was never populated
      * and attention read garbage, collapsing decode after a few tokens. This write is a
      * trivial rmsnorm+copy per row (negligible vs MoE), so CPU is the correct home for it. */
+    const K3Row *mr = m->mux_rows;   /* a multiplexed step: each row's own caches and position */
     for (int t = 0; t < C; t++) {
-        float *Lrow = m->Lc[li] + (int64_t)(pos0 + t) * kvl,
-              *Rrow = m->Rc[li] + (int64_t)(pos0 + t) * qr;
+        int pt = mr ? mr[t].pos : pos0 + t;
+        float *Lrow = (mr ? mr[t].seq->Lc[li] : m->Lc[li]) + (int64_t)pt * kvl,
+              *Rrow = (mr ? mr[t].seq->Rc[li] : m->Rc[li]) + (int64_t)pt * qr;
         const float *cv = ckv + (int64_t)t * (kvl + qr);
         rmsnorm_(Lrow, cv, a->kva_ln, kvl, c->eps);
         memcpy(Rrow, cv + kvl, qr * sizeof(float));
@@ -1623,20 +1645,25 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
     if(c->index_hd > 0 && c->idx_type[li] && k3_dsa_indexer_on()){
         /* the chunk's keys in one call ([C, index_hd] from [C, hidden], rows contiguous
          * in Ic; every kernel computes a row as the one-row call does), then per row */
-        w_matmul(a->Ic + (int64_t)pos0 * c->index_hd, x, &a->wk, C);
+        float *ikb = mr ? falloc((int64_t)C * c->index_hd) : a->Ic + (int64_t)pos0 * c->index_hd;
+        w_matmul(ikb, x, &a->wk, C);
         for(int t=0;t<C;t++){
-            float *ikd = a->Ic + (int64_t)(pos0+t) * c->index_hd;
+            int pt = mr ? mr[t].pos : pos0 + t;
+            float *ikd = mr ? mr[t].seq->Ic[li] + (int64_t)pt * c->index_hd : a->Ic + (int64_t)pt * c->index_hd;
+            if (mr) memcpy(ikd, ikb + (int64_t)t * c->index_hd, (size_t)c->index_hd * sizeof(float));
             rmsnorm_(ikd, ikd, a->knw, c->index_hd, c->eps);
             if(c->qk_rope > 0)
-                dsa_rope(ikd, pos0+t, c->qk_rope, c->theta);   /* in-place on first qk_rope dims */
+                dsa_rope(ikd, pt, c->qk_rope, c->theta);   /* in-place on first qk_rope dims */
         }
+        if (mr) free(ikb);
     }
     w_matmul(gv,x,&a->g,C);
 #ifdef COLI_VULKAN
     if(a->kvb.vk_gone) k3_w_reload(&a->kvb);   /* its rows are read on the CPU below */
 #endif
     for(int tt=0;tt<C;tt++){
-        int nt=pos0+tt+1;
+        int nt=(mr?mr[tt].pos:pos0+tt)+1;
+        const float *Lc_=mr?mr[tt].seq->Lc[li]:m->Lc[li], *Rc_=mr?mr[tt].seq->Rc[li]:m->Rc[li];
         const float *qvt=qv+(int64_t)tt*H*qh, *gvt=gv+(int64_t)tt*H*vh;
         float *ctxt=ctx+(int64_t)tt*H*vh;
         #pragma omp parallel for schedule(static)
@@ -1647,7 +1674,7 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
             for(int d=0;d<c->qk_nope;d++) w_addrow(&a->kvb,rbase+d,qp[d],qabs);
             float *sc=falloc(nt);
             for(int t=0;t<nt;t++){
-                const float *Lt=m->Lc[li]+(int64_t)t*kvl, *Rt=m->Rc[li]+(int64_t)t*qr;
+                const float *Lt=Lc_+(int64_t)t*kvl, *Rt=Rc_+(int64_t)t*qr;
                 float s2=0; for(int i=0;i<kvl;i++) s2+=qabs[i]*Lt[i];
                 for(int i=0;i<qr;i++) s2+=qrp[i]*Rt[i];
                 sc[t]=s2*c->attn_scale;
@@ -1655,7 +1682,7 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
             softmax_(sc,nt);
             float clat[4096]; memset(clat,0,kvl*sizeof(float));
             for(int t=0;t<nt;t++){
-                const float *Lt=m->Lc[li]+(int64_t)t*kvl; float s2=sc[t];
+                const float *Lt=Lc_+(int64_t)t*kvl; float s2=sc[t];
                 for(int i=0;i<kvl;i++) clat[i]+=s2*Lt[i];
             }
             free(sc);
@@ -2778,6 +2805,59 @@ static float *step_chunk(Model *m, const int *ids, int pos0, int C){
     return step_chunk_ex(m,ids,pos0,C,NULL,NULL,NULL);
 }
 
+/* ---- several conversations at once (KV_SLOTS>1, serve_mux) ------------------- */
+static void k3_seq_swap(Model *m, K3Seq *q){
+#define K3_SEQ_SWAP(T,a,b) do{ T t_=(a); (a)=(b); (b)=t_; }while(0)
+    K3_SEQ_SWAP(float**,m->kstate,q->kstate); K3_SEQ_SWAP(float**,m->cwq,q->cwq);
+    K3_SEQ_SWAP(float**,m->cwk,q->cwk); K3_SEQ_SWAP(float**,m->cwv,q->cwv);
+    K3_SEQ_SWAP(float**,m->Lc,q->Lc); K3_SEQ_SWAP(float**,m->Rc,q->Rc);
+    K3_SEQ_SWAP(int,m->max_t,q->max_t); K3_SEQ_SWAP(kv_prefix,m->kvp,q->kvp);
+    if(!q->Ic&&!(q->Ic=calloc(m->c.n_layers,sizeof(float*)))){ fprintf(stderr,"[serve] out of memory\n"); exit(1); }   /* slot 0's place */
+    for(int i=0;i<m->c.n_layers;i++) K3_SEQ_SWAP(float*,m->L[i].m.Ic,q->Ic[i]);
+#undef K3_SEQ_SWAP
+}
+/* A conversation's recurrent state of its own; its MLA caches come with its first
+ * request (prepare_request_state's kv_alloc), as the Model's do. */
+static void k3_seq_alloc(Model *m, K3Seq *q){
+    Cfg *c=&m->c; int P=c->kda_proj;
+    memset(q,0,sizeof *q);
+    q->kstate=calloc(c->n_layers,sizeof(float*)); q->cwq=calloc(c->n_layers,sizeof(float*));
+    q->cwk=calloc(c->n_layers,sizeof(float*)); q->cwv=calloc(c->n_layers,sizeof(float*));
+    q->Ic=calloc(c->n_layers,sizeof(float*));
+    for(int i=0;i<c->n_layers;i++) if(m->L[i].kda&&m->kstate[i]){
+        q->kstate[i]=afcalloc((int64_t)c->kda_heads*c->kda_hd*c->kda_hd);
+        q->cwq[i]=afcalloc((int64_t)P*c->conv_k);
+        q->cwk[i]=afcalloc((int64_t)P*c->conv_k);
+        q->cwv[i]=afcalloc((int64_t)P*c->conv_k);
+    }
+}
+
+/* One decode step of several conversations: row s is the token ids[s] at
+ * rows[s].pos of the conversation rows[s].seq, every conversation parked. The
+ * matrices, the routed experts and lm_head run once over the S rows; the KDA and MLA
+ * read and write each row's own state (m->mux_rows). The CPU kernels give a row the
+ * same bits whatever S is, so each conversation gets the logits it would alone. */
+static float *k3_step_rows(Model *m, const K3Row *rows, const int *ids, int S){
+    Cfg *c=&m->c; int D=c->hidden;
+    int nbmax=(c->n_layers+c->res_bs-1)/c->res_bs, nb=0;
+    float *hidden=falloc((int64_t)S*D), *bres=falloc((int64_t)S*nbmax*D);
+    k3_embed(m,ids,0,S,hidden);
+    m->mux_rows=rows;
+    k3_layers_forward_range(m,hidden,bres,&nb,0,S,0,c->n_layers,NULL,NULL,NULL);
+    m->mux_rows=NULL;
+    float *mix=falloc((int64_t)S*D), *logits=falloc((int64_t)S*c->vocab);
+    double t0=now_s();
+    for(int t=0;t<S;t++){
+        res_mix(mix+(int64_t)t*D,hidden+(int64_t)t*D,bres+(int64_t)t*nbmax*D,nb,D,m->out_sw,c->eps);
+        rmsnorm_(mix+(int64_t)t*D,mix+(int64_t)t*D,m->final_norm,D,c->eps);
+    }
+    w_matmul(logits,mix,&m->lm_head,S);
+    m->t_head+=now_s()-t0;
+    for(int t=0;t<S;t++) kv_prefix_record(&rows[t].seq->kvp,ids+t,rows[t].pos,1);
+    free(hidden); free(bres); free(mix);
+    return logits;
+}
+
 static void kv_alloc(Model *m, int max_t){
     Cfg *c=&m->c;
     /* Serve calls this once per request, and it used to calloc Lc/Rc over the
@@ -3553,7 +3633,18 @@ static void serve_hits(Model *m){
     printf("HITS %d %d %s\n",rows,E,hex); fflush(stdout); free(hex); free(bm);
 }
 
-static int serve_one(Model *m, Tok *T, ServeReq *q){
+/* When a request's prefill began, and the counters then: DONE and PROF report its share. */
+typedef struct { double t0, a0, e0, d0, h0; uint64_t hit0, miss0; } K3ReqClock;
+/* What a request's decoding needs from its start: the chat framing it was given. */
+typedef struct { int chat, thinking, sp[4]; } K3ReqChat;
+
+/* A request's prompt into the state the Model holds: its tokens (plain or K3CHAT1),
+ * the budget, ACCEPT, the prefix reuse and the photos, the prefill and its
+ * read-out. 1 with the prompt's ids and the logits after it; 0 when the request ended
+ * here, its ERROR written; -1 when the input is gone. poll: read CANCEL during the
+ * prefill (a lone serve), NULL to leave every command for later (serve_mux). */
+static int k3_serve_start(Model *m, Tok *T, ServeReq *q, int **ids_out, int *np_out, float **lo_out,
+                          K3ReqClock *clk, K3ReqChat *chatinfo, K3ServePoll *poll){
     int cap=65536, *ids=malloc((size_t)cap*sizeof(int)), np=0;
     if(!ids){ coli_serve_write_error(stdout,q->id,"out of memory"); return 0; }
     int sp[4]={-1,-1,-1,-1}, chat=0, thinking=0;
@@ -3662,29 +3753,41 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
 #ifdef COLI_VULKAN
     { int r=k3c_prefill_rows(m); if(r>0 && !g_lfp) chunk=r; }   /* the chain's chunk from the budget: big MoE steps */
 #endif
-    double t0=now_s(), a0=m->t_attn, e0=m->t_moe, d0=m->t_eload, h0=m->t_head;
-    uint64_t hit0=m->hits, miss0=m->miss;
+    clk->t0=now_s(); clk->a0=m->t_attn; clk->e0=m->t_moe; clk->d0=m->t_eload; clk->h0=m->t_head;
+    clk->hit0=m->hits; clk->miss0=m->miss;
     float *lo=NULL;
     /* `i` is the ABSOLUTE position: attention and the MLA Lc/Rc slots are
      * position-indexed, so the loop starts at `reuse`, not at 0. */
     int prefill_cancelled=0;
-    K3ServePoll poll={q->id,0};
     for(int i=reuse;i<np;i+=chunk){
         int C=np-i<chunk?np-i:chunk;
-        free(lo); lo=step_chunk_ex(m,ids+i,i,C,k3_serve_poll_cancel,&poll,
+        free(lo); lo=step_chunk_ex(m,ids+i,i,C,poll?k3_serve_poll_cancel:NULL,poll,
                                    &prefill_cancelled);
         if(prefill_cancelled) break;
     }
     if(prefill_cancelled){
         free(lo); k3_cancel_unpublished_state(m); free(ids);
-        if(!poll.fatal) coli_serve_write_error(stdout,q->id,"CANCELLED");
-        return poll.fatal?-1:0;
+        if(!poll->fatal) coli_serve_write_error(stdout,q->id,"CANCELLED");
+        return poll->fatal?-1:0;
     }
     /* Turn boundary: the state now covers exactly the prompt. A photo here is
      * what an agentic edit of the NEXT request restores from. */
     k3_ckpt_save(m, q->pin ? lo : NULL);
     if(q->pin) fprintf(stderr,"[PIN] stato fotografato a %d token\n",np);
     g_echo_k=0; g_echo_id=NULL;   /* la lettura riguarda il prefill, non la decodifica */
+    *ids_out=ids; *np_out=np; *lo_out=lo;
+    chatinfo->chat=chat; chatinfo->thinking=thinking; memcpy(chatinfo->sp,sp,sizeof sp);
+    return 1;
+}
+
+static int serve_one(Model *m, Tok *T, ServeReq *q){
+    int *ids=NULL, np=0; float *lo=NULL; K3ReqClock clk; K3ReqChat ci;
+    K3ServePoll poll={q->id,0};
+    int started=k3_serve_start(m,T,q,&ids,&np,&lo,&clk,&ci,&poll);
+    if(started<=0) return started;
+    int chat=ci.chat, thinking=ci.thinking, *sp=ci.sp;
+    double t0=clk.t0, a0=clk.a0, e0=clk.e0, d0=clk.d0, h0=clk.h0;
+    uint64_t hit0=clk.hit0, miss0=clk.miss0;
     int gen=0, limited=1, cancelled=0, xsup=0, xopen=0, xtl=0, xtool=0;
     char buf[512], xtag[320];   /* tool-call open tags carry attributes: call tool="..." index="..." (#1143) */
     double tg=now_s();
@@ -3764,6 +3867,176 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
     return 0;
 }
 
+/* ---- several conversations at once (KV_SLOTS>1) -------------------------------
+ * The gateway's cache slots, each a conversation with a state of its own (K3Seq). A
+ * SUBMIT on a free slot starts its request at once through k3_serve_start, on that
+ * slot's state: its prefix reuse and photos work as a lone serve's (its prefill is
+ * not interrupted: the commands wait for it). Then every step picks the next token of
+ * each active request and runs one forward over a row of each (k3_step_rows): the
+ * matrices and the experts are read once for all of them. A request's frames, its
+ * chat markers and tool sideband included, are a lone request's; they interleave by
+ * id. As alone, STOP and CANCEL end a request with DONE. */
+static K3Seq *g_k3_mux_seq;   /* [slots]: the conversations the Model does not hold */
+static int g_k3_mux_cur;      /* the slot the Model holds, -1 when every one is parked */
+
+typedef struct {
+    ServeReq q;
+    int active, cancel, limited, gen, s, forwards;
+    int *ids, np;
+    float *lo;                  /* the logits the next pick reads */
+    K3ReqClock clk;
+    K3ReqChat ci;
+    int xsup, xopen, xtl, xtool;
+    char xtag[320];
+    double tg;                  /* when its decoding began */
+} K3MuxReq;
+
+static void k3_mux_bind(Model *m, int slot){
+    if(g_k3_mux_cur==slot) return;
+    if(g_k3_mux_cur>=0) k3_seq_swap(m,&g_k3_mux_seq[g_k3_mux_cur]);
+    if(slot>=0) k3_seq_swap(m,&g_k3_mux_seq[slot]);
+    g_k3_mux_cur=slot;
+}
+
+/* A request's end, as serve_one ends one. */
+static void k3_mux_finish(Model *m, K3MuxReq *r, int slot){
+    free(r->lo); r->lo=NULL; free(r->ids); r->ids=NULL; r->active=0;
+    if(r->cancel) r->limited=0;
+    /* the end of the reply: the next turn extends THIS state (a photo when they are on) */
+    k3_mux_bind(m,slot); k3_ckpt_save(m,NULL);
+    double dt=now_s()-r->clk.t0, decode=now_s()-r->tg;
+    uint64_t hits=m->hits-r->clk.hit0, misses=m->miss-r->clk.miss0, total=hits+misses;
+    ColiServeDone done={r->gen,decode>0?r->gen/decode:0.0,total?100.0*hits/total:0.0,rss_gb(),r->np,r->limited};
+    char done_line[256];
+    int done_bytes=coli_serve_format_done(done_line,sizeof(done_line),r->q.id,&done);
+    if(done_bytes>0) fwrite(done_line,1,(size_t)done_bytes,stdout);
+    double moe=m->t_moe-r->clk.e0, disk=m->t_eload-r->clk.d0;
+    printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %d\n",
+           dt,r->np,r->gen,disk,0.0,moe>disk?moe-disk:moe,m->t_attn-r->clk.a0,m->t_head-r->clk.h0,r->forwards);
+    fflush(stdout);
+    serve_hits(m);
+}
+
+/* The next token of an active request, as serve_one's loop picks and sends it (the
+ * chat markers to their channels): 1 with the token when the request goes on, 0 when
+ * it ended. */
+static int k3_mux_pick(Model *m, Tok *T, K3MuxReq *r, int slot, int *tk_out){
+    if(r->cancel||r->s>=r->q.max_tok){ k3_mux_finish(m,r,slot); return 0; }
+    int tk=sample_tok(r->lo,m->c.vocab,r->q.temp,r->q.top_p);
+    g_lp_tail[0]=0;
+    if(r->q.logprobs>0) coli_logprob_tail(g_lp_tail,sizeof g_lp_tail,r->lo,m->c.vocab,tk,r->q.logprobs);
+    free(r->lo); r->lo=NULL;
+    int eos=0; for(int i=0;i<m->c.n_eos;i++) if(tk==m->c.eos[i]) eos=1;
+    int show=!eos, *sp=r->ci.sp;
+    char buf[512];
+    if(r->ci.chat&&sp[0]>=0){
+        if(tk==sp[0]||tk==sp[1]){
+            r->xsup=1; r->xopen=(tk==sp[0]); r->xtl=0; show=0;
+        } else if(tk==sp[2]){
+            if(r->xsup){
+                r->xsup=0; r->xtag[r->xtl]=0;
+                if(r->xopen&&!strcmp(r->xtag,"response")&&r->ci.thinking)
+                    serve_data(r->q.id,"</think>",8);
+                else if(k3_tool_tag(r->xtag)){
+                    char lb[352];
+                    int n=snprintf(lb,sizeof lb,"%s%s<|sep|>",r->xopen?"<|open|>":"<|close|>",r->xtag);
+                    if(n>0&&n<(int)sizeof lb) serve_tool(r->q.id,lb,n);
+                    if(!strcmp(r->xtag,"tools")) r->xtool=r->xopen;
+                }
+            }
+            show=0;
+        } else if(r->xsup){
+            int nb=tok_decode(T,&tk,1,buf,sizeof(buf)-1);
+            if(r->xtl+nb<(int)sizeof(r->xtag)){ memcpy(r->xtag+r->xtl,buf,(size_t)nb); r->xtl+=nb; }
+            show=0;
+        } else if(tk==sp[3]) show=0;
+    }
+    if(show){
+        int nb=tok_decode(T,&tk,1,buf,sizeof(buf)-1);
+        if(r->xtool) serve_tool(r->q.id,buf,nb);
+        else serve_data_maybe_lp(r->q.id,buf,nb);
+    }
+    if(!eos) r->gen++;
+    r->s++;
+    if(eos){ r->limited=0; k3_mux_finish(m,r,slot); return 0; }
+    if(r->s>=r->q.max_tok){ k3_mux_finish(m,r,slot); return 0; }
+    *tk_out=tk; return 1;
+}
+
+static void serve_mux(Model *m, Tok *T){
+    int n=g_k3_mux_slots, V=m->c.vocab, input_eof=0;
+    K3MuxReq *rq=calloc((size_t)n,sizeof *rq);
+    K3Row *rows=malloc((size_t)n*sizeof *rows);
+    int *tok=malloc((size_t)n*sizeof(int)), *who=malloc((size_t)n*sizeof(int));
+    if(!rq||!rows||!tok||!who){ fprintf(stderr,"[serve] out of memory\n"); exit(1); }
+    unsigned long long steps=0, nrows=0;
+    fprintf(stderr,"[kimi_k3] serving %d conversations at once (KV_SLOTS)\n",n);
+    for(;;){
+        int active=0; for(int i=0;i<n;i++) active+=rq[i].active;
+        /* idle: wait for a command; decoding: take one only when one is there */
+        if(!input_eof&&(!active||serve_stdin_readable())){
+            ColiServeCommand command;
+            ColiServeReadResult result=coli_serve_read_command(stdin,&kimi_wire,&command);
+            if(result==COLI_SERVE_READ_EOF||result==COLI_SERVE_READ_BAD_FRAME) input_eof=1;
+            else if(result==COLI_SERVE_READ_NOMEM){ coli_serve_write_error(stdout,command.id,"out of memory"); input_eof=1; }
+            else if(result==COLI_SERVE_READ_BAD_REQUEST){
+                if(command.kind==COLI_SERVE_COMMAND_SUBMIT) coli_serve_write_error(stdout,command.id,"bad submit header");
+                coli_serve_command_dispose(&command);
+            } else if(result==COLI_SERVE_READ_OK){
+                if(command.kind==COLI_SERVE_COMMAND_STOP||command.kind==COLI_SERVE_COMMAND_CANCEL){
+                    for(int i=0;i<n;i++) if(rq[i].active&&!strcmp(rq[i].q.id,command.id)) rq[i].cancel=1;
+                } else if(command.kind==COLI_SERVE_COMMAND_SUBMIT){
+                    if(command.slot<0||command.slot>=n) coli_serve_write_error(stdout,command.id,"invalid cache slot");
+                    else if(rq[command.slot].active) coli_serve_write_error(stdout,command.id,"cache slot busy");
+                    else {
+                        K3MuxReq *t=&rq[command.slot];
+                        memset(t,0,sizeof *t);
+                        snprintf(t->q.id,sizeof(t->q.id),"%s",command.id);
+                        t->q.max_tok=command.max_tokens; t->q.temp=command.temperature; t->q.top_p=command.top_p;
+                        t->q.logprobs=command.logprobs; t->q.pin=command.pin;
+                        t->q.payload=(char*)coli_serve_command_take_payload(&command);
+                        t->q.plen=(int)command.payload_bytes;
+                        k3_mux_bind(m,command.slot);
+                        int ok=k3_serve_start(m,T,&t->q,&t->ids,&t->np,&t->lo,&t->clk,&t->ci,NULL);
+                        free(t->q.payload); t->q.payload=NULL;
+                        if(ok>0){ t->active=1; t->limited=1; t->forwards=1; t->tg=now_s(); }
+                    }
+                }
+                coli_serve_command_dispose(&command);
+            }
+        }
+        active=0; for(int i=0;i<n;i++) active+=rq[i].active;
+        if(!active){ if(input_eof) break; continue; }
+        int S=0, ended=0;
+        for(int i=0;i<n;i++) if(rq[i].active){
+            int tk;
+            if(!k3_mux_pick(m,T,&rq[i],i,&tk)){ ended=1; continue; }
+            rows[S]=(K3Row){&g_k3_mux_seq[i],rq[i].np+rq[i].s-1}; tok[S]=tk; who[S]=i; S++;
+        }
+        if(S){
+            k3_mux_bind(m,-1);   /* every conversation parked: the rows read theirs */
+            float *lo=k3_step_rows(m,rows,tok,S);
+            steps++; nrows+=(unsigned long long)S;
+            for(int s=0;s<S;s++){
+                K3MuxReq *t=&rq[who[s]];
+                t->lo=falloc(V); memcpy(t->lo,lo+(int64_t)s*V,(size_t)V*sizeof(float));
+                t->forwards++;
+            }
+            free(lo);
+        }
+        if(ended){
+#ifdef COLI_VULKAN
+            k3_vk_report(m,"turn");
+#endif
+            serve_emap(m);
+        }
+    }
+    fprintf(stderr,"[kimi_k3] KV_SLOTS=%d: %llu decode steps, %llu rows (%.2f a step)\n",n,steps,nrows,
+            steps?(double)nrows/(double)steps:0.0);
+    k3_mux_bind(m,0);
+    free(rq); free(rows); free(tok); free(who);
+}
+
 static void serve_loop(Model *m, Tok *T){
     /* PRIMA del sentinella: su Windows stdout in modalita' TEXT trasforma il \n
      * finale in \r\n, il gateway non lo riconosce e resta in attesa per sempre
@@ -3772,6 +4045,7 @@ static void serve_loop(Model *m, Tok *T){
     coli_serve_stdio_init();
     coli_serve_write_ready(stdout,rss_gb());
     serve_emap(m);                        /* after READY and STAT: the boot reader discards what precedes them */
+    if(g_k3_mux_slots>1){ serve_mux(m,T); return; }
     for(;;){
         ServeReq q={0}; int r;
         do r=serve_read_req(stdin,stdout,&q,NULL); while(r==0);
@@ -3784,6 +4058,14 @@ static void serve_loop(Model *m, Tok *T){
 int main(int argc, char **argv){
     coli_omp_tune_threads("kimi_k3");   /* squadra sui core fisici, niente spin-wait: vedi omp_tune.h */
     int serving=getenv("SERVE")&&getenv("SERVE")[0]=='1';
+    if(serving){   /* KV_SLOTS: the conversations a serve decodes at once */
+        const char *ks=getenv("KV_SLOTS");
+        if(ks&&*ks){
+            char *end=NULL; long v=strtol(ks,&end,10);
+            if(end==ks||*end||v<1||v>16){ fprintf(stderr,"KV_SLOTS must be between 1 and 16\n"); return 2; }
+            g_k3_mux_slots=(int)v;
+        }
+    }
     /* Usage was printed only when there were NO arguments, so `--help` fell
      * through as the model directory and the engine went looking for
      * "--help/config.json". Nobody should have to read the source to find the
@@ -3873,6 +4155,12 @@ int main(int argc, char **argv){
     if(serving){
         if(!has_tok){ fprintf(stderr,"serve mode needs tokenizer.json\n"); return 1; }
         coli_rt_term_arm();   /* SIGTERM must reach the save below (#1629) */
+        if(g_k3_mux_slots>1){   /* slot 0 is the Model's own state */
+            g_k3_mux_seq=calloc((size_t)g_k3_mux_slots,sizeof *g_k3_mux_seq);
+            if(!g_k3_mux_seq){ fprintf(stderr,"[serve] out of memory for %d conversations\n",g_k3_mux_slots); return 1; }
+            for(int i=1;i<g_k3_mux_slots;i++) k3_seq_alloc(&m,&g_k3_mux_seq[i]);
+            g_k3_mux_cur=0;
+        }
          serve_loop(&m,&T);
         /* Questo ramo non salvava affatto la storia: gli altri motori lo
          * fanno subito dopo il loop, qui mancava del tutto, quindi la
