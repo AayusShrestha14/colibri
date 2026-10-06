@@ -814,6 +814,13 @@ int coli_v4_block_window_batch_ref(
     const ColiDeepSeekV4Config *config, ColiExpertStore *experts,
     const float *inputs_hc, const int *tokens, int start_position, int batch,
     char *error, size_t error_size);
+/* rows of several conversations, each with its attention state and position */
+int coli_v4_block_window_rows_ref(
+    float *outputs_hc, ColiDeepSeekV4WindowAttentionState **attention,
+    const ColiDeepSeekV4LayerWeights *weights,
+    const ColiDeepSeekV4Config *config, ColiExpertStore *experts,
+    const float *inputs_hc, const int *tokens, const int *positions, int batch,
+    char *error, size_t error_size);
 /* ==== end deepseek_v4_block_batch.h ==== */
 
 /* ==== begin deepseek_v4_resource_plan.h ==== */
@@ -1126,6 +1133,17 @@ struct ColiV4Session {
      * early returns of generate() leave nothing behind. */
     float *echo_hidden;
     float *echo_scores;
+    /* A request started with prefill_only (a multiplexed serve, KV_SLOTS): where
+     * its decoding stands, for coli_v4_sessions_step to go on from. */
+    struct {
+        int current, last, count, max_new, done, logprobs;
+        float logit;
+        double first_at;
+        ColiV4SessionTokenFn on_token;
+        void *user_data;
+        ColiV4SessionScoresFn on_scores;
+        void *scores_user_data;
+    } mux;
 };
 
 /* RAM-tiered expert open used by coli_v4_engine_open (replaces ld --wrap).

@@ -1361,7 +1361,13 @@ static int v4c_decide(const ColiV4Engine *engine) {
     if (g_v4c_decision >= 0) return g_v4c_decision;
     if (!g_v4_vk_ready || !engine) return 0;
     int tier_on = vkt_wanted() && !(engine->experts && engine->experts->gpu) && engine->config.n_routed_experts > 0;
-    return g_v4c_decision = coli_vk_chain_decide("deepseek_v4", tier_on, COLI_VK_CHAIN_UNMEASURED);
+    g_v4c_decision = coli_vk_chain_decide("deepseek_v4", tier_on, COLI_VK_CHAIN_UNMEASURED);
+    if (g_v4c_decision && g_v4_mux_slots > 1) {
+        g_v4c_decision = 0;
+        fprintf(stderr, "[VK] deepseek_v4: KV_SLOTS=%d: the dense chain is off (it keeps one conversation's state on the device); "
+                        "the expert tier runs every conversation's experts\n", g_v4_mux_slots);
+    }
+    return g_v4c_decision;
 }
 static void v4c_start(const ColiV4Engine *cengine) {
     ColiV4Engine *engine = (ColiV4Engine *)cengine;

@@ -1299,7 +1299,13 @@ static int v41c_decide(Model *m) {   /* once: early when the trunk may live on t
     if (g_v41c_decision >= 0) return g_v41c_decision;
     if (!g_vk_ready) return 0;
     int tier_on = vkt_wanted() && m->c.n_routed > 0;
-    return g_v41c_decision = coli_vk_chain_decide("deepseek_v41", tier_on, COLI_VK_CHAIN_UNMEASURED);
+    g_v41c_decision = coli_vk_chain_decide("deepseek_v41", tier_on, COLI_VK_CHAIN_UNMEASURED);
+    if (g_v41c_decision && g_v41_mux_slots > 1) {
+        g_v41c_decision = 0;
+        fprintf(stderr, "[VK] deepseek_v41: KV_SLOTS=%d: the dense chain is off (it keeps one conversation's state on the device); "
+                        "the expert tier runs every conversation's experts\n", g_v41_mux_slots);
+    }
+    return g_v41c_decision;
 }
 static void v41c_start(Model *m) {
     if (!g_vk_ready) return;

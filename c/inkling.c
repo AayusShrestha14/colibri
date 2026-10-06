@@ -174,6 +174,15 @@ typedef struct {
     int n, cap;
 } LCache;
 
+/* One conversation's state for a multiplexed serve (KV_SLOTS>1, serve_mux below):
+ * its K and V (a sliding layer's ring), its four short-convolution banks, where it
+ * stands and the record of the tokens it holds. The Model holds the conversation a
+ * prefill runs on (ink_seq_swap trades it for a parked one); a multiplexed decode
+ * step parks them all and reads each row's from its InkRow. */
+typedef struct { float **K, **V; float **cs[4]; int kv_len; kv_prefix kvp; } InkSeq;
+typedef struct { InkSeq *seq; int pos; } InkRow;
+static int g_ink_mux_slots = 1;   /* KV_SLOTS: the conversations a serve decodes at once */
+
 typedef struct {
     Cfg c;
     shards S;
@@ -205,6 +214,9 @@ typedef struct {
     void *vkchain;                        /* the dense chain's device state (inkling_chain.h), NULL until it runs */
     void *vkchain2;                       /* its layers on COLI_VK_DEV2's device, after the primary's (inkling_chain.h) */
 #endif
+    /* A multiplexed decode step (ink_step_rows): row s is the token at
+     * mux_rows[s].pos of mux_rows[s].seq; NULL in every other forward. */
+    const InkRow *mux_rows;
 } Model;
 
 /* ---------- utility ---------- */
@@ -1685,6 +1697,15 @@ static inline int kv_ring_rows(const Cfg *c, int li, int max_t) {
     return (c->local[li] && c->window > 0 && c->window < max_t) ? c->window : max_t;
 }
 
+/* A short convolution over S rows: in a multiplexed step each row is the next input
+ * of its own conversation's bank (sconv_apply over that one row), else the rows are a
+ * sequence through the Model's bank. */
+static void ink_sconv(Model *m, float *seq, int S, int C, const float *w, int bank, int li) {
+    if (!m->mux_rows) { sconv_apply(seq, S, C, w, m->cs[bank][li], m->c.conv_k); return; }
+    for (int s = 0; s < S; s++)
+        sconv_apply(seq + (int64_t)s*C, 1, C, w, m->mux_rows[s].seq->cs[bank][li], m->c.conv_k);
+}
+
 /* ---------- attention (GQA + sliding/global + relative bias + K/V sconv) ---------- */
 static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, float *out) {
     Cfg *c = &m->c;
@@ -1692,7 +1713,9 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
     int local = c->local[li];
     /* the ring made an over-run silent (t%win wraps instead of writing OOB), so
      * fail fast here: every caller sizes the cache via kv_alloc before stepping */
-    if (pos0 + S > m->max_t) { fprintf(stderr, "attention: pos %d+%d exceeds kv alloc %d\n", pos0, S, m->max_t); exit(1); }
+    const InkRow *mr = m->mux_rows;   /* a multiplexed step: each row's own conversation and position */
+    if (mr) { for (int s = 0; s < S; s++) if (mr[s].pos >= m->max_t) { fprintf(stderr, "attention: pos %d exceeds kv alloc %d\n", mr[s].pos, m->max_t); exit(1); } }
+    else if (pos0 + S > m->max_t) { fprintf(stderr, "attention: pos %d+%d exceeds kv alloc %d\n", pos0, S, m->max_t); exit(1); }
     int qdim = H*hd, kvdim = KV*hd, group = H/KV;
     float *q  = falloc((int64_t)S*qdim);
     float *k  = falloc((int64_t)S*kvdim);
@@ -1703,8 +1726,8 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
     matmul_w(vv, x, l->v, S, D, kvdim);
     matmul_w(rr, x, l->r, S, D, H*c->d_rel);
     /* short convs on K and V (sequence-wise, over the raw projections) */
-    sconv_apply(k,  S, kvdim, l->k_cw, m->cs[0][li], c->conv_k);
-    sconv_apply(vv, S, kvdim, l->v_cw, m->cs[1][li], c->conv_k);
+    ink_sconv(m, k,  S, kvdim, l->k_cw, 0, li);
+    ink_sconv(m, vv, S, kvdim, l->v_cw, 1, li);
     /* per-head q/k rmsnorm (scaling below is 1/hd, not 1/sqrt(hd), because of this) */
     for (int s = 0; s < S; s++) {
         for (int h = 0; h < H;  h++) rmsnorm_row(q + (int64_t)s*qdim  + h*hd, q + (int64_t)s*qdim  + h*hd, l->qn, hd, c->eps);
@@ -1725,9 +1748,12 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
         #pragma omp for collapse(2) schedule(static)
         for (int h = 0; h < H; h++) {
             for (int s = 0; s < S; s++) {
-                int qpos = pos0 + s;
+                int qpos = mr ? mr[s].pos : pos0 + s;
+                int sp0 = mr ? qpos : pos0;       /* the scratch's first position: the row's own in a multiplexed step */
                 int t0 = local && qpos - c->window + 1 > 0 ? qpos - c->window + 1 : 0;
-                int tb = pos0 > t0 ? pos0 : t0;   /* first row served by the scratch */
+                int tb = sp0 > t0 ? sp0 : t0;   /* first row served by the scratch */
+                float **Kc = mr ? mr[s].seq->K : m->K, **Vc = mr ? mr[s].seq->V : m->V;
+                int64_t srow = mr ? (int64_t)s*kvdim : 0;
                 /* mix the relative-bias bank for this (token, head): rl[dist] */
                 const float *rv = rr + (int64_t)s*H*c->d_rel + h*c->d_rel;
                 for (int e = 0; e < ext; e++) {
@@ -1742,11 +1768,11 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                     if (en > 1.0) tau = 1.f + c->log_alpha * (float)log(en);
                 }
                 const float *qv = q + (int64_t)s*qdim + h*hd;
-                const float *Kh = m->K[li] + ((int64_t)(h/group)*win)*hd;
-                const float *Kb = k  + (int64_t)(h/group)*hd;
+                const float *Kh = Kc[li] + ((int64_t)(h/group)*win)*hd;
+                const float *Kb = k  + srow + (int64_t)(h/group)*hd;
                 for (int t = t0; t <= qpos; t++) {
                     const float *kv = t < tb ? Kh + (int64_t)(t % win)*hd
-                                             : Kb + (int64_t)(t - pos0)*kvdim;
+                                             : Kb + (int64_t)(t - sp0)*kvdim;
                     float acc = dot_f32_lanes(qv, kv, hd);
                     int dist = qpos - t;
                     sc[t - t0] = tau * (acc*scale + (dist < ext ? rl[dist] : 0.f));
@@ -1755,11 +1781,11 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                 softmax_row(sc, n);
                 float *cx = ctx + (int64_t)s*qdim + h*hd;
                 for (int d = 0; d < hd; d++) cx[d] = 0.f;
-                const float *Vh = m->V[li] + ((int64_t)(h/group)*win)*hd;
-                const float *Vb = vv + (int64_t)(h/group)*hd;
+                const float *Vh = Vc[li] + ((int64_t)(h/group)*win)*hd;
+                const float *Vb = vv + srow + (int64_t)(h/group)*hd;
                 for (int t = t0; t <= qpos; t++) {
                     const float *vrow = t < tb ? Vh + (int64_t)(t % win)*hd
-                                               : Vb + (int64_t)(t - pos0)*kvdim;
+                                               : Vb + (int64_t)(t - sp0)*kvdim;
                     float a = sc[t - t0];
                     for (int d = 0; d < hd; d++) cx[d] += a * vrow[d];
                 }
@@ -1769,11 +1795,12 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
     }
     /* append K,V to the cache (ring on sliding layers); rows the ring would
      * overwrite within this same batch are skipped, they can never be read */
-    int s0 = S - win > 0 ? S - win : 0;
+    int s0 = !mr && S - win > 0 ? S - win : 0;   /* a multiplexed step: every row to its own cache */
     for (int s = s0; s < S; s++) for (int h = 0; h < KV; h++) {
-        int t = pos0 + s;
-        memcpy(m->K[li] + ((int64_t)h*win + t % win)*hd, k  + (int64_t)s*kvdim + h*hd, hd*sizeof(float));
-        memcpy(m->V[li] + ((int64_t)h*win + t % win)*hd, vv + (int64_t)s*kvdim + h*hd, hd*sizeof(float));
+        int t = mr ? mr[s].pos : pos0 + s;
+        float *Kd = mr ? mr[s].seq->K[li] : m->K[li], *Vd = mr ? mr[s].seq->V[li] : m->V[li];
+        memcpy(Kd + ((int64_t)h*win + t % win)*hd, k  + (int64_t)s*kvdim + h*hd, hd*sizeof(float));
+        memcpy(Vd + ((int64_t)h*win + t % win)*hd, vv + (int64_t)s*kvdim + h*hd, hd*sizeof(float));
     }
     matmul_w(out, ctx, l->o, S, qdim, D);
     free(q); free(k); free(vv); free(rr); free(ctx);
@@ -2514,14 +2541,14 @@ static void inkling_layers_forward_range(Model *m, float *x, int S, int pos0,
         double ta = now_s();
         attention(m, l, i, nrm, S, pos0, tmp);
         m->t_attn += now_s() - ta;
-        sconv_apply(tmp, S, D, l->a_cw, m->cs[2][i], c->conv_k);
+        ink_sconv(m, tmp, S, D, l->a_cw, 2, i);
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
         for (int s = 0; s < S; s++)
             rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D,
                         l->post_ln, D, c->eps);
         if (c->sparse[i]) moe(m, l, i, nrm, S, tmp);
         else dense_mlp(m, l, nrm, S, tmp);
-        sconv_apply(tmp, S, D, l->m_cw, m->cs[3][i], c->conv_k);
+        ink_sconv(m, tmp, S, D, l->m_cw, 3, i);
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
     }
     free(nrm); free(tmp);
@@ -2721,6 +2748,61 @@ static float *step_mm(Model *m, const int *ids, int S, int pos0, int *tf_out,
 
 static float *step(Model *m, const int *ids, int S, int pos0, int *tf_out) {
     return step_mm(m, ids, S, pos0, tf_out, NULL, 0);
+}
+
+/* ---- several conversations at once (KV_SLOTS>1, serve_mux) ------------------- */
+static void ink_seq_swap(Model *m, InkSeq *q) {
+    float **K = m->K, **V = m->V; int len = m->kv_len; kv_prefix p = m->kvp;
+    m->K = q->K; m->V = q->V; m->kv_len = q->kv_len; m->kvp = q->kvp;
+    q->K = K; q->V = V; q->kv_len = len; q->kvp = p;
+    for (int j = 0; j < 4; j++) { float **cs = m->cs[j]; m->cs[j] = q->cs[j]; q->cs[j] = cs; }
+}
+/* A conversation's state of its own, the shape the Model's has at its max_t. */
+static void ink_seq_alloc(Model *m, InkSeq *q) {
+    Cfg *c = &m->c;
+    memset(q, 0, sizeof *q);
+    q->K = calloc(c->n_layers, sizeof(float*)); q->V = calloc(c->n_layers, sizeof(float*));
+    for (int j = 0; j < 4; j++) q->cs[j] = calloc(c->n_layers, sizeof(float*));
+    for (int i = 0; i < c->n_layers; i++) {
+        int kv = L_KV(c,i), hd = L_HD(c,i);
+        int64_t rows = kv_ring_rows(c, i, m->max_t);
+        q->K[i] = falloc((int64_t)kv * rows * hd);
+        q->V[i] = falloc((int64_t)kv * rows * hd);
+        for (int j = 0; j < 4; j++)
+            if (m->cs[j][i]) q->cs[j][i] = calloc((size_t)ink_cs_cells(c, j, i), sizeof(float));
+    }
+    kv_prefix_alloc(&q->kvp, m->max_t);
+}
+
+/* One decode step of several conversations: row s is the token ids[s] at
+ * rows[s].pos of the conversation rows[s].seq, every conversation parked. The
+ * matrices, the routed experts and lm_head run once over the S rows; the attention
+ * and the short convolutions read and write each row's own state (m->mux_rows). The
+ * CPU kernels give a row the same bits whatever S is, so each conversation gets the
+ * logits it would alone. S rows of logits. */
+static float *ink_step_rows(Model *m, const InkRow *rows, const int *ids, int S) {
+    Cfg *c = &m->c; int D = c->hidden;
+    float *x = falloc((int64_t)S*D);
+    for (int s = 0; s < S; s++) {
+        wt_row_f32(m->embed, (int64_t)ids[s]*D, x + (int64_t)s*D, D);
+        if (m->embed_norm) rmsnorm_row(x + (int64_t)s*D, x + (int64_t)s*D, m->embed_norm, D, c->eps);
+    }
+    m->mux_rows = rows;
+    inkling_layers_forward_range(m, x, S, 0, 0, c->n_layers);
+    m->mux_rows = NULL;
+    for (int s = 0; s < S; s++) {
+        rows[s].seq->kv_len = rows[s].pos + 1;
+        kv_prefix_record(&rows[s].seq->kvp, ids + s, rows[s].pos, 1);
+    }
+    float *normed = falloc((int64_t)S*D), *logit = falloc((int64_t)S * c->unpad_vocab);
+    for (int s = 0; s < S; s++) {
+        float *nr = normed + (int64_t)s*D;
+        rmsnorm_row(nr, x + (int64_t)s*D, m->final_norm, D, c->eps);
+        for (int d = 0; d < D; d++) nr[d] /= c->mup;
+    }
+    matmul_w(logit, normed, m->lm_head, S, D, c->unpad_vocab);
+    free(x); free(normed);
+    return logit;
 }
 
 static void state_reset(Model *m) {
@@ -3069,7 +3151,15 @@ static void serve_hits(Model *m) {
     fflush(stdout); free(hex); free(bm);
 }
 
-static int serve_one(Model *m, Tok *T, SReq *q) {
+/* When a request's prefill began, and the counters then: DONE and PROF report its share. */
+typedef struct { double t0, f0, e0, s0, a0; uint64_t h0, m0; } InkReqClock;
+
+/* A request's prompt into the state the Model holds: its tokens and audio, the
+ * budget, the prefix reuse and the photos, the prefill and its read-out. 1 with the
+ * prompt's ids and the logits after it; 0 when the request ended here, its ERROR
+ * written. serve_one and serve_mux start every request here. */
+static int ink_serve_start(Model *m, Tok *T, SReq *q, int **ids_out, int *np_out, float **logit_out,
+                           InkReqClock *clk) {
     Cfg *c = &m->c;
     int cap = q->plen + 16;
     int *ids = malloc((size_t)cap * sizeof(int));
@@ -3160,10 +3250,10 @@ static int serve_one(Model *m, Tok *T, SReq *q) {
         fflush(stderr);
     }
     if (!reuse) state_reset(m);
-    double t0 = now_s();
-    uint64_t h0 = m->hits, m0 = m->miss;
+    clk->t0 = now_s();
+    clk->h0 = m->hits; clk->m0 = m->miss;
     /* per-turn phase snapshot for the PROF line (timers accumulate globally) */
-    double f0 = m->t_fill, e0 = m->t_expert, s0 = m->t_shared, a0 = m->t_attn;
+    clk->f0 = m->t_fill; clk->e0 = m->t_expert; clk->s0 = m->t_shared; clk->a0 = m->t_attn;
     /* `reuse` is the ABSOLUTE position of the first fresh token: attention and
      * the KV slots are position-indexed, so this has to be the real offset. */
     float *logit = step_mm(m, ids + reuse, np - reuse, reuse, NULL, q->audio, naud);
@@ -3178,6 +3268,17 @@ static int serve_one(Model *m, Tok *T, SReq *q) {
         }
     }
     g_echo_k = 0; g_echo_id = NULL;   /* la lettura riguarda il prefill, non la decodifica */
+    *ids_out = ids; *np_out = np; *logit_out = logit;
+    return 1;
+}
+
+static int serve_one(Model *m, Tok *T, SReq *q) {
+    Cfg *c = &m->c;
+    int *ids = NULL, np = 0; float *logit = NULL; InkReqClock clk;
+    if (!ink_serve_start(m, T, q, &ids, &np, &logit, &clk)) return 0;
+    double t0 = clk.t0;
+    uint64_t h0 = clk.h0, m0 = clk.m0;
+    double f0 = clk.f0, e0 = clk.e0, s0 = clk.s0, a0 = clk.a0;
     int forwards = 1;                      /* il prefill e' il primo forward */
     int len = np, gen = 0, limited = 1, cancelled = 0;
     char buf[512];
@@ -3307,6 +3408,153 @@ static void serve_tiers_emap(Model *m) {
     fflush(stdout); free(hex);
 }
 
+/* ---- several conversations at once (KV_SLOTS>1) -------------------------------
+ * The gateway's cache slots, each a conversation with a state of its own (InkSeq).
+ * A SUBMIT on a free slot starts its request at once through ink_serve_start, on that
+ * slot's state: its prefix reuse and photos work as a lone serve's. Then every step
+ * picks the next token of each active request and runs one forward over a row of
+ * each (ink_step_rows): the matrices and the experts are read once for all of them.
+ * A request's frames are a lone request's; they interleave by id. As alone, CANCEL
+ * ends a request with DONE and STOP is not read. */
+static InkSeq *g_ink_mux_seq;   /* [slots]: the conversations the Model does not hold */
+static int g_ink_mux_cur;       /* the slot the Model holds, -1 when every one is parked */
+
+typedef struct {
+    SReq q;
+    int active, cancel, limited, forwards;
+    int *ids, np, gen;
+    float *lo;                  /* the logits the next pick reads */
+    int hist[128], nhist;       /* the repetition penalty's history, as serve_one keeps it */
+    InkReqClock clk;
+} InkMuxReq;
+
+static void ink_mux_bind(Model *m, int slot) {
+    if (g_ink_mux_cur == slot) return;
+    if (g_ink_mux_cur >= 0) ink_seq_swap(m, &g_ink_mux_seq[g_ink_mux_cur]);
+    if (slot >= 0) ink_seq_swap(m, &g_ink_mux_seq[slot]);
+    g_ink_mux_cur = slot;
+}
+
+/* A request's end, as serve_one ends one. */
+static void ink_mux_finish(Model *m, InkMuxReq *r) {
+    free(r->lo); r->lo = NULL; free(r->ids); r->ids = NULL; r->active = 0;
+    if (r->cancel) r->limited = 0;
+    double dt = now_s() - r->clk.t0;
+    double tot = (double)(m->hits - r->clk.h0 + m->miss - r->clk.m0);
+    ColiServeDone done = {r->gen, dt > 0 ? r->gen/dt : 0.0,
+                          tot ? 100.0*(m->hits - r->clk.h0)/tot : 0.0, rss_gb(), r->np, r->limited};
+    char done_line[256];
+    int done_bytes = coli_serve_format_done(done_line, sizeof(done_line), r->q.id, &done);
+    if (done_bytes > 0) fwrite(done_line, 1, (size_t)done_bytes, stdout);
+    printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %d\n", dt, r->np, r->gen,
+           m->t_fill - r->clk.f0, m->t_shared - r->clk.s0, m->t_expert - r->clk.e0, m->t_attn - r->clk.a0,
+           0.0, r->forwards);
+    fflush(stdout);
+    serve_hits(m);
+}
+
+/* The next token of an active request, as serve_one's loop picks and sends it: 1
+ * with the token when the request goes on, 0 when it ended. */
+static int ink_mux_pick(Model *m, Tok *T, InkMuxReq *r, float rep, int *tk_out) {
+    Cfg *c = &m->c;
+    if (r->cancel || r->gen >= r->q.max_tok) { ink_mux_finish(m, r); return 0; }
+    apply_rep_penalty(r->lo, c->unpad_vocab, r->hist, r->nhist, rep);
+    int tk = sample_logits(r->lo, c->unpad_vocab, r->q.temp, r->q.top_p);
+    char lptail[1024]; lptail[0] = 0;
+    if (r->q.logprobs > 0) coli_logprob_tail(lptail, sizeof lptail, r->lo, c->unpad_vocab, tk, r->q.logprobs);
+    free(r->lo); r->lo = NULL;
+    if (tk == c->eos) { r->limited = 0; ink_mux_finish(m, r); return 0; }
+    if (r->nhist < 128) r->hist[r->nhist++] = tk;
+    else { memmove(r->hist, r->hist + 1, 127*sizeof(int)); r->hist[127] = tk; }
+    char buf[512];
+    int nb = tok_decode(T, &tk, 1, buf, sizeof(buf)-1);
+    if (r->q.logprobs > 0) coli_serve_write_data_lp(stdout, r->q.id, buf, (size_t)nb, lptail);
+    else coli_serve_write_data(stdout, r->q.id, buf, (size_t)nb);
+    r->gen++;
+    if (r->gen >= r->q.max_tok) { ink_mux_finish(m, r); return 0; }
+    *tk_out = tk; return 1;
+}
+
+static void serve_mux(Model *m, Tok *T) {
+    int n = g_ink_mux_slots, V = m->c.unpad_vocab, input_eof = 0;
+    InkMuxReq *rq = calloc((size_t)n, sizeof *rq);
+    InkRow *rows = malloc((size_t)n * sizeof *rows);
+    int *tok = malloc((size_t)n * sizeof(int)), *who = malloc((size_t)n * sizeof(int));
+    if (!rq || !rows || !tok || !who) { fprintf(stderr, "[serve] out of memory\n"); exit(1); }
+    float rep = getenv("REP_PEN") ? atof(getenv("REP_PEN")) : 1.1f;
+    unsigned long long steps = 0, nrows = 0;
+    fprintf(stderr, "[inkling] serving %d conversations at once (KV_SLOTS)\n", n);
+    for (;;) {
+        int active = 0; for (int i = 0; i < n; i++) active += rq[i].active;
+        /* idle: wait for a command; decoding: take one only when one is there */
+        if (!input_eof && (!active || stdin_readable())) {
+            ColiServeCommand command;
+            ColiServeReadResult result = coli_serve_read_command(stdin, &inkling_wire, &command);
+            if (result == COLI_SERVE_READ_EOF || result == COLI_SERVE_READ_BAD_FRAME) input_eof = 1;
+            else if (result == COLI_SERVE_READ_NOMEM) { coli_serve_write_error(stdout, command.id, "out of memory"); input_eof = 1; }
+            else if (result == COLI_SERVE_READ_BAD_REQUEST) {
+                if (command.kind == COLI_SERVE_COMMAND_SUBMIT) coli_serve_write_error(stdout, command.id, "bad submit header");
+                coli_serve_command_dispose(&command);
+            } else if (result == COLI_SERVE_READ_OK) {
+                if (command.kind == COLI_SERVE_COMMAND_CANCEL) {
+                    for (int i = 0; i < n; i++) if (rq[i].active && !strcmp(rq[i].q.id, command.id)) rq[i].cancel = 1;
+                } else if (command.kind == COLI_SERVE_COMMAND_SUBMIT) {
+                    if (command.slot < 0 || command.slot >= n) coli_serve_write_error(stdout, command.id, "invalid cache slot");
+                    else if (rq[command.slot].active) coli_serve_write_error(stdout, command.id, "SLOT_BUSY");
+                    else {
+                        InkMuxReq *t = &rq[command.slot];
+                        memset(t, 0, sizeof *t);
+                        snprintf(t->q.id, sizeof(t->q.id), "%s", command.id);
+                        t->q.max_tok = command.max_tokens; t->q.temp = command.temperature;
+                        t->q.logprobs = command.logprobs; t->q.pin = command.pin;
+                        t->q.top_p = command.top_p; t->q.plen = (int)command.payload_bytes;
+                        t->q.alen = (int)command.extension_bytes;
+                        t->q.audio = coli_serve_command_extension(&command);
+                        t->q.payload = (char *)coli_serve_command_take_payload(&command);
+                        ink_mux_bind(m, command.slot);
+                        int ok = ink_serve_start(m, T, &t->q, &t->ids, &t->np, &t->lo, &t->clk);
+                        free(t->q.payload); t->q.payload = NULL; t->q.audio = NULL;
+                        if (ok) {
+                            t->active = 1; t->limited = 1; t->forwards = 1;
+                            for (int i = (t->np > 128 ? t->np - 128 : 0); i < t->np; i++) t->hist[t->nhist++] = t->ids[i];
+                        }
+                    }
+                }
+                coli_serve_command_dispose(&command);
+            }
+        }
+        active = 0; for (int i = 0; i < n; i++) active += rq[i].active;
+        if (!active) { if (input_eof) break; continue; }
+        int S = 0, ended = 0;
+        for (int i = 0; i < n; i++) if (rq[i].active) {
+            int tk;
+            if (!ink_mux_pick(m, T, &rq[i], rep, &tk)) { ended = 1; continue; }
+            rows[S] = (InkRow){&g_ink_mux_seq[i], rq[i].np + rq[i].gen - 1}; tok[S] = tk; who[S] = i; S++;
+        }
+        if (S) {
+            ink_mux_bind(m, -1);   /* every conversation parked: the rows read theirs */
+            float *lo = ink_step_rows(m, rows, tok, S);
+            steps++; nrows += (unsigned long long)S;
+            for (int s = 0; s < S; s++) {
+                InkMuxReq *t = &rq[who[s]];
+                t->lo = falloc(V); memcpy(t->lo, lo + (int64_t)s * V, (size_t)V * sizeof(float));
+                t->forwards++;
+            }
+            free(lo);
+        }
+        if (ended) {
+#ifdef COLI_VULKAN
+            ink_vk_report(); ink_vk_tier_report(m, "turn");
+#endif
+            serve_tiers_emap(m);
+        }
+    }
+    fprintf(stderr, "[inkling] KV_SLOTS=%d: %llu decode steps, %llu rows (%.2f a step)\n", n, steps, nrows,
+            steps ? (double)nrows / (double)steps : 0.0);
+    ink_mux_bind(m, 0);
+    free(rq); free(rows); free(tok); free(who);
+}
+
 static void serve_loop(Model *m, Tok *T) {
     /* Before the sentinel: on Windows a TEXT-mode stdout rewrites the trailing \n
      * as \r\n, the gateway never matches it and waits forever (#748). Lives in
@@ -3321,6 +3569,7 @@ static void serve_loop(Model *m, Tok *T) {
     coli_serve_write_ready(stdout,rss_gb());
     serve_hwinfo(m);
     serve_tiers_emap(m);
+    if (g_ink_mux_slots > 1) { serve_mux(m, T); return; }
     for (;;) {
         while (!g_qn) if (serve_read_cmd(stdin, stdout, NULL) < 0) return;   /* blocks on stdin */
         SReq q = g_q[0];
@@ -3451,6 +3700,12 @@ int main(int argc, char **argv) {
     /* SERVE=1: the openai_server.py gateway drives the engine over stdin/stdout
      * (READY handshake, SUBMIT/CANCEL, DATA/DONE frames) — same protocol colibri. */
     if (getenv("SERVE") && getenv("SERVE")[0] == '1') {
+        const char *ks = getenv("KV_SLOTS");   /* the conversations decoded at once */
+        if (ks && *ks) {
+            char *end = NULL; long v = strtol(ks, &end, 10);
+            if (end == ks || *end || v < 1 || v > 16) { fprintf(stderr, "KV_SLOTS must be between 1 and 16\n"); return 2; }
+            g_ink_mux_slots = (int)v;
+        }
         Model m; model_init(&m, snap, cap, bits);
         pins_load(&m, snap);
 #ifdef COLI_VULKAN
@@ -3459,6 +3714,13 @@ int main(int argc, char **argv) {
 #endif
         char tkp[2048]; snprintf(tkp, sizeof(tkp), "%s/tokenizer.json", snap);
         Tok T; tok_load(&T, tkp);
+        if (g_ink_mux_slots > 1) {   /* the whole context's state for every slot; slot 0 is the Model's */
+            kv_alloc(&m, ink_ctx_max() + 8);
+            g_ink_mux_seq = calloc((size_t)g_ink_mux_slots, sizeof *g_ink_mux_seq);
+            if (!g_ink_mux_seq) { fprintf(stderr, "[serve] out of memory for %d conversations\n", g_ink_mux_slots); return 1; }
+            for (int i = 1; i < g_ink_mux_slots; i++) ink_seq_alloc(&m, &g_ink_mux_seq[i]);
+            g_ink_mux_cur = 0;
+        }
         coli_rt_term_arm();   /* SIGTERM must reach the save below (#1629) */
         serve_loop(&m, &T);
         usage_save(&m, snap);

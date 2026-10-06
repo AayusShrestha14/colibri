@@ -868,6 +868,20 @@ typedef struct {
     double kl_sum; uint64_t kl_n;         /* mean KL(true top-K mass || chosen mass) */
 } RouteStats;
 
+/* One conversation's state for a multiplexed serve (KV_SLOTS>1, serve_mux below):
+ * what a forward reads and writes that belongs to one token sequence. The Model holds
+ * the conversation being prefilled; the others wait here, and q36_seq_swap trades the
+ * two sets. A multiplexed decode step parks them all and reads each row's from its
+ * Q36Row. mpos and rope_delta are an image turn's rope positions: the decode rows of
+ * that turn sit past them. */
+typedef struct {
+    float **K, **V, **DN_rec, **DN_conv;
+    int kv_len;
+    kv_prefix kvp;
+    int *mpos, mpos_len, rope_delta;
+} Q36Seq;
+typedef struct { Q36Seq *seq; int pos; } Q36Row;
+
 typedef struct {
     Cfg c;
     shards S;
@@ -930,6 +944,10 @@ typedef struct {
      * slots allocated, the first time a verify that deep runs. */
     int snap_rows, snap_slots;
     float **snap_rec[Q36_SPEC_SNAPS], **snap_conv[Q36_SPEC_SNAPS];
+    /* A multiplexed decode step (q36_step_rows): row s is the token at
+     * mux_rows[s].pos of mux_rows[s].seq, so the attention and DeltaNet read and
+     * write that conversation's state; NULL in every other forward. */
+    const Q36Row *mux_rows;
 } Model;
 
 static pthread_mutex_t g_pilot_mx = PTHREAD_MUTEX_INITIALIZER;
@@ -3029,24 +3047,32 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             if (gate_dim) memcpy(gate + ((int64_t)s*H + hh)*gate_dim, qs + hd, gate_dim*sizeof(float));
         }
     }
+    const Q36Row *mr = m->mux_rows;   /* a multiplexed step: each row's own conversation and position */
     for (int s = 0; s < S; s++) {
+        int pos = mr ? mr[s].pos : pos_base + s;
+        /* the rope of the row's conversation: an image turn's decode rows sit at
+         * pos + rope_delta on every axis (mrope_at past the prompt) */
+        int mrope = mr ? (mr[s].seq->mpos || mr[s].seq->rope_delta) : (m->mpos || m->rope_delta);
+        int p3[3];
+        if (mrope) { if (mr) p3[0] = p3[1] = p3[2] = pos + mr[s].seq->rope_delta; else mrope_at(m, pos, p3); }
         for (int hh = 0; hh < H; hh++) {
             float *qh = query + ((int64_t)s*H + hh)*hd;
             if (l->qn) rmsnorm_row(qh, qh, l->qn, hd, c->eps);
-            if (m->mpos || m->rope_delta) { int p3[3]; mrope_at(m, pos_base + s, p3); rope_head_mrope(qh, p3, c->mrope_section, rotary, c->theta); }
-            else rope_head_partial(qh, pos_base + s, rotary, hd, c->theta);
+            if (mrope) rope_head_mrope(qh, p3, c->mrope_section, rotary, c->theta);
+            else rope_head_partial(qh, pos, rotary, hd, c->theta);
         }
         for (int kvh = 0; kvh < KV; kvh++) {
             float *kh = k + (int64_t)s*KV*kvd + kvh*kvd;
             if (l->kn) rmsnorm_row(kh, kh, l->kn, kvd, c->eps);
-            if (m->mpos || m->rope_delta) { int p3[3]; mrope_at(m, pos_base + s, p3); rope_head_mrope(kh, p3, c->mrope_section, rotary, c->theta); }
-            else rope_head_partial(kh, pos_base + s, rotary, kvd, c->theta);
+            if (mrope) rope_head_mrope(kh, p3, c->mrope_section, rotary, c->theta);
+            else rope_head_partial(kh, pos, rotary, kvd, c->theta);
         }
     }
     for (int s = 0; s < S; s++) for (int kvh = 0; kvh < KV; kvh++) {
-        int t = pos_base + s;
-        memcpy(m->K[layer] + ((int64_t)kvh*m->max_t + t)*kvd, k + (int64_t)s*KV*kvd + kvh*kvd, kvd*sizeof(float));
-        memcpy(m->V[layer] + ((int64_t)kvh*m->max_t + t)*kvd, vv + (int64_t)s*KV*kvd + kvh*kvd, kvd*sizeof(float));
+        int t = mr ? mr[s].pos : pos_base + s;
+        float *Kl = mr ? mr[s].seq->K[layer] : m->K[layer], *Vl = mr ? mr[s].seq->V[layer] : m->V[layer];
+        memcpy(Kl + ((int64_t)kvh*m->max_t + t)*kvd, k + (int64_t)s*KV*kvd + kvh*kvd, kvd*sizeof(float));
+        memcpy(Vl + ((int64_t)kvh*m->max_t + t)*kvd, vv + (int64_t)s*KV*kvd + kvh*kvd, kvd*sizeof(float));
     }
     float scale = 1.f / sqrtf((float)hd);
     float *ctx = falloc((int64_t)S*H*hd);
@@ -3054,7 +3080,8 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     for (int hh = 0; hh < H; hh++) {
         for (int s = 0; s < S; s++) {
             int kvh = hh / q_per_kv;
-            int qpos = pos_base + s;
+            int qpos = mr ? mr[s].pos : pos_base + s;
+            const float *Kl = mr ? mr[s].seq->K[layer] : m->K[layer], *Vl = mr ? mr[s].seq->V[layer] : m->V[layer];
             const float *qv = query + ((int64_t)s*H + hh)*hd;
             int tid = 0;
 #ifdef _OPENMP
@@ -3062,7 +3089,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
 #endif
             float *sc = m->attn_sc + (int64_t)tid * m->kv_cap;
             for (int t = 0; t <= qpos; t++) {
-                const float *kv = m->K[layer] + ((int64_t)kvh*m->max_t + t)*kvd;
+                const float *kv = Kl + ((int64_t)kvh*m->max_t + t)*kvd;
                 float acc = dot_f32_lanes(qv, kv, kvd);
                 sc[t] = acc * scale;
             }
@@ -3070,7 +3097,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             float *cx = ctx + ((int64_t)s*H + hh)*hd;
             for (int dd = 0; dd < kvd; dd++) cx[dd] = 0;
             for (int t = 0; t <= qpos; t++) {
-                const float *vrow = m->V[layer] + ((int64_t)kvh*m->max_t + t)*kvd;
+                const float *vrow = Vl + ((int64_t)kvh*m->max_t + t)*kvd;
                 float a = sc[t]; for (int dd = 0; dd < kvd; dd++) cx[dd] += a * vrow[dd];
             }
         }
@@ -3793,8 +3820,10 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
     float *kv = falloc(vdim);
     float *delta = falloc(vdim);
 
-    float *rec = m->DN_rec[layer];      /* [vh*kdim*vdim] */
-    float *ring = m->DN_conv[layer];    /* [conv_dim*(convk-1)] */
+    /* [vh*kdim*vdim] and [conv_dim*(convk-1)]; a multiplexed step parks every
+     * conversation and takes each row's below */
+    float *rec = m->DN_rec ? m->DN_rec[layer] : NULL;
+    float *ring = m->DN_conv ? m->DN_conv[layer] : NULL;
     FILE *dbg = layer == 0 && getenv("DN_DBG") ? fopen(getenv("DN_DBG"), "wb") : NULL;
 
     /* Decode token with the layer on the GPU: gates on the CPU (two tiny
@@ -3843,6 +3872,7 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
         matmul(ab, xb, l->dn_a, rows, H, vh);
         if (tm_on() && S==1){ double t=tm_now(); g_dn_sub[0]+=t-_d0; _d0=t; }
         for (int r = 0; r < rows; r++) {
+        if (m->mux_rows) { rec = m->mux_rows[base + r].seq->DN_rec[layer]; ring = m->mux_rows[base + r].seq->DN_conv[layer]; }
         const float *qkv = gpu_block ? qkvz + (int64_t)r * proj_dim : qkvb + (int64_t)r * conv_dim;
         const float *z = gpu_block ? qkv + conv_dim : zb + (int64_t)r * value_dim;
         const float *b = bb + (int64_t)r * vh, *a = ab + (int64_t)r * vh;
@@ -4317,6 +4347,99 @@ static float *step_ex(Model *m, const int *ids, int S, int pos_base, int nlogits
 
 static float *step(Model *m, const int *ids, int S, int pos_base) {
     return step_ex(m, ids, S, pos_base, 1);
+}
+
+/* ---- several conversations at once (KV_SLOTS>1, serve_mux) --------------------
+ * Each conversation owns a Q36Seq: its K and V rows, its DeltaNet state, its record
+ * of the tokens its rows hold, an image turn's rope positions. The Model holds the
+ * conversation a prefill runs on (q36_seq_swap trades it for a parked one); a decode
+ * step parks them all and runs one forward over a row of each (q36_step_rows). */
+static void q36_seq_swap(Model *m, Q36Seq *q) {
+#define Q36_SEQ_SWAP(T,a,b) do { T t_ = (a); (a) = (b); (b) = t_; } while (0)
+    Q36_SEQ_SWAP(float **, m->K, q->K); Q36_SEQ_SWAP(float **, m->V, q->V);
+    Q36_SEQ_SWAP(float **, m->DN_rec, q->DN_rec); Q36_SEQ_SWAP(float **, m->DN_conv, q->DN_conv);
+    Q36_SEQ_SWAP(int, m->kv_len, q->kv_len); Q36_SEQ_SWAP(kv_prefix, m->kvp, q->kvp);
+    Q36_SEQ_SWAP(int *, m->mpos, q->mpos); Q36_SEQ_SWAP(int, m->mpos_len, q->mpos_len);
+    Q36_SEQ_SWAP(int, m->rope_delta, q->rope_delta);
+#undef Q36_SEQ_SWAP
+}
+
+/* A conversation's state of its own, at the Model's KV capacity (ensure_kv sized it
+ * for the whole context before the serve began): 0 when out of memory. */
+static void q36_seq_free(Model *m, Q36Seq *q) {
+    for (int i = 0; i < m->c.n_layers; i++) {
+        if (q->K) free(q->K[i]); if (q->V) free(q->V[i]);
+        if (q->DN_rec) free(q->DN_rec[i]); if (q->DN_conv) free(q->DN_conv[i]);
+    }
+    free(q->K); free(q->V); free(q->DN_rec); free(q->DN_conv);
+    kv_prefix_free(&q->kvp); free(q->mpos);
+    memset(q, 0, sizeof *q);
+}
+static int q36_seq_alloc(Model *m, Q36Seq *q) {
+    Cfg *c = &m->c; memset(q, 0, sizeof *q);
+    int n = c->n_layers;
+    q->K = calloc((size_t)n, sizeof(float *)); q->V = calloc((size_t)n, sizeof(float *));
+    q->DN_rec = calloc((size_t)n, sizeof(float *)); q->DN_conv = calloc((size_t)n, sizeof(float *));
+    int ok = q->K && q->V && q->DN_rec && q->DN_conv && kv_prefix_alloc(&q->kvp, m->kv_cap);
+    for (int i = 0; ok && i < n; i++) {
+        if (c->is_attn[i]) {
+            size_t kv = (size_t)c->kv_heads * m->kv_cap * c->k_head_dim;
+            q->K[i] = malloc(kv * sizeof(float)); q->V[i] = malloc(kv * sizeof(float));
+            ok = q->K[i] && q->V[i];
+        } else if (m->DN_rec[i]) {
+            q->DN_rec[i] = calloc((size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, sizeof(float));
+            q->DN_conv[i] = calloc((size_t)c->dn_conv_dim * (c->dn_convk - 1), sizeof(float));
+            ok = q->DN_rec[i] && q->DN_conv[i];
+        }
+    }
+    if (!ok) { q36_seq_free(m, q); return 0; }
+    return 1;
+}
+
+/* One decode step of several conversations: row s is the token ids[s] at
+ * rows[s].pos of the conversation rows[s].seq, every conversation parked. The
+ * projections, the routed experts and lm_head run once over the S rows; the
+ * attention and DeltaNet read and write each row's own conversation (m->mux_rows).
+ * The CPU kernels give a row the same bits whatever S is, so each conversation gets
+ * the logits it would alone. Decode rows are never an image's. S rows of logits. */
+static float *q36_step_rows(Model *m, const Q36Row *rows, const int *ids, int S) {
+    Cfg *c = &m->c; int D = c->hidden;
+    if (g_pilot && m->token_count > 0) {
+        pthread_mutex_lock(&g_pilot_mx);
+        memset(m->is_queued, 0, (size_t)c->n_layers * c->n_experts);
+        pthread_mutex_unlock(&g_pilot_mx);
+    }
+    float *x = falloc((int64_t)S*D);
+    for (int s = 0; s < S; s++) {
+        if (ids[s] < 0 || ids[s] >= c->vocab) {
+            fprintf(stderr, "token id %d out of range 0..%d -- refusing\n", ids[s], c->vocab - 1);
+            exit(1);
+        }
+        if (m->embed_h) f16_to_f32_bulk(m->embed_h + (int64_t)ids[s]*D, x + (int64_t)s*D, D);
+        else memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
+    }
+    tier_rebuild_evicted(m);
+    m->mux_rows = rows;
+    layers_forward_range(m, x, S, 0, 0, c->n_layers, 1, NULL);
+    m->mux_rows = NULL;
+    for (int s = 0; s < S; s++) {
+        Q36Seq *q = rows[s].seq;
+        kv_prefix_record(&q->kvp, ids + s, rows[s].pos, 1);
+        q->kv_len = rows[s].pos + 1;
+    }
+    m->token_count += S; m->freq_token_count += S;
+    if (!m->hot_pinned && m->hot_n > 0 && m->freq_token_count >= m->warmup_tokens) pin_hot_experts(m);
+    float *last = falloc((int64_t)S*D), *logit = falloc((int64_t)S * c->vocab);
+    double _th = tm_now();
+    for (int s = 0; s < S; s++) rmsnorm_row(last + (int64_t)s*D, x + (int64_t)s*D, m->final_norm, D, c->eps);
+    /* the head once for every row; the CUDA tier's copy answers a row at a time */
+    int on_card = 1;
+    for (int s = 0; s < S && on_card; s++)
+        on_card = qt_lmhead_matmul(logit + (int64_t)s * c->vocab, last + (int64_t)s*D, D, c->vocab);
+    if (!on_card) matmul_d(logit, last, &m->lm_head, S, D, c->vocab);
+    if (tm_on()) { tm_add(S, 5, tm_now()-_th); g_tm_dec_tokens += S; }
+    free(x); free(last);
+    return logit;
 }
 
 static void pilot_realload(Model *m, int layer, int eid) {
@@ -4935,7 +5058,7 @@ static int *read_int_array(jval *o, const char *key, int *n_out) {
  * session hangs forever (#748). compat.h's coli_serve_binary_mode (#749)
  * carries that fix for every engine; see its comment for the full story. */
 
-typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen;
+typedef struct { char id[64]; int slot, max_tok; float temp, top_p; char *payload; int plen;
                  int logprobs;   /* SUBMIT logprobs=k: 0 = canale spento (opt-in) */
                  int pin;        /* SUBMIT pin=1: fotografa lo stato dopo il prefill */
                } ServeReq;
@@ -4988,17 +5111,18 @@ static int serve_read_req(ServeReq *q){
         if(t!='\n'){ free(payload); return -1; }
         payload[bytes]=0;
         snprintf(q->id,sizeof(q->id),"%s",id);
-        q->payload=payload; q->plen=(int)bytes;
+        q->payload=payload; q->plen=(int)bytes; q->slot=dslot;
         return 3;
     }
-    if(!strcmp(cmd,"CANCEL")||!strcmp(cmd,"STOP")) return 0;
+    /* 4: the request it names ends (serve_mux; a lone serve reads them mid-turn) */
+    if(!strcmp(cmd,"CANCEL")||!strcmp(cmd,"STOP")){ snprintf(q->id,sizeof(q->id),"%s",id); return 4; }
     if(strcmp(cmd,"SUBMIT")) return 0;
     int slot, plen, max_tok; float temp, top_p;
     if(sscanf(line,"%*s %*s %d %d %d %f %f",&slot,&plen,&max_tok,&temp,&top_p)!=5 ||
        plen<0||plen>(1<<24)||max_tok<0){   /* 0 = modalita jev, vedi sotto */
         printf("ERROR %s bad submit header\n",id); fflush(stdout); return 0;
     }
-    (void)slot;
+    q->slot = slot;
     /* Le chiavi key=value stanno dopo i campi fissi. Si riusa il parser
      * condiviso di decode_batch.h invece di scriverne un secondo: e lo stesso
      * namespace che colibri.c gia accetta, quindi i due motori non divergono.
@@ -5198,25 +5322,33 @@ static int qwen36_serve_budget(int np, int max_tok, int max_ctx, int read_only){
     return max_tok > room ? room : max_tok;
 }
 
-static void serve_one(Model *m, ServeReq *q){
+/* The counters when a request's decoding began: PROF and DONE report its share. */
+typedef struct { double s_disk, s_attn, s_moe, s_head, t0; } Q36ReqClock;
+
+/* A request's prompt into the conversation the Model holds: its tokens and image,
+ * the budget, ACCEPT, the prefix reuse and the pins, the prefill and its read-out.
+ * 1 with the prompt's ids and the logits after it; 0 when the request ended here,
+ * its ERROR written. serve_one and serve_mux start every request here. */
+static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, float **lo_out,
+                           Q36ReqClock *clk){
     int *ids=NULL, np=0;
     encode_text(q->payload, &ids, &np);          /* payload is raw prompt text; qwen36 adds no BOS */
     if(g_pending_image.present){
         Cfg *vc = &m->c;
         if(!m->vis_ready){
             printf("ERROR %s this engine has no vision tower; images are not supported\n",q->id);
-            fflush(stdout); q36_pending_image_clear(); free(ids); return;
+            fflush(stdout); q36_pending_image_clear(); free(ids); return 0;
         }
         unsigned long long want = (unsigned long long)g_pending_image.grid_h*g_pending_image.grid_w*
             vc->vis_in_ch*vc->vis_temporal*vc->vis_patch*vc->vis_patch*sizeof(float);
         if(g_pending_image.bytes!=want){
             printf("ERROR %s BAD_IMAGE bytes=%llu expected=%llu\n",q->id,g_pending_image.bytes,want);
-            fflush(stdout); q36_pending_image_clear(); free(ids); return;
+            fflush(stdout); q36_pending_image_clear(); free(ids); return 0;
         }
         if(q36_vision_attach(m,(const float*)g_pending_image.patches,g_pending_image.grid_h,
                              g_pending_image.grid_w,ids,np)<0){
             printf("ERROR %s BAD_IMAGE the prompt and the grid disagree\n",q->id);
-            fflush(stdout); q36_pending_image_clear(); free(ids); return;
+            fflush(stdout); q36_pending_image_clear(); free(ids); return 0;
         }
         q36_pending_image_clear();
     }
@@ -5224,7 +5356,7 @@ static void serve_one(Model *m, ServeReq *q){
     int budget = qwen36_serve_budget(np, q->max_tok, max_ctx, q->logprobs > 0);
     if(budget < 0){
         printf("ERROR %s CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d\n",q->id,np,q->max_tok,max_ctx);
-        fflush(stdout); free(ids); return;
+        fflush(stdout); free(ids); return 0;
     }
     if(budget < q->max_tok){
         fprintf(stderr,"[serve] max_tokens %d clamped to %d (context %d - prompt %d); raise Q36_MAXT for longer answers\n",
@@ -5285,12 +5417,21 @@ static void serve_one(Model *m, ServeReq *q){
     float *lo = step(m, ids + reuse, np - reuse, reuse);
     qt_stats_mark();
     if (q->pin) pin_save(m, ids, np, lo);
-    int gen=0, limited=1, forwards=1;   /* il prefill e' il primo forward */
-    const double s_disk=m->t_disk, s_attn=tm_sum(0)+tm_sum(1), s_moe=tm_sum(2), s_head=tm_sum(5);
-    int eos_ids[4]; int n_eos=serve_eos_ids(eos_ids,4);
-    double t0=now_s();
-    unsigned char sbuf[16]; int sbn=0;
+    clk->s_disk=m->t_disk; clk->s_attn=tm_sum(0)+tm_sum(1); clk->s_moe=tm_sum(2); clk->s_head=tm_sum(5);
+    clk->t0=now_s();
     g_echo_k = 0; g_echo_id = NULL;   /* la lettura riguarda il prefill, non la decodifica */
+    *ids_out=ids; *np_out=np; *lo_out=lo;
+    return 1;
+}
+
+static void serve_one(Model *m, ServeReq *q){
+    int *ids=NULL, np=0; float *lo=NULL; Q36ReqClock clk;
+    if(!q36_serve_start(m,q,&ids,&np,&lo,&clk)) return;
+    int gen=0, limited=1, forwards=1;   /* il prefill e' il primo forward */
+    const double s_disk=clk.s_disk, s_attn=clk.s_attn, s_moe=clk.s_moe, s_head=clk.s_head;
+    int eos_ids[4]; int n_eos=serve_eos_ids(eos_ids,4);
+    double t0=clk.t0;
+    unsigned char sbuf[16]; int sbn=0;
     Q36Spec spec; q36_spec_begin(m, &spec, ids, np);   /* COLI_LOOKUP=1: drafts, every token still sampled from the exact logits */
     for(int s=0;s<q->max_tok;s++){
         int tk = serve_sample(lo, m->c.vocab, q->temp, q->top_p);
@@ -5672,9 +5813,170 @@ static int q36_clef_test_modes(Model *m){
     return 0;
 }
 
+/* ---- several conversations at once (KV_SLOTS>1) -------------------------------
+ * The gateway's cache slots, each a conversation with a state of its own (Q36Seq).
+ * A SUBMIT on a free slot starts its request at once through q36_serve_start, on
+ * that slot's state: its prefix reuse and pins work as a lone serve's. Then every
+ * step picks the next token of each active request and runs one forward over a row
+ * of each (q36_step_rows): the matrices and the experts are read once for all of
+ * them. A request's frames are a lone request's; they interleave by id. Nothing
+ * drafts (speculation follows one conversation). STOP and CANCEL end a request as
+ * serve_one ends it, with ERROR CANCELLED. A Clef DECIDE runs at once on its slot. */
+static int g_q36_mux_slots = 1;
+static Q36Seq *g_q36_mux_seq;   /* [slots]: the conversations the Model does not hold */
+static int g_q36_mux_cur;       /* the slot the Model holds, -1 when every one is parked */
+
+typedef struct {
+    ServeReq q;
+    int active, cancel, limited, forwards;
+    int *ids, np, gen;
+    float *lo;                  /* the logits the next pick reads */
+    Q36ReqClock clk;
+    unsigned char sbuf[16]; int sbn;
+} Q36MuxReq;
+
+static void q36_mux_bind(Model *m, int slot){
+    if (g_q36_mux_cur == slot) return;
+    if (g_q36_mux_cur >= 0) q36_seq_swap(m, &g_q36_mux_seq[g_q36_mux_cur]);   /* the held one back */
+    if (slot >= 0) q36_seq_swap(m, &g_q36_mux_seq[slot]);
+    g_q36_mux_cur = slot;
+}
+
+/* The whole context's KV for every slot, before READY: slot 0 is the Model's own. */
+static int q36_mux_alloc(Model *m){
+    int n = g_q36_mux_slots;
+    m->max_t = qwen36_max_ctx(); ensure_kv(m);
+    g_q36_mux_seq = calloc((size_t)n, sizeof *g_q36_mux_seq);
+    if (!g_q36_mux_seq || !m->K) return 0;
+    for (int i = 1; i < n; i++) if (!q36_seq_alloc(m, &g_q36_mux_seq[i])) return 0;
+    g_q36_mux_cur = 0;
+    return 1;
+}
+
+/* A request's end, as serve_one ends one. */
+static void q36_mux_finish(Model *m, Q36MuxReq *r){
+    free(r->lo); r->lo = NULL; free(r->ids); r->ids = NULL; r->active = 0;
+    if (g_q36_mux_cur != r->q.slot) q36_mux_bind(m, r->q.slot);
+    /* an image turn's rope positions go with the turn, as q36_vision_detach drops them */
+    free(m->mpos); m->mpos = NULL; m->mpos_len = m->rope_delta = 0;
+    if (r->sbn > 0) serve_data(r->q.id, (char *)r->sbuf, r->sbn);   /* the trailing partial UTF-8 */
+    if (r->cancel) { printf("ERROR %s CANCELLED\n", r->q.id); fflush(stdout); return; }
+    double dt = now_s() - r->clk.t0;
+    hits_emit(m);
+    {
+        double disk = m->t_disk - r->clk.s_disk, moe = tm_sum(2) - r->clk.s_moe;
+        printf("PROF %.6f %d %d %.6f %.6f %.6f %.6f %.6f %llu\n", dt, r->np, r->gen,
+               disk, 0.0, moe > disk ? moe - disk : 0.0, tm_sum(0) + tm_sum(1) - r->clk.s_attn,
+               tm_sum(5) - r->clk.s_head, (unsigned long long)r->forwards);
+        fflush(stdout);
+    }
+    printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n", r->q.id, r->gen,
+           dt > 0 ? r->gen / dt : 0.0, 0.0, rss_gb(), r->np, r->limited);
+    fflush(stdout);
+}
+
+/* The next token of an active request, as serve_one's loop picks and sends it: 1
+ * with the token when the request goes on, 0 when it ended. */
+static int q36_mux_pick(Model *m, Q36MuxReq *r, const int *eos_ids, int n_eos, int *tk_out){
+    if (r->cancel || r->gen >= r->q.max_tok) { q36_mux_finish(m, r); return 0; }
+    int tk = serve_sample(r->lo, m->c.vocab, r->q.temp, r->q.top_p);
+    char lptail[1024]; lptail[0] = 0;
+    if (r->q.logprobs > 0) coli_logprob_tail(lptail, sizeof lptail, r->lo, m->c.vocab, tk, r->q.logprobs);
+    free(r->lo); r->lo = NULL;
+    for (int e = 0; e < n_eos; e++) if (tk == eos_ids[e]) { r->limited = 0; q36_mux_finish(m, r); return 0; }
+    unsigned char tmp[256]; int tn = 0; decode_id_to_bytes(tk, tmp, &tn);
+    if (r->q.logprobs > 0) serve_data_lp(r->q.id, (char *)tmp, tn, lptail);
+    else {
+        unsigned char chunk[256]; int cn = 0; utf8_drain(r->sbuf, &r->sbn, tmp, tn, chunk, &cn);
+        if (cn > 0) serve_data(r->q.id, (char *)chunk, cn);
+    }
+    r->gen++;
+    /* the next logits are not needed after the last requested token (serve_one) */
+    if (r->gen >= r->q.max_tok) { q36_mux_finish(m, r); return 0; }
+    *tk_out = tk; return 1;
+}
+
+static void serve_mux(Model *m){
+    int n = g_q36_mux_slots, V = m->c.vocab, input_eof = 0;
+    Q36MuxReq *rq = calloc((size_t)n, sizeof *rq);
+    Q36Row *rows = malloc((size_t)n * sizeof *rows);
+    int *tok = malloc((size_t)n * sizeof(int)), *who = malloc((size_t)n * sizeof(int));
+    if (!rq || !rows || !tok || !who) { fprintf(stderr, "[serve] out of memory\n"); exit(1); }
+    int eos_ids[4]; int n_eos = serve_eos_ids(eos_ids, 4);
+    unsigned long long steps = 0, nrows = 0;
+    fprintf(stderr, "[qwen36] serving %d conversations at once (KV_SLOTS)\n", n);
+    for (;;) {
+        int active = 0; for (int i = 0; i < n; i++) active += rq[i].active;
+        /* idle: wait for a command; decoding: take one only when one is there */
+        if (!input_eof && (!active || coli_serve_stdin_ready())) {
+            ServeReq q = {0};
+            int r = serve_read_req(&q);
+            if (r < 0) input_eof = 1;
+            else if (r == 4) {
+                for (int i = 0; i < n; i++) if (rq[i].active && !strcmp(rq[i].q.id, q.id)) rq[i].cancel = 1;
+            } else if (r == 2 || r == 3) {
+                int bad = q.slot < 0 || q.slot >= n;
+                if (bad || rq[q.slot].active) {
+                    printf("ERROR %s %s\n", q.id, bad ? "invalid cache slot" : "SLOT_BUSY"); fflush(stdout);
+                } else if (r == 3) {
+                    q36_mux_bind(m, q.slot); clef_serve_one(m, &q);
+                } else {
+                    Q36MuxReq *t = &rq[q.slot];
+                    memset(t, 0, sizeof *t); t->q = q; q.payload = NULL;
+                    q36_mux_bind(m, t->q.slot);
+                    int ok = q36_serve_start(m, &t->q, &t->ids, &t->np, &t->lo, &t->clk);
+                    /* the image's rows are the prompt's: no decode row reads them; its rope
+                     * positions stay with the conversation until the turn ends */
+                    free(m->vis_rows); free(m->vis_map); m->vis_rows = NULL; m->vis_map = NULL;
+                    m->vis_rows_n = m->vis_map_len = 0;
+                    if (ok) { t->active = 1; t->limited = 1; t->forwards = 1; }
+                    else { free(m->mpos); m->mpos = NULL; m->mpos_len = m->rope_delta = 0; }
+                    free(t->q.payload); t->q.payload = NULL;
+                    if (ok) emap_emit(m);
+                }
+                free(q.payload);
+            }
+        }
+        active = 0; for (int i = 0; i < n; i++) active += rq[i].active;
+        if (!active) { if (input_eof) break; continue; }
+        int S = 0, ended = 0;
+        for (int i = 0; i < n; i++) if (rq[i].active) {
+            int tk;
+            if (!q36_mux_pick(m, &rq[i], eos_ids, n_eos, &tk)) { ended = 1; continue; }
+            rows[S] = (Q36Row){&g_q36_mux_seq[i], rq[i].np + rq[i].gen - 1}; tok[S] = tk; who[S] = i; S++;
+        }
+        if (S) {
+            /* every conversation parked: the rows read theirs from g_q36_mux_seq */
+            q36_mux_bind(m, -1);
+            float *lo = q36_step_rows(m, rows, tok, S);
+            steps++; nrows += (unsigned long long)S;
+            for (int s = 0; s < S; s++) {
+                Q36MuxReq *t = &rq[who[s]];
+                t->lo = falloc(V); memcpy(t->lo, lo + (int64_t)s * V, (size_t)V * sizeof(float));
+                t->forwards++;
+            }
+            free(lo);
+        }
+        if (ended) {
+#ifdef COLI_VULKAN
+            vk_report();
+            vk_tier_turn(m, "turn");
+#endif
+            emap_emit(m);
+        }
+    }
+    fprintf(stderr, "[qwen36] KV_SLOTS=%d: %llu decode steps, %llu rows (%.2f a step)\n", n, steps, nrows,
+            steps ? (double)nrows / (double)steps : 0.0);
+    q36_mux_bind(m, 0);
+    free(rq); free(rows); free(tok); free(who);
+}
+
 static void serve_loop(Model *m){
     coli_serve_binary_mode();
     setvbuf(stdin,NULL,_IONBF,0);
+    if(g_q36_mux_slots>1 && !q36_mux_alloc(m)){
+        fprintf(stderr,"[serve] unable to allocate the state of %d conversations (KV_SLOTS)\n",g_q36_mux_slots); return;
+    }
     fputs("\x01\x01READY\x01\x01\n",stdout);
     /* fra READY e STAT: il gateway lo legge nella stretta di mano, quindi sa che
      * modalita' serve prima della prima richiesta (docs/serve_protocol.md) */
@@ -5685,9 +5987,10 @@ static void serve_loop(Model *m){
     fflush(stdout);
     emap_emit(m);          /* dopo READY e STAT: il boot reader legge STAT dopo il sentinel */
     fflush(stdout);
+    if(g_q36_mux_slots>1){ serve_mux(m); return; }
     for(;;){
         ServeReq q={0}; int r;
-        do r=serve_read_req(&q); while(r==0);
+        do r=serve_read_req(&q); while(r==0||r==4);
         if(r<0) return;
         /* Resend the grid after EVERY turn, not only after READY: at boot the
          * expert cache is empty by definition, and that cold snapshot stayed
@@ -5974,6 +6277,16 @@ int main(int argc, char **argv) {
      * is ever reached — which is exactly how `coli` launches it (SERVE=1, no
      * prompt argument). */
     int serve_mode = getenv("SERVE") && getenv("SERVE")[0]=='1';
+    if (serve_mode) {   /* KV_SLOTS: how many conversations the serve decodes at once */
+        const char *ks = getenv("KV_SLOTS");
+        if (ks && *ks) {
+            char *end = NULL; long v = strtol(ks, &end, 10);
+            if (end == ks || *end || v < 1 || v > 16) { fprintf(stderr, "KV_SLOTS must be between 1 and 16\n"); return 2; }
+            g_q36_mux_slots = (int)v;
+        }
+        if (g_q36_mux_slots > 1)
+            fprintf(stderr, "[qwen36] KV_SLOTS=%d: nothing drafts (speculation follows one conversation)\n", g_q36_mux_slots);
+    }
     if (getenv("CLEF_RECORDS") || getenv("CLEF_TOKENIZE")) serve_mode = 1;   /* Clef's test modes: no prompt */
 
     /* load tokenizer early so text-prompt mode can encode before model_init */
@@ -6033,6 +6346,11 @@ int main(int argc, char **argv) {
     /* measured on a Radeon 780M: decode and prefill both faster (docs/vulkan.md) */
     if (g_vk_ready && !qq_active())
         g_vk_chain = coli_vk_chain_decide("qwen36", vkt_wanted() && m.c.n_experts > 0, COLI_VK_CHAIN_ON);
+    if (g_vk_chain && g_q36_mux_slots > 1) {
+        g_vk_chain = 0;
+        fprintf(stderr, "[VK] qwen36: KV_SLOTS=%d: the dense chain is off (it keeps one conversation's state on the device); "
+                        "the expert tier runs every conversation's experts\n", g_q36_mux_slots);
+    }
     if (g_vk_ready) {
         /* COLI_VK_IMPORT: 1 the device reads the dense rows in place, 0 it copies them.
          * Unset: in place for a model without routed experts (Qwen3.8-27B, Clef) on a
@@ -6244,6 +6562,10 @@ int main(int argc, char **argv) {
                 }
             }
             m.dn_dev = n > 0;
+            if (m.dn_dev && g_q36_mux_slots > 1) {   /* the card holds one conversation's DeltaNet state */
+                m.dn_dev = 0;
+                fprintf(stderr, "[dn] KV_SLOTS=%d: DeltaNet on the CPU\n", g_q36_mux_slots);
+            }
             if (n) fprintf(stderr, "[dn] %d DeltaNet layers run on the GPU end to end (conv, recurrence, gated norm; %.0f MB of state in VRAM)\n",
                            n, vram / 1048576.0);
             else fprintf(stderr, "[dn] Q36_DN_GPU=1 but no layer has both projections on one card; the CPU path stands\n");

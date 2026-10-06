@@ -559,12 +559,27 @@ OpenAI clients omit it and keep the original slot 0 behavior.
 }
 ```
 
-Each slot owns its token history, compressed MLA/DSA KV memory, MTP window, and
-crash-safe persistence file (`.coli_kv`, `.coli_kv.1`, ...). The engine matches
-each request's tokenized prompt against the slot's history and reuses the common
-KV prefix, so stateless HTTP turns keep their cache across requests and even
-across engine restarts. Use `COLI_KV_SLOTS=N` as the environment equivalent.
-Start small: at the default 4096-token context, every slot costs hundreds of MB.
+Each slot owns its token history and its conversation's state: the KV cache, and
+on the engines that have them the DeltaNet, KDA and convolution states and the
+compressed DeepSeek attention. The engine matches each request's tokenized prompt
+against the slot's history and reuses the common prefix, so stateless HTTP turns
+keep their cache across requests. On GLM-5.2 each slot also has its MTP window and
+a crash-safe persistence file (`.coli_kv`, `.coli_kv.1`, ...), so the cache
+survives an engine restart too. Use `COLI_KV_SLOTS=N` as the environment
+equivalent. Start small: at the default 4096-token context, every slot costs
+hundreds of MB, and `coli plan` counts them.
+
+Every text engine serves the slots at the same time. Requests on different slots
+are decoded together: each step takes the next token of every active
+conversation as one batch, so the weights and the routed experts a step reads
+serve all of them, while each row's attention and recurrent state stay its own
+conversation's. A request gets the tokens it would get alone (greedy on the CPU,
+the same bytes; `tests/serve_mux_check.py` checks it on every engine). A prompt is
+prefilled when it arrives, between two steps. With more than one slot, the
+engines other than GLM-5.2 and GLM-5.3-Flash draft nothing (MTP, DSpark and
+prompt lookup follow one conversation), and their Vulkan dense chain, DeltaNet on
+the GPU and Metal paths stay off; the Vulkan expert tier serves every
+conversation's experts.
 
 ## Web dashboard
 

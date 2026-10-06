@@ -436,6 +436,22 @@ jobs:
           - family: decide-sanitize
             req: c/tools/requirements-jev-sdk.txt
             extra: -r c/tools/oracle-requirements.txt
+          # several conversations at once (KV_SLOTS, tests/serve_mux_check.py): each engine's
+          # requests decoded together, frame for frame against the same requests served
+          # alone, on the CPU and with the expert tier; the same under ASan and UBSan;
+          # DeepSeek's in legs of their own (their fixtures pin another transformers)
+          - family: mux
+            req: c/tools/requirements-qwen38-tiny.txt
+            extra: numpy pillow
+          - family: mux-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
+            extra: numpy pillow
+          - family: mux-deepseek
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          - family: mux-deepseek-sanitize
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

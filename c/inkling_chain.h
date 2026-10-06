@@ -1024,6 +1024,11 @@ static void inkc_start(Model *m) {
 #endif
     (void)e;
     g_vk_chain = coli_vk_chain_decide("inkling", vkt_ready(), INKLING_CHAIN_IGPU);
+    if (g_vk_chain && g_ink_mux_slots > 1) {
+        g_vk_chain = 0;
+        fprintf(stderr, "[VK] inkling: KV_SLOTS=%d: the dense chain is off (it keeps one conversation's state on the device); "
+                        "the expert tier runs every conversation's experts\n", g_ink_mux_slots);
+    }
     if (g_inkc_fit.L && !g_inkc_fit.n) g_vk_chain = 0;   /* the fit left no layer to the device (its line said so) */
     if (g_vk_chain && !vkc_init()) g_vk_chain = 0;
     if (g_vk_chain || g_inkc_fit2_on) atexit(vkc_shutdown_all);

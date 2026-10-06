@@ -1523,6 +1523,14 @@ rebuilds the KDA state on the CPU from the input rows the chain records since th
 copy was last current (embedding rows, or the vision tower's), a prefill's worth of CPU
 work.
 
+**Several conversations at once (the other engines).** qwen36, qwen38, OLMoE, Inkling,
+Kimi K3, MiMo, DeepSeek V4 and V4.1 decode `KV_SLOTS`' conversations together too, but
+their dense chain keeps one conversation's state on the device, so it stays off with
+more than one slot (a `[VK] <engine>: KV_SLOTS=n: the dense chain is off` line says
+so): the dense part runs on the CPU, and the routed-expert tier serves the experts of
+every conversation's row. `tests/vulkan_engines.sh mux` checks each engine's frames
+against the same requests served alone, on the CPU and with the tier.
+
 **Several conversations at once (colibri).** `KV_SLOTS`' batched decode (one row from
 each active conversation, each at its own position) runs on the chain: the norms, the
 projections and the MoE take the batch's rows as one; each row's new KV rows go to its

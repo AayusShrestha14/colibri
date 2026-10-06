@@ -1054,6 +1054,7 @@ static void k3c_start(Model *m, int tier_on) {
         if (g_k3_cuda) no = "the CUDA expert tier is on and keeps its priority";
 #endif
         if (!no && k3_dsa_indexer_on()) no = "KIMI_DSA_INDEXER=1 fills its index cache on the CPU";
+        if (!no && g_k3_mux_slots > 1) no = "several conversations at once (KV_SLOTS): it keeps one conversation's state on the device";
         if (!no && g_k3_fit.L > 0 && g_k3_fit.n < 1) {   /* the fit's line said so: nothing of the chain on the device */
             vkc_fit_placed("kimi_k3", &g_k3_fit);
             return;

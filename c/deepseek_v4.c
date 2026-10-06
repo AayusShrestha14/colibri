@@ -6707,6 +6707,97 @@ int coli_v4_block_window_batch_ref(
                          phase, moe_reason());
     return set_error(error, error_size, "hybrid batched block failed in %s", phase);
 }
+
+/* Several conversations' rows through one block (KV_SLOTS, the serve's multiplexed
+ * decode): row t is the next token of the conversation whose window attention state
+ * is attention[t], at positions[t]. The mixes, the hyper-connections and the routed
+ * experts are coli_v4_block_window_batch_ref's on the CPU (the experts through the
+ * union over the rows, token-exact as the note above it says); the attention is the
+ * single-token one each conversation's own decode step runs, on its own state. So
+ * each row comes out with the bits its conversation's lone decode step gives. The
+ * device's KV ring serves one conversation, so its marks are dropped before every
+ * row's attention (a no-op without the GPU tier). */
+int coli_v4_block_window_rows_ref(
+    float *outputs_hc, ColiDeepSeekV4WindowAttentionState **attention,
+    const ColiDeepSeekV4LayerWeights *weights,
+    const ColiDeepSeekV4Config *config, ColiExpertStore *experts,
+    const float *inputs_hc, const int *tokens, const int *positions, int batch,
+    char *error, size_t error_size) {
+    if (!outputs_hc || !attention || !weights || !config || !experts ||
+        !inputs_hc || !tokens || !positions || batch < 1 || batch > 128) return -1;
+    int d = config->hidden_size, hc = config->hc_mult;
+    size_t hd = (size_t)hc * d;
+    float *states = malloc((size_t)batch * hd * sizeof(*states));
+    float *normalized = malloc((size_t)batch * d * sizeof(*normalized));
+    float *branches = malloc((size_t)batch * d * sizeof(*branches));
+    float *posts = malloc((size_t)batch * hc * sizeof(*posts));
+    float *combs = malloc((size_t)batch * hc * hc * sizeof(*combs));
+    float *reduced = malloc((size_t)d * sizeof(*reduced));
+    float *ffn_normalized = malloc((size_t)batch * d * sizeof(*ffn_normalized));
+    float *ffn_branch = malloc((size_t)batch * d * sizeof(*ffn_branch));
+    float *ffn_post = malloc((size_t)batch * hc * sizeof(*ffn_post));
+    float *ffn_comb = malloc((size_t)batch * hc * hc * sizeof(*ffn_comb));
+    if (!states || !normalized || !branches || !posts || !combs || !reduced ||
+        !ffn_normalized || !ffn_branch || !ffn_post || !ffn_comb) {
+        free(ffn_comb); free(ffn_post); free(ffn_branch); free(ffn_normalized);
+        free(reduced); free(combs); free(posts); free(branches);
+        free(normalized); free(states); return -1;
+    }
+    int result = 0;
+    const char *phase = "attention hyper-connection";
+    for (int item = 0; !result && item < batch; item++)
+        result = normalized_hc_pre(
+            reduced, posts + (size_t)item * hc, combs + (size_t)item * hc * hc,
+            normalized + (size_t)item * d, inputs_hc + (size_t)item * hd,
+            weights, config, "attn", "attn_norm.weight");
+    if (!result) phase = "attention";
+    for (int item = 0; !result && item < batch; item++) {
+#ifdef COLI_V4_GPU_TIER
+        coli_v4_gpu_kv_cache_invalidate_all();
+#endif
+        result = coli_v4_attention_window_token_ref(
+            branches + (size_t)item * d, attention[item], weights, config,
+            normalized + (size_t)item * d, positions[item], error, error_size);
+    }
+    if (!result) phase = "attention post / FFN hyper-connection";
+    for (int item = 0; !result && item < batch; item++) {
+        float *state = states + (size_t)item * hd;
+        result = coli_v4_hc_post(
+            state, branches + (size_t)item * d, inputs_hc + (size_t)item * hd,
+            posts + (size_t)item * hc, combs + (size_t)item * hc * hc, hc, d);
+        if (!result) coli_bf16_round_array(state, hd);
+        if (!result) result = normalized_hc_pre(
+            reduced, ffn_post + (size_t)item * hc, ffn_comb + (size_t)item * hc * hc,
+            ffn_normalized + (size_t)item * d, state,
+            weights, config, "ffn", "ffn_norm.weight");
+    }
+    if (!result) phase = "MoE";
+    if (!result && batch > 1 && v4_expert_union_enabled())
+        result = v4_moe_batch_union(ffn_branch, weights, config, experts,
+                                    ffn_normalized, tokens, batch);
+    else
+        for (int item = 0; !result && item < batch; item++)
+            result = moe_token_pipeline(
+                ffn_branch + (size_t)item * d, weights, config, experts,
+                ffn_normalized + (size_t)item * d, tokens[item]);
+    if (!result) phase = "FFN hyper-connection post";
+    for (int item = 0; !result && item < batch; item++) {
+        result = coli_v4_hc_post(
+            outputs_hc + (size_t)item * hd, ffn_branch + (size_t)item * d,
+            states + (size_t)item * hd, ffn_post + (size_t)item * hc,
+            ffn_comb + (size_t)item * hc * hc, hc, d);
+        if (!result) coli_bf16_round_array(outputs_hc + (size_t)item * hd, hd);
+    }
+    free(ffn_comb); free(ffn_post); free(ffn_branch); free(ffn_normalized);
+    free(reduced); free(combs); free(posts); free(branches);
+    free(normalized); free(states);
+    if (!result) return 0;
+    if (error && error_size && error[0]) return -1;
+    if (moe_reason()[0])
+        return set_error(error, error_size, "multiplexed block failed in %s: %s",
+                         phase, moe_reason());
+    return set_error(error, error_size, "multiplexed block failed in %s", phase);
+}
 #endif /* COLI_V4_UNIT_BLOCK_HYBRID */
 
 #ifdef COLI_V4_UNIT_COMPRESSOR_SNAPSHOT
@@ -12648,6 +12739,10 @@ int coli_v4_prompt_build(char **output, size_t *output_length,
 #include "decode_batch.h"   /* coli_logprob_tail: the numeric channel's tail, same bytes as the other engines */
 #include "tok.h"
 
+/* KV_SLOTS of a serve: more than one, the conversations decode together, one row of a
+ * batch each (coli_v4_sessions_step). */
+static int g_v4_mux_slots = 1;
+
 static int load_embedding(float *state, const ColiSafetensorsIndex *index,
                           const ColiDeepSeekV4Config *config, int token) {
     const ColiSafetensorsTensor *embed = coli_st_find(index, "embed.weight");
@@ -15140,6 +15235,29 @@ int coli_v4_session_generate(ColiV4Session *session,
                                   generated_count, options->stop_at_sentence);
     }
     double first_at = spec_now();
+    if (options->prefill_only) {
+        /* A multiplexed serve: coli_v4_sessions_step decodes the rest, one row of a
+         * batch per step, from where this leaves it. */
+        session->mux.current = current;
+        session->mux.logit = current_logit;
+        session->mux.last = last_processed;
+        session->mux.count = generated_count;
+        session->mux.max_new = max_new;
+        session->mux.done = done || generated_count >= max_new;
+        session->mux.logprobs = options->logprobs;
+        session->mux.first_at = first_at;
+        session->mux.on_token = on_token;
+        session->mux.user_data = user_data;
+        session->mux.on_scores = options->on_scores;
+        session->mux.scores_user_data = options->scores_user_data;
+        session->generated_count = generated_count;
+        if (stats_out) {
+            stats_out->prompt_tokens = prompt_count;
+            stats_out->generated_tokens = generated_count;
+            stats_out->time_to_first_token_sec = first_at - setup_done;
+        }
+        return 0;
+    }
 
     int draft_limit = getenv("V4_DRAFT") ? atoi(getenv("V4_DRAFT")) : 0;
     if (draft_limit < 0) draft_limit = 0;
@@ -15444,6 +15562,138 @@ int coli_v4_session_generate(ColiV4Session *session,
     return 0;
 }
 
+/* Every head score of several hidden rows, [batch][vocab]: the batch's rows of
+ * head_scores, each with the same head_bf16_dot (the CPU) as alone, the head read once
+ * for the batch while it is resident. */
+static int head_scores_batch(ColiV4Engine *engine, const float *hidden,
+                             const ColiSafetensorsIndex *index,
+                             const ColiDeepSeekV4Config *config, int batch,
+                             float *scores) {
+    double t0 = spec_now();
+    const ColiSafetensorsTensor *head = coli_st_find(index, "head.weight");
+    int d = config->hidden_size, vocab = config->vocab_size;
+    if (!head || head->dtype != COLI_ST_BF16 || batch < 1) return -1;
+    const uint16_t *resident = coli_v4_head_cache_data(
+        engine, coli_st_tensor_shard(index, head), (uint64_t)head->off,
+        (size_t)vocab * d * sizeof(uint16_t));
+    int result = 0;
+    if (!resident || batch == 1) {
+        for (int item = 0; !result && item < batch; item++)
+            result = head_scores_impl(engine, hidden + (size_t)item * d, index,
+                                      config, scores + (size_t)item * vocab);
+    } else {
+#ifdef COLI_VULKAN
+        int on_device = coli_v4_vk_matmul &&
+                        coli_v4_vk_matmul(11, resident, NULL, 0, vocab, d, scores,
+                                          hidden, batch) == 0;
+        if (!on_device)
+#endif
+        #pragma omp parallel for schedule(static)
+        for (int row = 0; row < vocab; row++) {
+            const uint16_t *weight = resident + (size_t)row * d;
+            for (int item = 0; item < batch; item++)
+                scores[(size_t)item * vocab + row] = head_bf16_dot(
+                    weight, hidden + (size_t)item * d, d);
+        }
+        V4_DUMP_LOGITS(scores, (size_t)batch * vocab);
+    }
+    g_v4_prof_head_s += spec_now() - t0;
+    return result;
+}
+
+/* One decode step of several conversations (a multiplexed serve, KV_SLOTS): each
+ * session's request was started with prefill_only and is not done; its next token goes
+ * through the layers as one row of a batch, at its own position, against its own
+ * attention state (coli_v4_block_window_rows_ref), and the head picks each row's
+ * token. The token is emitted as the session's lone decode step emits it, and the
+ * session's mux cursor moves on; mux.done says the request has ended (an end of
+ * sequence, its budget, or its token callback asking to stop). */
+int coli_v4_sessions_step(ColiV4Session **sessions, int count,
+                          char *error, size_t error_size) {
+    if (!sessions || count < 1 || count > 128) return -1;
+    ColiV4Engine *engine = sessions[0]->engine;
+    const ColiDeepSeekV4Config *config = &sessions[0]->config;
+    ColiSafetensorsIndex *index = coli_v4_engine_target_index(engine);
+    ColiExpertStore *experts = coli_v4_engine_expert_store(engine);
+    int d = config->hidden_size, vocab = config->vocab_size;
+    int layers = config->num_hidden_layers;
+    size_t hd = (size_t)config->hc_mult * d;
+    float *state = malloc((size_t)count * hd * sizeof(*state));
+    float *next = malloc((size_t)count * hd * sizeof(*next));
+    float *hidden = malloc((size_t)count * d * sizeof(*hidden));
+    float *scores = malloc((size_t)count * vocab * sizeof(*scores));
+    int *tokens = malloc((size_t)count * sizeof(*tokens));
+    int *positions = malloc((size_t)count * sizeof(*positions));
+    ColiDeepSeekV4WindowAttentionState **attention =
+        malloc((size_t)count * sizeof(*attention));
+    int result = -1;
+    if (!state || !next || !hidden || !scores || !tokens || !positions || !attention)
+        goto out;
+    for (int t = 0; t < count; t++) {
+        tokens[t] = sessions[t]->mux.current;
+        positions[t] = sessions[t]->mux.last + 1;
+        if (load_embedding(state + (size_t)t * hd, index, config, tokens[t])) {
+            snprintf(error, error_size, "V4 embedding read failed");
+            goto taint;
+        }
+    }
+    double t0 = spec_now();
+    for (int layer_id = 0; layer_id < layers; layer_id++) {
+        ColiDeepSeekV4LayerWeights layer;
+        if (coli_v4_layer_load(engine, &layer, config, index, layer_id,
+                               error, error_size)) goto taint;
+        for (int t = 0; t < count; t++) attention[t] = sessions[t]->attention[layer_id];
+        int failed = coli_v4_block_window_rows_ref(
+            next, attention, &layer, config, experts, state, tokens, positions,
+            count, error, error_size);
+        coli_v4_layer_free(engine, &layer);
+        if (failed) goto taint;
+        float *swap = state; state = next; next = swap;
+    }
+    g_v4_prof_block_s += spec_now() - t0;
+    g_v4_prof_forwards += count;
+    for (int t = 0; t < count; t++) {
+        /* the token is in the conversation's attention state from here on */
+        kv_prefix_record(&sessions[t]->fed, &tokens[t], positions[t], 1);
+        if (final_hidden(hidden + (size_t)t * d, state + (size_t)t * hd, index,
+                         config, error, error_size)) goto taint;
+    }
+    if (head_scores_batch(engine, hidden, index, config, count, scores)) {
+        snprintf(error, error_size, "V4 head failed");
+        goto taint;
+    }
+    for (int t = 0; t < count; t++) {
+        ColiV4Session *session = sessions[t];
+        const float *row = scores + (size_t)t * vocab;
+        int current = 0;
+        float logit = 0.0f;
+        if (head_scores_argmax(row, vocab, &current, &logit)) {
+            snprintf(error, error_size, "V4 head failed");
+            goto taint;
+        }
+        session->mux.current = current;
+        session->mux.logit = logit;
+        session->mux.last = positions[t];
+        session->generated[session->mux.count++] = current;
+        session->generated_count = session->mux.count;
+        if (session->mux.on_scores)
+            session->mux.on_scores(session->mux.scores_user_data, positions[t],
+                                   current, row, vocab);
+        int stop = session_emit_token(session, session->mux.on_token,
+                                      session->mux.user_data, current, logit,
+                                      positions[t], session->mux.count, 0);
+        session->mux.done = stop || session->mux.count >= session->mux.max_new;
+    }
+    result = 0;
+    goto out;
+taint:
+    for (int t = 0; t < count; t++) kv_prefix_taint(&sessions[t]->fed);
+out:
+    free(attention); free(positions); free(tokens); free(scores);
+    free(hidden); free(next); free(state);
+    return result;
+}
+
 static int v4_oracle_teacher_forcing(
         const int *full_ids, int full_count, const int *expected, int expect_count,
         ColiDeepSeekV4WindowAttentionState **attention,
@@ -15620,6 +15870,7 @@ typedef struct {
     int fatal;
     int logprobs;
     char tail[1024];   /* the next DATA frame's logprob tail, from on_scores */
+    int mux;           /* a multiplexed serve (KV_SLOTS): its loop reads the commands */
 } V4ServeStream;
 
 static const ColiServeWireProfile v4_wire = {
@@ -15812,6 +16063,25 @@ static void v4_prof_emit(double wall_s, int prompt_tokens, int completion,
     fflush(stdout);
 }
 
+/* A SUBMIT's fields, its prompt taken, the command disposed. */
+static void v4_serve_take_submit(ColiServeCommand *command, V4ServeRequest *request) {
+    int prefix_bytes = command->prefix_bytes;
+    if (prefix_bytes < 0 || (uint64_t)prefix_bytes > command->payload_bytes)
+        prefix_bytes = 0;
+    memset(request, 0, sizeof(*request));
+    snprintf(request->id, sizeof(request->id), "%s", command->id);
+    request->prompt = (char *)coli_serve_command_take_payload(command);
+    request->prompt_bytes = (int)command->payload_bytes;
+    request->max_tokens = command->max_tokens;
+    request->temperature = command->temperature;
+    request->top_p = command->top_p;
+    request->extension_bytes = (int)command->extension_bytes;
+    request->prefix_bytes = prefix_bytes;
+    request->logprobs = command->logprobs;
+    request->pin = command->pin;
+    coli_serve_command_dispose(command);
+}
+
 static int v4_serve_read_request(FILE *input, FILE *output,
                                  V4ServeRequest *request,
                                  const char *active_id) {
@@ -15844,21 +16114,7 @@ static int v4_serve_read_request(FILE *input, FILE *output,
         coli_serve_command_dispose(&command);
         return -2;
     }
-    int prefix_bytes = command.prefix_bytes;
-    if (prefix_bytes < 0 || (uint64_t)prefix_bytes > command.payload_bytes)
-        prefix_bytes = 0;
-    memset(request, 0, sizeof(*request));
-    snprintf(request->id, sizeof(request->id), "%s", command.id);
-    request->prompt = (char *)coli_serve_command_take_payload(&command);
-    request->prompt_bytes = (int)command.payload_bytes;
-    request->max_tokens = command.max_tokens;
-    request->temperature = command.temperature;
-    request->top_p = command.top_p;
-    request->extension_bytes = (int)command.extension_bytes;
-    request->prefix_bytes = prefix_bytes;
-    request->logprobs = command.logprobs;
-    request->pin = command.pin;
-    coli_serve_command_dispose(&command);
+    v4_serve_take_submit(&command, request);
     return 2;
 }
 
@@ -15910,7 +16166,7 @@ static int v4_serve_token(void *user_data, int token, float logit,
             v4_serve_data(stdout, stream->request_id, piece, bytes);
     }
     stream->tail[0] = 0;
-    if (v4_serve_drain_commands(stream)) {
+    if (!stream->mux && v4_serve_drain_commands(stream)) {
         stream->cancelled = 1;
         return 1;
     }
@@ -15973,8 +16229,9 @@ static void v4_serve_scores(void *user_data, int position, int token,
                       stream->logprobs);
 }
 
-static int v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
-                        V4ServeRequest *request) {
+/* A request's checks before its prefill: 1 with its ACCEPT written, 0 with its ERROR. */
+static int v4_serve_admit(ColiV4Engine *engine, ColiV4Session *session,
+                          V4ServeRequest *request) {
     if (request->extension_bytes) {
         v4_serve_error(stdout, request->id, "unsupported request extension");
         return 0;
@@ -16024,22 +16281,46 @@ static int v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
         request->max_tokens = context - prompt_count;
     }
     coli_serve_write_accept(stdout, request->id, prompt_count);
+    return 1;
+}
 
-    ColiExpertStoreStats before = {0}, after = {0};
+/* Where the counters stood when a request started: its DONE and PROF lines report what
+ * moved since. */
+typedef struct {
+    ColiExpertStoreStats experts;
+    double disk, matmul, wait, block, head, started;
+    long long forwards;
+} V4ServeMarks;
+
+static void v4_serve_mark(ColiV4Engine *engine, V4ServeMarks *marks) {
+    memset(marks, 0, sizeof(*marks));
     if (engine->experts && engine->experts->ops && engine->experts->ops->stats)
-        engine->experts->ops->stats(engine->experts, &before);
-    double disk_before =
+        engine->experts->ops->stats(engine->experts, &marks->experts);
+    marks->disk =
         engine->experts ? coli_v4_expert_store_disk_sec(engine->experts) : 0.0;
-    double matmul_before =
+    marks->matmul =
         engine->experts ? coli_v4_expert_store_matmul_sec(engine->experts) : 0.0;
-    double wait_before =
+    marks->wait =
         engine->experts ? coli_v4_expert_store_wait_sec(engine->experts) : 0.0;
-    double block_before = g_v4_prof_block_s, head_before = g_v4_prof_head_s;
-    long long forwards_before = g_v4_prof_forwards;
-    V4ServeStream stream = {session, request->id, 0, 0, request->logprobs, {0}};
+    marks->block = g_v4_prof_block_s;
+    marks->head = g_v4_prof_head_s;
+    marks->forwards = g_v4_prof_forwards;
+    marks->started = spec_now();
+}
+
+static void v4_serve_finish(ColiV4Engine *engine, ColiV4Session *session,
+                            const char *id, const V4ServeMarks *marks,
+                            int generated, int eos_stopped, int cancelled,
+                            int max_tokens, int prompt_tokens, double decode_sec);
+
+static int v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
+                        V4ServeRequest *request) {
+    if (!v4_serve_admit(engine, session, request)) return 0;
+    V4ServeMarks marks;
+    v4_serve_mark(engine, &marks);
+    V4ServeStream stream = {session, request->id, 0, 0, request->logprobs, {0}, 0};
     ColiV4SessionGenerateStats stats = {0};
     char error[512] = {0};
-    double started = spec_now();
     int result = coli_v4_session_generate(
         session, request->prompt, (size_t)request->prompt_bytes,
         &(ColiV4SessionGenerateOptions){
@@ -16056,48 +16337,61 @@ static int v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
             .scores_user_data = &stream,
         },
         v4_serve_token, &stream, &stats, error, sizeof(error));
-    double elapsed = spec_now() - started;
     if (stream.fatal) return -1;
     if (result) {
         v4_serve_error(stdout, request->id, error);
         return 0;
     }
+    v4_serve_finish(engine, session, request->id, &marks, stats.generated_tokens,
+                    stats.eos_stopped, stream.cancelled, request->max_tokens,
+                    stats.prompt_tokens, stats.decode_sec);
+    return 0;
+}
+
+/* A request's DONE and PROF lines, then the turn's reports: `generated` tokens, the
+ * last one an end of sequence when eos_stopped; decode_sec from the first token. */
+static void v4_serve_finish(ColiV4Engine *engine, ColiV4Session *session,
+                            const char *id, const V4ServeMarks *marks,
+                            int generated, int eos_stopped, int cancelled,
+                            int max_tokens, int prompt_tokens, double decode_sec) {
+    double elapsed = spec_now() - marks->started;
+    ColiExpertStoreStats after = {0};
     if (engine->experts && engine->experts->ops && engine->experts->ops->stats)
         engine->experts->ops->stats(engine->experts, &after);
-    uint64_t hits = after.hits - before.hits;
-    uint64_t misses = after.misses - before.misses;
+    uint64_t hits = after.hits - marks->experts.hits;
+    uint64_t misses = after.misses - marks->experts.misses;
     double hit_rate = hits + misses ? 100.0 * hits / (hits + misses) : 0.0;
-    int completion = stats.generated_tokens - (stats.eos_stopped ? 1 : 0);
+    int completion = generated - (eos_stopped ? 1 : 0);
     if (completion < 0) completion = 0;
-    int length_limited = !stream.cancelled && !stats.eos_stopped &&
-                         request->max_tokens > 0 &&   /* a read-only request is not cut short */
-                         stats.generated_tokens >= request->max_tokens;
-    double decode = stats.decode_sec > 0.0 ? stats.decode_sec : elapsed;
+    int length_limited = !cancelled && !eos_stopped &&
+                         max_tokens > 0 &&   /* a read-only request is not cut short */
+                         generated >= max_tokens;
+    double decode = decode_sec > 0.0 ? decode_sec : elapsed;
     /* Trailing field: prompt tokens served from the previous turn's attention
      * state instead of being prefilled again. Appended rather than inserted --
      * openai_server.py accepts `len(fields) >= 7`, so an older reader ignores
      * it and a newer one can report it. */
-    v4_serve_done(stdout, request->id, completion,
+    v4_serve_done(stdout, id, completion,
                   decode > 0.0 ? completion / decode : 0.0,
-                  hit_rate, v4_serve_rss_gb(), stats.prompt_tokens,
+                  hit_rate, v4_serve_rss_gb(), prompt_tokens,
                   length_limited, session->prefix_reused);
     double expert_disk_s = engine->experts
-        ? coli_v4_expert_store_disk_sec(engine->experts) - disk_before
+        ? coli_v4_expert_store_disk_sec(engine->experts) - marks->disk
         : 0.0;
     double expert_matmul_s = engine->experts
-        ? coli_v4_expert_store_matmul_sec(engine->experts) - matmul_before
+        ? coli_v4_expert_store_matmul_sec(engine->experts) - marks->matmul
         : 0.0;
     double expert_wait_s = engine->experts
-        ? coli_v4_expert_store_wait_sec(engine->experts) - wait_before
+        ? coli_v4_expert_store_wait_sec(engine->experts) - marks->wait
         : 0.0;
     /* Block time minus the expert compute and the expert wait measured inside it.
      * The store's disk seconds are NOT subtracted: summed across loader lanes,
      * they exceeded the wall on a cold tiny run (0.073 s of disk in a 0.034 s turn). */
-    double attention_s = (g_v4_prof_block_s - block_before) - expert_matmul_s - expert_wait_s;
+    double attention_s = (g_v4_prof_block_s - marks->block) - expert_matmul_s - expert_wait_s;
     if (attention_s < 0.0) attention_s = 0.0;
-    v4_prof_emit(elapsed, stats.prompt_tokens, completion,
+    v4_prof_emit(elapsed, prompt_tokens, completion,
                  expert_disk_s, expert_wait_s, expert_matmul_s, attention_s,
-                 g_v4_prof_head_s - head_before, g_v4_prof_forwards - forwards_before);
+                 g_v4_prof_head_s - marks->head, g_v4_prof_forwards - marks->forwards);
 #ifdef COLI_V4_GPU_TIER
     if (coli_v4_hybrid_enabled() && (g_v4_hyb_gpu_n + g_v4_hyb_cpu_n +
                            g_v4_hyb_upload_n + g_v4_hyb_skip_n))
@@ -16132,7 +16426,153 @@ static int v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
                                &g_v4_mir_nread[r], __ATOMIC_RELAXED));
         fprintf(stderr, "%s\n", line);
     }
-    return 0;
+}
+
+/* ---- several conversations at once (KV_SLOTS>1) ---------------------------------
+ * The gateway's cache slots, each a conversation with a session of its own. A SUBMIT
+ * on a free slot is prefilled at once on that slot's session (its prompt cache works
+ * as a lone serve's) up to its first token. Then every step decodes the next token of
+ * each active request as one row of a batch (coli_v4_sessions_step). A request's frames
+ * are a lone request's; they interleave by id. As alone, STOP and CANCEL end a request
+ * with DONE. Nothing drafts: DSpark stays unloaded. */
+typedef struct {
+    V4ServeRequest request;
+    V4ServeStream stream;
+    V4ServeMarks marks;
+    ColiV4Session *session;
+    int active, stop;
+} V4MuxRequest;
+
+static void v4_mux_finish(ColiV4Engine *engine, V4MuxRequest *r, int cancelled) {
+    ColiV4Session *session = r->session;
+    int count = session->mux.count;
+    int eos = count > 0 && session->generated[count - 1] == 1;
+    r->active = 0;
+    v4_serve_finish(engine, session, r->request.id, &r->marks, count, eos, cancelled,
+                    r->request.max_tokens, session->prompt_count,
+                    count ? spec_now() - session->mux.first_at : 0.0);
+}
+
+static void v4_mux_start(ColiV4Engine *engine, V4MuxRequest *r) {
+    if (!v4_serve_admit(engine, r->session, &r->request)) return;
+    v4_serve_mark(engine, &r->marks);
+    r->stream = (V4ServeStream){r->session, r->request.id, 0, 0, r->request.logprobs, {0}, 1};
+#ifdef COLI_V4_GPU_TIER
+    coli_v4_gpu_kv_cache_invalidate_all();   /* the device's KV ring held another conversation */
+#endif
+    ColiV4SessionGenerateStats stats = {0};
+    char error[512] = {0};
+    int result = coli_v4_session_generate(
+        r->session, r->request.prompt, (size_t)r->request.prompt_bytes,
+        &(ColiV4SessionGenerateOptions){
+            .max_new_tokens = r->request.max_tokens,
+            .no_dspark = 1,
+            .prefix_bytes = (size_t)r->request.prefix_bytes,
+            .logprobs = r->request.logprobs,
+            .pin = r->request.pin,
+            .on_echo = r->request.logprobs > 0 ? v4_serve_echo : NULL,
+            .on_scores = r->request.logprobs > 0 ? v4_serve_scores : NULL,
+            .scores_user_data = &r->stream,
+            .prefill_only = 1,
+        },
+        v4_serve_token, &r->stream, &stats, error, sizeof(error));
+    if (result) {
+        v4_serve_error(stdout, r->request.id, error);
+        return;
+    }
+    if (r->session->mux.done) v4_mux_finish(engine, r, 0);
+    else r->active = 1;
+}
+
+static void v4_serve_mux(ColiV4Engine *engine, ColiV4Session **sessions, int n) {
+    V4MuxRequest *requests = calloc((size_t)n, sizeof(*requests));
+    ColiV4Session **rows = calloc((size_t)n, sizeof(*rows));
+    int *row_slot = calloc((size_t)n, sizeof(*row_slot));
+    if (!requests || !rows || !row_slot) {
+        fprintf(stderr, "[V4] out of memory for %d conversations\n", n);
+        free(row_slot); free(rows); free(requests);
+        return;
+    }
+    unsigned long long steps = 0, row_count = 0;
+    int input_eof = 0;
+    fprintf(stderr, "[V4] serving %d conversations at once (KV_SLOTS)\n", n);
+    for (;;) {
+        int active = 0;
+        for (int i = 0; i < n; i++) active += requests[i].active;
+        /* idle: wait for a command; decoding: take one only when one is there */
+        if (!input_eof && (!active || coli_stdin_readable())) {
+            ColiServeCommand command;
+            ColiServeReadResult result = coli_serve_read_command(stdin, &v4_wire, &command);
+            if (result == COLI_SERVE_READ_EOF || result == COLI_SERVE_READ_BAD_FRAME) {
+                input_eof = 1;
+            } else if (result == COLI_SERVE_READ_NOMEM) {
+                coli_serve_write_error(stdout, command.id, "out of memory");
+                input_eof = 1;
+            } else if (result == COLI_SERVE_READ_BAD_REQUEST) {
+                if (command.kind == COLI_SERVE_COMMAND_SUBMIT)
+                    coli_serve_write_error(stdout, command.id, "bad submit header");
+                coli_serve_command_dispose(&command);
+            } else if (result != COLI_SERVE_READ_OK) {
+                /* nothing to do */
+            } else if (command.kind == COLI_SERVE_COMMAND_STOP ||
+                       command.kind == COLI_SERVE_COMMAND_CANCEL) {
+                for (int i = 0; i < n; i++)
+                    if (requests[i].active && !strcmp(requests[i].request.id, command.id))
+                        requests[i].stop = 1;
+                coli_serve_command_dispose(&command);
+            } else if (command.kind != COLI_SERVE_COMMAND_SUBMIT) {
+                coli_serve_command_dispose(&command);
+            } else if (command.slot < 0 || command.slot >= n || requests[command.slot].active) {
+                coli_serve_write_error(stdout, command.id,
+                                       command.slot < 0 || command.slot >= n
+                                           ? "invalid cache slot" : "SLOT_BUSY");
+                coli_serve_command_dispose(&command);
+            } else {
+                V4MuxRequest *r = &requests[command.slot];
+                memset(r, 0, sizeof(*r));
+                r->session = sessions[command.slot];
+                v4_serve_take_submit(&command, &r->request);
+                v4_mux_start(engine, r);
+                free(r->request.prompt);
+                r->request.prompt = NULL;
+            }
+        }
+        active = 0;
+        for (int i = 0; i < n; i++) active += requests[i].active;
+        if (!active) {
+            if (input_eof) break;
+            continue;
+        }
+        int count = 0;
+        for (int i = 0; i < n; i++) {
+            if (!requests[i].active) continue;
+            if (requests[i].stop) {
+                v4_mux_finish(engine, &requests[i], 1);
+                continue;
+            }
+            rows[count] = sessions[i];
+            row_slot[count++] = i;
+        }
+        if (!count) continue;
+        char error[512] = {0};
+        if (coli_v4_sessions_step(rows, count, error, sizeof(error))) {
+            /* the step left every row's attention state part way: each request ends,
+             * and its conversation starts over (its prompt cache is tainted) */
+            for (int k = 0; k < count; k++) {
+                v4_serve_error(stdout, requests[row_slot[k]].request.id, error);
+                requests[row_slot[k]].active = 0;
+            }
+            continue;
+        }
+        steps++;
+        row_count += (unsigned long long)count;
+        for (int k = 0; k < count; k++)
+            if (sessions[row_slot[k]]->mux.done)
+                v4_mux_finish(engine, &requests[row_slot[k]], 0);
+    }
+    fprintf(stderr, "[V4] KV_SLOTS=%d: %llu decode steps, %llu rows (%.2f a step)\n", n,
+            steps, row_count, steps ? (double)row_count / (double)steps : 0.0);
+    free(row_slot); free(rows); free(requests);
 }
 
 static int v4_serve_main(void) {
@@ -16145,14 +16585,25 @@ static int v4_serve_main(void) {
     int max_tokens = getenv("NGEN") ? atoi(getenv("NGEN")) : 1024;
     if (context < 2) context = 4096;
     if (max_tokens < 1) max_tokens = 1024;
+    const char *slots_env = getenv("KV_SLOTS");   /* the conversations decoded at once */
+    if (slots_env && *slots_env) {
+        char *end = NULL;
+        long slots = strtol(slots_env, &end, 10);
+        if (end == slots_env || *end || slots < 1 || slots > 16) {
+            fprintf(stderr, "KV_SLOTS must be between 1 and 16\n");
+            return 2;
+        }
+        g_v4_mux_slots = (int)slots;
+    }
+    int n = g_v4_mux_slots;
     char error[512] = {0};
     ColiV4Engine *engine = NULL;
-    ColiV4Session *session = NULL;
+    ColiV4Session *sessions[16] = {0};
     ColiV4EngineOpenOptions open_options = {
         .target_model_dir = model_dir,
         .context_tokens = context,
         .pin_slots_per_layer = -1,
-        .no_dspark = 0,
+        .no_dspark = n > 1,   /* several conversations: nothing drafts */
     };
     const char *ram = getenv("RAM_GB");
     if (ram && atof(ram) > 0.0)
@@ -16165,17 +16616,20 @@ static int v4_serve_main(void) {
     }
     v4_vk_open(engine);
     context = engine->runtime.context_tokens;
-    if (coli_v4_session_create(
-            &session, engine,
-            &(ColiV4SessionCreateOptions){
-                .max_prompt_tokens = context,
-                .max_new_tokens_cap = max_tokens,
-            },
-            error, sizeof(error))) {
-        fprintf(stderr, "%s\n", error);
-        coli_v4_engine_destroy(engine);
-        return 1;
-    }
+    for (int i = 0; i < n; i++)
+        if (coli_v4_session_create(
+                &sessions[i], engine,
+                &(ColiV4SessionCreateOptions){
+                    .max_prompt_tokens = context,
+                    .max_new_tokens_cap = max_tokens,
+                },
+                error, sizeof(error))) {
+            fprintf(stderr, "%s\n", error);
+            for (int k = 0; k < i; k++) coli_v4_session_destroy(sessions[k]);
+            coli_v4_engine_destroy(engine);
+            return 1;
+        }
+    ColiV4Session *session = sessions[0];
 
     /* Eagerly load all dense layers so GPU upload happens at startup.
      * This avoids the 25s wall-clock gap between layers during the first
@@ -16196,7 +16650,8 @@ static int v4_serve_main(void) {
     v4_hwinfo_emit();
     coli_v4_expert_store_emit_tiers(engine->experts);
     coli_v4_expert_store_emit_emap(engine->experts);
-    for (;;) {
+    if (n > 1) v4_serve_mux(engine, sessions, n);
+    for (; n == 1;) {
         V4ServeRequest request = {0};
         int result;
         do result = v4_serve_read_request(stdin, stdout, &request, NULL);
@@ -16209,7 +16664,7 @@ static int v4_serve_main(void) {
         }
     }
     v4_vk_close();
-    coli_v4_session_destroy(session);
+    for (int i = 0; i < n; i++) coli_v4_session_destroy(sessions[i]);
     coli_v4_engine_destroy(engine);
     return 0;
 }

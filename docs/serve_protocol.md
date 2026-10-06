@@ -80,7 +80,12 @@ DECIDE <id> <slot> <bytes>\n<payload>\n
 - `slot` — KV slot index, `0 … KV_SLOTS-1` (`KV_SLOTS` env, 1–16, default 1). A slot
   holds one conversation's KV; the engine matches the tokenized payload against the
   slot's history and reuses the common prefix (truncate-and-extend), so stateless
-  HTTP turns keep their cache.
+  HTTP turns keep their cache. With `KV_SLOTS` above 1 every text engine takes a
+  `SUBMIT` on a free slot while others decode: its prompt is prefilled at once, and
+  from then on each decode step runs one row for every active request. The frames of
+  the requests interleave, each tagged with its `id`. A `SUBMIT` on a slot whose
+  request is still running gets `ERROR <id> SLOT_BUSY`; a slot out of range,
+  `ERROR <id> invalid cache slot`.
 - `bytes` — exact byte length of `payload` (UTF-8, may contain newlines). The engine
   reads exactly that many bytes after the header line, then one trailing `\n`.
 - `payload` — the fully rendered prompt (the server owns the chat template).
