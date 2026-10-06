@@ -100,6 +100,8 @@ typedef struct {
     VkPipeline gemm[VKC_GEMM_MAX]; int gemm_bm[VKC_GEMM_MAX], gemm_bn[VKC_GEMM_MAX], ngemm;
     VkPipeline dnrec[VKC_DNREC_MAX]; int dnrec_kd[VKC_DNREC_MAX], ndnrec;
     VkShaderModule mod_gemv4; VkPipeline gemv4; int gemv4_xs;   /* chain_gemv.comp: the vectorized decode GEMV */
+    /* chain_gemm.comp: int8/int4 prompt GEMMs, x rounded to f16 once (COLI_VK_CHAIN_GEMM) */
+    VkShaderModule mod_tg; VkPipeline tg;
     VkShaderModule mmod[PM_N]; VkPipeline mpipe[PM_N]; int mla_ok;   /* chain_mla, chain_hgemv, chain_dsa */
     /* chain_attn_flash.comp: the attention core on the matrix units for prompt chunks,
      * one pipeline per (head dim, query heads per kv head) */
@@ -370,6 +372,25 @@ int vkc_init(void) {
      * cooperative matrices, the shader's tiling assumes four of them */
     if (KC.core.coop_sg == 64) KC.mod_fa = load_module(KC.core.spv_path, "chain_attn_flash.spv");
     dsv4_init();
+    /* the int8/int4 prompt GEMM on the matrix units (chain_gemm.comp, subgroups of 64);
+     * COLI_VK_CHAIN_GEMM=0 leaves those formats to the GEMMs below */
+    {
+        const char *e = getenv("COLI_VK_CHAIN_GEMM");
+        if (KC.core.coop_sg == 64 && !(e && *e == '0') && (KC.mod_tg = load_module(KC.core.spv_path, "chain_gemm.spv"))) {
+            int32_t tt = 4;
+            VkSpecializationMapEntry me = {0, 0, 4};
+            VkSpecializationInfo si = {1, &me, 4, &tt};
+            VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss = {
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+                .requiredSubgroupSize = 64};
+            VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = &rss,
+                          .flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT,
+                          .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = KC.mod_tg, .pName = "main",
+                          .pSpecializationInfo = &si}, .layout = KC.pl};
+            if (vkCreateComputePipelines(KC.dev, VK_NULL_HANDLE, 1, &ci, NULL, &KC.tg) != VK_SUCCESS) KC.tg = VK_NULL_HANDLE;
+        }
+    }
     /* the fp32 tiled GEMM at the backend's tiles; none = every S on the GEMV */
     KC.mod_gemm = KC.core.gemm_tiles ? load_module(KC.core.spv_path, "qmatmul_gemm.spv") : VK_NULL_HANDLE;
     for (int k = 0; KC.mod_gemm && k < KC.core.gemm_tiles && k < VKC_GEMM_MAX; k++) {
@@ -755,6 +776,11 @@ static int matmul_aligned(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcB
         int rows_wg = 256 / lpr;   /* at least, at subgroups of 64 */
         int wg = (ti->O + rows_wg - 1) / rows_wg; if (wg > 1024) wg = 1024;
         ok = record(KC.gemv4, bd, 4, &pc7, sizeof pc7, (uint32_t)wg, (uint32_t)S, 1);
+    }
+    else if (path >= 0 && KC.tg && (ti->fmt == 1 || ti->fmt == 2 || (ti->fmt == 4 && ti->gs >= 8 && ti->gs % 8 == 0)) &&
+             ti->I % 64 == 0 && ti->O % 128 == 0 && ti->rowWords % 4 == 0) {
+        ok = record(KC.tg, bd, 4, &pc, sizeof pc, (uint32_t)((S + 63) / 64), (uint32_t)(ti->O / 128), 1);
+        KC.st.tile_gemms += ok;
     }
     else if (path >= 0)
         ok = record(KC.gemm[path], bd, 4, &pc, sizeof pc, (uint32_t)((ti->O + KC.gemm_bm[path] - 1) / KC.gemm_bm[path]),
@@ -1619,6 +1645,8 @@ void vkc_shutdown(void) {
         if (KC.mmod[i]) vkDestroyShaderModule(KC.dev, KC.mmod[i], NULL);
     }
     for (int i = 0; i < KC.ngemm; i++) vkDestroyPipeline(KC.dev, KC.gemm[i], NULL);
+    if (KC.tg) vkDestroyPipeline(KC.dev, KC.tg, NULL);
+    if (KC.mod_tg) vkDestroyShaderModule(KC.dev, KC.mod_tg, NULL);
     for (int i = 0; i < KC.ndnrec; i++) vkDestroyPipeline(KC.dev, KC.dnrec[i], NULL);
     if (KC.gemv4) vkDestroyPipeline(KC.dev, KC.gemv4, NULL);
     if (KC.mod_gemv4) vkDestroyShaderModule(KC.dev, KC.mod_gemv4, NULL);

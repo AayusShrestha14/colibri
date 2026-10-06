@@ -678,6 +678,7 @@ typedef struct {
     unsigned long long attn_blocked;   /* attention calls through chain_attnb (blocks of rows) */
     unsigned long long attn_flash;     /* attention calls through chain_attn_flash (matrix units) */
     unsigned long long attn_slices;    /* extra submissions that cut a long attention (COLI_VK_ATTN_SLICE) */
+    unsigned long long tile_gemms;     /* prompt matmuls through chain_gemm.comp (matrix units) */
 } VkcStats;
 void vkc_stats(VkcStats *st);
 /* COLI_VK_CHAIN_PROF=1: one stderr line of device time per kind of op */
