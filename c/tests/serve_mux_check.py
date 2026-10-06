@@ -146,8 +146,7 @@ def main():
         a, b = strip(want[k]), strip(got_all.get(rid, []))
         if rid in controls:
             # stopped or cancelled after its first token: what it sent is the start of the
-            # reference's, and it ends in DONE (a stop) or ERROR CANCELLED (a cancel), unless
-            # it was through before the command arrived
+            # reference's, and it has ended, unless it was through before the command arrived
             body, end = b[:-1], b[-1:]
             full = b == a
             # the bytes it sent, not the frames: an engine flushes the partial UTF-8 it
@@ -157,9 +156,9 @@ def main():
                                 if not f.startswith((b"DONE", b"ERROR")))
             if not full and body and text(body) == text(a)[:len(text(body))]:
                 body = a[:len(body)]
-            # a STOP ends in DONE, or in ERROR CANCELLED on an engine that treats it as one
-            # (qwen36 does, alone or not)
-            ends = [[b"DONE"], [b"ERROR CANCELLED"]] if controls[rid] == b"STOP" else [[b"ERROR CANCELLED"]]
+            # it ends as the engine ends one alone: DONE or ERROR CANCELLED (qwen36 treats a
+            # STOP as a cancel, OLMoE ends a cancel with DONE)
+            ends = [[b"DONE"], [b"ERROR CANCELLED"]]
             ok = len(body) >= 1 and body == a[:len(body)] and (full or end in ends)
             if not ok:
                 bad.append(f"{rid}: {controls[rid].decode()} after the first token gave {b}, the reference {a}")

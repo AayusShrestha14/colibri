@@ -123,6 +123,16 @@ typedef struct {
     int n, cap;
 } LCache;
 
+/* One conversation's KV for a multiplexed serve (KV_SLOTS>1, serve_mux below): its
+ * key and value rows and the record of the tokens they hold. The Model holds the
+ * conversation a prefill runs on (olm_seq_swap trades it for a parked one); a
+ * multiplexed decode step parks them all and reads each row's from its OlmRow. */
+typedef struct { float **K, **V; int kv_len, kv_hi; kv_prefix kvp; } OlmSeq;   /* kv_hi: the positions its KV pages reach */
+typedef struct { OlmSeq *seq; int pos; } OlmRow;
+static int g_olm_mux_slots = 1;   /* KV_SLOTS: the conversations a serve decodes at once */
+static OlmSeq *g_olm_mux_seq;      /* [slots]: the conversations the Model does not hold */
+static int g_olm_mux_cur;          /* the slot the Model holds, -1 when every one is parked */
+
 typedef struct {
     Cfg c;
     shards S;
@@ -165,6 +175,9 @@ typedef struct {
     uint8_t *is_queued;     /* [n_layers * n_experts], 1 if expert is currently in the prefetch queue */
     float pilot_conf_limit; /* CONF_LIMIT env: cumulative gate probability threshold (e.g. 0.92) */
     uint64_t *last_access;  /* [n_layers * n_experts], clock time when expert was last accessed */
+    /* A multiplexed decode step (olm_step_rows): row s is the token at
+     * mux_rows[s].pos of mux_rows[s].seq; NULL in every other forward. */
+    const OlmRow *mux_rows;
 } Model;
 
 static pthread_mutex_t g_pilot_mx = PTHREAD_MUTEX_INITIALIZER;
@@ -1234,14 +1247,17 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     for (int s = 0; s < S; s++) {
         rmsnorm_row(q + (int64_t)s*D, q + (int64_t)s*D, l->qn, D, c->eps);
         rmsnorm_row(k + (int64_t)s*D, k + (int64_t)s*D, l->kn, D, c->eps);
-        int pos = pos_base + s;
+        int pos = m->mux_rows ? m->mux_rows[s].pos : pos_base + s;
         for (int hh = 0; hh < H; hh++) { rope_head(q + (int64_t)s*D + hh*hd, pos, c); rope_head(k + (int64_t)s*D + hh*hd, pos, c); }
     }
-    /* scrive k,v nella kv-cache alle posizioni pos_base..pos_base+S-1 */
+    /* scrive k,v nella kv-cache alle posizioni pos_base..pos_base+S-1 (in un passo
+     * multiplexato: ogni riga alla sua, nella cache della sua conversazione) */
+    const OlmRow *mr = m->mux_rows;
     for (int s = 0; s < S; s++) for (int hh = 0; hh < H; hh++) {
-        int t = pos_base + s;
-        memcpy(m->K[layer] + ((int64_t)hh*m->max_t + t)*hd, k + (int64_t)s*D + hh*hd, hd*sizeof(float));
-        memcpy(m->V[layer] + ((int64_t)hh*m->max_t + t)*hd, vv + (int64_t)s*D + hh*hd, hd*sizeof(float));
+        int t = mr ? mr[s].pos : pos_base + s;
+        float *Kl = mr ? mr[s].seq->K[layer] : m->K[layer], *Vl = mr ? mr[s].seq->V[layer] : m->V[layer];
+        memcpy(Kl + ((int64_t)hh*m->max_t + t)*hd, k + (int64_t)s*D + hh*hd, hd*sizeof(float));
+        memcpy(Vl + ((int64_t)hh*m->max_t + t)*hd, vv + (int64_t)s*D + hh*hd, hd*sizeof(float));
     }
     int Tk = pos_base + S;             /* numero di key totali disponibili */
     float scale = 1.f / sqrtf((float)hd);
@@ -1249,11 +1265,12 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     #pragma omp parallel for collapse(2) schedule(static)
     for (int hh = 0; hh < H; hh++) {
         for (int s = 0; s < S; s++) {
-            int qpos = pos_base + s;
+            int qpos = mr ? mr[s].pos : pos_base + s;
+            const float *Kl = mr ? mr[s].seq->K[layer] : m->K[layer], *Vl = mr ? mr[s].seq->V[layer] : m->V[layer];
             const float *qv = q + (int64_t)s*D + hh*hd;
             float sc[4096];
             for (int t = 0; t <= qpos; t++) {          /* causale: t <= qpos */
-                const float *kv = m->K[layer] + ((int64_t)hh*m->max_t + t)*hd;
+                const float *kv = Kl + ((int64_t)hh*m->max_t + t)*hd;
                 float acc = dot_f32_lanes(qv, kv, hd);
                 sc[t] = acc * scale;
             }
@@ -1261,7 +1278,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             float *cx = ctx + (int64_t)s*D + hh*hd;
             for (int dd = 0; dd < hd; dd++) cx[dd] = 0;
             for (int t = 0; t <= qpos; t++) {
-                const float *vrow = m->V[layer] + ((int64_t)hh*m->max_t + t)*hd;
+                const float *vrow = Vl + ((int64_t)hh*m->max_t + t)*hd;
                 float a = sc[t];
                 for (int dd = 0; dd < hd; dd++) cx[dd] += a * vrow[dd];
             }
@@ -1813,6 +1830,54 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     return logit;
 }
 
+/* ---- several conversations at once (KV_SLOTS>1, serve_mux) ------------------- */
+static void olm_seq_swap(Model *m, OlmSeq *q) {
+    float **K = m->K, **V = m->V; int len = m->kv_len; kv_prefix p = m->kvp;
+    m->K = q->K; m->V = q->V; m->kv_len = q->kv_len; m->kvp = q->kvp;
+    q->K = K; q->V = V; q->kv_len = len; q->kvp = p;
+}
+
+/* One decode step of several conversations: row s is the token ids[s] at
+ * rows[s].pos of the conversation rows[s].seq, every conversation parked. The
+ * matrices, the routed experts and lm_head run once over the S rows; the attention
+ * reads and writes each row's own KV (m->mux_rows). The CPU kernels give a row the
+ * same bits whatever S is, so each conversation gets the logits it would alone. */
+static float *olm_step_rows(Model *m, const OlmRow *rows, const int *ids, int S) {
+    Cfg *c = &m->c; int D = c->hidden;
+    /* The KV and the expert cache share one room (kv_room_fit): the positions every
+     * conversation's KV reaches, summed, before this step's pages are written. */
+    for (int s = 0; s < S; s++) if (rows[s].pos + 1 > rows[s].seq->kv_hi) rows[s].seq->kv_hi = rows[s].pos + 1;
+    int reach = 0;
+    for (int i = 0; i < g_olm_mux_slots; i++) reach += g_olm_mux_seq[i].kv_hi;
+    kv_room_fit(m, reach);
+    if (g_pilot && m->token_count > 0) {
+        pthread_mutex_lock(&g_pilot_mx);
+        memset(m->is_queued, 0, (size_t)c->n_layers * c->n_experts);
+        pthread_mutex_unlock(&g_pilot_mx);
+    }
+    float *x = falloc((int64_t)S*D);
+    for (int s = 0; s < S; s++) memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
+    m->mux_rows = rows;
+    layers_forward_range(m, x, S, 0, 0, c->n_layers, 1);
+    m->mux_rows = NULL;
+    m->token_count += S; m->freq_token_count += S;
+    if (!m->hot_pinned && m->hot_n > 0 && m->freq_token_count >= m->warmup_tokens)
+        pin_hot_experts(m);
+    for (int s = 0; s < S; s++) {
+        OlmSeq *q = rows[s].seq;
+        q->kv_len = rows[s].pos + 1;
+        kv_prefix_record(&q->kvp, ids + s, rows[s].pos, 1);
+    }
+    float *last = falloc((int64_t)S*D), *logit = falloc((int64_t)S * c->vocab);
+    for (int s = 0; s < S; s++) rmsnorm_row(last + (int64_t)s*D, x + (int64_t)s*D, m->final_norm, D, c->eps);
+    double t_head = now_s();
+    MATMUL_RES(logit, last, m->lm_head, m->vk_lm_head, S, D, c->vocab);
+    g_prof_head_s += now_s() - t_head;
+    g_prof_forwards += 1;
+    free(x); free(last);
+    return logit;
+}
+
 static void pilot_realload(Model *m, int layer, int eid) {
     LCache *lc = &m->cache[layer];
     Cfg *c = &m->c;
@@ -2273,7 +2338,15 @@ static void serve_hits(Model *m) {
  * and the B arm of the A/B that shows reuse changes nothing but the time. */
 static int kv_prefix_off(void){ const char *e = getenv("COLI_KV_PREFIX"); return e && *e == '0'; }
 
-static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
+/* The counters when a request's prefill began: DONE and PROF report its share. */
+typedef struct { double t0, attn0, moe0, head0; uint64_t h0, m0, disk0; long long fwd0; } OlmReqClock;
+
+/* A request's prompt into the KV the Model holds: its tokens, the budget, the
+ * prefix reuse and the pins, the prefill and its read-out. 1 with the prompt's ids
+ * and the logits after it; 0 when the request ended here, its ERROR written.
+ * serve_one and serve_mux start every request here. */
+static int olm_serve_start(Model *m, Tok *T, SReq *q, int ctx_cap, int **ids_out, int *np_out,
+                           float **logit_out, OlmReqClock *clk) {
     Cfg *c = &m->c;
     int cap = q->plen + 16;
     int *ids = malloc((size_t)cap * sizeof(int));
@@ -2344,17 +2417,15 @@ static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
                     m->kvp.len, m->kvp.cap, np);
         fflush(stderr);
     }
-    double t0 = now_s();
-    uint64_t h0 = m->hits, m0 = m->miss;
-    uint64_t disk0 = __atomic_load_n(&m->disk_ns, __ATOMIC_RELAXED);
-    double attn0 = g_prof_attn_s, moe0 = g_prof_moe_s, head0 = g_prof_head_s;
-    long long fwd0 = g_prof_forwards;
+    clk->t0 = now_s();
+    clk->h0 = m->hits; clk->m0 = m->miss;
+    clk->disk0 = __atomic_load_n(&m->disk_ns, __ATOMIC_RELAXED);
+    clk->attn0 = g_prof_attn_s; clk->moe0 = g_prof_moe_s; clk->head0 = g_prof_head_s;
+    clk->fwd0 = g_prof_forwards;
     /* `reuse` is the ABSOLUTE position of the first fresh token: attention
      * and the KV rows are position-indexed, so this has to be the real
      * offset, not a count of what is left to do. */
     float *logit = step(m, ids + reuse, np - reuse, reuse);
-    int hist_len = np, gen = 0, limited = 1, cancelled = 0;
-    char buf[512];
     if (q->pin && logit) {
         coli_pin_pool_init(&g_pins, c->vocab);
         if (coli_pin_store(&g_pins, ids, np, logit)) {
@@ -2362,6 +2433,21 @@ static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
         }
     }
     g_echo_k = 0; g_echo_id = NULL;   /* la lettura riguarda il prefill, non la decodifica */
+    *ids_out = ids; *np_out = np; *logit_out = logit;
+    return 1;
+}
+
+static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
+    Cfg *c = &m->c;
+    int *ids = NULL, np = 0; float *logit = NULL; OlmReqClock clk;
+    if (!olm_serve_start(m, T, q, ctx_cap, &ids, &np, &logit, &clk)) return 0;
+    double t0 = clk.t0;
+    uint64_t h0 = clk.h0, m0 = clk.m0;
+    uint64_t disk0 = clk.disk0;
+    double attn0 = clk.attn0, moe0 = clk.moe0, head0 = clk.head0;
+    long long fwd0 = clk.fwd0;
+    int hist_len = np, gen = 0, limited = 1, cancelled = 0;
+    char buf[512];
     for (int s = 0; s < q->max_tok && !cancelled; s++) {
         int nt = pick_tok(logit, c->vocab, -1);
         char lptail[1024]; lptail[0] = 0;
@@ -2504,6 +2590,149 @@ static void serve_tiers_emap(Model *m) {
     fflush(stdout); free(hex);
 }
 
+/* ---- several conversations at once (KV_SLOTS>1) -------------------------------
+ * The gateway's cache slots, each a conversation with KV rows of its own (OlmSeq).
+ * A SUBMIT on a free slot starts its request at once through olm_serve_start, on
+ * that slot's KV: its prefix reuse and pins work as a lone serve's. Then every step
+ * picks the next token of each active request and runs one forward over a row of
+ * each (olm_step_rows): the matrices and the experts are read once for all of them.
+ * A request's frames are a lone request's; they interleave by id. As alone, CANCEL
+ * ends a request with DONE and STOP is not read. */
+
+typedef struct {
+    SReq q;
+    int active, cancel, limited;
+    int *ids, np, gen;
+    float *lo;                  /* the logits the next pick reads */
+    OlmReqClock clk;
+} OlmMuxReq;
+
+static void olm_mux_bind(Model *m, int slot) {
+    if (g_olm_mux_cur == slot) return;
+    if (g_olm_mux_cur >= 0) olm_seq_swap(m, &g_olm_mux_seq[g_olm_mux_cur]);
+    if (slot >= 0) olm_seq_swap(m, &g_olm_mux_seq[slot]);
+    g_olm_mux_cur = slot;
+}
+
+/* A request's end, as serve_one ends one. */
+static void olm_mux_finish(Model *m, OlmMuxReq *r) {
+    free(r->lo); r->lo = NULL; free(r->ids); r->ids = NULL; r->active = 0;
+    if (r->cancel) r->limited = 0;
+    double dt = now_s() - r->clk.t0;
+    double tot = (double)(m->hits - r->clk.h0 + m->miss - r->clk.m0);
+    ColiServeDone done = {
+        .completion_tokens = r->gen,
+        .tokens_per_second = dt > 0 ? r->gen/dt : 0.0,
+        .cache_hit_percent = tot ? 100.0*(m->hits-r->clk.h0)/tot : 0.0,
+        .rss_gb = rss_gb(),
+        .prompt_tokens = r->np,
+        .length_limited = r->limited,
+    };
+    coli_serve_write_done(stdout, r->q.id, &done);
+    double disk_s = (double)(__atomic_load_n(&m->disk_ns, __ATOMIC_RELAXED) - r->clk.disk0) / 1e9;
+    double matmul_s = (g_prof_moe_s - r->clk.moe0) - disk_s; if (matmul_s < 0.0) matmul_s = 0.0;
+    printf("PROF %.6f %d %d %.6f 0.0 %.6f %.6f %.6f %lld\n", dt, r->np, r->gen, disk_s, matmul_s,
+           g_prof_attn_s - r->clk.attn0, g_prof_head_s - r->clk.head0, g_prof_forwards - r->clk.fwd0);
+    fflush(stdout);
+    serve_hits(m);
+}
+
+/* The next token of an active request, as serve_one's loop picks and sends it: 1
+ * with the token when the request goes on, 0 when it ended. */
+static int olm_mux_pick(Model *m, Tok *T, OlmMuxReq *r, int ctx_cap, int *tk_out) {
+    Cfg *c = &m->c;
+    if (r->cancel || r->gen >= r->q.max_tok) { olm_mux_finish(m, r); return 0; }
+    g_temp = r->q.temp; g_nuc = r->q.top_p;
+    int nt = pick_tok(r->lo, c->vocab, -1);
+    char lptail[1024]; lptail[0] = 0;
+    if (r->q.logprobs > 0) coli_logprob_tail(lptail, sizeof lptail, r->lo, c->vocab, nt, r->q.logprobs);
+    free(r->lo); r->lo = NULL;
+    if (is_stop(nt)) { r->limited = 0; olm_mux_finish(m, r); return 0; }
+    char buf[512];
+    int nb = tok_decode(T, &nt, 1, buf, sizeof(buf)-1);
+    if (r->q.logprobs > 0) coli_serve_write_data_lp(stdout, r->q.id, buf, (size_t)nb, lptail);
+    else coli_serve_write_data(stdout, r->q.id, buf, (size_t)nb);
+    r->gen++;
+    if (r->gen >= r->q.max_tok || r->np + r->gen >= ctx_cap) { olm_mux_finish(m, r); return 0; }
+    *tk_out = nt; return 1;
+}
+
+static void serve_mux(Model *m, Tok *T, int ctx_cap) {
+    int n = g_olm_mux_slots, V = m->c.vocab, input_eof = 0;
+    OlmMuxReq *rq = calloc((size_t)n, sizeof *rq);
+    OlmRow *rows = malloc((size_t)n * sizeof *rows);
+    int *tok = malloc((size_t)n * sizeof(int)), *who = malloc((size_t)n * sizeof(int));
+    if (!rq || !rows || !tok || !who) { fprintf(stderr, "[serve] out of memory\n"); exit(1); }
+    unsigned long long steps = 0, nrows = 0;
+    fprintf(stderr, "[olmoe] serving %d conversations at once (KV_SLOTS)\n", n);
+    for (;;) {
+        int active = 0; for (int i = 0; i < n; i++) active += rq[i].active;
+        /* idle: wait for a command; decoding: take one only when one is there */
+        if (!input_eof && (!active || coli_stdin_readable())) {
+            ColiServeCommand command;
+            ColiServeReadResult result = coli_serve_read_command(stdin, &olmoe_wire, &command);
+            if (result == COLI_SERVE_READ_EOF || result == COLI_SERVE_READ_BAD_FRAME) input_eof = 1;
+            else if (result == COLI_SERVE_READ_NOMEM) { coli_serve_write_error(stdout, command.id, "out of memory"); input_eof = 1; }
+            else if (result == COLI_SERVE_READ_BAD_REQUEST) {
+                if (command.kind == COLI_SERVE_COMMAND_SUBMIT) coli_serve_write_error(stdout, command.id, "bad submit header");
+                coli_serve_command_dispose(&command);
+            } else if (result == COLI_SERVE_READ_OK) {
+                if (command.kind == COLI_SERVE_COMMAND_CANCEL) {
+                    for (int i = 0; i < n; i++) if (rq[i].active && !strcmp(rq[i].q.id, command.id)) rq[i].cancel = 1;
+                } else if (command.kind == COLI_SERVE_COMMAND_SUBMIT) {
+                    if (command.slot < 0 || command.slot >= n) coli_serve_write_error(stdout, command.id, "invalid cache slot");
+                    else if (rq[command.slot].active) coli_serve_write_error(stdout, command.id, "cache slot busy");
+                    else {
+                        OlmMuxReq *t = &rq[command.slot];
+                        memset(t, 0, sizeof *t);
+                        snprintf(t->q.id, sizeof(t->q.id), "%s", command.id);
+                        t->q.max_tok = command.max_tokens; t->q.logprobs = command.logprobs; t->q.pin = command.pin;
+                        t->q.temp = command.temperature; t->q.top_p = command.top_p;
+                        t->q.payload = (char *)coli_serve_command_take_payload(&command);
+                        t->q.plen = (int)command.payload_bytes;
+                        olm_mux_bind(m, command.slot);
+                        int ok = olm_serve_start(m, T, &t->q, ctx_cap, &t->ids, &t->np, &t->lo, &t->clk);
+                        free(t->q.payload); t->q.payload = NULL;
+                        if (ok) {
+                            t->active = 1; t->limited = 1;
+                            if (t->np > g_olm_mux_seq[command.slot].kv_hi) g_olm_mux_seq[command.slot].kv_hi = t->np;
+                        }
+                    }
+                }
+                coli_serve_command_dispose(&command);
+            }
+        }
+        active = 0; for (int i = 0; i < n; i++) active += rq[i].active;
+        if (!active) { if (input_eof) break; continue; }
+        int S = 0, ended = 0;
+        for (int i = 0; i < n; i++) if (rq[i].active) {
+            int tk;
+            if (!olm_mux_pick(m, T, &rq[i], ctx_cap, &tk)) { ended = 1; continue; }
+            rows[S] = (OlmRow){&g_olm_mux_seq[i], rq[i].np + rq[i].gen - 1}; tok[S] = tk; who[S] = i; S++;
+        }
+        if (S) {
+            olm_mux_bind(m, -1);   /* every conversation parked: the rows read theirs */
+            float *lo = olm_step_rows(m, rows, tok, S);
+            steps++; nrows += (unsigned long long)S;
+            for (int s = 0; s < S; s++) {
+                OlmMuxReq *t = &rq[who[s]];
+                t->lo = falloc(V); memcpy(t->lo, lo + (int64_t)s * V, (size_t)V * sizeof(float));
+            }
+            free(lo);
+        }
+        if (ended) {
+#ifdef COLI_VULKAN
+            olmoe_vk_report(); vkt_report("turn", m->hits, m->miss);
+#endif
+            serve_tiers_emap(m);
+        }
+    }
+    fprintf(stderr, "[olmoe] KV_SLOTS=%d: %llu decode steps, %llu rows (%.2f a step)\n", n, steps, nrows,
+            steps ? (double)nrows / (double)steps : 0.0);
+    olm_mux_bind(m, 0);
+    free(rq); free(rows); free(tok); free(who);
+}
+
 static void serve_loop(Model *m, Tok *T, int ctx_cap) {
     coli_serve_stdio_init();
     int tok_eos = tok_id_of(T, "|||IP_ADDRESS|||");
@@ -2511,6 +2740,7 @@ static void serve_loop(Model *m, Tok *T, int ctx_cap) {
     coli_serve_write_ready(stdout, rss_gb());
     serve_hwinfo(m);
     serve_tiers_emap(m);
+    if (g_olm_mux_slots > 1) { serve_mux(m, T, ctx_cap); return; }
     for (;;) {
         while (!g_qn) if (serve_read_cmd(stdin, stdout, NULL) < 0) return;
         SReq q = g_q[0];
@@ -2590,6 +2820,12 @@ int main(int argc, char **argv) {
      * the dashboard) — same protocol as colibri.c/inkling.c/kimi_k3.c. v1:
      * one request at a time, full re-prefill every turn (see serve_one()). */
     if (getenv("SERVE") && getenv("SERVE")[0] == '1') {
+        const char *ks = getenv("KV_SLOTS");   /* the conversations decoded at once */
+        if (ks && *ks) {
+            char *end = NULL; long v = strtol(ks, &end, 10);
+            if (end == ks || *end || v < 1 || v > 16) { fprintf(stderr, "KV_SLOTS must be between 1 and 16\n"); return 2; }
+            g_olm_mux_slots = (int)v;
+        }
         int ctx_cap = getenv("CTX") ? atoi(getenv("CTX")) : 4096;
         if (ctx_cap < 1 || ctx_cap > 4096) {   /* attention()'s sc[4096] score buffer hard-caps this */
             fprintf(stderr, "CTX must be 1..4096 (got %d)\n", ctx_cap);
@@ -2614,6 +2850,22 @@ int main(int argc, char **argv) {
          * CLI paths (generate/run_chat/PPL) leave it unallocated, which makes
          * every kv_prefix call there a no-op. */
         kv_prefix_alloc(&m.kvp, m.max_t);
+        if (g_olm_mux_slots > 1) {   /* slot 0 is the Model's own KV */
+            g_olm_mux_seq = calloc((size_t)g_olm_mux_slots, sizeof *g_olm_mux_seq);
+            for (int s = 1; g_olm_mux_seq && s < g_olm_mux_slots; s++) {
+                OlmSeq *q = &g_olm_mux_seq[s];
+                q->K = calloc(m.c.n_layers, sizeof(float*)); q->V = calloc(m.c.n_layers, sizeof(float*));
+                for (int i = 0; i < m.c.n_layers; i++) {
+                    q->K[i] = falloc((int64_t)m.c.n_heads * m.max_t * m.c.head_dim);
+                    q->V[i] = falloc((int64_t)m.c.n_heads * m.max_t * m.c.head_dim);
+                }
+                kv_prefix_alloc(&q->kvp, m.max_t);
+            }
+            if (!g_olm_mux_seq) { fprintf(stderr, "[serve] out of memory for %d conversations\n", g_olm_mux_slots); return 1; }
+            g_olm_mux_cur = 0;
+            fprintf(stderr, "[olmoe] KV_SLOTS=%d: nothing drafts, each conversation has %d positions of KV\n",
+                    g_olm_mux_slots, m.max_t);
+        }
         Tok T;
         char tokpath[2048]; snprintf(tokpath, sizeof(tokpath), "%s/tokenizer.json", snap);
         tok_load(&T, tokpath);

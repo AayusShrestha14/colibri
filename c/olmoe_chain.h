@@ -609,6 +609,11 @@ static void olc_start(Model *m) {
     if (!g_vk_ready) return;
     /* measured on a Radeon 780M (docs/vulkan.md, "OLMoE and Inkling") */
     g_vk_chain = coli_vk_chain_decide("olmoe", vkt_ready(), OLMOE_CHAIN_IGPU);
+    if (g_vk_chain && g_olm_mux_slots > 1) {
+        g_vk_chain = 0;
+        fprintf(stderr, "[VK] olmoe: KV_SLOTS=%d: the dense chain is off (it keeps one conversation's KV on the device); "
+                        "the expert tier runs every conversation's experts\n", g_olm_mux_slots);
+    }
     if (g_olc_fit_on) {   /* the chain was set up in model_init (olc_place) */
         OlmChain *ch = (OlmChain *)m->vkchain;
         if (!(ch && ch->ok)) g_vk_chain = 0;   /* N = 0, or no layer reached the device */
