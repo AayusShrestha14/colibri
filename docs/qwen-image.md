@@ -278,6 +278,16 @@ convolutions as a band's taps and one GEMM, the norms, the shortcuts; the mid bl
 attention over every pixel on the CPU), with the CPU's decode as the fallback. The
 text encoder runs on the CPU.
 
+A card whose free memory does not hold the transformer (it is 7.1 GB in int8: a 6 or
+8 GB card) keeps the blocks that fit and uploads the others at every step, two at a
+time, each going up while the block before it runs; their matrices never go through
+the one-by-one path, so the device is not asked for more memory than it has. The
+start says how many blocks stay (`[VK] qwenimage: 9 of 32 blocks stay on the
+device`), and `COLI_VK_QI_RESIDENT=n` forces the number. On the 780M, streaming
+every block costs 0.3 s on a 512x512 step (5.64 s against 5.35); a discrete card
+moves them over PCIe, about 6.5 GB a step. With blocks streamed, the VAE decodes on
+the CPU.
+
 Measured on a Radeon 780M (an integrated GPU sharing the RAM of the 8-core Zen 4
 above), 8 steps:
 

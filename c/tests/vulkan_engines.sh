@@ -913,6 +913,11 @@ QIPY
   done
   qi_chain "qwenimage chain, the attention in slices" 32 COLI_VK_ATTN_SLICE=60000
   grep -qa 'qwenimage chain: [0-9]* steps' qi-vk.log || { cat qi-vk.log; fail "qwenimage chain, slices: no step on the device"; }
+  # a device that holds one block of the two, or none: the others go up each step
+  for r in 1 0; do
+    qi_chain "qwenimage chain, $r of 2 blocks resident" 8 COLI_VK_QI_RESIDENT=$r
+    grep -qa "qwenimage chain: $((2 - r)) blocks streamed" qi-vk.log || { cat qi-vk.log; fail "qwenimage chain, $r resident: no block streamed"; }
+  done
   qi_chain "qwenimage chain, the device lost" 32 COLI_VK_CHAIN_FAULT=9
   grep -qa 'qwenimage chain: a frame failed' qi-vk.log || { cat qi-vk.log; fail "qwenimage chain, device lost: no loss handled"; }
   COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_IMG_BITS=8 COLI_IMG_ACT8=0 ./qwenimage --model qwenimage_tiny --prompt "a red fox in the snow" \
@@ -1263,7 +1268,7 @@ family_kimi_mimo_sanitize() {
   # qwenimage's DiT on the chain: the oracle, then the attention in slices
   $PY tools/make_qwenimage_tiny.py qwenimage_tiny
   local qa
-  for qa in COLI_VK_ATTN_SLICE=0 COLI_VK_ATTN_SLICE=60000; do
+  for qa in COLI_VK_ATTN_SLICE=0 COLI_VK_ATTN_SLICE=60000 COLI_VK_QI_RESIDENT=0; do
     env ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2 \
       COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_IMG_BITS=32 COLI_IMG_ACT8=0 $qa ./qwenimage --model qwenimage_tiny --ref qwenimage_tiny/ref \
       > san.log 2>&1 || { cat san.log; fail "asan qwenimage chain $qa: the oracle"; }

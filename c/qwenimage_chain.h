@@ -24,11 +24,21 @@
  * tiles, the softmax online), so a prediction agrees with the CPU's to rounding: the
  * oracle (tests/vulkan_engines.sh, mimo-qwenimage) holds every stage to its tolerance.
  *
+ * A device whose free memory does not hold every block (an 8 GB card: the int8 DiT is
+ * 7.1 GB) keeps blocks 0..R-1 and uploads the others each step, two at a time: block l
+ * goes up while block l-1 runs, into the place block l-2 leaves once its frame is
+ * through (qic_plan decides R when the weights load, from the device's free memory less
+ * the steps' buffers and COLI_VK_TIER_RESERVE_GB; COLI_VK_QI_RESIDENT=n forces it). The
+ * streamed blocks' matrices then stay off the per-matrix path (the prompt's prefix, a
+ * step the chain does not take: on the CPU), so nothing asks the device for more than it
+ * has, and the VAE decodes on the CPU.
+ *
  * Declines (the CPU's path runs, its matrices on the device one by one as before):
  * COLI_VK_CHAIN off, a matrix the device does not take, the device's memory refusing a
  * buffer. A device lost in a step: the step runs again on the CPU, and the CPU runs from
  * there (the latents are the host's). */
 #include "vk_chain.h"
+#include "vk_kvsplit.h"   /* vkc_dev_avail */
 
 typedef struct {
     int ok, failed;
@@ -44,6 +54,10 @@ typedef struct {
     VkcBuf **pk, **pv;           /* per block, the prompt's keys (permuted) and values, [L][D] */
     unsigned long long steps;
     double wait_ms;
+    int resident, streamed;      /* blocks the device keeps (0..resident-1), blocks uploaded each step */
+    int slot[2];                 /* the streamed block in each of the two places (-1: none) */
+    unsigned long long ser[2];   /* the frame that last read it */
+    unsigned long long stream_bytes;
 } QiChain;
 
 static QiChain g_qic;
@@ -63,10 +77,81 @@ static void qic_off(const char *why) {
     g_qic.failed = 1;
 }
 
-/* The weights and the norms, once: the same device copies the per-matrix path uses. */
+static void qic_block_mats(DitBlock *B, Lin **m) {
+    m[0] = &B->q; m[1] = &B->k; m[2] = &B->v; m[3] = &B->o; m[4] = &B->gate; m[5] = &B->proj; m[6] = &B->out;
+}
+static size_t qic_block_bytes(DitBlock *B) {
+    Lin *m[7]; qic_block_mats(B, m);
+    size_t b = 0;
+    for (int k = 0; k < 7; k++) {
+        int fmt = m[k]->m.fmt == QI_I8 ? 1 : m[k]->m.fmt == QI_BF16 ? 11 : 10;
+        b += coli_vk_tensor_payload(fmt, m[k]->m.K, m[k]->m.N, 0) + coli_vk_buffer_alignment();
+    }
+    return b;
+}
+/* When the weights load, before anything goes up: whether the chain runs, and how many
+ * blocks the device keeps (all, or what its free memory holds after a 1024x1024 step's
+ * buffers, a prompt of 256 tokens' keys and values and COLI_VK_TIER_RESERVE_GB). */
+static void qic_plan(Dit *d) {
+    g_qic_on = vkc_init() && coli_vk_chain_decide("qwenimage", -1, COLI_VK_CHAIN_ON) == COLI_VK_CHAIN_ON;
+    int L = d->layers, R = L;
+    size_t block = qic_block_bytes(&d->B[0]), avail = 0;
+    const char *e = getenv("COLI_VK_QI_RESIDENT");
+    if (e && *e) R = atoi(e) < 0 ? 0 : atoi(e) > L ? L : atoi(e);
+    else if (coli_vk_dense()) {
+        size_t N = 4096, T = N + 256, D = d->dim, M = d->mlp;
+        size_t work = 4 * (3 * N * D + 2 * N * M + (N + 2 * T) * D + 2 * (size_t)L * 256 * D) + 2 * block;
+        avail = vkc_dev_avail();
+        size_t room = avail / 10 * 8, need = vkc_fit_reserve() + work;
+        room = room > need ? room - need : 0;
+        R = block ? (int)(room / block) : L;
+        if (R > L) R = L;
+    }
+    g_qic.resident = R; g_qic.streamed = L - R; g_qic.slot[0] = g_qic.slot[1] = -1;
+    if (R == L) return;
+    for (int l = R; l < L; l++) {   /* the per-matrix path leaves them on the CPU */
+        Lin *m[7]; qic_block_mats(&d->B[l], m);
+        for (int k = 0; k < 7; k++) m[k]->gpu = 0;
+    }
+    char why[96];
+    if (e && *e) snprintf(why, sizeof why, "COLI_VK_QI_RESIDENT=%s", e);
+    else snprintf(why, sizeof why, "%.1f GiB free on the device", avail / 1073741824.0);
+    if (g_qic_on)
+        fprintf(stderr, "[VK] qwenimage: %d of %d blocks stay on the device (%s); the other %d go up each step, "
+                        "the VAE decodes on the CPU\n", R, L, why, L - R);
+    else
+        fprintf(stderr, "[VK] qwenimage: %d of %d blocks' matrices on the device (%s); the other %d run on the CPU\n",
+                R, L, why, L - R);
+}
+
+/* A streamed block's matrices up, into the place block l-2 leaves once its frame is
+ * through */
+static void qic_unstream(Dit *d, int s) {
+    if (g_qic.slot[s] < 0) return;
+    Lin *m[7]; qic_block_mats(&d->B[g_qic.slot[s]], m);
+    for (int k = 0; k < 7; k++) if (m[k]->vk) { coli_vk_tensor_free((ColiVkTensor *)m[k]->vk); m[k]->vk = NULL; }
+    g_qic.slot[s] = -1;
+}
+static int qic_stream(Dit *d, int l) {
+    int s = l & 1;
+    if (g_qic.slot[s] >= 0) {
+        if (!vkc_wait_serial(g_qic.ser[s])) return 0;
+        qic_unstream(d, s);
+    }
+    Lin *m[7]; qic_block_mats(&d->B[l], m);
+    g_qic.slot[s] = l;
+    for (int k = 0; k < 7; k++) {
+        if (!qic_tensor(m[k])) return 0;
+        g_qic.stream_bytes += coli_vk_tensor_bytes((ColiVkTensor *)m[k]->vk);
+    }
+    return 1;
+}
+
+/* The weights and the norms, once: the same device copies the per-matrix path uses
+ * (the blocks the device keeps; the streamed ones go up each step). */
 static int qic_setup(Dit *d) {
     int H = d->hd, Lr = d->layers;
-    for (int l = 0; l < Lr; l++) {
+    for (int l = 0; l < g_qic.resident; l++) {
         DitBlock *B = &d->B[l];
         Lin *m[7] = {&B->q, &B->k, &B->v, &B->o, &B->gate, &B->proj, &B->out};
         for (int k = 0; k < 7; k++)
@@ -86,7 +171,7 @@ static int qic_setup(Dit *d) {
     g_qic.mod = vkc_buf(5 * (size_t)d->dim * sizeof(float), VKC_UP);
     if (!ok || !g_qic.pk || !g_qic.pv || !g_qic.mod) { qic_off("the device refused the parameters' buffer"); return 0; }
     g_qic.ok = 1;
-    fprintf(stderr, "[VK] qwenimage chain: %d blocks on the device\n", Lr);
+    fprintf(stderr, "[VK] qwenimage chain: %d blocks on the device\n", Lr);   /* resident or streamed */
     return 1;
 }
 
@@ -154,9 +239,7 @@ static int qic_attn(const VkcEncAttn *at, int N, int L) {
 
 /* One denoising step on the device: out[N][in_ch]. 0: not taken (the CPU runs it). */
 static int qic_forward(Dit *d, const Prefix *p, DitStep *s, const float *lat, float t, float *out) {
-    if (g_qic_on < 0) g_qic_on = g_vk_ready && vkc_init() &&
-                                 coli_vk_chain_decide("qwenimage", -1, COLI_VK_CHAIN_ON) == COLI_VK_CHAIN_ON;
-    if (!g_qic_on || g_qic.failed || vkc_lost()) return 0;
+    if (g_qic_on <= 0 || g_qic.failed || vkc_lost()) return 0;
     if (!g_qic.ok && !qic_setup(d)) return 0;
     int N = s->N, L = p->L, D = d->dim, H = d->heads, hd = d->hd, M = d->mlp, C = d->in_ch;
     if (hd > 128 || D > 4096 || hd % 2) { qic_off("a head or a row its ops do not take"); return 0; }
@@ -196,6 +279,7 @@ static int qic_forward(Dit *d, const Prefix *p, DitStep *s, const float *lat, fl
              vkc_matmul(qic_tensor(&d->img_in), g_qic.lat, 0, g_qic.x, 0, N);
     for (int l = 0; ok && l < d->layers; l++) {
         DitBlock *B = &d->B[l];
+        if (l >= g_qic.resident && !qic_stream(d, l)) { ok = 0; break; }
         VkcNorm nq = {N * H, hd, H, 0, D, hd, 0, D, hd, l * 2 * hd, 0, 0, d->eps, 1.f}, nk = nq;
         nk.x_off = nk.y_off = (int)(KO + (size_t)L * D); nk.w_off = l * 2 * hd + hd;
         ok = vkc_enc_norm(g_qic.x, NULL, g_qic.mod, g_qic.h, &n1) &&
@@ -214,11 +298,17 @@ static int qic_forward(Dit *d, const Prefix *p, DitStep *s, const float *lat, fl
              vkc_ew(g_qic.g, g_qic.g, g_qic.u, NULL, NULL, &sw) &&
              vkc_matmul(qic_tensor(&B->out), g_qic.g, 0, g_qic.h, 0, N) &&
              vkc_ew(g_qic.x, g_qic.x, g_qic.h, NULL, g_qic.mod, &g2) &&
-             vkc_submit(0) && vkc_begin();   /* a submission a block: no single one runs for seconds */
+             vkc_submit(0);   /* a submission a block: no single one runs for seconds */
+        if (ok && l >= g_qic.resident) g_qic.ser[l & 1] = vkc_serial();
+        ok = ok && vkc_begin();
     }
     ok = ok && vkc_enc_norm(g_qic.x, NULL, g_qic.mod, g_qic.h, &no) &&
          vkc_matmul(qic_tensor(&d->proj_out), g_qic.h, 0, g_qic.pred, 0, N) &&
          vkc_copy(g_qic.predd, 0, g_qic.pred, 0, (size_t)N * C) && vkc_submit(1);
+    if (g_qic.streamed) {   /* every frame is through: the streamed blocks' places are free */
+        if (!ok && !vkc_lost()) vkc_finish();
+        qic_unstream(d, 0); qic_unstream(d, 1);
+    }
     if (!ok) {
         if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(0); }
         qic_off("a frame failed (the device was lost); this step runs again on the CPU");
@@ -236,5 +326,8 @@ static void qic_report(void) {
     fprintf(stderr, "[VK] qwenimage chain: %llu steps, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
                     "%.1f ms waiting for the device, %.1f MiB on the device\n",
             g_qic.steps, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, st.dev_bytes / 1048576.0);
+    if (g_qic.streamed)
+        fprintf(stderr, "[VK] qwenimage chain: %d blocks streamed, %.1f MiB uploaded\n", g_qic.streamed,
+                g_qic.stream_bytes / 1048576.0);
     vkc_prof_print();
 }

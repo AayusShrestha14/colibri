@@ -541,6 +541,9 @@ static void dit_config(Dit *d, const char *model){
     }
 }
 
+#ifdef COLI_VULKAN
+static void qic_plan(Dit *d);   /* qwenimage_chain.h: the blocks the device keeps */
+#endif
 static void dit_load(Dit *d, const char *model){
     if (d->loaded) return;
     char dir[2048]; snprintf(dir, sizeof dir, "%s/transformer", model);
@@ -588,7 +591,10 @@ static void dit_load(Dit *d, const char *model){
             now_s() - t0);
 #ifdef COLI_VULKAN
     /* after the DiT's weights, once: a missing device costs one line */
-    if (!g_vk_tried) { g_vk_tried = 1; g_vk_ready = coli_vk_init_env("qwenimage"); }
+    if (!g_vk_tried) {
+        g_vk_tried = 1; g_vk_ready = coli_vk_init_env("qwenimage");
+        if (g_vk_ready) qic_plan(d);   /* before the prompt's prefix uploads anything */
+    }
 #endif
 }
 
@@ -771,7 +777,7 @@ static void dit_step_free(DitStep *s){
  * device's decode fails) the CPU's. */
 static int qi_vae_decode(QiVae *v, const float *z, int h, int w, uint8_t *rgba, float *out_f){
 #ifdef COLI_VULKAN
-    if (g_qic_on > 0 && !g_qic.failed && qvv_decode(v, z, h, w, rgba, out_f) == 0) return 0;
+    if (g_qic_on > 0 && !g_qic.failed && !g_qic.streamed && qvv_decode(v, z, h, w, rgba, out_f) == 0) return 0;
 #endif
     return qiv_decode(v, z, h, w, rgba, out_f);
 }
@@ -1462,6 +1468,7 @@ static void usage(void){
         "       COLI_IMG_ACT8=0  f32 activations in the DiT (default where VNNI exists: int8, about 2x per step)\n"
         "       COLI_IMG_TE=resident|stage  keep the text encoder loaded between prompts (serve default: resident)\n"
         "       COLI_IMG_LOAD_THREADS=n  layers loaded at once (default 4)\n"
+        "       COLI_VK_QI_RESIDENT=n  transformer blocks kept on the GPU (default: what its free memory holds)\n"
         "       COLI_VULKAN=1 (a VK=1 build): the transformer on the GPU; COLI_VK_CHAIN=0 keeps each step's blocks\n"
         "                    off the device chain (the matrices one by one)\n");
 }
