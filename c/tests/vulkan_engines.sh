@@ -4296,11 +4296,11 @@ mux_gate() {  # <engine> <snapshot> <slots> <env...>
   fi
   echo "${SAN:+asan }$out${MUX_LONG:+ (prompts $MUX_LONG times longer)}${1:+ [$*]}"
 }
-mux_engine() {  # <engine> <snapshot> <env...>; VKENV: more environment for the Vulkan gate
+mux_engine() {  # <engine> <snapshot> <env...>; VKENV: more environment for the Vulkan gate, VKTOL its bound
   local eng=$1 snap=$2 vk=(${VKENV:-}); shift 2
   mux_gate "$eng" "$snap" 4 "$@"
   MUX_LONG=3 mux_gate "$eng" "$snap" 3 "$@"
-  MUX_TOL=1e-4 mux_gate "$eng" "$snap" 4 COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 COLI_VK_CHAIN=0 "${vk[@]}" "$@"
+  MUX_TOL=${VKTOL:-1e-4} mux_gate "$eng" "$snap" 4 COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 COLI_VK_CHAIN=0 "${vk[@]}" "$@"
 }
 mux_build() {  # <make targets...>
   if [ "${SAN:-0}" = 1 ]; then
@@ -4339,7 +4339,9 @@ family_mux() {
   VKENV=K3_IDOT=0 mux_engine kimi_k3 kimi_k3_tiny
   $PY tools/make_mimo_tiny.py --output ./mimo_tiny --force --vision
   mimo_served_fixture
-  mux_engine mimo mimo_tiny_served
+  # MiMo's logprobs reach -270: the device's sums move their last digits by up to 1.5e-4
+  # (6e-7 of the value), so its gate takes the family's 1e-3, as vulkan_chain_serve.py's
+  VKTOL=1e-3 mux_engine mimo mimo_tiny_served
   make clean >/dev/null 2>&1 || true
 }
 family_mux_deepseek() {
