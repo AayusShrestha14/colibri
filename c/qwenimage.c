@@ -762,6 +762,19 @@ static void dit_step_free(DitStep *s){
 
 #ifdef COLI_VULKAN
 #include "qwenimage_chain.h"   /* COLI_VK_CHAIN: every block of a step on the device */
+#ifdef QI_HAVE_VAE
+#include "qwenimage_vae_vk.h"  /* and the VAE decoder after it */
+#endif
+#endif
+#ifdef QI_HAVE_VAE
+/* The VAE decode: on the device when the transformer's chain runs, else (or when the
+ * device's decode fails) the CPU's. */
+static int qi_vae_decode(QiVae *v, const float *z, int h, int w, uint8_t *rgba, float *out_f){
+#ifdef COLI_VULKAN
+    if (g_qic_on > 0 && !g_qic.failed && qvv_decode(v, z, h, w, rgba, out_f) == 0) return 0;
+#endif
+    return qiv_decode(v, z, h, w, rgba, out_f);
+}
 #endif
 static void dit_forward(Dit *d, const Prefix *p, DitStep *s, const float *lat, float t, float *out){
 #ifdef COLI_VULKAN
@@ -1070,7 +1083,7 @@ static int engine_generate(Engine *e, const char *prompt, int width, int height,
         emit_progress(pg, "decode", steps, steps, t0);
 #ifdef QI_HAVE_VAE
         if (!e->vae && !(e->vae = engine_vae(e, msg, msgn))) rc = -1;
-        if (rc == 0 && qiv_decode(e->vae, lat, gh, gw, rgba, NULL) != 0) { snprintf(msg, msgn, "VAE decode failed"); rc = -1; }
+        if (rc == 0 && qi_vae_decode(e->vae, lat, gh, gw, rgba, NULL) != 0) { snprintf(msg, msgn, "VAE decode failed"); rc = -1; }
 #else
         /* no VAE compiled in: show the first three latent channels, stretched */
         for (int y = 0; y < height; y++)
@@ -1387,7 +1400,7 @@ static int run_oracle(Engine *e, const char *refdir){
         if (vae && fin) {
             uint8_t *rgba = xmalloc((size_t)width * height * 4);
             float *of = fmalloc((size_t)4 * width * height);
-            qiv_decode(vae, fin, gh, gw, rgba, of);
+            qi_vae_decode(vae, fin, gh, gw, rgba, of);
             float *img_ref = ref_tensor(&R, "vae_out", NULL);
             if (img_ref) fails += cmp("VAE output (ref latents)", of, img_ref, (size_t)4 * width * height) > LOOSE;
             st_tensor *rt = st_find(&R, "rgba");
@@ -1403,7 +1416,7 @@ static int run_oracle(Engine *e, const char *refdir){
             }
             const char *tag = getenv("QWENIMAGE_ORACLE_TAG");
             char out[2200]; snprintf(out, sizeof out, "%s/oracle_c%s%s.png", refdir, tag ? "_" : "", tag ? tag : "");
-            qiv_decode(vae, mine, gh, gw, rgba, NULL);
+            qi_vae_decode(vae, mine, gh, gw, rgba, NULL);
             if (!write_png(out, rgba, width, height)) fprintf(stderr, "[oracle] our own chained image: %s\n", out);
             /* PSNR of the RGB of our chained image against the reference's: the
              * number that says what int8 weights or activations cost in pixels */
@@ -1434,6 +1447,9 @@ static void qi_vk_report(void){
 #ifdef COLI_VULKAN
     if (g_vk_ready) fprintf(stderr, "[VK] qwenimage: %llu matmuls on the GPU\n", coli_vk_matmul_calls());
     qic_report();
+#ifdef QI_HAVE_VAE
+    if (g_qvv.decodes) fprintf(stderr, "[VK] qwenimage vae: %llu decodes on the device\n", g_qvv.decodes);
+#endif
 #endif
 }
 

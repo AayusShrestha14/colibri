@@ -269,6 +269,40 @@ static void test_attn_hk(int S, int pos_base, int H, int KVH, int hd, int use_li
 }
 static void test_attn(int S, int pos_base, int hd, int use_list) { test_attn_hk(S, pos_base, 4, 2, hd, use_list); }
 
+/* chain_vae.comp (Qwen-Image's VAE): a band's 3x3 taps, with and without the 2x upsample,
+ * and the DupUp3D shortcut added; both are copies, so the bytes must be the CPU's. */
+static void test_vae_ops(int H, int W, int C, int u2, int y0, int nb) {
+    int Ho = H << u2, Wo = W << u2, C9 = 9 * C;
+    size_t xn = (size_t)H * W * C, qn = (size_t)nb * Wo * C9;
+    float *x = fvec(xn + 5, 1.f), *ref = malloc(qn * sizeof *ref);
+    for (int px = 0; px < nb * Wo; px++)
+        for (int kx = 0; kx < 3; kx++) for (int ky = 0; ky < 3; ky++) for (int c = 0; c < C; c++) {
+            int row = y0 + px / Wo, col = px % Wo, sy = row + ky - 1, sx = col + kx - 1;
+            ref[(size_t)px * C9 + kx * 3 * C + ky * C + c] =
+                sy >= 0 && sy < Ho && sx >= 0 && sx < Wo ? x[5 + ((size_t)(sy >> u2) * W + (sx >> u2)) * C + c] : 0.f;
+        }
+    VkcBuf *xb = up(x, xn + 5), *qb = vkc_buf((qn + 3) * 4, VKC_DOWN);
+    VkcVae p = {0, C, H, W, u2, Ho, Wo, y0, (int)qn, 5, 3, 0, 0};
+    vkc_begin(); int ok = vkc_vae(xb, qb, NULL, &p); ok = vkc_submit(1) && ok;
+    CHECK(ok && memcmp((float *)vkc_ptr(qb) + 3, ref, qn * 4) == 0, "vae taps H %d W %d C %d up %d rows %d+%d", H, W, C, u2, y0, nb);
+    /* DupUp3D: the half-size map x (C channels) into a 2H x 2W map of Co channels */
+    int Co = 4, *tab = malloc((size_t)Co * 4 * sizeof *tab);
+    for (int i = 0; i < Co * 4; i++) tab[i] = (i * 7 + 3) % C;
+    size_t yn = (size_t)(2 * H) * (2 * W) * Co;
+    float *y = fvec(yn, 1.f), *yr = malloc(yn * sizeof *yr);
+    for (int px = 0; px < 4 * H * W; px++) for (int o = 0; o < Co; o++) {
+        int row = px / (2 * W), col = px % (2 * W), src = (row >> 1) * W + (col >> 1), sub = (row & 1) * 2 + (col & 1);
+        yr[(size_t)px * Co + o] = y[(size_t)px * Co + o] + x[5 + (size_t)src * C + tab[o * 4 + sub]];
+    }
+    VkcBuf *yb = up(y, yn), *tb = vkc_buf((size_t)Co * 4 * sizeof(int), VKC_DEV);
+    VkcVae d = {1, C, H, W, 1, 2 * H, 2 * W, 0, (int)yn, 5, 0, Co, C};
+    vkc_begin(); ok = vkc_write(tb, 0, tab, (size_t)Co * 4 * sizeof(int)) && vkc_vae(xb, yb, tb, &d); ok = vkc_submit(1) && ok;
+    float *got = down(yb, 0, yn);
+    CHECK(ok && memcmp(got, yr, yn * 4) == 0, "vae dup H %d W %d C %d", H, W, C);
+    vkc_free(xb); vkc_free(qb); vkc_free(yb); vkc_free(tb);
+    free(x); free(ref); free(tab); free(y); free(yr); free(got);
+}
+
 /* GATE_ADD (Qwen-Image's gated residual): y = a + e[col] * b, a gate per column. */
 static void test_ew_gate(void) {
     int R = 5, D = 70;
@@ -2733,6 +2767,8 @@ int main(int argc, char **argv) {
     test_attn_full(70, 129, 2, 64); test_attn_full(1, 300, 4, 128);
     printf("attn full done\n");
     test_ew_gate();
+    test_vae_ops(5, 7, 3, 0, 0, 5); test_vae_ops(5, 7, 3, 1, 3, 4); test_vae_ops(4, 4, 16, 1, 0, 8);
+    printf("vae ops done\n");
     VkcStats st; vkc_stats(&st);
     printf("chain: %llu frames, %llu ops, %llu matmuls (%llu GEMM), %llu barriers\n", st.frames, st.ops, st.matmuls, st.gemms, st.barriers);
     vkc_shutdown();

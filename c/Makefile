@@ -746,6 +746,8 @@ VK_SPV   += shaders/chain_attn_flash.spv
 # a diffusion step's attention, every query row over every key row (made on first use;
 # qwenimage_chain.h)
 VK_SPV   += shaders/chain_attn_full.spv
+# Qwen-Image's VAE decoder: a band's 3x3 taps and the DupUp3D shortcut (made on first use)
+VK_SPV   += shaders/chain_vae.spv
 endif
 
 # Optional AMD XDNA2 (Ryzen AI NPU) lane, Windows. Same opt-in shape as VK=1:

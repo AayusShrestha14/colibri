@@ -907,7 +907,10 @@ for k in c:
 print(f"OK {os.environ['TAG']}: {len(c)} stages match the CPU run")
 QIPY
   }
-  for bits in 8 16 32; do qi_chain "qwenimage chain bits=$bits" $bits; done
+  for bits in 8 16 32; do
+    qi_chain "qwenimage chain bits=$bits" $bits
+    grep -qa 'qwenimage vae: [0-9]* decodes on the device' qi-vk.log || { cat qi-vk.log; fail "qwenimage chain bits=$bits: the VAE did not decode on the device"; }
+  done
   qi_chain "qwenimage chain, the attention in slices" 32 COLI_VK_ATTN_SLICE=60000
   grep -qa 'qwenimage chain: [0-9]* steps' qi-vk.log || { cat qi-vk.log; fail "qwenimage chain, slices: no step on the device"; }
   qi_chain "qwenimage chain, the device lost" 32 COLI_VK_CHAIN_FAULT=9
@@ -915,6 +918,7 @@ QIPY
   COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_IMG_BITS=8 COLI_IMG_ACT8=0 ./qwenimage --model qwenimage_tiny --prompt "a red fox in the snow" \
     --width 256 --height 256 --steps 2 --seed 1 --out qi-vk.png 2> qi-vk-gen.err
   grep -qa 'qwenimage chain: [0-9]* steps' qi-vk-gen.err || { cat qi-vk-gen.err; fail "qwenimage chain picture: the chain never ran"; }
+  grep -qa 'qwenimage vae: 1 decodes on the device' qi-vk-gen.err || { cat qi-vk-gen.err; fail "qwenimage chain picture: the VAE did not decode on the device"; }
   $PY - <<'QIPY'
 import sys; sys.path.insert(0, ".")
 import image_engine as e

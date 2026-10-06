@@ -687,6 +687,16 @@ typedef struct { int S, T, H, hd, q_off, q_row, k_off, v_off, kv_row, o_off, o_r
 int vkc_attn_full(VkcBuf *qkv, VkcBuf *o, const VkcAttnFull *p);
 int vkc_attn_full_ready(void);
 
+/* chain_vae.comp: Qwen-Image's VAE decoder (qwenimage_vae_vk.h), the two steps of its
+ * convolutions that are not a GEMM; maps channel-last [H][W][C]. mode 0: the 3x3 taps of
+ * output rows y0.. (n = pixels x 9C floats at o_off, [kx][ky][c] a pixel, zero outside the
+ * Ho x Wo map; up 1: x is H x W, nearest-upsampled 2x); mode 1: o[o_off + p*Co + c] +=
+ * the DupUp3D shortcut's input channel tab[c*4 + sub-pixel] of the half-size map x (dupC
+ * channels), n = pixels x Co. Made on first use. */
+typedef struct { int mode, C, H, W, up, Ho, Wo, y0, n, x_off, o_off, Co, dupC; } VkcVae;
+int vkc_vae(VkcBuf *x, VkcBuf *o, VkcBuf *tab, const VkcVae *p);
+int vkc_vae_ready(void);
+
 /* counters, for the engines' [VK] lines */
 typedef struct {
     unsigned long long frames, waits, ops, matmuls, gemms, barriers, bytes_up, bytes_down;

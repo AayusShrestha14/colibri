@@ -272,8 +272,11 @@ per step. Without the chain (`COLI_VK_CHAIN=0`, or a device that refuses the
 chain's buffers) the matrices run there one by one and the attention on the CPU,
 as before. The weights keep the storage `COLI_IMG_BITS` gave them (int8 by default,
 bf16 or f32) and the activations stay f32, so `COLI_IMG_ACT8` does not apply on the
-device and the result is the CPU's `COLI_IMG_ACT8=0` run up to summation order. The
-text encoder and the VAE run on the CPU.
+device and the result is the CPU's `COLI_IMG_ACT8=0` run up to summation order. When
+the chain runs, the VAE decodes on the device too (`qwenimage_vae_vk.h`: its 3x3
+convolutions as a band's taps and one GEMM, the norms, the shortcuts; the mid block's
+attention over every pixel on the CPU), with the CPU's decode as the fallback. The
+text encoder runs on the CPU.
 
 Measured on a Radeon 780M (an integrated GPU sharing the RAM of the 8-core Zen 4
 above), 8 steps:
@@ -282,10 +285,12 @@ above), 8 steps:
 |---|---|---|---|
 | CPU | 11.6 s | 67 s | 1 min 52 s |
 | GPU, the matrices one by one | 11.8 s | 63 s | |
-| GPU, the chain | 5.4 s | 39 s | 62 s |
+| GPU, the chain | 5.4 s | 38 s | 61 s |
 
-The image's time with the chain: 11 s to load and encode the prompt, 43 s of
-denoising, 8 s of VAE. Loading went from 34 s to 7.5 s in this release: four
+The image's time with the chain: 11 s to load and encode the prompt, 42 s of
+denoising, 7.5 s of VAE (6.1 s of it on the device; 8.0 s on the CPU). At 1024x1024
+the VAE takes 24 s on the 780M against the CPU's 28 to 30: an integrated GPU's f32
+products gain little there, a discrete card's more. Loading went from 34 s to 7.5 s in this release: four
 layers at once, each matrix quantized straight from its bf16 rows
 (`COLI_IMG_LOAD_THREADS` sets how many; each holds one matrix's bf16 bytes, up to
 about 140 MB, while it quantizes). On a 1024x1024 step the 780M spends half the

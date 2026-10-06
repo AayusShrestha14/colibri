@@ -1424,6 +1424,30 @@ int vkc_attn_full_ready(void) {
     return KF.mod != VK_NULL_HANDLE;
 }
 
+/* chain_vae.comp (Qwen-Image's VAE: a band's 3x3 taps, the DupUp3D shortcut): made on first use */
+static struct { VkShaderModule mod; VkPipeline pipe; int tried; } g_kva[2];
+#define KVA (g_kva[g_kd])
+static void kva_shutdown(void) {
+    if (KVA.pipe) vkDestroyPipeline(KC.dev, KVA.pipe, NULL);
+    if (KVA.mod) vkDestroyShaderModule(KC.dev, KVA.mod, NULL);
+    memset(&KVA, 0, sizeof KVA);
+}
+int vkc_vae_ready(void) {
+    if (!vkc_ready()) return 0;
+    if (!KVA.pipe && !KVA.tried) {
+        KVA.tried = 1;
+        if ((KVA.mod = load_module(KC.core.spv_path, "chain_vae.spv"))) KVA.pipe = make_pipe(KVA.mod, NULL);
+    }
+    return KVA.pipe != VK_NULL_HANDLE;
+}
+int vkc_vae(VkcBuf *x, VkcBuf *o, VkcBuf *tab, const VkcVae *p) {
+    if (p->n < 1 || !vkc_vae_ready()) return 0;
+    KC.kind = PK_EW;
+    VkcBind bd[3] = {B(x, 0), B(o, 1), B(p->mode == 1 ? tab : NULL, 0)};
+    uint32_t gx, gy; grid(((uint64_t)p->n + 255) / 256, &gx, &gy);
+    return record(KVA.pipe, bd, 3, p, sizeof *p, gx, gy, 1);
+}
+
 static VkPipeline ke_pipe(void) {
     if (KE.pipe || KE.tried || !vkc_ready()) return KE.pipe;
     KE.tried = 1;
@@ -1719,6 +1743,7 @@ void vkc_shutdown(void) {
     kab_shutdown();
     ke_shutdown();
     kf_shutdown();
+    kva_shutdown();
     for (int i = 0; i < P_NPIPE; i++) {
         if (KC.pipe[i]) vkDestroyPipeline(KC.dev, KC.pipe[i], NULL);
         if (KC.mod[i]) vkDestroyShaderModule(KC.dev, KC.mod[i], NULL);
