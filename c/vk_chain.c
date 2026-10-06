@@ -96,6 +96,7 @@ typedef struct {
     VkDescriptorSetLayout dsl;
     VkPipelineLayout pl;
     VkShaderModule mod[P_NPIPE], mod_gemm, mod_dnrec;
+    VkShaderModule mod_gv2; VkPipeline gv2;   /* chain_gemv2.comp: int8 decode GEMVs (COLI_VK_CHAIN_GEMV2) */
     VkPipeline pipe[P_NPIPE];
     VkPipeline gemm[VKC_GEMM_MAX]; int gemm_bm[VKC_GEMM_MAX], gemm_bn[VKC_GEMM_MAX], ngemm;
     VkPipeline dnrec[VKC_DNREC_MAX]; int dnrec_kd[VKC_DNREC_MAX], ndnrec;
@@ -353,6 +354,17 @@ int vkc_init(void) {
             VkSpecializationInfo si = {1, &me, 4, &v};
             if ((KC.gemv4 = make_pipe(KC.mod_gemv4, &si))) KC.gemv4_xs = xs;
         }
+    }
+    /* the int8/int4 decode GEMV with lanes per row and rows per workgroup chosen per
+     * matrix (chain_gemv2.comp): needs clustered subgroup operations */
+    {
+        const char *e = getenv("COLI_VK_CHAIN_GEMV2");
+        VkPhysicalDeviceSubgroupProperties sgp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &sgp};
+        vkGetPhysicalDeviceProperties2((VkPhysicalDevice)KC.core.phys, &p2);
+        int ok = (sgp.supportedOperations & VK_SUBGROUP_FEATURE_CLUSTERED_BIT) && (sgp.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+                 sgp.subgroupSize >= 16 && !(e && *e == '0');
+        if (ok && (KC.mod_gv2 = load_module(KC.core.spv_path, "chain_gemv2.spv"))) KC.gv2 = make_pipe(KC.mod_gv2, NULL);
     }
     /* the MLA, KDA and mHC shaders, optional: without one only its ops decline */
     for (int i = 0; i < PM_N; i++) {
@@ -764,7 +776,17 @@ static int matmul_aligned(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcB
     int v4 = path < 0 && KC.gemv4 && per && ti->rowWords % 4 == 0 && ti->I % 4 == 0 &&
              (ti->fmt != 4 || (ti->gs > 0 && ti->gs % 32 == 0)) && (ti->rowWords / 4) * per / 4 <= KC.gemv4_xs;
     KC.kind = path >= 0 ? PK_GEMM : ti->fmt == 1 ? PK_GEMV8 : PK_GEMV;
-    if (v4) {
+    int g2 = path < 0 && KC.gv2 && S <= 4 && ti->fmt == 1 &&   /* int4 measured slower than chain_gemv here */
+             ti->I % 32 == 0 && ti->I <= 16384 && ti->rowWords % 4 == 0;
+    if (g2) {
+        /* rows a workgroup: short matrices in small blocks, so they still fill the device */
+        int rpw = ti->O <= 1024 ? 16 : ti->O <= 4096 ? 32 : 64;
+        /* a speculative verify's rows (S <= 4) share each weight load */
+        int nr = S <= 4 && S * ti->I <= 16384 ? S : 1;
+        struct { int fmt, S, I, O, rowWords, gs, rpw, nr; } pc8 = {ti->fmt, S, ti->I, ti->O, ti->rowWords, ti->gs, rpw, nr};
+        ok = record(KC.gv2, bd, 4, &pc8, sizeof pc8, (uint32_t)((ti->O + rpw - 1) / rpw), (uint32_t)((S + nr - 1) / nr), 1);
+    }
+    else if (v4) {
         /* each workgroup stages x once: give it enough rows that the staging does not
          * rival the weights, while keeping enough workgroups to fill the device */
         /* lanes per row: about sixteen 16-byte steps each (COLI_VK_CHAIN_GEMV_LPR overrides) */
@@ -1650,6 +1672,8 @@ void vkc_shutdown(void) {
     for (int i = 0; i < KC.ndnrec; i++) vkDestroyPipeline(KC.dev, KC.dnrec[i], NULL);
     if (KC.gemv4) vkDestroyPipeline(KC.dev, KC.gemv4, NULL);
     if (KC.mod_gemv4) vkDestroyShaderModule(KC.dev, KC.mod_gemv4, NULL);
+    if (KC.gv2) vkDestroyPipeline(KC.dev, KC.gv2, NULL);
+    if (KC.mod_gv2) vkDestroyShaderModule(KC.dev, KC.mod_gv2, NULL);
     if (KC.mod_gemm) vkDestroyShaderModule(KC.dev, KC.mod_gemm, NULL);
     if (KC.mod_dnrec) vkDestroyShaderModule(KC.dev, KC.mod_dnrec, NULL);
     for (int i = 0; i < KC.nfa; i++) vkDestroyPipeline(KC.dev, KC.fa[i], NULL);

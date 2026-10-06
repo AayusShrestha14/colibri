@@ -491,7 +491,8 @@ static void extra(void) {
     on = vkt_init(&vc, NULL);
     CHECK(on && vkt_layers() == 1, "extra: no device form, the tier has %d layers (want the main one)", vkt_layers());
     if (on) {
-        float x[H] = {0}; int id[K] = {0, 1, 2}; uint8_t taken[K];
+        float x[H]; memset(x, 0, sizeof x);   /* H is a variable (grouped() widens it) */
+        int id[K] = {0, 1, 2}; uint8_t taken[K];
         CHECK(vkt_issue(1, x, 1, K, id, taken) == 0, "extra: a layer past the tier's took rows");
         vkt_shutdown();
     }
