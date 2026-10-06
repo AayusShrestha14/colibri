@@ -238,6 +238,7 @@ jobs:
             req: c/tools/requirements-kimi-k3-tiny.txt
           - family: kimi-mimo-sanitize
             req: c/tools/requirements-mimo-tiny.txt
+            extra: -r c/tools/requirements-qwenimage-tiny.txt   # qwenimage under ASan too
           # MiMo-V2.6's dense chain (COLI_VK_CHAIN=1), and the same under ASan and UBSan
           - family: mimo-chain
             req: c/tools/requirements-mimo-tiny.txt

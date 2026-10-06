@@ -142,6 +142,7 @@ int  vkc_attn_part_chunks(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, const Vk
 typedef struct { int n, d, nz, a_off, a_z, sa_off, sa_z, o_off, so_off; } VkcKvsJoin;
 int  vkc_kvs_join(VkcBuf *parts, VkcBuf *out, const VkcKvsJoin *p);
 int  vkc_attn_flash_rows(void);   /* COLI_VK_CHAIN_FLASH: rows from which chain_attn_flash runs (0 = never) */
+long long vkc_attn_slice_budget(void);   /* COLI_VK_ATTN_SLICE below: rows x positions x width a submission (0 = never) */
 /* The attention ops (vkc_attn, vkc_attn_w, vkc_mla_core, vkc_relattn) whose rows x positions
  * x heads x head dim pass COLI_VK_ATTN_SLICE (2^32; 0 = never) record their rows in slices,
  * each ending its frame (submitted, not waited for) and the next in a new one: no single
@@ -163,6 +164,7 @@ int  vkc_dnrec(int KD, VkcBuf *cv, VkcBuf *ab, VkcBuf *z, VkcBuf *st, VkcBuf *pr
 #define VKC_EW_HC_INJ   5
 #define VKC_EW_HC_APPLY 6
 #define VKC_EW_SCALE    7
+#define VKC_EW_GATE_ADD 8
 typedef struct { int op, n, D, C, flags, e_row, y_off, a_off, b_off, c_off, e_off; float fc; } VkcEw;
 int  vkc_ew(VkcBuf *y, VkcBuf *a, VkcBuf *b, VkcBuf *c, VkcBuf *e, const VkcEw *p);
 /* chain_qsa.comp (mode 0: nb block keys from b0; mode 1: S rows' selections) */
@@ -675,6 +677,30 @@ int vkc_enc_attn(VkcBuf *qkv, VkcBuf *c2p, VkcBuf *p2c, VkcBuf *o, VkcBuf *rng, 
                  const VkcEncAttn *p);
 typedef struct { int mode, S, H, hd, x_off, x_row, p_off, p_row, y_off, nr, r0; } VkcEncRel;
 int vkc_enc_rel(VkcBuf *x, VkcBuf *pt, VkcBuf *y, const VkcEncRel *p);
+
+/* chain_attn_full.comp: a diffusion step's attention (Qwen-Image's DiT). S query rows, each
+ * over all T key rows, H heads of hd (32, 64 or 128) floats, q, k and v token-major in one
+ * buffer: q[q_off + i*q_row + h*hd + d], k and v at k_off and v_off + t*kv_row + h*hd + d,
+ * the output at o_off + i*o_row + h*hd + d; the softmax's scale. 64 query rows of a head a
+ * workgroup, the keys in tiles of 64, the softmax online in float. Made on first use. */
+typedef struct { int S, T, H, hd, q_off, q_row, k_off, v_off, kv_row, o_off, o_row; float scale; } VkcAttnFull;
+int vkc_attn_full(VkcBuf *qkv, VkcBuf *o, const VkcAttnFull *p);
+int vkc_attn_full_ready(void);
+/* The same on the matrix units (chain_attn_coop.comp, cooperative matrices at subgroups of
+ * 32 or 64, hd 64 or 128): Q, K, V and P rounded to f16, the result the f32 one's to about
+ * 1e-3. 0: not on this device (nothing recorded). */
+int vkc_attn_full_coop(VkcBuf *qkv, VkcBuf *o, const VkcAttnFull *p);
+int vkc_attn_full_coop_ready(int hd);
+
+/* chain_vae.comp: Qwen-Image's VAE decoder (qwenimage_vae_vk.h), the two steps of its
+ * convolutions that are not a GEMM; maps channel-last [H][W][C]. mode 0: the 3x3 taps of
+ * output rows y0.. (n = pixels x 9C floats at o_off, [kx][ky][c] a pixel, zero outside the
+ * Ho x Wo map; up 1: x is H x W, nearest-upsampled 2x); mode 1: o[o_off + p*Co + c] +=
+ * the DupUp3D shortcut's input channel tab[c*4 + sub-pixel] of the half-size map x (dupC
+ * channels), n = pixels x Co. Made on first use. */
+typedef struct { int mode, C, H, W, up, Ho, Wo, y0, n, x_off, o_off, Co, dupC; } VkcVae;
+int vkc_vae(VkcBuf *x, VkcBuf *o, VkcBuf *tab, const VkcVae *p);
+int vkc_vae_ready(void);
 
 /* counters, for the engines' [VK] lines */
 typedef struct {
